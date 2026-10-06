@@ -1,0 +1,4 @@
+[package]
+name = "owt-test"
+version.workspace = true
+edition.workspace = true

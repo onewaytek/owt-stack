@@ -1,0 +1,70 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "UNLICENSED"
+publish = false
+repository = "https://github.com/onewaytek/owt-stack"
+
+# The versions every consumer is pinned to. An app depends on these through the
+# owt-* crates and, for the crates it also names directly, at the same major: a
+# shared crate is only shared while the axum/sqlx/askama majors agree.
+[workspace.dependencies]
+anyhow = "1"
+argon2 = "0.6"
+askama = "0.16"
+axum = { version = "0.8.9", default-features = false }
+axum-htmx = { version = "0.8", default-features = false }
+base64 = "0.23"
+cookie = { version = "0.18", features = ["private", "percent-encode"] }
+futures = "0.3"
+hmac = "0.13"
+html-escape = "0.2"
+http = "1"
+http-body-util = "0.1"
+jsonwebtoken = { version = "11", default-features = false }
+metrics = { version = "0.24", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+metrics-process = "2.4"
+opentelemetry = "0.33"
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+pbkdf2 = { version = "0.13", default-features = false }
+rand = "0.10"
+redis = { version = "1.7", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "cookies"] }
+rlimit = "0.11"
+rsa = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate"] }
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br", "set-header"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.34"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+unicode-normalization = "0.1"
+url = "2.5"
+
+owt-web = { path = "crates/owt-web" }
+owt-runtime = { path = "crates/owt-runtime" }
+owt-auth = { path = "crates/owt-auth" }
+owt-bus = { path = "crates/owt-bus" }
+owt-test = { path = "crates/owt-test" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"

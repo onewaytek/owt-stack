@@ -1,0 +1,37 @@
+[package]
+name = "owt-runtime"
+description = "Process plumbing the onewaytek apps share: configuration from the environment, logging and tracing, Prometheus metrics, the Postgres pool and locked migrations, serving with graceful shutdown."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["metrics"]
+# Prometheus exposition on its own listener, plus HTTP and runtime metrics.
+metrics = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:metrics-process"]
+# Trace export over OTLP gRPC when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
+
+[dependencies]
+anyhow.workspace = true
+axum = { workspace = true, features = ["tokio", "http1", "matched-path"] }
+metrics = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+metrics-process = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+rlimit.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
