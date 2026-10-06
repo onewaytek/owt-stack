@@ -11,7 +11,9 @@
 #    the committed .sqlx/ data; no database at build time. Migrations and Askama
 #    templates are compiled into the binary.
 # 3. runtime: distroless glibc, non-root. rustls means no OpenSSL; the image carries
-#    CA certificates for outbound TLS.
+#    CA certificates for outbound TLS. Distroless has no shell: an app whose
+#    operations `oc exec` shell tools into the pod (epicpartygame-rs's capacity
+#    harness runs `sh`, `timeout` and `env` there) keeps a debian-slim runtime.
 #
 # Built on GitHub-hosted runners and pushed to ghcr; the cluster pulls it through an
 # ImageStream (see templates/openshift/app.yaml). The ARC runners are rootless with no

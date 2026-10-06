@@ -46,6 +46,21 @@ on:
         description: Extra arguments for cargo test.
         type: string
         default: ""
+      container:
+        description: The job container (a Rust toolchain image).
+        type: string
+        default: rust:1-trixie
+      extra-env:
+        description: >-
+          KEY=VALUE lines added to the environment of every later step: test-only
+          values the suite needs (a session secret for test servers, a Redis db).
+          Never a real secret; pass those as secrets.
+        type: string
+        default: ""
+      node-version-file:
+        description: File naming the Node version for the stylesheet job; empty for 22.
+        type: string
+        default: ""
     secrets:
       OWT_STACK_TOKEN:
         description: Read access to onewaytek/owt-stack, to fetch the git dependency.
@@ -62,7 +77,7 @@ jobs:
     # used. Job and service containers share one pod, so services are on localhost,
     # Docker health-check options don't apply, and there are no `ports:` (a hostPort,
     # which every OpenShift SCC rejects).
-    container: rust:1-bookworm
+    container: ${{ inputs.container }}
     services:
       postgres:
         image: ${{ inputs.database != '' && format('postgres:{0}-alpine', inputs.postgres-major) || '' }}
@@ -76,7 +91,7 @@ jobs:
       DATABASE_URL: ${{ inputs.database != '' && format('postgres://postgres:postgres@127.0.0.1:5432/{0}', inputs.database) || '' }}
       REDIS_URL: ${{ inputs.redis && 'redis://127.0.0.1:6379' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Secrets can't appear in a step's `if:`, so the test is in the shell.
       - name: Fetch owt-stack with a token
         env:
@@ -86,6 +101,12 @@ jobs:
           if [ -n "$OWT_STACK_TOKEN" ]; then
             git config --global url."https://x-access-token:${OWT_STACK_TOKEN}@github.com/onewaytek/owt-stack".insteadOf "https://github.com/onewaytek/owt-stack"
           fi
+      - name: Extra environment
+        if: ${{ inputs.extra-env != '' }}
+        env:
+          EXTRA: ${{ inputs.extra-env }}
+        shell: bash
+        run: printf '%s\n' "$EXTRA" | grep -v '^[[:space:]]*$' >> "$GITHUB_ENV"
       - name: Wait for services
         if: ${{ inputs.database != '' || inputs.redis }}
         shell: bash
@@ -122,10 +143,11 @@ jobs:
     if: ${{ inputs.css-script != '' }}
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: ${{ inputs.node-version-file == '' && '22' || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
           cache: npm
       - run: npm ci
       - run: npm run ${{ inputs.css-script }}
