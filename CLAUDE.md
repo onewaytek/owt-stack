@@ -21,6 +21,5 @@ port), and they learn how to use it from `README.md`. So:
   `<!-- x-release-please-start-version -->` and `<!-- x-release-please-end -->` (or
   ends its line with `x-release-please-version`). Never in `.github/workflows/`: the
   default token cannot change a workflow file, and the release pull request fails.
-- Gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
-  `cargo test --workspace --all-features` (with `REDIS_URL` set, `owt-bus`'s Redis test
-  runs too).
+- Gate: `just check` (the root `justfile`); CI runs the same command. With
+  `REDIS_URL` set, `owt-bus`'s Redis test runs too.

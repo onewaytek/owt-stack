@@ -12,8 +12,10 @@ jobs:
   ci:
     uses: ./.github/workflows/rust-ci.yml
     with:
-      # The crates hold no SQL of their own to check; owt-bus tests against Redis.
+      # The same gate a developer runs (justfile). The crates hold no migrations;
+      # owt-runtime's job tests take advisory locks on a Postgres, and owt-bus's
+      # and the leases' tests use Redis.
+      check-command: just check
+      database: owt
       redis: true
-      sqlx-check: false
       css-script: ""
-      test-args: --workspace --all-features

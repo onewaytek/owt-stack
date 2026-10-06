@@ -15,8 +15,12 @@ Outside the crates:
 
 | Path | What it is |
 |---|---|
-| `.github/workflows/rust-ci.yml` | the reusable check workflow: fmt, audit, sqlx metadata, clippy, tests (on ARC), and the stylesheet build |
+| `.github/workflows/rust-ci.yml` | the reusable check workflow on ARC: the app's `just check`, or built-in fmt, audit, sqlx metadata, clippy and tests; the stylesheet build |
 | `.github/workflows/release-please.yml`, `conventional-commits.yml` | this repository's releases: Conventional Commits checked on every pull request, versions and the changelog by release-please |
+| `.github/workflows/release.yml` | reusable releases from conventional commits: stable on `main`, prereleases on `rc`, optional version write-back and changelog |
+| `.github/workflows/image.yml` | reusable image build for a released tag, pushed to ghcr with the channel's floating tags |
+| `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease |
+| `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime (with `templates/dockerignore`) |
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS, NetworkPolicies |
 | `tailwind/owt.css` | font stacks and htmx state variants (`htmx-request:opacity-50`) |
@@ -446,10 +450,30 @@ golden.check(); // a Golden dropped unchecked fails the test
 tests. Test requests carry no `Origin`, so cross-origin protection lets them through;
 set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
 
-## CI, images and deployment
+## Commands, CI, releases and deployment
 
-**CI:** call the reusable workflow. It runs fmt, `cargo audit`, the `.sqlx` freshness
-check, clippy and the tests on ARC, with Postgres and Redis as services:
+**Day to day:** copy `templates/justfile` and `templates/compose.yaml` into the app.
+Every app then answers to the same commands:
+
+```sh
+just setup        # npm ci, sqlx-cli, cargo-audit
+just db           # Postgres 18 and Redis 8 (compose.yaml), then the migrations
+just dev          # the app, with the stylesheet rebuilt on change
+just check        # the gate: fmt, clippy, rustdoc, .sqlx freshness, audit, tests
+just test --test worlds
+just prepare      # regenerate .sqlx/ after changing a query
+```
+
+`just check` is the gate before every commit, and CI runs the same command, so the
+two lists of checks can't drift. App-specific recipes go below the template's
+`---- app recipes ----` line. The compose ports and database name come from the
+app's `.env` (`POSTGRES_PORT`, `POSTGRES_DB`, ...), so two apps' stacks can run side
+by side.
+
+**CI:** call the reusable check workflow with the app's gate. It runs on ARC, with
+Postgres and Redis as services, installs `just`, `sqlx-cli` and `cargo-audit`,
+migrates, then runs `check-command`. Without `check-command`, it runs its own fmt,
+audit, sqlx, clippy and test steps.
 
 <!-- x-release-please-start-version -->
 ```yaml
@@ -457,6 +481,7 @@ jobs:
   checks:
     uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.2.0
     with:
+      check-command: just check
       database: myapp        # empty for no Postgres
       postgres-major: "18"   # match the CNPG image
       redis: true
@@ -467,12 +492,76 @@ jobs:
 ```
 <!-- x-release-please-end -->
 
-Image builds belong on GitHub-hosted runners (the ARC runners have no Docker daemon).
+**Releasing an app:** this is how an *app* releases, with semantic-release through the
+reusable `release.yml`. owt-stack releases itself differently, with release-please
+(see "Working on owt-stack"). Conventional commits decide an app's version: `feat` is
+a minor release, `fix` and `perf` are a patch, `!` or a `BREAKING CHANGE` footer is
+major (from 0.x too: a breaking change in 0.4.2 releases 1.0.0), and anything else
+releases nothing. `main` cuts stable releases; an `rc` branch, if the app has one, cuts
+`X.Y.Z-rc.N` prereleases. Each release is a `vX.Y.Z` tag, a GitHub release with
+generated notes, and an image in ghcr. An app with its own `.releaserc` must keep the
+`publishCmd` that writes `version` and `channel` to `$GITHUB_OUTPUT`, or no image is
+built.
 
-**Image:** copy `templates/Dockerfile` and set `BIN` and `PORT`. Pass the token as a
-BuildKit secret (`secrets: owt_stack_token=${{ secrets.OWT_STACK_TOKEN }}` in
-`docker/build-push-action`). Distroless has no shell; keep a debian-slim runtime if
-operations `oc exec` shell tools into the pod.
+<!-- x-release-please-start-version -->
+```yaml
+# .github/workflows/release.yml
+on:
+  push: {branches: [main, rc]}
+  workflow_dispatch:          # promote-rc.yml starts rc releases this way
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+  release:
+    needs: ci
+    permissions: {contents: write, issues: write, pull-requests: write}
+    uses: onewaytek/owt-stack/.github/workflows/release.yml@v0.2.0
+  image:
+    needs: release
+    if: needs.release.outputs.version != ''
+    permissions: {contents: read, packages: write}
+    uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.2.0
+    with: {version: "${{ needs.release.outputs.version }}"}
+    secrets: inherit
+```
+
+- **An app whose code reads its version** writes it into its files with the release:
+  `with: {version-command: 'uv version "$VERSION" && uv lock', version-files:
+  "pyproject.toml uv.lock", changelog: true, uv: true}`. The files are committed back
+  as `chore(release): vX.Y.Z [skip ci]`. The command runs in bash, without the
+  release's token.
+- **Images** are tagged `X.Y.Z`, plus `X.Y` and `latest` (and `X` from 1.0) for a
+  stable release, or `rc` for a prerelease. Rebuild an existing tag by calling
+  `image.yml` from a `workflow_dispatch` with `floating-tags: false`.
+- **The rc channel** (optional): on each same-repository PR into `main`, once its
+  checks pass, merge the PR into `rc` and cut a prerelease. After each stable
+  release, merge `main` back into `rc`.
+
+```yaml
+# in pr.yml
+  promote:
+    needs: ci
+    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    permissions: {contents: write, actions: write, pull-requests: write}
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.2.0
+    with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}"}
+# in release.yml
+  sync-rc:
+    needs: release
+    if: github.ref_name == 'main'
+    permissions: {contents: write, actions: write, pull-requests: write}
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.2.0
+    with: {source: main, dispatch-release: false}
+```
+<!-- x-release-please-end -->
+
+Image builds run on GitHub-hosted runners: the ARC runners have no Docker daemon.
+
+**Image:** copy `templates/Dockerfile` (and `templates/dockerignore` as
+`.dockerignore`) and set `BIN` and `PORT`. `image.yml` passes `OWT_STACK_TOKEN` to the
+build as the BuildKit secret the Dockerfile mounts. Distroless has no shell: keep a
+debian-slim runtime if operations `oc exec` shell tools into the pod.
 
 **OpenShift:**
 
@@ -481,8 +570,9 @@ oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
   -p IMAGE=ghcr.io/onewaytek/myapp -p CHANNEL=rc -p PORT=8000 | oc apply -f -
 ```
 
-The ImageStream polls ghcr for the channel's tag, and the Deployment's trigger rolls
-out each new digest. App-specific environment is a patch on the Deployment.
+The ImageStream polls ghcr for the channel's tag (`rc` or `latest`), and the
+Deployment's trigger rolls out each new digest. App-specific environment is a patch
+on the Deployment.
 
 **Tailwind:** depend on the npm half and import it after Tailwind:
 
@@ -564,8 +654,9 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ## Working on owt-stack
 
-`cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-features`.
-`owt-bus`'s Redis test runs when `REDIS_URL` is set and is skipped otherwise.
+`just check` is the gate (fmt, clippy over every crate and feature, the tests with the
+README doctests, `cargo audit`), and CI runs the same command. `owt-bus`'s Redis test
+runs when `REDIS_URL` is set and is skipped otherwise.
 
 **Keep this README's instructions current.** A change to a public API, a template, the
 workflow's inputs or how an app adopts something updates the matching section here in

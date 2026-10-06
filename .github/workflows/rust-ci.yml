@@ -61,6 +61,15 @@ on:
           Never a real secret; pass those as secrets.
         type: string
         default: ""
+      check-command:
+        description: >-
+          The app's own gate (e.g. `just check`), run instead of the built-in fmt,
+          audit, sqlx, clippy and test steps, so CI runs exactly what a developer
+          runs. just, sqlx-cli and cargo-audit are installed for it, and the database
+          is migrated first. With it set, `audit`, `sqlx-check` and `test-args` are
+          ignored: the app's gate decides those.
+        type: string
+        default: ""
       node-version-file:
         description: File naming the Node version for the stylesheet job; empty for 22.
         type: string
@@ -151,18 +160,39 @@ jobs:
               GIT_CONFIG_VALUE_0="https://github.com/onewaytek/owt-stack"
           fi
           cargo fetch --locked
+      - name: Install the gate's tools
+        if: ${{ inputs.check-command != '' }}
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        # Pinned, so the gate doesn't change under an app between its own commits.
+        # sqlx-cli's major must match the apps' sqlx (0.9); move these together.
+        with:
+          tool: just@1.58.0,cargo-audit@0.22.2,sqlx-cli@0.9.0
+      - name: Migrate
+        if: ${{ inputs.check-command != '' && inputs.database != '' }}
+        # A library's tests can want a database without having migrations of their own.
+        shell: bash
+        run: if [ -d migrations ]; then sqlx migrate run; else echo "no migrations/ to apply"; fi
+      - name: The app's gate
+        if: ${{ inputs.check-command != '' }}
+        env:
+          CHECK: ${{ inputs.check-command }}
+        shell: bash
+        run: eval "$CHECK"
       - run: cargo fmt --check
+        if: ${{ inputs.check-command == '' }}
       - name: cargo audit
-        if: ${{ inputs.audit }}
+        if: ${{ inputs.check-command == '' && inputs.audit }}
         run: cargo install cargo-audit --locked && cargo audit --deny warnings
       - name: sqlx metadata is current
-        if: ${{ inputs.sqlx-check && inputs.database != '' }}
+        if: ${{ inputs.check-command == '' && inputs.sqlx-check && inputs.database != '' }}
         run: |
           cargo install sqlx-cli --locked --no-default-features --features postgres,rustls
           cargo sqlx migrate run
           SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets
       - run: cargo clippy --all-targets --locked -- -D warnings
+        if: ${{ inputs.check-command == '' }}
       - name: cargo test
+        if: ${{ inputs.check-command == '' }}
         env:
           TEST_ARGS: ${{ inputs.test-args }}
         shell: bash

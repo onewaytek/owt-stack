@@ -1,0 +1,136 @@
+name: Promote to rc
+
+# Reusable: keep the `rc` branch a superset of main plus every feature in flight,
+# so each PR's change ships as an X.Y.Z-rc.N prerelease before it merges.
+#
+#   # pr.yml, after the checks pass on a same-repository PR into main:
+#   promote:
+#     needs: [ci]
+#     permissions: {contents: write, actions: write, pull-requests: write}
+#     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@vX.Y.Z  # the release the app uses
+#     with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}"}
+#
+#   # release.yml, after a stable release on main:
+#   sync-rc:
+#     needs: release
+#     if: github.ref_name == 'main'
+#     permissions: {contents: write, actions: write, pull-requests: write}
+#     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@vX.Y.Z  # the release the app uses
+#     with: {source: main, dispatch-release: false}
+#
+# The merge retries on a non-fast-forward, so concurrent promotions serialize
+# without losing work. Conflicts resolve toward the incoming side (-X theirs):
+# PRs are squash-merged into main while rc carries their individual commits, so the
+# histories disagree on every line a later change edits again; main holds the final
+# form of anything rc already has, and a feature head is the newest intent for its
+# lines. A structural conflict (modify/delete, rename) still fails, and is reported
+# on the PR. The cost of -X theirs: two features in flight that edit the same lines
+# leave rc with whichever was promoted last until the next promotion or sync, and a
+# PR closed without merging stays in rc until it is reverted there.
+#
+# A push made with the workflow's own token starts no workflow, so the rc release is
+# started by dispatching the app's release workflow, which a workflow_dispatch may.
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        description: The branch to merge into rc (a PR's head, or main).
+        type: string
+        required: true
+      pr:
+        description: The PR's number, for the merge message and the conflict report.
+        type: string
+        default: ""
+      dispatch-release:
+        description: Start the app's release workflow on rc when rc changed.
+        type: boolean
+        default: true
+      release-workflow:
+        description: The app's release workflow file, dispatched on rc.
+        type: string
+        default: release.yml
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    # A fork's branch can't be fetched from here, and its code is not ours to promote.
+    if: ${{ github.repository_owner == 'onewaytek' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: merge
+        name: Merge into rc
+        env:
+          SRC: ${{ inputs.source }}
+          PR: ${{ inputs.pr }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$PR" ]; then msg="chore(rc): merge #${PR} (${SRC}) into rc"; else msg="chore(rc): merge ${SRC} into rc"; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3 4 5; do
+            git fetch --no-tags origin \
+              "+refs/heads/main:refs/remotes/origin/main" \
+              "+refs/heads/${SRC}:refs/remotes/origin/${SRC}"
+            git fetch --no-tags origin "+refs/heads/rc:refs/remotes/origin/rc" 2>/dev/null || true
+            if git rev-parse -q --verify refs/remotes/origin/rc >/dev/null; then
+              git checkout -q -B rc refs/remotes/origin/rc
+            else
+              git checkout -q -B rc refs/remotes/origin/main
+            fi
+            before=$(git rev-parse HEAD)
+            # rc stays a superset of main, so prereleases sort above the last release.
+            git merge -q --no-ff --no-edit -X theirs refs/remotes/origin/main
+            if [ "$SRC" != main ]; then
+              git merge -q --no-ff -X theirs -m "$msg" "refs/remotes/origin/${SRC}"
+            fi
+            if [ "$(git rev-parse HEAD)" = "$before" ]; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "rc already contains ${SRC}"
+              exit 0
+            fi
+            if git push origin rc; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "push raced another writer (attempt ${attempt}); retrying"
+            sleep $((attempt * 3))
+          done
+          echo "could not push rc after 5 attempts" >&2
+          exit 1
+      - name: Release rc
+        if: ${{ inputs.dispatch-release && steps.merge.outputs.changed == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          WORKFLOW: ${{ inputs.release-workflow }}
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: process.env.WORKFLOW,
+              ref: "rc",
+            });
+      - name: Report a conflict
+        if: ${{ failure() && inputs.pr != '' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR: ${{ inputs.pr }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR),
+              body: "⚠️ Could not merge this branch into `rc` (likely a conflict with another in-flight feature). Resolve by merging `rc` into this branch or rebasing onto it, then push.",
+            });
