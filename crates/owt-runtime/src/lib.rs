@@ -7,10 +7,13 @@
 //! * [`metrics`] (feature `metrics`): a Prometheus recorder, per-route HTTP timings,
 //!   runtime and pool gauges, `/metrics` on its own listener.
 //! * [`db`]: the Postgres pool, and migrations under an advisory lock.
+//! * [`jobs`]: background work on every replica, on one at a time (an advisory lock),
+//!   or on the replica holding a Redis lease (feature `redis`).
 //! * [`serve`]: bind, serve with client addresses, stop on SIGTERM or Ctrl-C.
 
 pub mod db;
 pub mod env;
+pub mod jobs;
 pub mod logging;
 #[cfg(feature = "metrics")]
 pub mod metrics;

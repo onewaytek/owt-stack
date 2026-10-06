@@ -14,7 +14,7 @@ axum = { workspace = true, features = ["tokio", "http1"] }
 cookie.workspace = true
 owt-auth.workspace = true
 owt-bus.workspace = true
-owt-runtime.workspace = true
+owt-runtime = { workspace = true, features = ["redis"] }
 owt-test.workspace = true
 owt-web.workspace = true
 redis.workspace = true

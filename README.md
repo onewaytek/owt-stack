@@ -6,7 +6,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | Crate | What an app gets |
 |---|---|
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
-| `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
+| `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement |
@@ -43,7 +43,8 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.2.0" }
 ```
 <!-- x-release-please-end -->
 
-`owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export.
+`owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export,
+`redis` for leases and leased jobs.
 
 A shared crate is only shared while the majors agree: an app that names `axum`, `sqlx`,
 `askama` or `redis` directly must use the major in this workspace's `Cargo.toml`.
@@ -356,6 +357,63 @@ let _first = socket.recv().await;
 
 `Bus::local` is the same API in one process, for tests. Channel names are a wire
 format between replicas: change them only with every replica.
+
+### Background jobs
+
+Every replica runs the same binary, so a periodic task runs everywhere unless it
+says otherwise. `owt_runtime::jobs` gives three modes, all with jitter, a loop that
+survives a failed or panicking run, and graceful shutdown:
+
+- `every_replica`: idempotent work; the task takes its rows with `SKIP LOCKED`.
+- `singleton`: at most one replica at a time, by a Postgres advisory lock that is
+  tried and skipped, never waited on.
+- `leased` (feature `redis`): one replica, the same one while it lives, by a Redis
+  lease renewed while held; on shutdown it is released, so another replica takes over
+  at once.
+
+```rust,no_run
+use std::time::Duration;
+use owt_runtime::jobs::{CancellationToken, Every, JobMetrics, Jobs, lease::Leases};
+
+# async fn demo(pool: sqlx::PgPool, redis: redis::aio::ConnectionManager) {
+let shutdown = CancellationToken::new();
+let jobs = Jobs::new(shutdown.clone()).metrics(JobMetrics::prefixed("myapp"));
+
+// Each replica sweeps, taking rows with FOR UPDATE SKIP LOCKED.
+let p = pool.clone();
+jobs.every_replica("weekly_pass", Every::new(Duration::from_secs(60)), move || {
+    let p = p.clone();
+    async move { sqlx::query("SELECT 1").execute(&p).await?; Ok(()) }
+});
+
+// One replica at a time drives the bots; the others skip that tick.
+jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_001, || async { Ok(()) });
+
+// One replica owns the clock; the TTL outlasts the period so ownership sticks.
+let leases = Leases::new(redis, Leases::new_holder_id(), "myapp");
+jobs.leased("clock", Every::new(Duration::from_secs(1)), leases, "clock", Duration::from_secs(5), |held| async move {
+    tokio::select! {
+        () = held.lost() => {}  // another replica took over mid-run: stop owner-only work
+        () = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+    Ok(())
+});
+
+// At SIGTERM: stop the loops (runs in progress finish), then exit.
+owt_runtime::serve::shutdown_signal().await;
+shutdown.cancel();
+jobs.stopped().await;
+# }
+```
+
+Name each advisory lock id once, in one place in the app: two jobs sharing an id
+exclude each other. Record runs with `JobMetrics::prefixed("myapp")`
+(`<prefix>_job_runs_total{job,outcome}`, `<prefix>_job_seconds{job}`), and call its
+`describe()` inside the closure passed to `owt_runtime::metrics::install`.
+
+A leased job keeps its lease while its replica lives as long as the TTL outlasts the
+period plus jitter: the lease is renewed at each tick, during a run, and when the run
+ends.
 
 ### Tests
 
