@@ -1,0 +1,10 @@
+# Copy to the app's repository as .dockerignore. The Dockerfile's `COPY . .` puts the
+# whole context into build layers, and a registry build cache exports those layers:
+# keep secrets and local state out of the context.
+.git
+.env
+.env.*
+target
+node_modules
+*.pem
+*.key

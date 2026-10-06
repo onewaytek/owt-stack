@@ -3,9 +3,13 @@
 //! 1. [`Client::begin`] builds the redirect to the provider and a [`Pending`] login
 //!    (state, and the PKCE verifier where the provider supports it) for the app to keep
 //!    in the person's session.
-//! 2. The provider redirects back with `code` and `state`. The app checks the state
-//!    with [`Pending::matches`], then [`Client::complete`] trades the code for a token
-//!    and the token for the [`Identity`] the provider vouches for.
+//! 2. The provider redirects back with `code` and `state`. [`Client::complete`] takes
+//!    both: it refuses a state that is not the pending login's, or a pending login
+//!    begun with another provider, before it trades the code for a token and the token
+//!    for the [`Identity`] the provider vouches for.
+//!
+//! Make the HTTP client with [`http_client`]: it gives up on a provider that stalls
+//! and follows no redirects, so the client secret goes only where it was addressed.
 //!
 //! A [`Provider`] is data: endpoints, scope, and how to read its user-info response.
 //! [`google`], [`discord`] and [`twitch`] are presets; [`oidc`] covers any `OpenID`
@@ -77,7 +81,7 @@ pub fn google() -> Provider {
     }
 }
 
-/// Discord.
+/// Discord, with PKCE.
 #[must_use]
 pub fn discord() -> Provider {
     Provider {
@@ -87,7 +91,7 @@ pub fn discord() -> Provider {
         token_url: "https://discord.com/api/oauth2/token".into(),
         userinfo_url: "https://discord.com/api/users/@me".into(),
         scope: "identify email",
-        pkce: false,
+        pkce: true,
         client_id_header: false,
         identity: |info| {
             Some(Identity {
@@ -165,6 +169,10 @@ fn oidc_identity(info: Value) -> Option<Identity> {
 /// to anyone else.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
+    /// The [`Provider::id`] it was begun with: a callback for one provider cannot
+    /// complete a login begun with another (the mix-up attack).
+    #[serde(default)]
+    pub provider: String,
     /// The `state` sent out, to be returned unchanged.
     pub state: String,
     /// The PKCE verifier, if a challenge was sent.
@@ -181,7 +189,7 @@ impl Pending {
 }
 
 /// A provider with this app's registration at it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     /// The provider.
     pub provider: Provider,
@@ -193,9 +201,37 @@ pub struct Client {
     pub redirect_uri: String,
 }
 
+impl std::fmt::Debug for Client {
+    /// Without the secret: a `{:?}` in a log line must not publish it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("provider", &self.provider.id)
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An HTTP client for talking to providers: ten seconds for a whole exchange, five to
+/// connect, and no redirects followed (a token endpoint that redirects would be sent
+/// the client secret again, wherever it pointed).
+pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// Why a sign-in failed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The callback's `state` is not the pending login's: not this browser's sign-in.
+    #[error("the callback's state does not match the sign-in that was begun")]
+    State,
+    /// The pending login was begun with another provider.
+    #[error("the sign-in was begun with another provider")]
+    Provider,
     /// The provider could not be reached or refused the exchange.
     #[error("talking to the provider: {0}")]
     Http(#[from] reqwest::Error),
@@ -228,17 +264,32 @@ impl Client {
                 .append_pair("code_challenge", &challenge)
                 .append_pair("code_challenge_method", "S256");
         }
-        Ok((url.into(), Pending { state, verifier }))
+        let provider = self.provider.id.to_owned();
+        Ok((
+            url.into(),
+            Pending {
+                provider,
+                state,
+                verifier,
+            },
+        ))
     }
 
-    /// Trade the callback's `code` for the person's identity. Check the state with
-    /// [`Pending::matches`] first.
+    /// Trade the callback's `code` for the person's identity, if its `state` is the
+    /// pending login's and that login was begun with this provider.
     pub async fn complete(
         &self,
         http: &reqwest::Client,
         pending: &Pending,
+        state: &str,
         code: &str,
     ) -> Result<Identity, Error> {
+        if pending.provider != self.provider.id {
+            return Err(Error::Provider);
+        }
+        if !pending.matches(state) {
+            return Err(Error::State);
+        }
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -302,7 +353,9 @@ mod tests {
         assert!(pending.matches(&state));
         assert!(!pending.matches("other"));
         assert!(pending.verifier.is_some());
-        assert!(client(discord()).begin().unwrap().1.verifier.is_none());
+        assert_eq!(pending.provider, "google");
+        assert!(client(discord()).begin().unwrap().1.verifier.is_some());
+        assert!(client(twitch()).begin().unwrap().1.verifier.is_none());
     }
 
     #[tokio::test]
@@ -333,13 +386,30 @@ mod tests {
             ..google()
         });
         let (_, pending) = c.begin().unwrap();
+        let http = http_client().unwrap();
+        assert!(matches!(
+            c.complete(&http, &pending, "not-the-state", "abc").await,
+            Err(Error::State)
+        ));
+        let elsewhere = client(discord()).begin().unwrap().1;
+        assert!(matches!(
+            c.complete(&http, &elsewhere, &elsewhere.state, "abc").await,
+            Err(Error::Provider)
+        ));
         let who = c
-            .complete(&reqwest::Client::new(), &pending, "abc")
+            .complete(&http, &pending, &pending.state, "abc")
             .await
             .unwrap();
         assert_eq!(
             (who.uid.as_str(), who.email.as_deref(), who.email_verified),
             ("42", Some("a@b.c"), true)
         );
+    }
+
+    #[test]
+    fn debug_output_keeps_the_secret() {
+        let mut c = client(google());
+        c.client_secret = "hunter2-secret".into();
+        assert!(!format!("{c:?}").contains("hunter2"));
     }
 }

@@ -17,6 +17,13 @@
 //!   has no one for.
 //! * Local (tests, one process): publishing goes straight to local subscribers.
 //!
+//! **Trust.** A message is not authenticated: whoever can `PUBLISH` to the Redis can
+//! put text in front of every subscriber, and apps publish rendered HTML. So the
+//! Redis is part of the app's trust boundary. Give it a password or an ACL user
+//! limited to `<prefix>:*`, keep other workloads off its network, and use a
+//! `rediss://` URL (TLS, verified against the system's roots) wherever the path to
+//! it leaves the node.
+//!
 //! **Failure handling**, each learnt from a fault-injection run:
 //! * A publish Redis refuses is delivered locally: a Redis blip degrades to
 //!   single-replica behaviour instead of silence.
@@ -646,5 +653,17 @@ mod tests {
             Some("k1")
         );
         assert!(sub.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tls_urls_are_understood() {
+        let client = redis::Client::open("rediss://user:pw@redis.example:6380/0").unwrap();
+        assert!(matches!(
+            client.get_connection_info().addr(),
+            redis::ConnectionAddr::TcpTls {
+                insecure: false,
+                ..
+            }
+        ));
     }
 }

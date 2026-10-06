@@ -48,6 +48,9 @@ parameters:
     value: lvms-vg1
   - name: MEMORY_LIMIT
     value: 512Mi
+  - name: METRICS_NAMESPACE
+    description: The namespace whose Prometheus scrapes the metrics port.
+    value: openshift-user-workload-monitoring
 objects:
   - apiVersion: image.openshift.io/v1
     kind: ImageStream
@@ -93,6 +96,8 @@ objects:
         metadata:
           labels: {app: "${NAME}"}
         spec:
+          # The app never calls the cluster API, so it holds no token for it.
+          automountServiceAccountToken: false
           containers:
             - name: app
               # Placeholder the trigger resolves (lookupPolicy.local).
@@ -107,7 +112,14 @@ objects:
                 - name: DATABASE_URL
                   valueFrom:
                     secretKeyRef: {name: "${NAME}-db-app", key: uri}
+                # Postgres over TLS, verified against the CA CNPG minted for this
+                # cluster (sqlx reads both variables; the URL names no sslmode).
+                - {name: PGSSLMODE, value: verify-full}
+                - {name: PGSSLROOTCERT, value: /etc/db-ca/ca.crt}
                 - {name: RUST_LOG, value: "info"}
+              volumeMounts:
+                - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
               # Startup includes connecting and migrating; until Postgres is up the
               # process exits and restarts, which this tolerates without flapping.
               startupProbe:
@@ -128,8 +140,17 @@ objects:
               securityContext:
                 runAsNonRoot: true
                 allowPrivilegeEscalation: false
+                # Nothing writes to the image; /tmp is an emptyDir.
+                readOnlyRootFilesystem: true
                 capabilities: {drop: [ALL]}
                 seccompProfile: {type: RuntimeDefault}
+          volumes:
+            - name: db-ca
+              secret:
+                secretName: ${NAME}-db-ca
+                items: [{key: ca.crt, path: ca.crt}]
+            - name: tmp
+              emptyDir: {medium: Memory, sizeLimit: 64Mi}
 
   - apiVersion: v1
     kind: Service
@@ -187,3 +208,50 @@ objects:
       resources:
         requests: {cpu: 100m, memory: 256Mi}
         limits: {memory: 512Mi}
+
+  # Who may connect. Without these, every pod in every namespace can reach the app
+  # (around the Route), its metrics and its database. A pod selected by a policy
+  # accepts only what some policy allows, so these are the whole list.
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME}
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      podSelector:
+        matchLabels: {app: "${NAME}"}
+      policyTypes: [Ingress]
+      ingress:
+        # The router, which is where the Route's traffic comes from.
+        - from:
+            - namespaceSelector:
+                matchLabels: {policy-group.network.openshift.io/ingress: ""}
+          ports: [{port: http}]
+        # Prometheus.
+        - from:
+            - namespaceSelector:
+                matchLabels: {kubernetes.io/metadata.name: "${METRICS_NAMESPACE}"}
+          ports: [{port: metrics}]
+
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME}-db
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      podSelector:
+        matchLabels: {cnpg.io/cluster: "${NAME}-db"}
+      policyTypes: [Ingress]
+      ingress:
+        # Postgres: the app, and the cluster's own instances (replication).
+        - from:
+            - podSelector:
+                matchLabels: {app: "${NAME}"}
+            - podSelector:
+                matchLabels: {cnpg.io/cluster: "${NAME}-db"}
+          ports: [{port: 5432}]
+        # The instance manager's status port, which the CNPG operator calls from its
+        # own namespace (it authenticates callers itself).
+        - ports: [{port: 8000}]

@@ -5,9 +5,9 @@ Rust, Axum, SQLx on Postgres, Askama, htmx and Tailwind, deployed to OpenShift.
 
 | Crate | What an app gets |
 |---|---|
-| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; fingerprinted static URLs; security headers and a nonce-based content security policy; a response deadline and body cap; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
+| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; fingerprinted static URLs; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
-| `owt-auth` | Argon2id hashing off the runtime with bounded concurrency, accepting Django `pbkdf2_sha256` hashes for migration; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
+| `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts, accepting Django `pbkdf2_sha256` hashes for migration; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port |
 
@@ -16,8 +16,8 @@ Outside the crates:
 | Path | What it is |
 |---|---|
 | `.github/workflows/rust-ci.yml` | the reusable check workflow: fmt, audit, sqlx metadata, clippy, tests (on ARC), and the stylesheet build |
-| `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime |
-| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres |
+| `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime (with `templates/dockerignore`) |
+| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS, NetworkPolicies |
 | `tailwind/owt.css` | font stacks and htmx state variants (`htmx-request:opacity-50`) |
 
 ## Using it
@@ -86,8 +86,13 @@ let app = Limits::default().apply(routes)
 
 - `headers::security` sends HSTS for the app's own host. An app that owns its whole
   domain adds `includeSubDomains` itself.
-- A WebSocket handler calls `CrossOrigin::same_origin` before upgrading: the layer
-  passes every `GET`.
+- Sign-in: `throttle::Throttle` around `password::verify_or_decoy`, keyed on
+  `client_ip::Source::client_ip` (configured for the proxies actually in front of
+  the app), and `redirect::local_or` on `?next=` before redirecting to it.
+- OAuth: `oauth::http_client()` for the exchange; `Client::complete` checks the
+  state and the provider itself.
+- The bus's Redis is inside the trust boundary: a password or ACL user, a network
+  only the app reaches, `rediss://` where the path leaves the node.
 - `Limits` bounds the time to a response, not the time a client takes to send a
   request: serve behind a proxy that bounds that (the OpenShift router does).
 

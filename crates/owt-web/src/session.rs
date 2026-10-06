@@ -87,7 +87,27 @@ impl<T> Clone for Sessions<T> {
 }
 
 type Validator<T> =
-    Arc<dyn Fn(Presented<T>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+    Arc<dyn Fn(Presented<T>) -> Pin<Box<dyn Future<Output = Verdict> + Send>> + Send + Sync>;
+
+/// What [`Sessions::validate_with`] decides about a session. A `bool` converts:
+/// `true` is [`Verdict::Valid`], `false` is [`Verdict::Revoked`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// It stands.
+    Valid,
+    /// It was revoked: it is no session, and its cookie is removed.
+    Revoked,
+    /// It could not be checked (the database did not answer). It is no session for
+    /// this request, and the cookie is kept: an outage must neither let a revoked
+    /// session through nor sign everyone out.
+    Unknown,
+}
+
+impl From<bool> for Verdict {
+    fn from(valid: bool) -> Self {
+        if valid { Self::Valid } else { Self::Revoked }
+    }
+}
 
 /// A session a request presented, as [`Sessions::validate_with`] sees it.
 #[derive(Clone, Debug)]
@@ -174,17 +194,22 @@ impl<T: SessionData> Sessions<T> {
         self
     }
 
-    /// Ask `valid` about every session the layer opens; one it refuses is no session,
-    /// and its cookie is removed. This is where revocation lives: compare the epoch in
-    /// the session's data with the account's (see the module docs). It runs on every
+    /// Ask `valid` about every session the layer opens; it answers with a
+    /// [`Verdict`], or a `bool`. This is where revocation lives: compare the epoch in
+    /// the session's data with the account's (see the module docs), and answer
+    /// [`Verdict::Unknown`] when the comparison could not be made. It runs on every
     /// request that carries a session, so make it one indexed read, or a cached one.
     #[must_use]
-    pub fn validate_with<F, Fut>(mut self, valid: F) -> Self
+    pub fn validate_with<F, Fut, V>(mut self, valid: F) -> Self
     where
         F: Fn(Presented<T>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = bool> + Send + 'static,
+        Fut: Future<Output = V> + Send + 'static,
+        V: Into<Verdict>,
     {
-        self.validator = Some(Arc::new(move |p| Box::pin(valid(p))));
+        self.validator = Some(Arc::new(move |p| {
+            let verdict = valid(p);
+            Box::pin(async move { verdict.await.into() })
+        }));
         self
     }
 
@@ -284,26 +309,30 @@ impl<T: SessionData> Sessions<T> {
     /// never cacheable.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
         let session = Session::<T>::default();
-        let mut refused = false;
+        let (mut refused, mut unchecked) = (false, false);
         if let Some(presented) = this.open(req.headers()) {
-            let valid = match &this.validator {
+            let verdict = match &this.validator {
                 Some(valid) => valid(presented.clone()).await,
-                None => true,
+                None => Verdict::Valid,
             };
-            if valid {
-                let mut inner = session.inner();
-                inner.id = Some(presented.id);
-                inner.issued = Some(presented.issued);
-                inner.data = presented.data;
-            } else {
-                refused = true;
+            match verdict {
+                Verdict::Valid => {
+                    let mut inner = session.inner();
+                    inner.id = Some(presented.id);
+                    inner.issued = Some(presented.issued);
+                    inner.data = presented.data;
+                }
+                Verdict::Revoked => refused = true,
+                Verdict::Unknown => unchecked = true,
             }
         }
         req.extensions_mut().insert(session.clone());
         let mut response = next.run(req).await;
         let changed = {
             let inner = session.inner();
-            inner.modified.then(|| {
+            // A handler that saw no session because it could not be checked must not
+            // replace the cookie with the empty one it was shown.
+            (inner.modified && !unchecked).then(|| {
                 (
                     inner.id.clone().unwrap_or_else(new_id),
                     inner.issued.unwrap_or_else(now),
@@ -646,5 +675,22 @@ mod tests {
             "{set}"
         );
         assert_eq!(text(res).await, "None");
+    }
+
+    #[tokio::test]
+    async fn a_session_that_cannot_be_checked_is_withheld_and_kept() {
+        let s = sessions();
+        let cookie = format!("sid={}", s.seal("abc", &Data { user: Some(7) }));
+        let down = s.validate_with(|_: Presented<Data>| async { Verdict::Unknown });
+        let app = who().layer(from_fn_with_state(down, Sessions::<Data>::layer));
+        let res = get_with(app.clone(), "/who", Some(&cookie)).await;
+        assert!(
+            res.headers().get(header::SET_COOKIE).is_none(),
+            "the cookie is kept"
+        );
+        assert_eq!(text(res).await, "None");
+        // Nor may a handler's change overwrite the cookie it never saw.
+        let res = get_with(app, "/login", Some(&cookie)).await;
+        assert!(res.headers().get(header::SET_COOKIE).is_none());
     }
 }

@@ -6,7 +6,9 @@
 //! secret through every form. This is the algorithm of Go 1.25's
 //! `http.CrossOriginProtection`:
 //!
-//! 1. `GET`, `HEAD` and `OPTIONS` pass: they must not change state.
+//! 1. `GET`, `HEAD` and `OPTIONS` pass: they must not change state. A `WebSocket`
+//!    upgrade is the exception: it is a `GET` that opens a channel acting with the
+//!    page's cookies, so it is checked like an unsafe request.
 //! 2. `Sec-Fetch-Site: same-origin` or `none` (typed URL, bookmark) passes; any other
 //!    value (`same-site`, `cross-site`) is refused unless its `Origin` is trusted.
 //! 3. Without `Sec-Fetch-Site` (browsers before 2023): no `Origin` passes, since
@@ -75,8 +77,9 @@ impl CrossOrigin {
         self
     }
 
-    /// Don't check requests whose path starts with one of `prefixes` (webhooks signed
-    /// another way, say).
+    /// Don't check requests to one of `prefixes` or below it (webhooks signed another
+    /// way, say). A prefix matches whole path segments: `/hooks` covers `/hooks` and
+    /// `/hooks/github`, not `/hooks-admin`.
     #[must_use]
     pub fn bypass<I, S>(mut self, prefixes: I) -> Self
     where
@@ -93,18 +96,24 @@ impl CrossOrigin {
         origin.is_some_and(|o| self.trusted.iter().any(|t| t == o.trim_end_matches('/')))
     }
 
+    fn bypassed(&self, path: &str) -> bool {
+        self.bypass.iter().any(|p| {
+            let p = p.trim_end_matches('/');
+            path.strip_prefix(p)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    }
+
     /// Whether a request with this method, path and headers may proceed.
     pub fn check(&self, method: &Method, path: &str, headers: &HeaderMap) -> Result<(), Refusal> {
-        if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
-            || self.bypass.iter().any(|p| path.starts_with(p.as_str()))
-        {
+        let safe = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+        if (safe && !is_websocket_upgrade(headers)) || self.bypassed(path) {
             return Ok(());
         }
         self.same_origin(headers)
     }
 
-    /// The origin test alone, whatever the method: for a WebSocket upgrade, which is a
-    /// `GET` that opens a channel acting with the page's cookies.
+    /// The origin test alone, whatever the method and path.
     pub fn same_origin(&self, headers: &HeaderMap) -> Result<(), Refusal> {
         let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         let origin = get(header::ORIGIN.as_str());
@@ -145,6 +154,13 @@ impl CrossOrigin {
             }
         }
     }
+}
+
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
 /// `host[:port]` as a `Host` header carries it (default ports omitted).
@@ -253,10 +269,44 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_are_checked_whatever_the_method() {
+    fn websocket_upgrades_are_checked_though_they_are_gets() {
         let c = CrossOrigin::new();
         let h = headers(&[("origin", "https://evil.test"), ("host", "a.test")]);
-        assert_eq!(c.check(&Method::GET, "/ws", &h), Ok(()));
+        assert_eq!(c.check(&Method::GET, "/page", &h), Ok(()));
         assert_eq!(c.same_origin(&h), Err(Refusal::OriginMismatch));
+        let upgrade = |origin: &'static str| {
+            headers(&[
+                ("upgrade", "WebSocket"),
+                ("origin", origin),
+                ("host", "a.test"),
+            ])
+        };
+        assert_eq!(
+            c.check(&Method::GET, "/ws", &upgrade("https://evil.test")),
+            Err(Refusal::OriginMismatch)
+        );
+        assert_eq!(
+            c.check(&Method::GET, "/ws", &upgrade("https://a.test")),
+            Ok(())
+        );
+        // A native client sends no Origin.
+        let native = headers(&[("upgrade", "websocket"), ("host", "a.test")]);
+        assert_eq!(c.check(&Method::GET, "/ws", &native), Ok(()));
+    }
+
+    #[test]
+    fn bypass_prefixes_match_whole_segments() {
+        let c = CrossOrigin::new().bypass(["/mcp", "/hooks/"]);
+        let h = headers(&[("sec-fetch-site", "cross-site")]);
+        for path in ["/mcp", "/mcp/", "/mcp/tools", "/hooks", "/hooks/github"] {
+            assert_eq!(c.check(&Method::POST, path, &h), Ok(()), "{path}");
+        }
+        for path in ["/mcp-admin", "/mcpx", "/hooksy", "/x/mcp"] {
+            assert_eq!(
+                c.check(&Method::POST, path, &h),
+                Err(Refusal::CrossSite),
+                "{path}"
+            );
+        }
     }
 }

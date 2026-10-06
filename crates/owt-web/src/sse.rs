@@ -16,8 +16,13 @@ use axum::response::Response;
 pub const HEARTBEAT: &str = "event: heartbeat\ndata: {}\n\n";
 
 /// An unnamed event: `data: ` on every line, a blank line to end it.
+///
+/// A line ends at `\n`, `\r\n` or a bare `\r`, as the event stream format has it: text
+/// that could smuggle a `\r` past this would start a line of its own choosing
+/// (`event:`, `retry:`) in the browser's parser.
 #[must_use]
 pub fn frame(data: &str) -> String {
+    let data = data.replace("\r\n", "\n").replace('\r', "\n");
     let mut out = String::with_capacity(data.len() + 16);
     let mut any = false;
     for line in data.lines() {
@@ -52,5 +57,11 @@ mod tests {
     fn frames() {
         assert_eq!(super::frame("a\nb"), "data: a\ndata: b\n\n");
         assert_eq!(super::frame(""), "data: \n\n");
+        assert_eq!(super::frame("a\r\nb"), "data: a\ndata: b\n\n");
+        // A bare carriage return ends a line in the browser, so it must end one here.
+        assert_eq!(
+            super::frame("hi\rretry: 99999999"),
+            "data: hi\ndata: retry: 99999999\n\n"
+        );
     }
 }

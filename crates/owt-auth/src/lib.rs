@@ -2,6 +2,7 @@
 //!
 //! * [`password`]: Argon2id hashing off the async runtime; Django's
 //!   `pbkdf2_sha256` hashes are accepted so accounts migrate on their next sign-in.
+//! * [`throttle`]: budgets for sign-in attempts, by address and by account.
 //! * [`oauth`]: the authorization-code flow (with PKCE where the provider supports
 //!   it) for signing people in with Google, Discord, Twitch or any OIDC provider.
 //! * [`jwt`]: bearer tokens an identity provider issued, verified locally against
@@ -12,6 +13,7 @@
 pub mod jwt;
 pub mod oauth;
 pub mod password;
+pub mod throttle;
 
 /// `len` URL-safe random characters (RFC 3986 unreserved): states and verifiers.
 pub(crate) fn random_token(len: usize) -> String {
