@@ -4,7 +4,7 @@ name: Rust CI
 #
 #   jobs:
 #     ci:
-#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.2.0
+#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.2.0 # x-release-please-version
 #       with: {database: pets, redis: true}
 #
 # Runs on the arc-openshift-k8s ARC scale set (override with the RUNS_ON

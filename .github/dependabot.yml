@@ -1,13 +1,23 @@
 # Keeps the commit pins in the workflows, and the crates, current: a pin nobody
 # updates is a vulnerability nobody patches.
+#
+# A dependency that reaches apps is released: its update commits as
+# "fix(deps): bump ...", which release-please counts as a patch. Several updates
+# merged between releases go out together in the one release pull request.
 version: 2
 updates:
+  # Apps run rust-ci.yml at a release tag, so its action pins ship with a release.
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
+    commit-message: {prefix: fix, include: scope}
   - package-ecosystem: cargo
     directory: /
     schedule: {interval: weekly}
+    # Dependabot counts every Cargo dependency as production (dev-dependencies too),
+    # so each update is "fix(deps): ...". Most reach apps through
+    # [workspace.dependencies]; the occasional test-only one costs a patch release.
+    commit-message: {prefix: fix, include: scope}
     groups:
       patch-and-minor:
         update-types: [minor, patch]

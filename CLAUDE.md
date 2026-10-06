@@ -11,9 +11,15 @@ port), and they learn how to use it from `README.md`. So:
   for anything needing a database or the network; `#`-prefixed lines for setup).
   Never mark one `ignore` to get past a failure: fix the example. YAML, CSS, shell and
   TOML blocks are not compiled; check them by eye.
-- **Releasing:** the workspace `version`, `package.json`, the README's tags and the usage
-  comment at the top of `.github/workflows/rust-ci.yml` move
-  together in the pull request; tag `vX.Y.Z` on `main` after it merges.
+- **Conventional Commits** for every commit message and pull request title (CI checks
+  both): `type(scope): summary`, scopes as in the README's "Working on owt-stack". A
+  change an app must adapt to is `type!:` with a `BREAKING CHANGE:` footer saying what
+  the app changes; it becomes the release's upgrade notes.
+- **Never bump versions or tag by hand.** release-please owns `version` in
+  `Cargo.toml`, `Cargo.lock`, `package.json`, the README's tags and the workflow's usage
+  comment, through its release pull request. A new mention of the version goes between
+  `<!-- x-release-please-start-version -->` and `<!-- x-release-please-end -->` (or
+  ends its line with `x-release-please-version`).
 - Gate: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
   `cargo test --workspace --all-features` (with `REDIS_URL` set, `owt-bus`'s Redis test
   runs too).

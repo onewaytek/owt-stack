@@ -171,7 +171,6 @@ fn oidc_identity(info: Value) -> Option<Identity> {
 pub struct Pending {
     /// The [`Provider::id`] it was begun with: a callback for one provider cannot
     /// complete a login begun with another (the mix-up attack).
-    #[serde(default)]
     pub provider: String,
     /// The `state` sent out, to be returned unchanged.
     pub state: String,
@@ -339,7 +338,7 @@ mod tests {
             provider,
             client_id: "cid".into(),
             client_secret: "s".into(),
-            redirect_uri: "https://example.com/accounts/google/login/callback/".into(),
+            redirect_uri: "https://example.com/auth/google/callback".into(),
         }
     }
 
@@ -348,9 +347,7 @@ mod tests {
         let (url, pending) = client(google()).begin().unwrap();
         assert!(url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?client_id=cid"));
         assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains(
-            "redirect_uri=https%3A%2F%2Fexample.com%2Faccounts%2Fgoogle%2Flogin%2Fcallback%2F"
-        ));
+        assert!(url.contains("redirect_uri=https%3A%2F%2Fexample.com%2Fauth%2Fgoogle%2Fcallback"));
         let parsed = url::Url::parse(&url).unwrap();
         let state = parsed
             .query_pairs()

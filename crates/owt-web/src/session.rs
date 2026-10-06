@@ -150,9 +150,8 @@ struct Sealed<T> {
     /// Unix seconds; the cookie is no session after this, whatever its holder does.
     #[serde(rename = "x")]
     expires: u64,
-    /// Unix seconds at which the session began; a cookie without it began at 0, so
-    /// it has outlived any lifetime.
-    #[serde(rename = "i", default)]
+    /// Unix seconds at which the session began.
+    #[serde(rename = "i")]
     issued: u64,
     #[serde(flatten)]
     data: T,

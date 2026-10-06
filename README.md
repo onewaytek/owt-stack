@@ -7,7 +7,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 |---|---|
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
-| `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts, accepting Django `pbkdf2_sha256` hashes for migration; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
+| `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement |
 
@@ -16,6 +16,7 @@ Outside the crates:
 | Path | What it is |
 |---|---|
 | `.github/workflows/rust-ci.yml` | the reusable check workflow: fmt, audit, sqlx metadata, clippy, tests (on ARC), and the stylesheet build |
+| `.github/workflows/release-please.yml`, `conventional-commits.yml` | this repository's releases: Conventional Commits checked on every pull request, versions and the changelog by release-please |
 | `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime (with `templates/dockerignore`) |
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS, NetworkPolicies |
 | `tailwind/owt.css` | font stacks and htmx state variants (`htmx-request:opacity-50`) |
@@ -25,6 +26,7 @@ file as its docs), so an API change that breaks these instructions fails CI.
 
 ## Adding it to an app
 
+<!-- x-release-please-start-version -->
 ```toml
 [dependencies]
 owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.2.0" }
@@ -39,6 +41,7 @@ tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "
 [dev-dependencies]
 owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.2.0" }
 ```
+<!-- x-release-please-end -->
 
 `owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export.
 
@@ -279,7 +282,7 @@ if !throttle.sign_in(ip, account) {
 // Argon2id on the blocking pool, a bounded number at once. An unknown account
 // (`None`) costs a real check too, so timing does not tell which accounts exist.
 if password::verify_or_decoy(given, stored_hash).await {
-    // Django hashes and older parameters verify; store a fresh hash.
+    // A hash made with weaker parameters than today's: store a fresh one.
     if stored_hash.is_some_and(password::needs_rehash) {
         let _new_hash = password::hash(given).await?;
     }
@@ -294,7 +297,7 @@ let google = oauth::Client {
     provider: oauth::google(),
     client_id: "id".into(),
     client_secret: "secret".into(),
-    redirect_uri: "https://app.example/accounts/google/login/callback/".into(),
+    redirect_uri: "https://app.example/auth/google/callback".into(),
 };
 let (_url, _pending) = google.begin()?;
 let http = oauth::http_client()?; // timeouts, no redirects followed
@@ -390,6 +393,7 @@ set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
 **CI:** call the reusable workflow. It runs fmt, `cargo audit`, the `.sqlx` freshness
 check, clippy and the tests on ARC, with Postgres and Redis as services:
 
+<!-- x-release-please-start-version -->
 ```yaml
 jobs:
   checks:
@@ -403,6 +407,7 @@ jobs:
         SESSION_SECRET=...
     secrets: inherit
 ```
+<!-- x-release-please-end -->
 
 Image builds belong on GitHub-hosted runners (the ARC runners have no Docker daemon).
 
@@ -423,9 +428,11 @@ out each new digest. App-specific environment is a patch on the Deployment.
 
 **Tailwind:** depend on the npm half and import it after Tailwind:
 
+<!-- x-release-please-start-version -->
 ```json
 "devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.2.0" }
 ```
+<!-- x-release-please-end -->
 
 ```css
 @import "tailwindcss" source(none);
@@ -507,6 +514,24 @@ workflow's inputs or how an app adopts something updates the matching section he
 the same pull request. The Rust examples are doctests, so a stale example fails
 `cargo test`; check the YAML, CSS and shell examples by eye.
 
-**Releasing:** bump `version` in the workspace `Cargo.toml` and `package.json`, update
-the tags in this README and the usage comment in `.github/workflows/rust-ci.yml`, merge, then tag `vX.Y.Z` on `main`. Apps move by changing
-their tag.
+**Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org)**
+(`feat(web): …`, `fix(auth): …`, `docs: …`), checked on every pull request. Scopes
+name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
+`tailwind`, `deps`.
+
+**Releasing is automatic.** release-please keeps a release pull request open against
+`main`, with the next version and the changelog since the last release. Merging it
+tags `vX.Y.Z` and publishes the GitHub release; apps move by changing their tag. While
+the version is 0.x, the bump follows Cargo's rules for 0.x:
+
+| Commit | Release |
+|---|---|
+| `fix:`, `perf:`, `revert:`, `feat:`; Dependabot's `fix(deps):` | 0.2.0 → 0.2.1 |
+| `feat!:`, or a `BREAKING CHANGE:` footer | 0.2.0 → 0.3.0 |
+| `docs:`, `chore:`, `ci:`, `test:`, `refactor:`, `style:`, `build:` | none on its own; listed nowhere |
+
+A breaking change says in its footer what an app must change; that text becomes the
+changelog's "Breaking changes", so the upgrade notes write themselves. The release pull
+request updates every version: the workspace `Cargo.toml`, `Cargo.lock`,
+`package.json`, the tags in this README (between `x-release-please` markers) and the
+usage comment in `rust-ci.yml`. A new reference to the version needs a marker too.

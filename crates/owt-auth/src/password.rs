@@ -11,18 +11,14 @@
 //! it. The permit moves into the blocking task, so a caller that gives up (a request
 //! timeout, a closed connection) does not free it while the hash is still running.
 //!
-//! [`verify`] also accepts Django's `pbkdf2_sha256$<iterations>$<salt>$<hash>`, the
-//! format a Django app's accounts carry over in. After a successful check against such
-//! a hash, [`needs_rehash`] says so and the app stores [`hash`] of the password it now
-//! holds in the clear: accounts migrate one sign-in at a time.
+//! When [`hash`]'s parameters are raised, [`needs_rehash`] says which stored hashes are
+//! weaker: the app stores a fresh [`hash`] after the next successful check.
 
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
-use base64::Engine;
 use std::sync::OnceLock;
 
-use subtle::ConstantTimeEq;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::spawn_blocking;
 
@@ -63,7 +59,7 @@ pub async fn hash(password: &str) -> anyhow::Result<String> {
     .await?
 }
 
-/// Whether `password` matches `stored` (Argon2 PHC, or Django `pbkdf2_sha256`).
+/// Whether `password` matches `stored`, an Argon2 PHC string.
 /// Anything unparseable matches nothing.
 pub async fn verify(password: &str, stored: &str) -> bool {
     let (password, stored) = (password.to_owned(), stored.to_owned());
@@ -77,9 +73,6 @@ pub async fn verify(password: &str, stored: &str) -> bool {
 }
 
 fn verify_blocking(password: &str, stored: &str) -> bool {
-    if stored.starts_with("pbkdf2_sha256$") {
-        return django_pbkdf2(password, stored).unwrap_or(false);
-    }
     PasswordHash::new(stored).is_ok_and(|parsed| {
         Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
@@ -124,24 +117,6 @@ pub fn needs_rehash(stored: &str) -> bool {
         || params.p_cost() < now.p_cost()
 }
 
-fn django_pbkdf2(password: &str, stored: &str) -> Option<bool> {
-    let mut parts = stored.splitn(4, '$');
-    let (_, iterations, salt, expected) =
-        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-    let iterations: u32 = iterations.parse().ok()?;
-    let expected = base64::engine::general_purpose::STANDARD
-        .decode(expected)
-        .ok()?;
-    let mut derived = vec![0u8; expected.len()];
-    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
-        password.as_bytes(),
-        salt.as_bytes(),
-        iterations,
-        &mut derived,
-    );
-    Some(bool::from(derived.ct_eq(&expected)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,16 +128,6 @@ mod tests {
         assert!(!verify("wrong", &h).await);
         assert!(!verify("x", "not-a-hash").await);
         assert!(!needs_rehash(&h));
-    }
-
-    /// Made by Django's algorithm: `hashlib.pbkdf2_hmac('sha256', pw, salt, 1000)`.
-    #[tokio::test]
-    async fn django_hashes_verify_and_ask_to_be_replaced() {
-        let stored = "pbkdf2_sha256$1000$saltsaltsalt$F7o7+5VTVzFAO998X6s3AHrDsJVdMiIlgndIMe19NvY=";
-        assert!(verify("correct horse", stored).await);
-        assert!(!verify("correct horsf", stored).await);
-        assert!(needs_rehash(stored));
-        assert!(!verify("correct horse", "pbkdf2_sha256$x$salt$AAAA").await);
     }
 
     #[tokio::test(flavor = "current_thread")]
