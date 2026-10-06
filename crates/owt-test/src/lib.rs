@@ -4,6 +4,9 @@
 //!   one response to the next as a browser would.
 //! * [`Server`]: the router on an ephemeral port, for tests that need a real socket
 //!   (`WebSockets`, SSE, an HTTP client of their own).
+//! * [`golden`]: rendered pages compared with snapshots on disk, modulo layout and
+//!   escaping style.
+//! * [`fragment`]: a page and its htmx fragment render one element the same way.
 //!
 //! Requests carry no `Origin` and no `Sec-Fetch-Site`, so cross-origin protection
 //! treats them as a non-browser client and lets them through; set the headers on a
@@ -13,6 +16,9 @@
     clippy::missing_panics_doc,
     reason = "test harness: a panic is a test failure"
 )]
+
+pub mod fragment;
+pub mod golden;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

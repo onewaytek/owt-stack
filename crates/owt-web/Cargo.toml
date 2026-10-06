@@ -10,7 +10,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 askama.workspace = true
-axum = { workspace = true, features = ["tokio", "http1", "query", "form"] }
+axum = { workspace = true, features = ["tokio", "http1", "query", "form", "original-uri"] }
 axum-htmx.workspace = true
 base64.workspace = true
 cookie.workspace = true

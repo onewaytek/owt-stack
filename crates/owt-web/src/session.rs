@@ -6,6 +6,8 @@
 //! and any replica opens any session. The costs of that choice:
 //!
 //! * **Size.** `T` travels on every request; keep it to identifiers and small flags.
+//!   A sealed cookie over 4 KB is dropped by browsers (sign-out included); the layer
+//!   logs a warning when it seals one.
 //! * **Revocation.** A sealed cookie is valid until it lapses, and [`Session::flush`]
 //!   only replaces the browser's copy: a copy taken earlier still opens. Revoke by
 //!   epoch: store a per-account counter in `T` at sign-in, bump it at sign-out and at
@@ -131,6 +133,9 @@ struct Config {
     absolute: Duration,
     secure: bool,
 }
+
+/// About the most a browser stores for one cookie, name and attributes included.
+const MAX_COOKIE_BYTES: usize = 4096;
 
 /// The longest a session lasts, however often it is re-sealed, unless
 /// [`Sessions::absolute_lifetime`] says otherwise (or `max_age` is longer).
@@ -293,7 +298,16 @@ impl<T: SessionData> Sessions<T> {
             .same_site(SameSite::Lax)
             .max_age(cookie::time::Duration::seconds(max_age))
             .build();
-        HeaderValue::from_str(&c.encoded().to_string()).ok()
+        let encoded = c.encoded().to_string();
+        if encoded.len() > MAX_COOKIE_BYTES {
+            // Browsers drop it without a word, and every later change with it.
+            tracing::warn!(
+                cookie = %self.inner.cookie,
+                bytes = encoded.len(),
+                "session cookie over 4 KB; browsers will ignore it"
+            );
+        }
+        HeaderValue::from_str(&encoded).ok()
     }
 
     /// The `Set-Cookie` value for a session.
@@ -447,6 +461,12 @@ impl<T: Default + Clone> Session<T> {
     #[must_use]
     pub fn issued(&self) -> Option<u64> {
         self.inner().issued
+    }
+
+    /// Whether anything changed it, so the response will reseal it.
+    #[must_use]
+    pub fn is_modified(&self) -> bool {
+        self.inner().modified
     }
 
     /// A new id, the same data, and a new beginning: at sign-in, against session
