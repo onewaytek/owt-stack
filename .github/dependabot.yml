@@ -1,0 +1,13 @@
+# Keeps the commit pins in the workflows, and the crates, current: a pin nobody
+# updates is a vulnerability nobody patches.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+  - package-ecosystem: cargo
+    directory: /
+    schedule: {interval: weekly}
+    groups:
+      patch-and-minor:
+        update-types: [minor, patch]

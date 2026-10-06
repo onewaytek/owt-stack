@@ -5,9 +5,9 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 
 | Crate | What an app gets |
 |---|---|
-| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; response headers; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
+| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
-| `owt-auth` | Argon2id hashing off the runtime, accepting Django `pbkdf2_sha256` hashes for migration; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
+| `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts, accepting Django `pbkdf2_sha256` hashes for migration; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement |
 
@@ -16,8 +16,8 @@ Outside the crates:
 | Path | What it is |
 |---|---|
 | `.github/workflows/rust-ci.yml` | the reusable check workflow: fmt, audit, sqlx metadata, clippy, tests (on ARC), and the stylesheet build |
-| `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime |
-| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres |
+| `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime (with `templates/dockerignore`) |
+| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS, NetworkPolicies |
 | `tailwind/owt.css` | font stacks and htmx state variants (`htmx-request:opacity-50`) |
 
 Every Rust example below is compiled by `cargo test` (the `readme` crate includes this
@@ -33,6 +33,9 @@ owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.2.0" }
 owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.2.0" }
 owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.2.0" }
 
+# The app's own: static files, request logs, compression.
+tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
+
 [dev-dependencies]
 owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.2.0" }
 ```
@@ -41,6 +44,10 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.2.0" }
 
 A shared crate is only shared while the majors agree: an app that names `axum`, `sqlx`,
 `askama` or `redis` directly must use the major in this workspace's `Cargo.toml`.
+
+An app that names `sqlx` uses its `tls-rustls-aws-lc-rs` feature, not `tls-rustls`
+(which means ring). With both rustls backends compiled in, rustls cannot pick one, and
+the first `rediss://` connection panics.
 
 **Developing against a local checkout:** patch the git source in the app's
 `.cargo/config.toml` (not committed) instead of editing `Cargo.toml`:
@@ -94,7 +101,8 @@ headers see every response.
 
 ```rust
 use axum::{Router, middleware::{from_fn, from_fn_with_state}, routing::get};
-use owt_web::{assets::Assets, csrf::CrossOrigin, headers, session::Sessions};
+use owt_web::{assets::Assets, csrf::CrossOrigin, headers::{self, Csp}, limits::Limits};
+use owt_web::session::{Presented, Sessions, Verdict};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -102,15 +110,41 @@ use std::time::Duration;
 pub struct SessionData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<i64>,
+    /// The account's epoch at sign-in; bumping the account's signs it out everywhere.
+    #[serde(default)]
+    pub epoch: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<owt_web::flash::Flash>,
 }
 
-pub fn router(key: cookie::Key, assets: Assets, trusted: &[String]) -> Router {
-    let sessions = Sessions::<SessionData>::new(key, "session", Duration::from_secs(14 * 86_400), true);
-    let pages = Router::new()
-        .route("/healthz", get(owt_web::healthz))
-        // ... the app's routes ...
+/// One indexed read: `SELECT epoch FROM account WHERE id = $1`.
+async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT epoch FROM account WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+}
+
+pub fn router(key: cookie::Key, assets: Assets, trusted: &[String], pool: sqlx::PgPool) -> Router {
+    // `__Host-`: browsers refuse a copy set over plain HTTP or by a sibling subdomain.
+    let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_secs(14 * 86_400), true)
+        .validate_with(move |s: Presented<SessionData>| {
+            let pool = pool.clone();
+            async move {
+                let Some(user_id) = s.data.user_id else { return Verdict::Valid };
+                match account_epoch(&pool, user_id).await {
+                    Ok(epoch) => (epoch == s.data.epoch).into(), // Valid or Revoked
+                    // An outage must neither admit a revoked session nor sign everyone out.
+                    Err(_) => Verdict::Unknown,
+                }
+            }
+        });
+    // Enforce once the browser console is quiet.
+    let csp = Csp::new().report_only(true);
+    let routes = Router::new().route("/healthz", get(owt_web::healthz));
+    // ... the app's routes ...
+    let pages = Limits::default()
+        .apply(routes)
         .layer(from_fn_with_state(sessions, Sessions::<SessionData>::layer))
         .layer(from_fn_with_state(CrossOrigin::new().trust(trusted), CrossOrigin::layer));
     Router::new()
@@ -121,10 +155,14 @@ pub fn router(key: cookie::Key, assets: Assets, trusted: &[String]) -> Router {
                 .layer(from_fn_with_state(assets.clone(), Assets::cache_policy)),
         )
         .merge(pages)
+        .layer(from_fn_with_state(csp, Csp::layer))
         .layer(from_fn(headers::private_by_default))
         .layer(from_fn(headers::security))
 }
 ```
+
+Templates put the request's nonce on inline scripts: take `owt_web::headers::Nonce` in
+the handler and write `<script nonce="{{ nonce }}">`.
 
 - **Session key:** `owt_web::session::key_from_base64(&env::required("SESSION_SECRET")?)`,
   at least 64 random bytes. Changing it signs everyone out.
@@ -214,22 +252,40 @@ async fn view() -> owt_web::Result<Fragment> {
 ```
 
 The fragment's cache policy is a required argument; use `no-store` for anything that
-differs per person. Test that page and fragment agree with `owt_test::fragment`
+differs per person. A response that sets the session cookie is `no-store` whatever it
+asked for, so a public fragment never hands one person's session to a cache. Test that page and fragment agree with `owt_test::fragment`
 (below).
 
 ### Authentication
 
 ```rust,no_run
-# async fn demo(stored_hash: &str, code: &str, pending: owt_auth::oauth::Pending) -> anyhow::Result<()> {
-use owt_auth::{jwt, oauth, password};
+# async fn demo(
+#     headers: axum::http::HeaderMap, peer: std::net::IpAddr, account: &str, given: &str,
+#     stored_hash: Option<&str>, next: Option<&str>,
+#     pending: owt_auth::oauth::Pending, state: &str, code: &str,
+# ) -> anyhow::Result<()> {
+use owt_auth::{jwt, oauth, password, throttle::Throttle};
+use owt_web::{client_ip::Source, redirect};
 
-// Passwords: Argon2id on the blocking pool. Django hashes verify too; rehash them.
-if password::verify("correct horse", stored_hash).await && password::needs_rehash(stored_hash) {
-    let _new_hash = password::hash("correct horse").await?;
+// Passwords. Throttle first: a sign-in over budget checks no password. The address
+// is the client's as the proxies in front of the app report it (one: the router).
+let throttle = Throttle::default(); // in the app's state, behind an Arc
+let ip = Source::ForwardedFor { proxies: 1 }.client_ip(&headers, peer);
+if !throttle.sign_in(ip, account) {
+    return Ok(()); // answer 429
+}
+// Argon2id on the blocking pool, a bounded number at once. An unknown account
+// (`None`) costs a real check too, so timing does not tell which accounts exist.
+if password::verify_or_decoy(given, stored_hash).await {
+    // Django hashes and older parameters verify; store a fresh hash.
+    if stored_hash.is_some_and(password::needs_rehash) {
+        let _new_hash = password::hash(given).await?;
+    }
+    let _to = redirect::local_or(next, "/"); // `?next=` never leaves this site
 }
 
-// Sign-in with a provider: redirect to `url`, keep `pending` in the session, then
-// on the callback check the state and trade the code.
+// Sign-in with a provider: redirect to `url` and keep `pending` in the session; on
+// the callback, `complete` checks the state and the provider, then trades the code.
 let google = oauth::Client {
     provider: oauth::google(),
     client_id: "id".into(),
@@ -237,13 +293,13 @@ let google = oauth::Client {
     redirect_uri: "https://app.example/accounts/google/login/callback/".into(),
 };
 let (_url, _pending) = google.begin()?;
-if pending.matches("state from the callback") {
-    let who = google.complete(&reqwest::Client::new(), &pending, code).await?;
-    println!("{} <{:?}>", who.uid, who.email);
-}
+let http = oauth::http_client()?; // timeouts, no redirects followed
+let who = google.complete(&http, &pending, state, code).await?;
+println!("{} <{:?}>", who.uid, who.email);
 
-// Machine clients with an IdP's token: signature, issuer, audience, expiry.
-let verifier = jwt::Verifier::discover(reqwest::Client::new(), "https://sso.example/realms/x", "myapp").await?;
+// Machine clients with an IdP's token: signature, algorithm, issuer, audience,
+// expiry and not-before.
+let verifier = jwt::Verifier::discover(http, "https://sso.example/realms/x", "myapp").await?;
 let claims: jwt::Claims = verifier.verify("eyJ...").await?;
 # let _ = claims; Ok(()) }
 ```
@@ -379,8 +435,10 @@ out each new digest. App-specific environment is a patch on the Deployment.
   (`Sec-Fetch-Site`) or, failing that, `Origin` says they came from another origin:
   Go 1.25's `CrossOriginProtection`. Forms carry no hidden field, and htmx sends no
   header. Session cookies stay `SameSite=Lax` as a second line.
-- **Sessions are cookies.** Sealed with AES-GCM; no store, no query per request.
-  Revoke by epoch (a counter in the account, copied into the session at sign-in).
+- **Sessions are cookies.** Sealed with AES-GCM; no store. Revoke by epoch (a counter
+  in the account, copied into the session at sign-in, bumped at sign-out) checked in
+  `Sessions::validate_with`. A session ends at its absolute lifetime however often it
+  is re-sealed, and a response that sets the cookie is never cacheable.
 - **Fragments have their own URLs.** Nothing varies by request header, so every
   response stays cacheable behind a CDN that ignores `Vary`.
 - **Library code holds no `query!` macros**, so it needs no `.sqlx/` metadata and builds
@@ -393,6 +451,45 @@ out each new digest. App-specific environment is a patch on the Deployment.
   the image trigger annotation and the CNPG Secret's name, which Kustomize's name
   transformers do not rewrite.
 
+## Security an app wires
+
+The router example under "Wiring an app" composes the layers; beyond it:
+
+- `headers::security` sends HSTS for the app's own host. An app that owns its whole
+  domain adds `includeSubDomains` itself.
+- Sign-in: `throttle::Throttle::sign_in` *before* `password::verify_or_decoy` (a
+  refused sign-in checks no password), keyed on `client_ip::Source::client_ip`
+  (configured for the proxies actually in front of the app), and
+  `redirect::local_or` on `?next=` before redirecting to it (see "Authentication").
+- OAuth: `oauth::http_client()` for the exchange; `Client::complete` checks the
+  state and the provider itself.
+- The bus's Redis is inside the trust boundary: a password or ACL user, a network
+  only the app reaches, `rediss://` where the path leaves the node.
+- `Limits` bounds the time to a response, not the time a client takes to send a
+  request: serve behind a proxy that bounds that (the OpenShift router does).
+- Start `Csp` in report-only mode and read the browser console before enforcing.
+  htmx needs `htmx.config.includeIndicatorStyles = false` (or its
+  `inlineStyleNonce`) and no `hx-on:*` attributes, which a nonce cannot cover.
+
+## Upgrading from 0.1
+
+- **Everyone signs in once more:** the sealed session gains its start time (`i`), and
+  cookies sealed before it no longer open. Session data may not use the field names
+  `k`, `x` or `i`.
+- `Sessions::validate_with`'s closure answers a `Verdict` (a `bool` still converts).
+- `oauth::Client::complete` takes the callback's `state`; drop the app's own
+  `Pending::matches` check. `Pending` gains `provider`, so a sign-in in flight across
+  the deploy fails once with `Error::Provider`.
+- `jwt::Error` and `oauth::Error` have new variants; a `match` on them needs arms.
+- `CrossOrigin::layer` refuses cross-origin WebSocket upgrades. A bypass prefix
+  matches whole path segments: `/mcp` no longer covers `/mcp-admin`.
+- The workspace's `tower-http` names only `timeout`; an app names its own features
+  (`fs` for `ServeDir`; see "Adding it to an app").
+- `sqlx` is built with `tls-rustls-aws-lc-rs` (above).
+- The OpenShift template adds NetworkPolicies, Postgres over verified TLS, a
+  read-only root filesystem and a `CNPG_NAMESPACE` parameter: process it into a
+  staging namespace first.
+
 ## Working on owt-stack
 
 `cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-features`.
@@ -404,5 +501,5 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 `cargo test`; check the YAML, CSS and shell examples by eye.
 
 **Releasing:** bump `version` in the workspace `Cargo.toml` and `package.json`, update
-the tags in this README, merge, then tag `vX.Y.Z` on `main`. Apps move by changing
+the tags in this README and the usage comment in `.github/workflows/rust-ci.yml`, merge, then tag `vX.Y.Z` on `main`. Apps move by changing
 their tag.

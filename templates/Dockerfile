@@ -15,6 +15,9 @@
 #    operations `oc exec` shell tools into the pod (epicpartygame-rs's capacity
 #    harness runs `sh`, `timeout` and `env` there) keeps a debian-slim runtime.
 #
+# Copy templates/dockerignore beside it as .dockerignore: both `COPY . .` steps take
+# the whole build context.
+#
 # Built on GitHub-hosted runners and pushed to ghcr; the cluster pulls it through an
 # ImageStream (see templates/openshift/app.yaml). The ARC runners are rootless with no
 # Docker daemon, so they run checks, never this.

@@ -64,7 +64,8 @@ impl Error {
         Self::Unprocessable(msg.into())
     }
 
-    /// 303 to `login` with `?next=<next>`.
+    /// 303 to `login` with `?next=<next>`. The sign-in handler must pass what comes
+    /// back through [`crate::redirect::local`] before redirecting to it.
     #[must_use]
     pub fn login_required(login: &str, next: &str) -> Self {
         let mut url = String::from(login);
