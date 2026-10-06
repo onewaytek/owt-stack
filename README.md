@@ -519,7 +519,7 @@ the version is 0.x, the bump follows Cargo's rules for 0.x:
 
 | Commit | Release |
 |---|---|
-| `fix:`, `perf:`, `revert:`, `feat:` | 0.2.0 → 0.2.1 |
+| `fix:`, `perf:`, `revert:`, `feat:`; Dependabot's `fix(deps):` | 0.2.0 → 0.2.1 |
 | `feat!:`, or a `BREAKING CHANGE:` footer | 0.2.0 → 0.3.0 |
 | `docs:`, `chore:`, `ci:`, `test:`, `refactor:`, `style:`, `build:` | none on its own; listed nowhere |
 
