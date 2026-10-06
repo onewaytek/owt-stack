@@ -82,6 +82,7 @@ struct Config {
     algorithms: Vec<Algorithm>,
     leeway: u64,
     min_refresh: Duration,
+    retry_after_failure: Duration,
     http: reqwest::Client,
 }
 
@@ -120,6 +121,7 @@ impl Verifier {
             algorithms: ASYMMETRIC.to_vec(),
             leeway: 5,
             min_refresh: Duration::from_secs(60),
+            retry_after_failure: RETRY_AFTER_FAILURE,
             http,
         })
     }
@@ -174,7 +176,9 @@ impl Verifier {
             .await
             .map_err(|_| Error::Timeout)??;
         // OpenID Connect Discovery §4.3: the document must be the issuer's own.
-        if d.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
+        // Exactly, trailing slash included, as it will be compared with every token's
+        // `iss`: a near match here would pass discovery and then refuse every token.
+        if d.issuer != issuer {
             return Err(Error::Discovery("it names another issuer"));
         }
         if !safe_url(&d.jwks_uri) {
@@ -233,7 +237,7 @@ impl Verifier {
                     >= if came {
                         min
                     } else {
-                        min.min(RETRY_AFTER_FAILURE)
+                        min.min(self.0.config.retry_after_failure)
                     }
             });
             if due {
@@ -503,5 +507,59 @@ mod tests {
         assert!(matches!(discover("/other").await, Err(Error::Discovery(_))));
         assert!(matches!(discover("/plain").await, Err(Error::Discovery(_))));
         assert!(discover("/good").await.is_ok());
+        // The same issuer but for a trailing slash is another issuer.
+        assert!(matches!(discover("/good/").await, Err(Error::Discovery(_))));
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_retried_sooner_than_a_good_one() {
+        let idp = idp().await;
+        let upstream = format!("{}/jwks", idp.base);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        // Down for the first request, then the provider's real keys.
+        let app = axum::Router::new().route(
+            "/jwks",
+            get(move || {
+                let first = c.fetch_add(1, Ordering::SeqCst) == 0;
+                let upstream = upstream.clone();
+                async move {
+                    if first {
+                        return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                    }
+                    let keys: serde_json::Value =
+                        reqwest::get(upstream).await.unwrap().json().await.unwrap();
+                    Ok(Json(keys))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let flaky = format!("http://{}/jwks", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let v = Verifier::new(
+            reqwest::Client::new(),
+            "https://idp.test",
+            "kynestro",
+            &flaky,
+        );
+        let v = Verifier::with(Config {
+            retry_after_failure: Duration::from_millis(200),
+            ..v.0.config.clone()
+        });
+        let good = token(&idp, "k1", "kynestro", 60);
+        assert!(matches!(
+            v.verify::<Claims>(&good).await,
+            Err(Error::Keys(_))
+        ));
+        // Inside the retry interval the provider is left alone.
+        assert!(matches!(
+            v.verify::<Claims>(&good).await,
+            Err(Error::UnknownKey)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Past it (and long before min_refresh's minute), it is asked again.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(v.verify::<Claims>(&good).await.unwrap().sub, "agent-7");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
