@@ -6,11 +6,25 @@
 //! [`flash`](Session::flash) and [`take_flashes`](Session::take_flashes).
 //!
 //! The serialized shape is `["success", "Saved."]`, compact because it rides in the
-//! session cookie.
+//! session cookie. For the same reason the messages waiting are bounded: at most
+//! [`MAX_PENDING`], the oldest dropped first, each at most [`MAX_CHARS`] long. A
+//! browser drops a cookie over 4 KB without a word, and with it every later change
+//! to the session, sign-out included, so messages that echo input (or pile up
+//! behind htmx requests no full page follows) must not be able to grow it.
+//!
+//! Two requests from one browser at once can show a message twice: one takes it, and
+//! the other, sealing the session it opened before that, puts it back. Sessions in a
+//! cookie are last-write-wins.
 
 use serde::{Deserialize, Serialize};
 
 use crate::session::Session;
+
+/// The most messages waiting at once.
+pub const MAX_PENDING: usize = 5;
+
+/// The longest message, in characters; a longer one is cut, ending in `…`.
+pub const MAX_CHARS: usize = 300;
 
 /// How a message should look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,9 +80,23 @@ pub trait HasFlashes {
 }
 
 impl<T: HasFlashes + Default + Clone> Session<T> {
-    /// Show `text` on the next page.
+    /// Show `text` on the next page (within [`MAX_PENDING`] and [`MAX_CHARS`]).
     pub fn flash(&self, level: Level, text: impl Into<String>) {
-        self.update(|d| d.flashes_mut().push(Flash(level, text.into())));
+        let mut text = text.into();
+        if text.chars().count() > MAX_CHARS {
+            let cut = text
+                .char_indices()
+                .nth(MAX_CHARS - 1)
+                .map_or(text.len(), |(i, _)| i);
+            text.truncate(cut);
+            text.push('…');
+        }
+        self.update(|d| {
+            let pending = d.flashes_mut();
+            pending.push(Flash(level, text));
+            let over = pending.len().saturating_sub(MAX_PENDING);
+            pending.drain(..over);
+        });
     }
 
     /// The messages waiting, once. Taking none leaves the session unchanged, so a
@@ -98,6 +126,25 @@ mod tests {
         fn flashes_mut(&mut self) -> &mut Vec<Flash> {
             &mut self.messages
         }
+    }
+
+    #[test]
+    fn pending_messages_are_bounded() {
+        let s = Session::<Data>::default();
+        for i in 0..MAX_PENDING + 3 {
+            s.flash(Level::Info, i.to_string());
+        }
+        let taken = s.take_flashes();
+        assert_eq!(taken.len(), MAX_PENDING);
+        assert_eq!(taken[0].text(), "3", "the oldest are dropped");
+
+        let exact = "é".repeat(MAX_CHARS);
+        s.flash(Level::Info, exact.clone());
+        s.flash(Level::Info, "é".repeat(MAX_CHARS + 1));
+        let taken = s.take_flashes();
+        assert_eq!(taken[0].text(), exact, "a message at the limit is whole");
+        assert_eq!(taken[1].text().chars().count(), MAX_CHARS);
+        assert!(taken[1].text().ends_with('…'));
     }
 
     #[test]

@@ -313,10 +313,10 @@ fragment::assert_same_element(&page.text(), "<main id=\"m\"> <p>Hi</p></main>", 
 // Golden pages: compared modulo layout, with what changes per run masked.
 // `UPDATE_GOLDEN=1 cargo test` rewrites the snapshots; review the diff.
 let normalize = Normalizer::new().uuids("<uuid>");
+# if false { // no snapshots beside the README
 let mut golden = Golden::new("tests/golden/pages");
 golden.take("home", normalize.normalize(&page.text()));
-# if false {
-golden.check();
+golden.check(); // a Golden dropped unchecked fails the test
 # }
 # }
 ```

@@ -17,6 +17,8 @@
 //! Someone who opens a fragment URL directly sees the bare fragment. Redirecting them
 //! would mean answering by request header, which is the hazard above.
 
+use std::fmt::Write as _;
+
 use askama::Template;
 use axum::http::{HeaderName, HeaderValue, header};
 use axum::response::{Html, IntoResponse, Response};
@@ -51,9 +53,22 @@ impl Fragment {
     }
 
     /// The page this fragment shows a state of: htmx records it in history
-    /// (`HX-Push-Url`). A URL that is not a valid header value is an error.
+    /// (`HX-Push-Url`). Non-ASCII characters (a decoded path segment, say) are
+    /// percent-encoded; a control character is an error. Build the query with
+    /// [`RequestInfo::query_with`](crate::request::RequestInfo::query_with).
     pub fn page(mut self, url: &str) -> crate::Result<Self> {
-        let v = HeaderValue::from_str(url).map_err(|_| {
+        let mut encoded = String::with_capacity(url.len());
+        for c in url.chars() {
+            if c.is_ascii() {
+                encoded.push(c);
+            } else {
+                let mut buf = [0; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    let _ = write!(encoded, "%{b:02X}");
+                }
+            }
+        }
+        let v = HeaderValue::from_str(&encoded).map_err(|_| {
             crate::Error::Internal(anyhow::anyhow!("page URL is not a header value: {url:?}"))
         })?;
         self.page = Some(v);
@@ -76,6 +91,10 @@ impl IntoResponse for Fragment {
 
 /// The page's `HX-Reselect: <selector>` header, for a tuple response:
 /// `([reselect("#viewport"), cache], Html(body))`.
+///
+/// # Panics
+/// If `selector` is not visible ASCII, on every response that carries it: name a
+/// literal selector, which the first test of the page catches.
 #[must_use]
 pub fn reselect(selector: &'static str) -> (HeaderName, HeaderValue) {
     (HX_RESELECT, HeaderValue::from_static(selector))
@@ -104,6 +123,11 @@ mod tests {
                 .page("/bad\nurl")
                 .is_err()
         );
+        let r = Fragment::new("", HeaderValue::from_static("no-store"))
+            .page("/worlds/Zürich?q=é")
+            .unwrap()
+            .into_response();
+        assert_eq!(r.headers()["hx-push-url"], "/worlds/Z%C3%BCrich?q=%C3%A9");
         let plain = Fragment::new("x", HeaderValue::from_static("no-store")).into_response();
         assert!(plain.headers().get("hx-push-url").is_none());
     }

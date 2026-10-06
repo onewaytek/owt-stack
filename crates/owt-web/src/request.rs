@@ -88,7 +88,9 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestInfo {
     type Rejection = Infallible;
 
     /// Reads the URI the client sent (`OriginalUri`, so a router nested under a prefix
-    /// still sees the whole path).
+    /// still sees the whole path). Only its path and query: a request target in
+    /// absolute form (`GET http://elsewhere/games/`) must not put a host of the
+    /// client's choosing into links built from `full_path`.
     fn from_request_parts(
         parts: &mut Parts,
         _: &S,
@@ -96,14 +98,15 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestInfo {
         let uri = parts
             .extensions
             .get::<OriginalUri>()
-            .map_or_else(|| parts.uri.clone(), |u| u.0.clone());
+            .map_or(&parts.uri, |u| &u.0);
+        let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
         let flag = |name: &str| {
             parts
                 .headers
                 .get(name)
                 .is_some_and(|v| v.as_bytes() == b"true")
         };
-        let mut info = Self::at(&uri.to_string());
+        let mut info = Self::at(path_and_query);
         info.is_htmx = flag("hx-request");
         info.is_boosted = flag("hx-boosted");
         std::future::ready(Ok(info))
@@ -137,6 +140,47 @@ mod tests {
             "?state=active&state=done&page=4"
         );
         assert_eq!(r.query_with("page", None), "?state=active&state=done");
+    }
+
+    #[tokio::test]
+    async fn an_absolute_form_target_yields_only_its_path() {
+        let (mut parts, ()) = Request::get("http://evil.example/games/?page=2")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let r = RequestInfo::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.path.as_str(), r.full_path.as_str()),
+            ("/games/", "/games/?page=2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nested_router_sees_the_whole_path() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = Router::new().nest(
+            "/admin",
+            Router::new().route("/events", get(|r: RequestInfo| async move { r.full_path })),
+        );
+        let res = app
+            .oneshot(
+                Request::get("/admin/events?x=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], b"/admin/events?x=1");
     }
 
     #[test]
