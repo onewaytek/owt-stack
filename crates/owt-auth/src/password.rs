@@ -87,10 +87,41 @@ fn verify_blocking(password: &str, stored: &str) -> bool {
     })
 }
 
-/// `stored` is not a current Argon2id hash: rehash after the next successful check.
+/// Check `password` for an account that may not exist: `stored` is its hash, or `None`
+/// if no account matched. `None` still costs a full Argon2 check (against a hash
+/// nothing matches), so the time a sign-in takes does not say whether the account
+/// exists.
+pub async fn verify_or_decoy(password: &str, stored: Option<&str>) -> bool {
+    static DECOY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    if let Some(stored) = stored {
+        return verify(password, stored).await;
+    }
+    // Hashed with today's parameters, so it costs what a real check costs.
+    let decoy = DECOY
+        .get_or_try_init(|| async { hash(&crate::random_token(32)).await })
+        .await;
+    if let Ok(decoy) = decoy {
+        verify(password, decoy).await;
+    }
+    false
+}
+
+/// `stored` is not an Argon2id hash at least as strong as [`hash`] makes today: rehash
+/// after the next successful check. This is what raises old hashes when the
+/// parameters are raised.
 #[must_use]
 pub fn needs_rehash(stored: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(stored) else {
+        return true;
+    };
+    let Ok(params) = argon2::Params::try_from(&parsed) else {
+        return true;
+    };
+    let now = argon2::Params::default();
     !stored.starts_with("$argon2id$")
+        || params.m_cost() < now.m_cost()
+        || params.t_cost() < now.t_cost()
+        || params.p_cost() < now.p_cost()
 }
 
 fn django_pbkdf2(password: &str, stored: &str) -> Option<bool> {
@@ -169,5 +200,38 @@ mod tests {
         for c in checks {
             assert!(c.await.unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn weaker_argon2_hashes_ask_to_be_replaced() {
+        assert!(!needs_rehash(&hash("x").await.unwrap()));
+        // Argon2id at a tenth of today's memory, and Argon2i at today's parameters.
+        let salt_and_hash = "c29tZXNhbHRzb21lc2FsdA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(needs_rehash(&format!(
+            "$argon2id$v=19$m=1024,t=2,p=1${salt_and_hash}"
+        )));
+        assert!(needs_rehash(&format!(
+            "$argon2i$v=19$m=19456,t=2,p=1${salt_and_hash}"
+        )));
+        assert!(needs_rehash("garbage"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_account_costs_a_check_and_never_matches() {
+        let stored = hash("correct horse").await.unwrap();
+        assert!(verify_or_decoy("correct horse", Some(&stored)).await);
+        assert!(!verify_or_decoy("wrong", Some(&stored)).await);
+        let started = std::time::Instant::now();
+        assert!(verify("correct horse", &stored).await);
+        let real = started.elapsed();
+        // The first decoy also hashes it; time the second.
+        assert!(!verify_or_decoy("correct horse", None).await);
+        let started = std::time::Instant::now();
+        assert!(!verify_or_decoy("correct horse", None).await);
+        assert!(
+            started.elapsed() > real / 4,
+            "the decoy took {:?}, a real check {real:?}",
+            started.elapsed()
+        );
     }
 }

@@ -16,6 +16,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Only to check that the workspace compiles in one rustls crypto backend.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 tokio.workspace = true
 
 [lints]

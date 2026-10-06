@@ -73,10 +73,15 @@ impl Assets {
     }
 
     /// The content hash of `path` (relative to the directory), or `None` if there is
-    /// no such file. Paths climbing out of the directory have none.
+    /// no such file. Paths that leave the directory (`..`, or an absolute path, which
+    /// would replace it) have none.
     #[must_use]
     pub fn hash(&self, path: &str) -> Option<String> {
-        if path.split('/').any(|seg| seg == "..") {
+        use std::path::{Component, Path};
+        let inside = Path::new(path)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+        if !inside || path.is_empty() {
             return None;
         }
         if self.0.watch {
@@ -143,6 +148,9 @@ mod tests {
         assert_eq!(url, format!("/static/css/app.css?v={h}"));
         assert_eq!(a.url("missing.js"), "/static/missing.js");
         assert_eq!(a.hash("../etc/passwd"), None);
+        assert_eq!(a.hash("css/../../etc/passwd"), None);
+        assert_eq!(a.hash("/etc/passwd"), None);
+        assert_eq!(a.hash(""), None);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Configuration from the environment.
 //!
 //! An empty or all-blank variable counts as unset, so a manifest can clear one with
-//! `VALUE: ""`. A variable that is set and does not parse is an error naming it.
+//! `VALUE: ""`. A variable that is set and does not parse is an error naming it, and
+//! not quoting it: the error is logged, and the variable may be a secret.
 //!
 //! The free functions read the process environment; [`Vars`] reads any map, which is
 //! how tests (and config built for a test) avoid mutating the process's.
@@ -58,7 +59,7 @@ impl Vars {
         self.var(name)
             .map(|v| {
                 v.parse::<T>()
-                    .map_err(|e| anyhow::anyhow!("{name}={v:?} does not parse: {e}"))
+                    .map_err(|e| anyhow::anyhow!("{name} does not parse: {e}"))
             })
             .transpose()
     }
@@ -79,7 +80,7 @@ impl Vars {
             None => Ok(default),
             Some("1" | "true" | "yes" | "on") => Ok(true),
             Some("0" | "false" | "no" | "off") => Ok(false),
-            Some(v) => anyhow::bail!("{name}={v:?} is not a boolean"),
+            Some(_) => anyhow::bail!("{name} is not a boolean"),
         }
     }
 
@@ -111,7 +112,7 @@ impl Vars {
                 .parse::<u64>()
                 .map(Duration::from_secs),
         };
-        parsed.map_err(|e| anyhow::anyhow!("{name}={v:?} is not a duration: {e}"))
+        parsed.map_err(|e| anyhow::anyhow!("{name} is not a duration: {e}"))
     }
 }
 
@@ -170,7 +171,7 @@ mod tests {
         assert_eq!(v.var("BLANK"), None);
         assert_eq!(v.parse_or::<u32>("BLANK", 4).unwrap(), 4);
         let e = v.parse::<u32>("BAD").unwrap_err().to_string();
-        assert!(e.contains("BAD"), "{e}");
+        assert!(e.contains("BAD") && !e.contains("x9"), "{e}");
         assert!(
             v.required("MISSING")
                 .unwrap_err()

@@ -11,17 +11,21 @@
 //! | [`session`] | typed sessions sealed in an encrypted cookie; no server-side store |
 //! | [`assets`] | content-fingerprinted static URLs with an `immutable` cache policy |
 //! | [`headers`] | security headers, a nonce-based content security policy, private-by-default caching, `noindex` |
+//! | [`redirect`] | `?next=` targets that stay on this site |
+//! | [`client_ip`] | the client's address behind proxies, by configuration |
 //! | [`limits`] | a response deadline and a request body cap |
 //! | [`htmx`] | `axum-htmx`'s extractors and responders, re-exported |
 //! | [`sse`] | event framing and the stream response |
 //! | [`pager`], [`text`] | page arithmetic; slugs, word truncation, paragraphs |
 
 pub mod assets;
+pub mod client_ip;
 pub mod csrf;
 pub mod error;
 pub mod headers;
 pub mod limits;
 pub mod pager;
+pub mod redirect;
 pub mod session;
 pub mod sse;
 pub mod text;
