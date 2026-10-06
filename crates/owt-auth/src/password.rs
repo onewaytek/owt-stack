@@ -8,7 +8,8 @@
 //! bounded: a burst of sign-ins queues for a permit instead of multiplying that by
 //! the blocking pool's 512 threads, which no pod's memory limit survives. The bound
 //! is the CPU count, at most [`MAX_DEFAULT_CONCURRENCY`]; [`set_concurrency`] changes
-//! it.
+//! it. The permit moves into the blocking task, so a caller that gives up (a request
+//! timeout, a closed connection) does not free it while the hash is still running.
 //!
 //! [`verify`] also accepts Django's `pbkdf2_sha256$<iterations>$<salt>$<hash>`, the
 //! format a Django app's accounts carry over in. After a successful check against such
@@ -51,8 +52,9 @@ async fn permit() -> SemaphorePermit<'static> {
 /// An Argon2id PHC string for `password`.
 pub async fn hash(password: &str) -> anyhow::Result<String> {
     let password = password.to_owned();
-    let _permit = permit().await;
+    let permit = permit().await;
     spawn_blocking(move || {
+        let _permit = permit;
         Argon2::default()
             .hash_password(password.as_bytes())
             .map(|h| h.to_string())
@@ -65,10 +67,13 @@ pub async fn hash(password: &str) -> anyhow::Result<String> {
 /// Anything unparseable matches nothing.
 pub async fn verify(password: &str, stored: &str) -> bool {
     let (password, stored) = (password.to_owned(), stored.to_owned());
-    let _permit = permit().await;
-    spawn_blocking(move || verify_blocking(&password, &stored))
-        .await
-        .unwrap_or(false)
+    let permit = permit().await;
+    spawn_blocking(move || {
+        let _permit = permit;
+        verify_blocking(&password, &stored)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn verify_blocking(password: &str, stored: &str) -> bool {

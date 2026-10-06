@@ -136,8 +136,23 @@ impl Csp {
     }
 
     /// Set (or replace) the directive `name`; an empty `value` removes it.
+    ///
+    /// # Panics
+    /// If `name` is not a directive name (letters and `-`) or `value` holds a `;`, a
+    /// `,` or anything a header cannot carry: a policy that could not be sent would
+    /// otherwise leave every page with none.
     #[must_use]
     pub fn directive(mut self, name: &str, value: &str) -> Self {
+        assert!(
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-'),
+            "CSP directive name {name:?}"
+        );
+        assert!(
+            value
+                .bytes()
+                .all(|b| (b' '..=b'~').contains(&b) && b != b';' && b != b','),
+            "CSP directive value for {name}: {value:?}"
+        );
         let inner = Arc::make_mut(&mut self.0);
         inner.directives.retain(|(k, _)| k != name);
         if !value.is_empty() {
@@ -327,5 +342,11 @@ mod tests {
                 .contains_key(header::CONTENT_SECURITY_POLICY_REPORT_ONLY)
         );
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
+    #[test]
+    #[should_panic(expected = "CSP directive value")]
+    fn a_directive_that_would_inject_another_is_refused() {
+        let _ = Csp::new().directive("img-src", "'self'; script-src *");
     }
 }
