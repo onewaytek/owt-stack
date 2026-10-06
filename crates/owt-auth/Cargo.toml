@@ -1,4 +1,32 @@
 [package]
 name = "owt-auth"
+description = "Authentication the onewaytek apps share: password hashing (with Django hashes accepted for migration), OAuth 2 sign-in with PKCE, and JWT bearer verification against a JWKS."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+base64.workspace = true
+jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
+pbkdf2 = { workspace = true, features = ["hmac"] }
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true, features = ["tokio", "http1", "json"] }
+rsa.workspace = true
+
+[lints]
+workspace = true
