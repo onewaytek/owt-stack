@@ -44,7 +44,17 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS build
 ARG BIN
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --locked --recipe-path recipe.json
+# owt-stack is a private git dependency. The token arrives as a BuildKit secret
+# (docker/build-push-action: `secrets: owt_stack_token=...`), mounted for this step
+# only and passed to git through the environment, so it is in no layer and no
+# config file. Later steps find the checkout in CARGO_HOME and fetch nothing.
+RUN --mount=type=secret,id=owt_stack_token,required=false \
+    if [ -s /run/secrets/owt_stack_token ]; then \
+      export GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/owt_stack_token)@github.com/onewaytek/owt-stack.insteadOf" \
+        GIT_CONFIG_VALUE_0="https://github.com/onewaytek/owt-stack"; \
+    fi; \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
 ENV SQLX_OFFLINE=true
 RUN cargo build --release --locked --bin ${BIN} && cp target/release/${BIN} /app/server

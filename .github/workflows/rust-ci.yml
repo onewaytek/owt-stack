@@ -69,6 +69,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
+  # Fetch git dependencies with the git CLI, so the insteadOf rewrite below (the
+  # token for this private repository) applies.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   rust:

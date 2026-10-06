@@ -37,6 +37,13 @@ owt-web = { path = "../owt-stack/crates/owt-web" }
 owt-runtime = { path = "../owt-stack/crates/owt-runtime" }
 ```
 
+The repository is private, so fetching it needs a token with read access to it:
+
+- **CI:** an `OWT_STACK_TOKEN` secret (organization or repository), passed to the
+  reusable workflow with `secrets: inherit`.
+- **Image builds:** the same token as a BuildKit secret, `owt_stack_token`
+  (`templates/Dockerfile` shows the step that mounts it).
+
 A shared crate is only shared while the majors agree: an app that names `axum`, `sqlx`,
 `askama` or `redis` directly must use the major in this workspace's `Cargo.toml`.
 Upgrading one of those is a release of this repository first, then of every app.
