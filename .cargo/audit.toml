@@ -1,0 +1,10 @@
+# `cargo audit` (run in CI). Each ignored advisory says why it doesn't apply.
+
+[advisories]
+ignore = [
+    # rsa: Marvin, a timing side channel on private-key operations (decryption,
+    # signing); no fixed release. It arrives through jsonwebtoken's rust_crypto
+    # backend, and owt-auth only verifies signatures, a public-key operation.
+    # (The test suite signs with a throwaway key.)
+    "RUSTSEC-2023-0071",
+]
