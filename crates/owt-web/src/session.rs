@@ -6,16 +6,25 @@
 //! and any replica opens any session. The costs of that choice:
 //!
 //! * **Size.** `T` travels on every request; keep it to identifiers and small flags.
-//! * **Revocation.** A sealed cookie is valid until it lapses. Revoke by epoch: store a
-//!   per-account counter in `T` at sign-in, compare on every load, bump it to sign the
-//!   account out everywhere.
-//! * **Secret rotation** signs everyone out.
+//! * **Revocation.** A sealed cookie is valid until it lapses, and [`Session::flush`]
+//!   only replaces the browser's copy: a copy taken earlier still opens. Revoke by
+//!   epoch: store a per-account counter in `T` at sign-in, bump it at sign-out and at
+//!   a password change, and compare the two in [`Sessions::validate_with`], which
+//!   the layer asks about every session it opens.
+//! * **Lifetime.** A change re-seals the cookie for another `max_age`, but never past
+//!   [`Sessions::absolute_lifetime`] from when the session began (sign-in, or a
+//!   guest's first id).
+//! * **Secret rotation** signs everyone out, unless the old secret is kept for
+//!   opening with [`Sessions::also_open_with`] until its sessions have lapsed.
+//!
+//! A response that sets the cookie is marked uncacheable, whatever the handler said:
+//! a shared cache must never replay one person's session to the next.
 //!
 //! The id is opaque and random. It survives data changes, [`Session::cycle_id`]
 //! replaces it (at sign-in, against fixation) and [`Session::flush`] replaces it and
 //! the data (at sign-out). An app may use the id as a guest's identity.
 
-use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,7 +38,8 @@ use rand::RngExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// What a session's data must be.
+/// What a session's data must be. Its serialized field names share the cookie with
+/// the envelope's, so none may be `k`, `x` or `i`.
 pub trait SessionData:
     Serialize + DeserializeOwned + Default + Clone + Send + Sync + 'static
 {
@@ -64,24 +74,46 @@ pub fn key_from_base64(secret: &str) -> anyhow::Result<Key> {
 /// app's state and hand it to [`Sessions::layer`].
 pub struct Sessions<T> {
     inner: Arc<Config>,
-    _data: PhantomData<fn() -> T>,
+    validator: Option<Validator<T>>,
 }
 
 impl<T> Clone for Sessions<T> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            _data: PhantomData,
+            validator: self.validator.clone(),
         }
     }
 }
 
+type Validator<T> =
+    Arc<dyn Fn(Presented<T>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+/// A session a request presented, as [`Sessions::validate_with`] sees it.
+#[derive(Clone, Debug)]
+pub struct Presented<T> {
+    /// Its id.
+    pub id: String,
+    /// When it began, in Unix seconds.
+    pub issued: u64,
+    /// Its data.
+    pub data: T,
+}
+
+#[derive(Clone)]
 struct Config {
     key: Key,
+    /// Keys that still open sessions and seal none: a rotation's predecessors.
+    old_keys: Vec<Key>,
     cookie: String,
     max_age: Duration,
+    absolute: Duration,
     secure: bool,
 }
+
+/// The longest a session lasts, however often it is re-sealed, unless
+/// [`Sessions::absolute_lifetime`] says otherwise (or `max_age` is longer).
+pub const ABSOLUTE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// What the cookie holds, before sealing. Field names are short: they ride on every
 /// request.
@@ -92,6 +124,10 @@ struct Sealed<T> {
     /// Unix seconds; the cookie is no session after this, whatever its holder does.
     #[serde(rename = "x")]
     expires: u64,
+    /// Unix seconds at which the session began; a cookie without it began at 0, so
+    /// it has outlived any lifetime.
+    #[serde(rename = "i", default)]
+    issued: u64,
     #[serde(flatten)]
     data: T,
 }
@@ -104,17 +140,52 @@ fn now() -> u64 {
 
 impl<T: SessionData> Sessions<T> {
     /// Sessions sealed with `key` in the cookie `cookie`, good for `max_age`, `Secure`
-    /// when `secure` (always, outside plain-HTTP development).
+    /// when `secure` (always, outside plain-HTTP development). Name the cookie
+    /// `__Host-<name>` in production: browsers then refuse a copy set over plain HTTP
+    /// or by a sibling subdomain. A `__Host-` or `__Secure-` name is always `Secure`.
     pub fn new(key: Key, cookie: impl Into<String>, max_age: Duration, secure: bool) -> Self {
+        let cookie = cookie.into();
+        let secure = secure || cookie.starts_with("__Host-") || cookie.starts_with("__Secure-");
         Self {
             inner: Arc::new(Config {
                 key,
-                cookie: cookie.into(),
+                old_keys: Vec::new(),
+                cookie,
                 max_age,
+                absolute: ABSOLUTE_LIFETIME.max(max_age),
                 secure,
             }),
-            _data: PhantomData,
+            validator: None,
         }
+    }
+
+    /// End every session this long after it began, however recently it was re-sealed.
+    #[must_use]
+    pub fn absolute_lifetime(mut self, lifetime: Duration) -> Self {
+        Arc::make_mut(&mut self.inner).absolute = lifetime;
+        self
+    }
+
+    /// Also open sessions sealed with `key`, the secret before a rotation. Drop it
+    /// once `max_age` has passed since the rotation.
+    #[must_use]
+    pub fn also_open_with(mut self, key: Key) -> Self {
+        Arc::make_mut(&mut self.inner).old_keys.push(key);
+        self
+    }
+
+    /// Ask `valid` about every session the layer opens; one it refuses is no session,
+    /// and its cookie is removed. This is where revocation lives: compare the epoch in
+    /// the session's data with the account's (see the module docs). It runs on every
+    /// request that carries a session, so make it one indexed read, or a cached one.
+    #[must_use]
+    pub fn validate_with<F, Fut>(mut self, valid: F) -> Self
+    where
+        F: Fn(Presented<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        self.validator = Some(Arc::new(move |p| Box::pin(valid(p))));
+        self
     }
 
     /// The cookie's name.
@@ -123,12 +194,20 @@ impl<T: SessionData> Sessions<T> {
         &self.inner.cookie
     }
 
-    /// The cookie value for a session with `id` and `data`, expiring `max_age` from
-    /// now: what a response sets, and what a seeder hands a load generator.
+    /// The cookie value for a session with `id` and `data`, beginning now and
+    /// expiring `max_age` from now: what a seeder hands a load generator.
     pub fn seal(&self, id: &str, data: &T) -> String {
+        self.seal_begun(id, now(), data)
+    }
+
+    /// The cookie value for a session that began at `issued`: good for `max_age`
+    /// from now, and never past its absolute lifetime.
+    fn seal_begun(&self, id: &str, issued: u64, data: &T) -> String {
         let sealed = Sealed {
             id: id.to_owned(),
-            expires: now() + self.inner.max_age.as_secs(),
+            expires: (now() + self.inner.max_age.as_secs())
+                .min(issued.saturating_add(self.inner.absolute.as_secs())),
+            issued,
             data: data.clone(),
         };
         let plain = serde_json::to_string(&sealed).unwrap_or_default();
@@ -145,14 +224,27 @@ impl<T: SessionData> Sessions<T> {
     /// session.
     #[must_use]
     pub fn unseal(&self, value: &str) -> Option<(String, T)> {
-        let mut jar = cookie::CookieJar::new();
-        jar.add_original(Cookie::new(self.inner.cookie.clone(), value.to_owned()));
-        let opened = jar.private(&self.inner.key).get(&self.inner.cookie)?;
-        let sealed: Sealed<T> = serde_json::from_str(opened.value()).ok()?;
-        (sealed.expires > now()).then_some((sealed.id, sealed.data))
+        self.unseal_presented(value).map(|p| (p.id, p.data))
     }
 
-    fn open(&self, headers: &HeaderMap) -> Option<(String, T)> {
+    fn unseal_presented(&self, value: &str) -> Option<Presented<T>> {
+        let mut jar = cookie::CookieJar::new();
+        jar.add_original(Cookie::new(self.inner.cookie.clone(), value.to_owned()));
+        let opened = std::iter::once(&self.inner.key)
+            .chain(&self.inner.old_keys)
+            .find_map(|key| jar.private(key).get(&self.inner.cookie))?;
+        let sealed: Sealed<T> = serde_json::from_str(opened.value()).ok()?;
+        let now = now();
+        let alive = sealed.expires > now
+            && sealed.issued.saturating_add(self.inner.absolute.as_secs()) > now;
+        alive.then_some(Presented {
+            id: sealed.id,
+            issued: sealed.issued,
+            data: sealed.data,
+        })
+    }
+
+    fn open(&self, headers: &HeaderMap) -> Option<Presented<T>> {
         headers
             .get_all(header::COOKIE)
             .iter()
@@ -163,13 +255,12 @@ impl<T: SessionData> Sessions<T> {
                     .collect::<Vec<_>>()
             })
             .filter(|c| c.name() == self.inner.cookie)
-            .find_map(|c| self.unseal(c.value()))
+            .find_map(|c| self.unseal_presented(c.value()))
     }
 
-    /// The `Set-Cookie` value for a session.
-    fn set_cookie(&self, id: &str, data: &T) -> Option<HeaderValue> {
-        let max_age = i64::try_from(self.inner.max_age.as_secs()).unwrap_or(i64::MAX);
-        let c = Cookie::build((self.inner.cookie.clone(), self.seal(id, data)))
+    fn cookie(&self, value: String, max_age: u64) -> Option<HeaderValue> {
+        let max_age = i64::try_from(max_age).unwrap_or(i64::MAX);
+        let c = Cookie::build((self.inner.cookie.clone(), value))
             .path("/")
             .http_only(true)
             .secure(self.inner.secure)
@@ -179,26 +270,60 @@ impl<T: SessionData> Sessions<T> {
         HeaderValue::from_str(&c.encoded().to_string()).ok()
     }
 
+    /// The `Set-Cookie` value for a session.
+    fn set_cookie(&self, id: &str, issued: u64, data: &T) -> Option<HeaderValue> {
+        self.cookie(
+            self.seal_begun(id, issued, data),
+            self.inner.max_age.as_secs(),
+        )
+    }
+
     /// Middleware body, for `from_fn_with_state(sessions, Sessions::layer)`: open the
     /// request's session, expose it to handlers as [`Session<T>`], and seal it afresh
-    /// into the response if anything changed it.
+    /// into the response if anything changed it. A response that sets the cookie is
+    /// never cacheable.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
         let session = Session::<T>::default();
-        if let Some((id, data)) = this.open(req.headers()) {
-            let mut inner = session.inner();
-            inner.id = Some(id);
-            inner.data = data;
+        let mut refused = false;
+        if let Some(presented) = this.open(req.headers()) {
+            let valid = match &this.validator {
+                Some(valid) => valid(presented.clone()).await,
+                None => true,
+            };
+            if valid {
+                let mut inner = session.inner();
+                inner.id = Some(presented.id);
+                inner.issued = Some(presented.issued);
+                inner.data = presented.data;
+            } else {
+                refused = true;
+            }
         }
         req.extensions_mut().insert(session.clone());
         let mut response = next.run(req).await;
         let changed = {
             let inner = session.inner();
-            inner
-                .modified
-                .then(|| (inner.id.clone().unwrap_or_else(new_id), inner.data.clone()))
+            inner.modified.then(|| {
+                (
+                    inner.id.clone().unwrap_or_else(new_id),
+                    inner.issued.unwrap_or_else(now),
+                    inner.data.clone(),
+                )
+            })
         };
-        if let Some(v) = changed.and_then(|(id, data)| this.set_cookie(&id, &data)) {
-            response.headers_mut().append(header::SET_COOKIE, v);
+        let set = match changed {
+            Some((id, issued, data)) => this.set_cookie(&id, issued, &data),
+            // Take a refused session's cookie away rather than open it every request.
+            None if refused => this.cookie(String::new(), 0),
+            None => None,
+        };
+        if let Some(v) = set {
+            let h = response.headers_mut();
+            h.append(header::SET_COOKIE, v);
+            h.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(crate::headers::NEVER_CACHE),
+            );
         }
         response
     }
@@ -206,6 +331,8 @@ impl<T: SessionData> Sessions<T> {
 
 struct Inner<T> {
     id: Option<String>,
+    /// When the session began; `None` until it is first sealed.
+    issued: Option<u64>,
     data: T,
     modified: bool,
 }
@@ -214,6 +341,7 @@ impl<T: Default> Default for Inner<T> {
     fn default() -> Self {
         Self {
             id: None,
+            issued: None,
             data: T::default(),
             modified: false,
         }
@@ -280,17 +408,27 @@ impl<T: Default + Clone> Session<T> {
         f(&mut inner.data)
     }
 
-    /// A new id, the same data: at sign-in, against session fixation.
+    /// When the session began, in Unix seconds, if it has been sealed.
+    #[must_use]
+    pub fn issued(&self) -> Option<u64> {
+        self.inner().issued
+    }
+
+    /// A new id, the same data, and a new beginning: at sign-in, against session
+    /// fixation.
     pub fn cycle_id(&self) {
         let mut inner = self.inner();
         inner.id = Some(new_id());
+        inner.issued = None;
         inner.modified = true;
     }
 
-    /// A new id and empty data: at sign-out.
+    /// A new id and empty data: at sign-out. The cookie it replaces still opens if
+    /// someone kept a copy; revoke that with [`Sessions::validate_with`].
     pub fn flush(&self) {
         let mut inner = self.inner();
         inner.id = Some(new_id());
+        inner.issued = None;
         inner.data = T::default();
         inner.modified = true;
     }
@@ -403,5 +541,110 @@ mod tests {
             .unwrap()
             .to_bytes();
         assert_eq!(&body[..], b"Some(1)");
+    }
+
+    fn who() -> Router {
+        Router::new()
+            .route(
+                "/login",
+                get(|sess: Session<Data>| async move {
+                    sess.update(|d| d.user = Some(1));
+                    ([(header::CACHE_CONTROL, "public, s-maxage=600")], "in")
+                }),
+            )
+            .route(
+                "/who",
+                get(|sess: Session<Data>| async move { format!("{:?}", sess.read(|d| d.user)) }),
+            )
+    }
+
+    async fn get_with(app: Router, uri: &str, cookie: Option<&str>) -> Response {
+        let mut req = Request::get(uri);
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    async fn text(res: Response) -> String {
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_response_that_sets_the_cookie_is_never_cacheable() {
+        let app = who().layer(from_fn_with_state(sessions(), Sessions::<Data>::layer));
+        let res = get_with(app, "/login", None).await;
+        assert!(res.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(
+            res.headers()[header::CACHE_CONTROL],
+            crate::headers::NEVER_CACHE,
+            "the handler's public policy is overridden"
+        );
+    }
+
+    #[test]
+    fn sessions_end_at_their_absolute_lifetime_however_fresh_the_seal() {
+        let s = sessions().absolute_lifetime(Duration::from_secs(7200));
+        let data = Data { user: Some(7) };
+        assert!(
+            s.unseal(&s.seal_begun("abc", now() - 7000, &data))
+                .is_some()
+        );
+        // Sealed while the lifetime was longer, so its own expiry is still ahead.
+        let lenient = s.clone().absolute_lifetime(ABSOLUTE_LIFETIME);
+        let v = lenient.seal_begun("abc", now() - 7300, &data);
+        assert!(lenient.unseal(&v).is_some());
+        assert_eq!(s.unseal(&v), None);
+    }
+
+    #[test]
+    fn a_rotated_key_still_opens_and_no_longer_seals() {
+        let old = Sessions::<Data>::new(Key::generate(), "sid", Duration::from_secs(3600), true);
+        let v = old.seal("abc", &Data { user: Some(7) });
+        let new = sessions();
+        assert_eq!(new.unseal(&v), None);
+        let new = new.also_open_with(old.inner.key.clone());
+        assert_eq!(new.unseal(&v), Some(("abc".into(), Data { user: Some(7) })));
+        assert_eq!(old.unseal(&new.seal("abc", &Data::default())), None);
+    }
+
+    #[test]
+    fn host_prefixed_cookies_are_always_secure() {
+        let s = Sessions::<Data>::new(
+            Key::generate(),
+            "__Host-sid",
+            Duration::from_secs(60),
+            false,
+        );
+        let set = s.set_cookie("abc", now(), &Data::default()).unwrap();
+        assert!(set.to_str().unwrap().contains("Secure"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_session_is_no_session_and_loses_its_cookie() {
+        let s = sessions();
+        let cookie = format!("sid={}", s.seal("abc", &Data { user: Some(7) }));
+        let open = who().layer(from_fn_with_state(s.clone(), Sessions::<Data>::layer));
+        assert_eq!(
+            text(get_with(open, "/who", Some(&cookie)).await).await,
+            "Some(7)"
+        );
+
+        let revoking = s.validate_with(|p: Presented<Data>| async move { p.data.user != Some(7) });
+        let app = who().layer(from_fn_with_state(revoking, Sessions::<Data>::layer));
+        let res = get_with(app, "/who", Some(&cookie)).await;
+        let set = res.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            set.starts_with("sid=;") && set.contains("Max-Age=0"),
+            "{set}"
+        );
+        assert_eq!(text(res).await, "None");
     }
 }

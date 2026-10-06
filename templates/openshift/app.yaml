@@ -150,6 +150,10 @@ objects:
       name: ${NAME}
       namespace: ${NAMESPACE}
       labels: {app: "${NAME}"}
+      annotations:
+        # The router's own HSTS, so responses the app never sees (the router's 503
+        # page) carry it too. Matches owt_web::headers::HSTS.
+        haproxy.router.openshift.io/hsts_header: max-age=31536000
     spec:
       # No host: the router assigns <name>-<namespace>.<apps domain>.
       to: {kind: Service, name: "${NAME}"}

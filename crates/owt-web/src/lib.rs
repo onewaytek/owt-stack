@@ -10,7 +10,8 @@
 //! | [`csrf`] | tokenless cross-origin protection (`Sec-Fetch-Site`, then `Origin`) |
 //! | [`session`] | typed sessions sealed in an encrypted cookie; no server-side store |
 //! | [`assets`] | content-fingerprinted static URLs with an `immutable` cache policy |
-//! | [`headers`] | security headers, private-by-default caching, `noindex` |
+//! | [`headers`] | security headers, a nonce-based content security policy, private-by-default caching, `noindex` |
+//! | [`limits`] | a response deadline and a request body cap |
 //! | [`htmx`] | `axum-htmx`'s extractors and responders, re-exported |
 //! | [`sse`] | event framing and the stream response |
 //! | [`pager`], [`text`] | page arithmetic; slugs, word truncation, paragraphs |
@@ -19,6 +20,7 @@ pub mod assets;
 pub mod csrf;
 pub mod error;
 pub mod headers;
+pub mod limits;
 pub mod pager;
 pub mod session;
 pub mod sse;

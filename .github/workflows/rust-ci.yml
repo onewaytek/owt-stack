@@ -14,6 +14,10 @@ name: Rust CI
 #
 # This repository is private, so the calling repository must be in the same
 # organization and this repository's Actions settings must allow access from it.
+#
+# The runners are inside the cluster's network, so a pull request from a fork runs
+# nothing here: its code is not ours to run there. Actions are pinned to commits (a
+# tag can be moved); the comment beside each names the release.
 
 on:
   workflow_call:
@@ -66,6 +70,10 @@ on:
         description: Read access to onewaytek/owt-stack, to fetch the git dependency.
         required: false
 
+# The jobs read the repository and nothing else.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
@@ -75,6 +83,7 @@ env:
 
 jobs:
   rust:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     # ARC in Kubernetes container mode needs a job container whenever `services:` is
     # used. Job and service containers share one pod, so services are on localhost,
@@ -94,16 +103,10 @@ jobs:
       DATABASE_URL: ${{ inputs.database != '' && format('postgres://postgres:postgres@127.0.0.1:5432/{0}', inputs.database) || '' }}
       REDIS_URL: ${{ inputs.redis && 'redis://127.0.0.1:6379' || '' }}
     steps:
-      - uses: actions/checkout@v7
-      # Secrets can't appear in a step's `if:`, so the test is in the shell.
-      - name: Fetch owt-stack with a token
-        env:
-          OWT_STACK_TOKEN: ${{ secrets.OWT_STACK_TOKEN }}
-        shell: bash
-        run: |
-          if [ -n "$OWT_STACK_TOKEN" ]; then
-            git config --global url."https://x-access-token:${OWT_STACK_TOKEN}@github.com/onewaytek/owt-stack".insteadOf "https://github.com/onewaytek/owt-stack"
-          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Later steps run the repository's code; leave it no token to find.
+          persist-credentials: false
       - name: Extra environment
         if: ${{ inputs.extra-env != '' }}
         env:
@@ -112,11 +115,14 @@ jobs:
         run: printf '%s\n' "$EXTRA" | grep -v '^[[:space:]]*$' >> "$GITHUB_ENV"
       - name: Wait for services
         if: ${{ inputs.database != '' || inputs.redis }}
+        env:
+          DATABASE: ${{ inputs.database }}
+          REDIS: ${{ inputs.redis }}
         shell: bash
         run: |
           ports=()
-          [ -n "${{ inputs.database }}" ] && ports+=(5432)
-          [ "${{ inputs.redis }}" = "true" ] && ports+=(6379)
+          [ -n "$DATABASE" ] && ports+=(5432)
+          [ "$REDIS" = "true" ] && ports+=(6379)
           for _ in $(seq 60); do
             ok=1
             for p in "${ports[@]}"; do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null || ok=0; done
@@ -125,10 +131,26 @@ jobs:
           done
           echo "services on ${ports[*]} did not accept connections within 60s" >&2
           exit 1
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The token for this private repository exists in this step's environment and
+      # nowhere else: not in a git config file, and not when the tests, build scripts
+      # and proc macros below run. They find the checkout in CARGO_HOME and fetch
+      # nothing. Secrets can't appear in a step's `if:`, so the test is in the shell.
+      - name: Fetch dependencies
+        env:
+          OWT_STACK_TOKEN: ${{ secrets.OWT_STACK_TOKEN }}
+        shell: bash
+        run: |
+          if [ -n "$OWT_STACK_TOKEN" ]; then
+            export GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0="url.https://x-access-token:${OWT_STACK_TOKEN}@github.com/onewaytek/owt-stack.insteadOf" \
+              GIT_CONFIG_VALUE_0="https://github.com/onewaytek/owt-stack"
+          fi
+          cargo fetch --locked
       - run: cargo fmt --check
       - name: cargo audit
         if: ${{ inputs.audit }}
@@ -140,17 +162,27 @@ jobs:
           cargo sqlx migrate run
           SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked ${{ inputs.test-args }}
+      - name: cargo test
+        env:
+          TEST_ARGS: ${{ inputs.test-args }}
+        shell: bash
+        # Unquoted on purpose: several arguments.
+        run: cargo test --locked $TEST_ARGS
 
   css:
-    if: ${{ inputs.css-script != '' }}
+    if: ${{ inputs.css-script != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version-file == '' && '22' || '' }}
           node-version-file: ${{ inputs.node-version-file }}
           cache: npm
       - run: npm ci
-      - run: npm run ${{ inputs.css-script }}
+      - name: Build the stylesheet
+        env:
+          CSS_SCRIPT: ${{ inputs.css-script }}
+        run: npm run "$CSS_SCRIPT"
