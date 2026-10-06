@@ -1,6 +1,6 @@
 [package]
 name = "owt-runtime"
-description = "Process plumbing the onewaytek apps share: configuration from the environment, logging and tracing, Prometheus metrics, the Postgres pool and locked migrations, serving with graceful shutdown."
+description = "Process plumbing the onewaytek apps share: configuration from the environment, logging and tracing, Prometheus metrics, the Postgres pool and locked migrations, background jobs across replicas, serving with graceful shutdown."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,8 @@ publish.workspace = true
 default = ["metrics"]
 # Prometheus exposition on its own listener, plus HTTP and runtime metrics.
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:metrics-process"]
+# Leases in Redis, and jobs that run on whichever replica holds one.
+redis = ["dep:redis"]
 # Trace export over OTLP gRPC when OTEL_EXPORTER_OTLP_ENDPOINT is set.
 otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
 
@@ -23,15 +25,19 @@ metrics-process = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
+rand.workspace = true
+redis = { workspace = true, optional = true, features = ["script"] }
 rlimit.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+redis = { workspace = true, features = ["script"] }
 
 [lints]
 workspace = true
