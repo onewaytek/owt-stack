@@ -1,0 +1,38 @@
+/* What every owt-stack app's stylesheet starts from. Import it after Tailwind:
+
+     @import "tailwindcss" source(none);
+     @import "../path/to/owt-stack/tailwind/owt.css";
+     @source "../templates";
+
+   It defines no colours: each app keeps its own palette. It holds what is the same
+   everywhere: the system font stacks, and variants for the classes htmx puts on
+   elements while a request is in flight, so markup can say
+   `htmx-request:opacity-50` instead of hand-written CSS. */
+
+@theme {
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial,
+    sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
+    monospace;
+}
+
+/* On the element issuing the request (or its hx-indicator), and anything inside it. */
+@custom-variant htmx-request (&.htmx-request, .htmx-request &);
+/* The target being swapped out, then the new content settling in. */
+@custom-variant htmx-swapping (&.htmx-swapping, .htmx-swapping &);
+@custom-variant htmx-settling (&.htmx-settling, .htmx-settling &);
+@custom-variant htmx-added (&.htmx-added, .htmx-added &);
+
+/* htmx's own indicator rule, so `hx-indicator` works without htmx injecting a
+   <style> (which a Content-Security-Policy would refuse: set
+   htmx.config.includeIndicatorStyles = false). */
+.htmx-indicator {
+  opacity: 0;
+  transition: opacity 200ms ease-in;
+}
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+}

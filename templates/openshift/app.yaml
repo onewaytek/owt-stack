@@ -1,0 +1,185 @@
+# One owt-stack app on OpenShift: its image channel, Deployment, Service, Route and
+# CloudNativePG database. An OpenShift Template rather than a Kustomize base, because
+# the app's name has to reach places Kustomize's name transformers don't (the image
+# trigger annotation, the ImageStreamTag, the CNPG-minted Secret's name):
+#
+#   oc process -f app.yaml -p NAME=pets -p NAMESPACE=pets \
+#     -p IMAGE=ghcr.io/onewaytek/pets -p CHANNEL=rc -p PORT=3000 | oc apply -f -
+#
+# Deploys are pull-based. The cluster API is on RFC1918 and nothing in CI pushes to
+# it: CI publishes ghcr.io/<org>/<app>:<channel>, the ImageStream re-imports it on
+# OpenShift's schedule (~15 min), and the Deployment's image trigger rolls out each
+# new digest. ghcr credentials live in the cluster-wide pull secret.
+#
+# Migrations need no Job: the binary applies its embedded SQLx migrations at startup
+# under an advisory lock (owt_runtime::db::migrate_locked), so replicas serialize.
+#
+# App-specific environment (REDIS_URL, SESSION_SECRET, ...) is added by patching the
+# Deployment after processing, or by copying this file into the app's repository.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: owt-app
+  annotations:
+    description: An owt-stack app with its Postgres, pulled from ghcr.
+parameters:
+  - name: NAME
+    description: The app's name; every object is named after it.
+    required: true
+  - name: NAMESPACE
+    required: true
+  - name: IMAGE
+    description: The image repository, without a tag (ghcr.io/onewaytek/pets).
+    required: true
+  - name: CHANNEL
+    description: The floating tag to follow (rc, or latest for stable releases).
+    value: rc
+  - name: PORT
+    description: The port the binary listens on.
+    value: "8000"
+  - name: REPLICAS
+    value: "1"
+  - name: POSTGRES_MAJOR
+    description: Postgres major version; CI's service image must match.
+    value: "18"
+  - name: DB_SIZE
+    value: 2Gi
+  - name: STORAGE_CLASS
+    value: lvms-vg1
+  - name: MEMORY_LIMIT
+    value: 512Mi
+objects:
+  - apiVersion: image.openshift.io/v1
+    kind: ImageStream
+    metadata:
+      name: ${NAME}
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      # Lets the Deployment name `${NAME}:${CHANNEL}` and have it resolved to a digest.
+      lookupPolicy: {local: true}
+      tags:
+        - name: ${CHANNEL}
+          from: {kind: DockerImage, name: "${IMAGE}:${CHANNEL}"}
+          # ghcr can't call in, so the cluster polls it.
+          importPolicy: {scheduled: true}
+          # Source, not Local: the node pulls from ghcr itself, authenticated by the
+          # cluster-wide pull secret. Local routes through the internal registry,
+          # whose pull-through only consults this namespace's secrets.
+          referencePolicy: {type: Source}
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: ${NAME}
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+      annotations:
+        # What deploys a release: OpenShift rewrites the image when the tag resolves
+        # to a new digest, and that spec change rolls.
+        image.openshift.io/triggers: >-
+          [{"from": {"kind": "ImageStreamTag", "name": "${NAME}:${CHANNEL}"},
+          "fieldPath": "spec.template.spec.containers[?(@.name==\"app\")].image"}]
+    spec:
+      replicas: ${{REPLICAS}}
+      # Surge before terminate: with one replica, this is what keeps a rollout (or a
+      # bad image) from taking the site down.
+      strategy:
+        type: RollingUpdate
+        rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+      selector:
+        matchLabels: {app: "${NAME}"}
+      template:
+        metadata:
+          labels: {app: "${NAME}"}
+        spec:
+          containers:
+            - name: app
+              # Placeholder the trigger resolves (lookupPolicy.local).
+              image: ${NAME}:${CHANNEL}
+              ports:
+                - {name: http, containerPort: "${{PORT}}"}
+                - {name: metrics, containerPort: 9464}
+              env:
+                - {name: BIND_ADDR, value: "0.0.0.0:${PORT}"}
+                # CNPG-minted; points at <name>-db-rw, so it follows a switchover and
+                # the password rotates without an edit here.
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef: {name: "${NAME}-db-app", key: uri}
+                - {name: RUST_LOG, value: "info"}
+              # Startup includes connecting and migrating; until Postgres is up the
+              # process exits and restarts, which this tolerates without flapping.
+              startupProbe:
+                httpGet: {path: /healthz, port: http}
+                periodSeconds: 5
+                failureThreshold: 60
+              readinessProbe:
+                httpGet: {path: /healthz, port: http}
+                periodSeconds: 10
+              livenessProbe:
+                httpGet: {path: /healthz, port: http}
+                periodSeconds: 30
+              resources:
+                # No CPU limit: CPU-bound work bursts instead of being throttled.
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {memory: "${MEMORY_LIMIT}"}
+              # restricted-v2 compatible; the SCC assigns the UID.
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+                seccompProfile: {type: RuntimeDefault}
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ${NAME}
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      selector: {app: "${NAME}"}
+      ports:
+        - {name: http, port: 80, targetPort: http}
+        # Scraped in-cluster only; no Route points here.
+        - {name: metrics, port: 9464, targetPort: metrics}
+
+  - apiVersion: route.openshift.io/v1
+    kind: Route
+    metadata:
+      name: ${NAME}
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      # No host: the router assigns <name>-<namespace>.<apps domain>.
+      to: {kind: Service, name: "${NAME}"}
+      port: {targetPort: http}
+      tls:
+        termination: edge
+        insecureEdgeTerminationPolicy: Redirect
+
+  - apiVersion: postgresql.cnpg.io/v1
+    kind: Cluster
+    metadata:
+      name: ${NAME}-db
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      # One instance on a single-node cluster: a standby on the same node buys
+      # availability during drains, not durability.
+      instances: 1
+      # CNPG's image, not docker.io/postgres: the stock image needs a passwd entry
+      # for its UID, and restricted-v2 assigns an arbitrary one.
+      imageName: ghcr.io/cloudnative-pg/postgresql:${POSTGRES_MAJOR}
+      primaryUpdateStrategy: unsupervised
+      bootstrap:
+        initdb:
+          database: ${NAME}
+          owner: ${NAME}
+      storage:
+        size: ${DB_SIZE}
+        storageClass: ${STORAGE_CLASS}
+      enableSuperuserAccess: false
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {memory: 512Mi}

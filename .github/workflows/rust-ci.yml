@@ -1,0 +1,131 @@
+name: Rust CI
+
+# Reusable: the checks every owt-stack app runs, called from the app's own workflow:
+#
+#   jobs:
+#     ci:
+#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.1.0
+#       with: {database: pets, redis: true}
+#
+# Runs on the arc-openshift-k8s ARC scale set (override with the RUNS_ON
+# repository or organization variable, a JSON string such as '"ubuntu-latest"').
+# Image builds and releases do not belong here: the ARC runners are rootless with no
+# Docker daemon, so they run on GitHub-hosted runners in the app's own workflow.
+#
+# This repository is private, so the calling repository must be in the same
+# organization and this repository's Actions settings must allow access from it.
+
+on:
+  workflow_call:
+    inputs:
+      database:
+        description: Postgres database name for the tests; empty for no Postgres.
+        type: string
+        default: ""
+      postgres-major:
+        description: Postgres major version; match the deployment's CNPG image.
+        type: string
+        default: "18"
+      redis:
+        description: Start a Redis for the tests (REDIS_URL=redis://127.0.0.1:6379).
+        type: boolean
+        default: false
+      sqlx-check:
+        description: Check that .sqlx/ matches the queries (cargo sqlx prepare --check).
+        type: boolean
+        default: true
+      audit:
+        description: Fail on advisories in Cargo.lock (cargo audit).
+        type: boolean
+        default: true
+      css-script:
+        description: npm script that builds the stylesheet; empty to skip the job.
+        type: string
+        default: css:build
+      test-args:
+        description: Extra arguments for cargo test.
+        type: string
+        default: ""
+    secrets:
+      OWT_STACK_TOKEN:
+        description: Read access to onewaytek/owt-stack, to fetch the git dependency.
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+
+jobs:
+  rust:
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    # ARC in Kubernetes container mode needs a job container whenever `services:` is
+    # used. Job and service containers share one pod, so services are on localhost,
+    # Docker health-check options don't apply, and there are no `ports:` (a hostPort,
+    # which every OpenShift SCC rejects).
+    container: rust:1-bookworm
+    services:
+      postgres:
+        image: ${{ inputs.database != '' && format('postgres:{0}-alpine', inputs.postgres-major) || '' }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ inputs.database }}
+      redis:
+        image: ${{ inputs.redis && 'redis:8-alpine' || '' }}
+    env:
+      DATABASE_URL: ${{ inputs.database != '' && format('postgres://postgres:postgres@127.0.0.1:5432/{0}', inputs.database) || '' }}
+      REDIS_URL: ${{ inputs.redis && 'redis://127.0.0.1:6379' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      # Secrets can't appear in a step's `if:`, so the test is in the shell.
+      - name: Fetch owt-stack with a token
+        env:
+          OWT_STACK_TOKEN: ${{ secrets.OWT_STACK_TOKEN }}
+        shell: bash
+        run: |
+          if [ -n "$OWT_STACK_TOKEN" ]; then
+            git config --global url."https://x-access-token:${OWT_STACK_TOKEN}@github.com/onewaytek/owt-stack".insteadOf "https://github.com/onewaytek/owt-stack"
+          fi
+      - name: Wait for services
+        if: ${{ inputs.database != '' || inputs.redis }}
+        shell: bash
+        run: |
+          ports=()
+          [ -n "${{ inputs.database }}" ] && ports+=(5432)
+          [ "${{ inputs.redis }}" = "true" ] && ports+=(6379)
+          for _ in $(seq 60); do
+            ok=1
+            for p in "${ports[@]}"; do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null || ok=0; done
+            [ $ok = 1 ] && exit 0
+            sleep 1
+          done
+          echo "services on ${ports[*]} did not accept connections within 60s" >&2
+          exit 1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - name: cargo audit
+        if: ${{ inputs.audit }}
+        run: cargo install cargo-audit --locked && cargo audit --deny warnings
+      - name: sqlx metadata is current
+        if: ${{ inputs.sqlx-check && inputs.database != '' }}
+        run: |
+          cargo install sqlx-cli --locked --no-default-features --features postgres,rustls
+          cargo sqlx migrate run
+          SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked ${{ inputs.test-args }}
+
+  css:
+    if: ${{ inputs.css-script != '' }}
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run ${{ inputs.css-script }}
