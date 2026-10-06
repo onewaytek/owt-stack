@@ -35,8 +35,16 @@ pub struct RequestInfo {
 impl RequestInfo {
     /// The request at `uri` (a path with an optional query), as no client sent it:
     /// error pages, tests, and pages rendered outside a request.
+    ///
+    /// Leading slashes collapse to one. `GET //elsewhere.example/` is a path to the
+    /// server and another host to a browser, so a link built from it (the 404 page's
+    /// "sign in and come back") would leave the site.
     #[must_use]
     pub fn at(uri: &str) -> Self {
+        let uri = match uri.strip_prefix("//") {
+            Some(rest) => &format!("/{}", rest.trim_start_matches('/')),
+            None => uri,
+        };
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
         Self {
             path: path.to_owned(),
@@ -188,5 +196,23 @@ mod tests {
         let r = RequestInfo::at("/admin/events/3/");
         assert!(r.is_under("/admin/") && r.is_under("/admin/events") && !r.is_under("/adm"));
         assert!(!RequestInfo::at("/administer/").is_under("/admin"));
+    }
+
+    #[tokio::test]
+    async fn a_path_cannot_read_as_another_host() {
+        // `GET //evil.example/x`: a link built from the path would be
+        // protocol-relative, and leave the site.
+        for target in ["//evil.example/x?y=1", "///evil.example/x?y=1"] {
+            let (mut parts, ()) = Request::get(target).body(()).unwrap().into_parts();
+            let r = RequestInfo::from_request_parts(&mut parts, &())
+                .await
+                .unwrap();
+            assert_eq!(
+                (r.path.as_str(), r.full_path.as_str()),
+                ("/evil.example/x", "/evil.example/x?y=1"),
+                "{target}"
+            );
+        }
+        assert_eq!(RequestInfo::at("//evil.example").path, "/evil.example");
     }
 }

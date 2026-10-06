@@ -117,11 +117,12 @@ pub struct SessionData {
     pub messages: Vec<owt_web::flash::Flash>,
 }
 
-/// One indexed read: `SELECT epoch FROM account WHERE id = $1`.
-async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<i64> {
+/// One indexed read: `SELECT epoch FROM account WHERE id = $1`. `None`: no such
+/// account any more.
+async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<Option<i64>> {
     sqlx::query_scalar("SELECT epoch FROM account WHERE id = $1")
         .bind(user_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
 }
 
@@ -133,7 +134,8 @@ pub fn router(key: cookie::Key, assets: Assets, trusted: &[String], pool: sqlx::
             async move {
                 let Some(user_id) = s.data.user_id else { return Verdict::Valid };
                 match account_epoch(&pool, user_id).await {
-                    Ok(epoch) => (epoch == s.data.epoch).into(), // Valid or Revoked
+                    // Valid, or Revoked: signed out everywhere, or the account is gone.
+                    Ok(epoch) => (epoch == Some(s.data.epoch)).into(),
                     // An outage must neither admit a revoked session nor sign everyone out.
                     Err(_) => Verdict::Unknown,
                 }
@@ -281,6 +283,8 @@ if password::verify_or_decoy(given, stored_hash).await {
     if stored_hash.is_some_and(password::needs_rehash) {
         let _new_hash = password::hash(given).await?;
     }
+    // Then `session.cycle_id()` before storing who signed in: a session id fixed
+    // on this browser by someone else must not become a signed-in one.
     let _to = redirect::local_or(next, "/"); // `?next=` never leaves this site
 }
 

@@ -22,6 +22,11 @@
 //! budget, which is still a bound. The address must be the client's, not the
 //! proxy's: see `owt_web::client_ip`. An IPv6 address is counted by its /64, the
 //! block one client is usually given.
+//!
+//! An address over its own budget spends nothing from an account's: its sign-in is
+//! refused unchecked, so it was no guess, and charging for it would let one address
+//! hold every account's sign-ins off (and fill the table with names) at any rate it
+//! cared to send.
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
@@ -86,10 +91,27 @@ fn client_key(address: IpAddr) -> IpAddr {
     }
 }
 
+/// The longest account key kept. No account name is longer; a request's worth of
+/// text passed off as one must not be stored whole.
+const MAX_ACCOUNT_KEY_BYTES: usize = 256;
+
 /// The key `account` is counted under: trimmed and lower case, so that variants of
-/// one name share its budget.
+/// one name share its budget, and cut to [`MAX_ACCOUNT_KEY_BYTES`].
 fn account_key(account: &str) -> String {
-    account.trim().to_lowercase()
+    let account = account.trim();
+    // Cut before lower-casing, so a megabyte of text is not copied to be discarded.
+    let mut end = account.len().min(MAX_ACCOUNT_KEY_BYTES);
+    while !account.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut key = account[..end].to_lowercase();
+    // Lower-casing can lengthen it.
+    let mut end = key.len().min(MAX_ACCOUNT_KEY_BYTES);
+    while !key.is_char_boundary(end) {
+        end -= 1;
+    }
+    key.truncate(end);
+    key
 }
 
 impl Throttle {
@@ -124,18 +146,17 @@ impl Throttle {
     /// Count a sign-in to `account` from `address`, before its password is checked;
     /// `false` once any budget is spent, and then the password must not be checked.
     pub fn sign_in(&self, address: IpAddr, account: &str) -> bool {
-        let address_ok = self.attempt(address)
+        // In this order, each only if the one before allowed it: a sign-in an
+        // address's budget refuses is not checked, so it costs the account nothing.
+        self.attempt(address)
             && self
                 .sign_ins_by_address
                 .check_key(&client_key(address))
-                .is_ok();
-        // Charged even when the address is over budget: an attacker's own address
-        // running out must not leave the account's budget untouched.
-        let account_ok = self
-            .sign_ins_by_account
-            .check_key(&account_key(account))
-            .is_ok();
-        address_ok && account_ok
+                .is_ok()
+            && self
+                .sign_ins_by_account
+                .check_key(&account_key(account))
+                .is_ok()
     }
 }
 
@@ -233,5 +254,36 @@ mod tests {
             t.attempt(ip(1));
         }
         assert!(t.sign_ins_by_account.len() < 1000);
+    }
+
+    #[test]
+    fn an_address_over_budget_spends_no_accounts_budget() {
+        let t = Throttle::new(Budgets {
+            attempts_per_address: 100_000,
+            sign_ins_per_address: 2,
+            sign_ins_per_account: 2,
+        });
+        // One address walks a list of names, far past its own budget.
+        for i in 0..500 {
+            t.sign_in(ip(1), &format!("user-{i}"));
+            t.sign_in(ip(1), "ann");
+        }
+        assert!(
+            t.sign_ins_by_account.len() <= 2,
+            "{} account keys held for one address",
+            t.sign_ins_by_account.len()
+        );
+        // It spent what its own budget allowed, no more: the 500th name is untouched.
+        assert!(t.sign_in(ip(2), "user-499"));
+    }
+
+    #[test]
+    fn long_account_names_are_not_stored_whole() {
+        let t = Throttle::new(budgets(1));
+        let long = "a".repeat(100_000);
+        assert!(t.sign_in(ip(1), &long));
+        assert!(!t.sign_in(ip(2), &long), "it still has one budget");
+        assert!(account_key(&long).len() <= MAX_ACCOUNT_KEY_BYTES);
+        assert!(account_key(&"é".repeat(100_000)).len() <= MAX_ACCOUNT_KEY_BYTES);
     }
 }

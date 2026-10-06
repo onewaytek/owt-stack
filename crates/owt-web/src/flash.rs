@@ -7,10 +7,12 @@
 //!
 //! The serialized shape is `["success", "Saved."]`, compact because it rides in the
 //! session cookie. For the same reason the messages waiting are bounded: at most
-//! [`MAX_PENDING`], the oldest dropped first, each at most [`MAX_CHARS`] long. A
-//! browser drops a cookie over 4 KB without a word, and with it every later change
-//! to the session, sign-out included, so messages that echo input (or pile up
-//! behind htmx requests no full page follows) must not be able to grow it.
+//! [`MAX_PENDING`], the oldest dropped first, each at most [`MAX_CHARS`] long and
+//! [`MAX_BYTES`] as serialized. A browser drops a cookie over 4 KB without a word,
+//! and with it every later change to the session, sign-out included, so messages
+//! that echo input (or pile up behind htmx requests no full page follows) must not
+//! be able to grow it. The bound is in bytes as well as characters because the
+//! cookie is: a character is up to four bytes, and six once JSON escapes it.
 //!
 //! Two requests from one browser at once can show a message twice: one takes it, and
 //! the other, sealing the session it opened before that, puts it back. Sessions in a
@@ -25,6 +27,40 @@ pub const MAX_PENDING: usize = 5;
 
 /// The longest message, in characters; a longer one is cut, ending in `…`.
 pub const MAX_CHARS: usize = 300;
+
+/// The longest message, in bytes of its JSON string; a longer one is cut, ending in
+/// `…`. With [`MAX_PENDING`] waiting, that is about 2.8 KB of sealed cookie.
+pub const MAX_BYTES: usize = 400;
+
+/// The bytes `c` takes inside a JSON string, as `serde_json` writes it.
+fn json_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if c < ' ' => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// `text` within [`MAX_CHARS`] and [`MAX_BYTES`], cut and ended with `…` if it was not.
+fn bounded(mut text: String) -> String {
+    const ELLIPSIS: char = '…';
+    let (mut chars, mut bytes) = (0, 0);
+    // Where to cut so that the ellipsis still fits, if a cut turns out to be needed.
+    let mut cut = 0;
+    for (i, c) in text.char_indices() {
+        chars += 1;
+        bytes += json_len(c);
+        if chars > MAX_CHARS || bytes > MAX_BYTES {
+            text.truncate(cut);
+            text.push(ELLIPSIS);
+            return text;
+        }
+        if chars < MAX_CHARS && bytes + ELLIPSIS.len_utf8() <= MAX_BYTES {
+            cut = i + c.len_utf8();
+        }
+    }
+    text
+}
 
 /// How a message should look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,17 +116,10 @@ pub trait HasFlashes {
 }
 
 impl<T: HasFlashes + Default + Clone> Session<T> {
-    /// Show `text` on the next page (within [`MAX_PENDING`] and [`MAX_CHARS`]).
+    /// Show `text` on the next page (within [`MAX_PENDING`], [`MAX_CHARS`] and
+    /// [`MAX_BYTES`]).
     pub fn flash(&self, level: Level, text: impl Into<String>) {
-        let mut text = text.into();
-        if text.chars().count() > MAX_CHARS {
-            let cut = text
-                .char_indices()
-                .nth(MAX_CHARS - 1)
-                .map_or(text.len(), |(i, _)| i);
-            text.truncate(cut);
-            text.push('…');
-        }
+        let text = bounded(text.into());
         self.update(|d| {
             let pending = d.flashes_mut();
             pending.push(Flash(level, text));
@@ -138,13 +167,31 @@ mod tests {
         assert_eq!(taken.len(), MAX_PENDING);
         assert_eq!(taken[0].text(), "3", "the oldest are dropped");
 
-        let exact = "é".repeat(MAX_CHARS);
+        let exact = "e".repeat(MAX_CHARS);
         s.flash(Level::Info, exact.clone());
-        s.flash(Level::Info, "é".repeat(MAX_CHARS + 1));
+        s.flash(Level::Info, "e".repeat(MAX_CHARS + 1));
         let taken = s.take_flashes();
         assert_eq!(taken[0].text(), exact, "a message at the limit is whole");
         assert_eq!(taken[1].text().chars().count(), MAX_CHARS);
         assert!(taken[1].text().ends_with('…'));
+
+        // Bytes bind before characters when the characters are wide or escaped.
+        let exact = "é".repeat(MAX_BYTES / 2);
+        assert_eq!(bounded(exact.clone()), exact);
+        for (filler, each) in [("é", 2), ("漢", 3), ("\"", 2), ("\u{1}", 6), ("😀", 4)] {
+            let cut = bounded(filler.repeat(MAX_BYTES));
+            assert!(cut.ends_with('…'), "{filler:?}");
+            let json = serde_json::to_string(&cut).unwrap();
+            assert!(
+                json.len() - 2 <= MAX_BYTES,
+                "{filler:?}: {}",
+                json.len() - 2
+            );
+            assert!(
+                json.len() - 2 > MAX_BYTES - each - 3,
+                "{filler:?} cut too soon"
+            );
+        }
     }
 
     #[test]
@@ -164,5 +211,43 @@ mod tests {
             serde_json::to_string(&f).unwrap(),
             r#"["success","Saved."]"#
         );
+    }
+
+    #[test]
+    fn the_most_that_can_wait_fits_a_cookie() {
+        use crate::session::Sessions;
+        #[derive(Clone, Default, Serialize, Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            m: Vec<Flash>,
+        }
+        impl HasFlashes for Wire {
+            fn flashes(&self) -> &[Flash] {
+                &self.m
+            }
+            fn flashes_mut(&mut self) -> &mut Vec<Flash> {
+                &mut self.m
+            }
+        }
+        let sessions = Sessions::<Wire>::new(
+            cookie::Key::generate(),
+            "__Host-session",
+            std::time::Duration::from_secs(3600),
+            true,
+        );
+        // Three-byte characters, quotes (two bytes in JSON) and control characters
+        // (six): what a message echoing hostile input could hold.
+        for filler in ["漢", "\"", "\u{1}"] {
+            let s = Session::<Wire>::default();
+            for _ in 0..=MAX_PENDING {
+                s.flash(Level::Warning, filler.repeat(MAX_CHARS * 2));
+            }
+            let sealed = sessions.seal("abcdefghijklmnopqrstuvwxyz012345", &s.read(Clone::clone));
+            assert!(
+                sealed.len() < 3000,
+                "{} bytes sealed with {filler:?}",
+                sealed.len()
+            );
+        }
     }
 }
