@@ -1,7 +1,7 @@
 # owt-stack
 
-What the onewaytek apps (epicpartygame-rs, pets and, after its port, kynestro) share:
-Rust, Axum, SQLx on Postgres, Askama, htmx and Tailwind, deployed to OpenShift.
+An opinionated stack used as a base for One Way Tek projects:
+Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to OpenShift.
 
 | Crate | What an app gets |
 |---|---|
