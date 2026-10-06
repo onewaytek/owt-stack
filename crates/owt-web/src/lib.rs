@@ -9,6 +9,8 @@
 //! | [`error`] | one handler error type and its HTTP mapping; error pages by marker |
 //! | [`csrf`] | tokenless cross-origin protection (`Sec-Fetch-Site`, then `Origin`) |
 //! | [`session`] | typed sessions sealed in an encrypted cookie; no server-side store |
+//! | [`flash`] | messages shown once, on the next page, carried in the session |
+//! | [`request`] | what a page template reads about its request: path, query, htmx |
 //! | [`assets`] | content-fingerprinted static URLs with an `immutable` cache policy |
 //! | [`headers`] | security headers, private-by-default caching, `noindex` |
 //! | [`htmx`] | `axum-htmx`'s extractors and responders, re-exported |
@@ -18,8 +20,10 @@
 pub mod assets;
 pub mod csrf;
 pub mod error;
+pub mod flash;
 pub mod headers;
 pub mod pager;
+pub mod request;
 pub mod session;
 pub mod sse;
 pub mod text;

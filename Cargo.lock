@@ -2057,7 +2057,9 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "cookie",
+ "html-escape",
  "http-body-util",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

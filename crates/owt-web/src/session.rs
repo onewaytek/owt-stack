@@ -280,6 +280,12 @@ impl<T: Default + Clone> Session<T> {
         f(&mut inner.data)
     }
 
+    /// Whether anything changed it, so the response will reseal it.
+    #[must_use]
+    pub fn is_modified(&self) -> bool {
+        self.inner().modified
+    }
+
     /// A new id, the same data: at sign-in, against session fixation.
     pub fn cycle_id(&self) {
         let mut inner = self.inner();

@@ -14,6 +14,8 @@
     reason = "test harness: a panic is a test failure"
 )]
 
+pub mod golden;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
