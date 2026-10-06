@@ -1,0 +1,166 @@
+name: App release (reusable)
+
+# Reusable: cut a release from conventional commits. Called from the app's own
+# workflow on a push to main (stable releases) or rc (X.Y.Z-rc.N prereleases):
+#
+#   jobs:
+#     release:
+#       needs: ci
+#       permissions: {contents: write, issues: write, pull-requests: write}
+#       uses: onewaytek/owt-stack/.github/workflows/release.yml@vX.Y.Z  # the release the app uses
+#     image:
+#       needs: release
+#       if: needs.release.outputs.version != ''
+#       permissions: {contents: read, packages: write}
+#       uses: onewaytek/owt-stack/.github/workflows/image.yml@vX.Y.Z  # the release the app uses
+#       with: {version: "${{ needs.release.outputs.version }}"}
+#       secrets: inherit
+#
+# The bump is semantic-release's reading of the commits since the branch's last
+# tag: `feat` is minor, `fix` and `perf` are patch, `!` or a BREAKING CHANGE footer
+# is major, and anything else releases nothing. The tag is `vX.Y.Z`, and a GitHub
+# release carries the generated notes.
+#
+# An app whose code reads its own version (kynestro serves it to MCP clients) sets
+# `version-command` and `version-files`: the command writes the version into those
+# files, and they are committed back with the release (`chore(release): vX.Y.Z
+# [skip ci]`), so the tag and the files agree.
+#
+# The tooling is pinned here, not in the app's package.json, so every app releases
+# with the same semantic-release and the app needs no Node dependency to do it.
+
+on:
+  workflow_call:
+    inputs:
+      version-command:
+        description: >-
+          Shell run with VERSION set to the new version before the release commit,
+          e.g. `uv version "$VERSION" && uv lock`. It runs in bash, without the
+          release's token. Empty: the version lives only in the tag.
+        type: string
+        default: ""
+      version-files:
+        description: Space-separated files the version command changes, committed back with the release.
+        type: string
+        default: ""
+      changelog:
+        description: Maintain CHANGELOG.md (committed back with the release).
+        type: boolean
+        default: false
+      uv:
+        description: Install uv for the version command (Python apps).
+        type: boolean
+        default: false
+    outputs:
+      version:
+        description: The version released, without the v; empty when nothing was.
+        value: ${{ jobs.release.outputs.version }}
+      channel:
+        description: stable (main) or rc (the rc branch's prereleases).
+        value: ${{ jobs.release.outputs.channel }}
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # One release at a time per branch: two runs computing the next version from the
+    # same tags would both cut it. A queued run is replaced by a newer one, which
+    # reads every commit since the last tag, so nothing is lost.
+    concurrency:
+      group: release-${{ github.repository }}-${{ github.ref_name }}
+      cancel-in-progress: false
+    # A push to a fork's main is not a release of ours.
+    if: ${{ github.repository_owner == 'onewaytek' && (github.ref_name == 'main' || github.ref_name == 'rc') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      version: ${{ steps.semrel.outputs.version }}
+      channel: ${{ steps.semrel.outputs.channel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # semantic-release pushes the tag (and any release commit) with its own
+          # token; it should not find another in .git/config.
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        if: ${{ inputs.uv }}
+      - name: Install semantic-release
+        # Outside the checkout, so the app's package.json and lockfile are neither
+        # consulted nor touched.
+        run: |
+          npm install --prefix "$RUNNER_TEMP/semrel" --no-audit --no-fund --no-save \
+            semantic-release@25.0.9 \
+            @semantic-release/exec@7.1.0 \
+            @semantic-release/git@11.0.1 \
+            @semantic-release/changelog@7.0.0 \
+            conventional-changelog-conventionalcommits@9.3.1
+      - name: Configuration
+        # An app's own .releaserc wins; otherwise the configuration follows the inputs.
+        # An app's own must keep the @semantic-release/exec publishCmd that writes
+        # `version` and `channel` to $GITHUB_OUTPUT, or the release's `version` output
+        # is empty and no image is ever built.
+        env:
+          VERSION_COMMAND: ${{ inputs.version-command }}
+          VERSION_FILES: ${{ inputs.version-files }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: |
+          set -euo pipefail
+          if ls .releaserc* release.config.* >/dev/null 2>&1; then
+            echo "using the repository's own semantic-release configuration"
+            exit 0
+          fi
+          node - <<'JS' > "$RUNNER_TEMP/releaserc.json"
+          const files = (process.env.VERSION_FILES || "").split(/\s+/).filter(Boolean);
+          const changelog = process.env.CHANGELOG === "true";
+          const command = process.env.VERSION_COMMAND || "";
+          const plugins = [
+            ["@semantic-release/commit-analyzer", { preset: "conventionalcommits" }],
+            ["@semantic-release/release-notes-generator", { preset: "conventionalcommits" }],
+          ];
+          if (changelog) plugins.push("@semantic-release/changelog");
+          plugins.push(["@semantic-release/exec", {
+            // Without this, execa runs the commands with /bin/sh, which is dash on
+            // Debian and Ubuntu: no `pipefail`, and the prepare step fails outright.
+            shell: "/bin/bash",
+            // prepareCmd is a lodash template (${nextRelease.version} is filled in
+            // here), so the app's command is not pasted into it: it arrives in
+            // VERSION_COMMAND and runs through eval, braces and all. The token that
+            // pushes the release is unset first: the command may run code the
+            // repository doesn't control (a dependency's build, under `uv lock`).
+            prepareCmd: command ? `unset GITHUB_TOKEN GH_TOKEN; set -euo pipefail; export VERSION=\${nextRelease.version}; eval "$VERSION_COMMAND"` : "true",
+            publishCmd: "echo \"version=${nextRelease.version}\" >> \"$GITHUB_OUTPUT\" && echo \"channel=${nextRelease.channel || 'stable'}\" >> \"$GITHUB_OUTPUT\"",
+          }]);
+          const assets = [...files, ...(changelog ? ["CHANGELOG.md"] : [])];
+          if (assets.length) plugins.push(["@semantic-release/git", {
+            assets,
+            message: "chore(release): v${nextRelease.version} [skip ci]\n\n${nextRelease.notes}",
+          }]);
+          plugins.push("@semantic-release/github");
+          // A branch that does not exist (an app without rc) is ignored.
+          console.log(JSON.stringify({
+            branches: ["main", { name: "rc", prerelease: true }],
+            tagFormat: "v${version}",
+            plugins,
+          }, null, 2));
+          JS
+          cp "$RUNNER_TEMP/releaserc.json" .releaserc.json
+          cat .releaserc.json
+      - id: semrel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION_COMMAND: ${{ inputs.version-command }}
+          NODE_PATH: ${{ runner.temp }}/semrel/node_modules
+        run: |
+          set -euo pipefail
+          # The generated configuration is not the app's file to commit.
+          git update-index --assume-unchanged .releaserc.json 2>/dev/null || true
+          echo ".releaserc.json" >> .git/info/exclude
+          "$RUNNER_TEMP/semrel/node_modules/.bin/semantic-release"

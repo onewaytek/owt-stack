@@ -1,0 +1,45 @@
+# Local dependencies for an owt-stack app: Postgres and Redis as CI and the cluster
+# run them. Copy to the app's repository; `just db` starts it and migrates.
+#
+# Ports and names come from the environment (the app's .env, which `just` loads), so
+# two apps' stacks can run side by side: set POSTGRES_PORT=5433 in one of them.
+# Images are fully qualified, because podman does not assume docker.io.
+name: ${APP:-app}
+
+services:
+  postgres:
+    # The major CI and the CNPG cluster run. Debian, not Alpine: glibc's collations,
+    # as CNPG's images have, so text sorts (and indexes) as in production, and a
+    # volume made by one libc is never opened by the other. 18 keeps its data
+    # under /var/lib/postgresql/18/, so the volume mounts /var/lib/postgresql.
+    image: docker.io/library/postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata18:/var/lib/postgresql
+    healthcheck:
+      # Over TCP: during first start the image runs a temporary server on the Unix
+      # socket only, and a socket check would report ready while it is about to stop.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-app}"]
+      interval: 2s
+      retries: 15
+
+  redis:
+    image: docker.io/library/redis:8-alpine
+    # As production runs it for a cache and a bus: no persistence, bounded,
+    # LRU-evicted.
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 15
+
+volumes:
+  pgdata18:

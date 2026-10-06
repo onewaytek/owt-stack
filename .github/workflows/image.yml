@@ -1,0 +1,125 @@
+name: Image
+
+# Reusable: build a released tag's image on a GitHub-hosted runner and push it to
+# ghcr. The ARC runners keep the checks; they are rootless with no Docker daemon.
+# The cluster pulls from ghcr: an ImageStream follows a floating tag and the
+# Deployment's image trigger rolls out each new digest
+# (templates/openshift/app.yaml).
+#
+# Tags pushed for version X.Y.Z:
+#   - always X.Y.Z;
+#   - with floating-tags, a stable release also moves X.Y and latest (and X from
+#     1.0), and a prerelease (X.Y.Z-rc.N) moves rc.
+#
+# Call it after release.yml (see there), or from the app's own workflow_dispatch to
+# rebuild an existing tag. Rebuilding an old tag with floating-tags would drag
+# latest or rc back to it: leave floating-tags off unless it is the newest release
+# in its channel.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The released version, with or without the v (0.2.0, v0.2.0-rc.1).
+        type: string
+        required: true
+      floating-tags:
+        description: Also move the channel's floating tags.
+        type: boolean
+        default: true
+      context:
+        description: The build context.
+        type: string
+        default: .
+      dockerfile:
+        description: The Dockerfile, relative to the repository root.
+        type: string
+        default: Dockerfile
+    outputs:
+      digest:
+        description: The pushed image's digest.
+        value: ${{ jobs.image.outputs.digest }}
+    secrets:
+      OWT_STACK_TOKEN:
+        description: Read access to onewaytek/owt-stack, passed to the build as the BuildKit secret owt_stack_token.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    if: ${{ github.repository_owner == 'onewaytek' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    env:
+      RAW_VERSION: ${{ inputs.version }}
+      FLOATING: ${{ inputs.floating-tags }}
+    steps:
+      # The channel comes from the version's shape, not from a second input that
+      # could disagree with it.
+      - name: Resolve version
+        run: |
+          set -euo pipefail
+          VERSION="${RAW_VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "not a release version: '${RAW_VERSION}' (expected e.g. 0.2.0 or v0.2.0-rc.1)" >&2
+            exit 1
+          fi
+          if [[ "$VERSION" == *-rc.* ]]; then CHANNEL=rc; else CHANNEL=stable; fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "CHANNEL=${CHANNEL}" >> "$GITHUB_ENV"
+          echo "building v${VERSION} (${CHANNEL}), floating tags: ${FLOATING}"
+
+      # Fails fast if the tag does not exist: only released code is built.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v${{ env.VERSION }}
+          persist-credentials: false
+
+      - name: Resolve tags
+        id: tags
+        run: |
+          set -euo pipefail
+          # ghcr rejects uppercase paths.
+          REPO="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          tags=("${REPO}:${VERSION}")
+          if [ "$FLOATING" = true ]; then
+            if [ "$CHANNEL" = rc ]; then
+              tags+=("${REPO}:rc")
+            else
+              IFS=. read -r major minor _ <<<"$VERSION"
+              tags+=("${REPO}:${major}.${minor}" "${REPO}:latest")
+              [ "$major" = 0 ] || tags+=("${REPO}:${major}")
+            fi
+          fi
+          { echo "list<<EOF"; printf '%s\n' "${tags[@]}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          printf 'tag %s\n' "${tags[@]}"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: VERSION=${{ env.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Mounted only for the step that fetches dependencies (templates/Dockerfile);
+          # it reaches no layer. Unset, the build runs but cannot fetch owt-stack.
+          secrets: |
+            owt_stack_token=${{ secrets.OWT_STACK_TOKEN }}

@@ -1,0 +1,79 @@
+# The commands every owt-stack app answers to. Copy to the app's repository and
+# add the app's own recipes below the line. `just` lists them.
+#
+# `just check` is the gate: run it before every commit, and CI runs the same
+# command (rust-ci.yml's `check-command: just check`), so the list of checks can't
+# drift between the two. It needs a migrated database for the .sqlx check:
+# `just db` first.
+
+set dotenv-load := true
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+# List the recipes.
+default:
+    @just --list --unsorted
+
+# Install the tools the recipes use.
+setup:
+    npm ci
+    cargo install sqlx-cli --locked --no-default-features --features postgres,rustls
+    cargo install cargo-audit --locked
+
+# Start Postgres and Redis (compose.yaml) and apply the migrations.
+db:
+    {{ compose }} up -d --wait
+    sqlx migrate run
+
+# Stop them (the data stays in the volume).
+db-stop:
+    {{ compose }} down
+
+# Build the stylesheet.
+css:
+    npm run css:build
+
+# Run the app, rebuilding the stylesheet on change.
+dev: css
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Invoke the binary directly: npx interposes a chain a single kill won't reach.
+    ./node_modules/.bin/tailwindcss -i assets/app.css -o static/css/app.css --watch=always &
+    watcher=$!
+    trap 'kill $watcher 2>/dev/null' EXIT
+    cargo run
+
+# Everything that must pass before a commit.
+check: fmt lint doc sqlx-check audit test
+
+# Formatting, checked rather than applied: the gate must not change files.
+fmt:
+    cargo fmt --check
+
+# Clippy, warnings fatal.
+lint:
+    cargo clippy --all-targets --locked -- -D warnings
+
+# Rustdoc, private items included, warnings fatal.
+doc:
+    RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo doc --no-deps --document-private-items
+
+# The committed .sqlx/ matches the queries (skipped for an app without one).
+sqlx-check:
+    if [ -d .sqlx ]; then SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
+
+# No advisories against Cargo.lock (ignored ones are in .cargo/audit.toml, with why).
+audit:
+    cargo audit --deny warnings
+
+# The tests; arguments pass through (`just test --test worlds`).
+test *args:
+    cargo test --locked {{ args }}
+
+# Regenerate .sqlx/ after changing a query.
+prepare:
+    cargo sqlx prepare -- --all-targets
+
+# docker compose where Docker is, podman compose otherwise.
+compose := `if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "podman compose"; fi`
+
+# ---- app recipes ----
