@@ -2054,6 +2054,16 @@ dependencies = [
 [[package]]
 name = "owt-test"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "cookie",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "url",
+]
 
 [[package]]
 name = "owt-web"

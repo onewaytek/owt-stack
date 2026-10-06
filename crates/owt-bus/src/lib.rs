@@ -617,7 +617,7 @@ mod tests {
         let heard = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
         let h = heard.clone();
         two.on_notice(Arc::new(move |k| {
-            h.lock().unwrap().push(k.map(str::to_owned))
+            h.lock().unwrap().push(k.map(str::to_owned));
         }));
         let mut sub = two.subscribe();
         sub.join(Room::B);
