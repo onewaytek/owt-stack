@@ -2,6 +2,8 @@
   "name": "@onewaytek/owt-stack",
   "version": "0.2.0",
   "private": true,
-  "description": "The stylesheet half of owt-stack. Apps depend on it as \"@onewaytek/owt-stack\": \"github:onewaytek/owt-stack#v0.2.0\" and import \"@onewaytek/owt-stack/tailwind/owt.css\".",
-  "files": ["tailwind"]
+  "description": "The stylesheet half of owt-stack. Apps depend on it as \"@onewaytek/owt-stack\": \"github:onewaytek/owt-stack#<tag>\" and import \"@onewaytek/owt-stack/tailwind/owt.css\".",
+  "files": [
+    "tailwind"
+  ]
 }

@@ -1,0 +1,33 @@
+name: Release
+
+# Conventional Commits on main drive the version. release-please keeps one release
+# pull request open that bumps every version reference and writes CHANGELOG.md;
+# merging it tags `vX.Y.Z` and publishes the GitHub release. Configuration:
+# release-please-config.json and .release-please-manifest.json.
+#
+# Pull requests opened with the default GITHUB_TOKEN start no workflows, so the
+# release pull request gets no CI. A RELEASE_PLEASE_TOKEN secret (a fine-grained
+# token or GitHub App token with contents and pull-requests write on this
+# repository) gives it CI like any other.
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    # A release touches no cluster: GitHub-hosted, like image builds.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}

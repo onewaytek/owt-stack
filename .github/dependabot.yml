@@ -5,9 +5,14 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
+    # Conventional Commits: "ci(deps): bump ...", which releases nothing.
+    commit-message: {prefix: ci, include: scope}
   - package-ecosystem: cargo
     directory: /
     schedule: {interval: weekly}
+    # "chore(deps): bump ...", which releases nothing on its own: apps resolve their
+    # own Cargo.lock. A floor that apps must move to is a `fix(deps)` by hand.
+    commit-message: {prefix: chore, include: scope}
     groups:
       patch-and-minor:
         update-types: [minor, patch]
