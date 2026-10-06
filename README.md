@@ -533,5 +533,6 @@ the version is 0.x, the bump follows Cargo's rules for 0.x:
 A breaking change says in its footer what an app must change; that text becomes the
 changelog's "Breaking changes", so the upgrade notes write themselves. The release pull
 request updates every version: the workspace `Cargo.toml`, `Cargo.lock`,
-`package.json`, the tags in this README (between `x-release-please` markers) and the
-usage comment in `rust-ci.yml`. A new reference to the version needs a marker too.
+`package.json` and the tags in this README (between `x-release-please` markers). A new
+reference to the version needs a marker too, outside `.github/workflows/`: GitHub lets
+no workflow's default token change a workflow file, so those carry no version.
