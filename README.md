@@ -481,6 +481,9 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `Pending::matches` check. `Pending` gains `provider`, so a sign-in in flight across
   the deploy fails once with `Error::Provider`.
 - `jwt::Error` and `oauth::Error` have new variants; a `match` on them needs arms.
+- `jwt::Verifier::discover` refuses a discovery document whose `issuer` is not
+  exactly the configured one (trailing slash included) or whose `jwks_uri` is not
+  https.
 - `CrossOrigin::layer` refuses cross-origin WebSocket upgrades. A bypass prefix
   matches whole path segments: `/mcp` no longer covers `/mcp-admin`.
 - The workspace's `tower-http` names only `timeout`; an app names its own features
