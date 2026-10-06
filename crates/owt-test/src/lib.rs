@@ -14,6 +14,7 @@
     reason = "test harness: a panic is a test failure"
 )]
 
+pub mod fragment;
 pub mod golden;
 
 use std::collections::BTreeMap;

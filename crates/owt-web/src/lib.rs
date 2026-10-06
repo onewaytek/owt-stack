@@ -14,6 +14,7 @@
 //! | [`assets`] | content-fingerprinted static URLs with an `immutable` cache policy |
 //! | [`headers`] | security headers, private-by-default caching, `noindex` |
 //! | [`htmx`] | `axum-htmx`'s extractors and responders, re-exported |
+//! | [`fragment`] | htmx fragments at their own URLs: `HX-Push-Url`, `HX-Reselect`, no `Vary` |
 //! | [`sse`] | event framing and the stream response |
 //! | [`pager`], [`text`] | page arithmetic; slugs, word truncation, paragraphs |
 
@@ -21,6 +22,7 @@ pub mod assets;
 pub mod csrf;
 pub mod error;
 pub mod flash;
+pub mod fragment;
 pub mod headers;
 pub mod pager;
 pub mod request;

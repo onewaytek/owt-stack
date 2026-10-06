@@ -13,6 +13,7 @@ cookie.workspace = true
 html-escape.workspace = true
 http-body-util.workspace = true
 regex.workspace = true
+scraper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

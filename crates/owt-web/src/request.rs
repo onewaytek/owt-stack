@@ -8,8 +8,9 @@
 //!
 //! Pages and htmx fragments should live at distinct URLs rather than be negotiated on
 //! `HX-Request`: a CDN that ignores `Vary` (Cloudflare, beyond encoding) would cache
-//! one variant and serve it for the other. [`RequestInfo::is_htmx`] is for chrome
-//! decisions, never for choosing between a page and a fragment at one URL.
+//! one variant and serve it for the other (see [`crate::fragment`]).
+//! [`RequestInfo::is_htmx`] is for chrome decisions, never for choosing between a
+//! page and a fragment at one URL.
 
 use std::convert::Infallible;
 
