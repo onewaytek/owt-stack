@@ -99,7 +99,8 @@ pub enum Verdict {
     Revoked,
     /// It could not be checked (the database did not answer). It is no session for
     /// this request, and the cookie is kept: an outage must neither let a revoked
-    /// session through nor sign everyone out.
+    /// session through nor sign everyone out. A handler's changes are dropped,
+    /// except [`Session::flush`] and [`Session::cycle_id`], which replace it.
     Unknown,
 }
 
@@ -331,8 +332,9 @@ impl<T: SessionData> Sessions<T> {
         let changed = {
             let inner = session.inner();
             // A handler that saw no session because it could not be checked must not
-            // replace the cookie with the empty one it was shown.
-            (inner.modified && !unchecked).then(|| {
+            // replace the cookie with the empty one it was shown, unless it replaced
+            // the session outright: a sign-out or sign-in during an outage stands.
+            (inner.modified && (!unchecked || inner.replaced)).then(|| {
                 (
                     inner.id.clone().unwrap_or_else(new_id),
                     inner.issued.unwrap_or_else(now),
@@ -364,6 +366,9 @@ struct Inner<T> {
     issued: Option<u64>,
     data: T,
     modified: bool,
+    /// The id was replaced ([`Session::cycle_id`], [`Session::flush`]): the handler
+    /// means this session, whatever the one presented was.
+    replaced: bool,
 }
 
 impl<T: Default> Default for Inner<T> {
@@ -373,6 +378,7 @@ impl<T: Default> Default for Inner<T> {
             issued: None,
             data: T::default(),
             modified: false,
+            replaced: false,
         }
     }
 }
@@ -450,6 +456,7 @@ impl<T: Default + Clone> Session<T> {
         inner.id = Some(new_id());
         inner.issued = None;
         inner.modified = true;
+        inner.replaced = true;
     }
 
     /// A new id and empty data: at sign-out. The cookie it replaces still opens if
@@ -460,6 +467,7 @@ impl<T: Default + Clone> Session<T> {
         inner.issued = None;
         inner.data = T::default();
         inner.modified = true;
+        inner.replaced = true;
     }
 }
 
@@ -692,5 +700,26 @@ mod tests {
         // Nor may a handler's change overwrite the cookie it never saw.
         let res = get_with(app, "/login", Some(&cookie)).await;
         assert!(res.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_during_an_outage_still_replaces_the_cookie() {
+        let s = sessions();
+        let cookie = format!("sid={}", s.seal("abc", &Data { user: Some(7) }));
+        let down = s
+            .clone()
+            .validate_with(|_: Presented<Data>| async { Verdict::Unknown });
+        let app = Router::new()
+            .route(
+                "/logout",
+                get(|sess: Session<Data>| async move { sess.flush() }),
+            )
+            .layer(from_fn_with_state(down, Sessions::<Data>::layer));
+        let res = get_with(app, "/logout", Some(&cookie)).await;
+        let set = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        let set = Cookie::parse_encoded(set).unwrap();
+        let (id, data) = s.unseal(set.value()).unwrap();
+        assert_ne!(id, "abc");
+        assert_eq!(data, Data::default());
     }
 }

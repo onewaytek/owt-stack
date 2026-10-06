@@ -51,6 +51,12 @@ parameters:
   - name: METRICS_NAMESPACE
     description: The namespace whose Prometheus scrapes the metrics port.
     value: openshift-user-workload-monitoring
+  - name: CNPG_NAMESPACE
+    description: >-
+      The namespace the CloudNativePG operator runs in (openshift-operators when
+      installed from OperatorHub for all namespaces), the only one that may call the
+      database instances' status port.
+    value: openshift-operators
 objects:
   - apiVersion: image.openshift.io/v1
     kind: ImageStream
@@ -253,5 +259,9 @@ objects:
                 matchLabels: {cnpg.io/cluster: "${NAME}-db"}
           ports: [{port: 5432}]
         # The instance manager's status port, which the CNPG operator calls from its
-        # own namespace (it authenticates callers itself).
-        - ports: [{port: 8000}]
+        # own namespace. Postgres metrics (9187) are not open: add a rule for the
+        # metrics namespace if a PodMonitor scrapes them.
+        - from:
+            - namespaceSelector:
+                matchLabels: {kubernetes.io/metadata.name: "${CNPG_NAMESPACE}"}
+          ports: [{port: 8000}]

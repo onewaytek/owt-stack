@@ -666,4 +666,14 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn rediss_can_build_its_tls_config() {
+        // redis builds `rustls::ClientConfig::builder()`, which panics when more than
+        // one crypto backend is compiled in and none was installed. sqlx's
+        // `tls-rustls` means ring and reqwest's means aws-lc-rs, so the workspace
+        // names sqlx's aws-lc-rs feature; `cargo test --workspace` unifies features
+        // as an app using every crate would.
+        let _ = rustls::ClientConfig::builder();
+    }
 }

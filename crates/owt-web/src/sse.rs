@@ -22,7 +22,12 @@ pub const HEARTBEAT: &str = "event: heartbeat\ndata: {}\n\n";
 /// (`event:`, `retry:`) in the browser's parser.
 #[must_use]
 pub fn frame(data: &str) -> String {
-    let data = data.replace("\r\n", "\n").replace('\r', "\n");
+    // Most frames hold no `\r`; only those pay for copying.
+    let data: std::borrow::Cow<'_, str> = if data.contains('\r') {
+        data.replace("\r\n", "\n").replace('\r', "\n").into()
+    } else {
+        data.into()
+    };
     let mut out = String::with_capacity(data.len() + 16);
     let mut any = false;
     for line in data.lines() {

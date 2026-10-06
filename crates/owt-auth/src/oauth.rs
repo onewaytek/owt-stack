@@ -166,8 +166,8 @@ fn oidc_identity(info: Value) -> Option<Identity> {
 }
 
 /// A sign-in waiting for its callback. Keep it in the person's session; it is useless
-/// to anyone else.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// to anyone else. Its `Debug` leaves out the state and the verifier.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Pending {
     /// The [`Provider::id`] it was begun with: a callback for one provider cannot
     /// complete a login begun with another (the mix-up attack).
@@ -199,6 +199,14 @@ pub struct Client {
     pub client_secret: String,
     /// This app's callback URL, exactly as registered.
     pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending")
+            .field("provider", &self.provider)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for Client {
