@@ -7,7 +7,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 |---|---|
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
-| `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts, accepting Django `pbkdf2_sha256` hashes for migration; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
+| `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement |
 
@@ -280,7 +280,7 @@ if !throttle.sign_in(ip, account) {
 // Argon2id on the blocking pool, a bounded number at once. An unknown account
 // (`None`) costs a real check too, so timing does not tell which accounts exist.
 if password::verify_or_decoy(given, stored_hash).await {
-    // Django hashes and older parameters verify; store a fresh hash.
+    // A hash made with weaker parameters than today's: store a fresh one.
     if stored_hash.is_some_and(password::needs_rehash) {
         let _new_hash = password::hash(given).await?;
     }
@@ -293,7 +293,7 @@ let google = oauth::Client {
     provider: oauth::google(),
     client_id: "id".into(),
     client_secret: "secret".into(),
-    redirect_uri: "https://app.example/accounts/google/login/callback/".into(),
+    redirect_uri: "https://app.example/auth/google/callback".into(),
 };
 let (_url, _pending) = google.begin()?;
 let http = oauth::http_client()?; // timeouts, no redirects followed

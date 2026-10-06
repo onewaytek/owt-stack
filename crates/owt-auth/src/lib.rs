@@ -1,7 +1,6 @@
 //! Authentication the onewaytek apps share.
 //!
-//! * [`password`]: Argon2id hashing off the async runtime; Django's
-//!   `pbkdf2_sha256` hashes are accepted so accounts migrate on their next sign-in.
+//! * [`password`]: Argon2id hashing off the async runtime, a bounded number at once.
 //! * [`throttle`]: budgets for sign-in attempts, by address and by account.
 //! * [`oauth`]: the authorization-code flow (with PKCE where the provider supports
 //!   it) for signing people in with Google, Discord, Twitch or any OIDC provider.

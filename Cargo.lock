@@ -2175,7 +2175,6 @@ dependencies = [
  "base64 0.23.1",
  "governor",
  "jsonwebtoken",
- "pbkdf2",
  "rand 0.10.3",
  "reqwest",
  "rsa",
@@ -2325,16 +2324,6 @@ checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
  "getrandom 0.4.3",
  "phc",
-]
-
-[[package]]
-name = "pbkdf2"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
-dependencies = [
- "digest 0.11.3",
- "hmac 0.13.0",
 ]
 
 [[package]]
