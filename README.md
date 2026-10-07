@@ -70,14 +70,10 @@ owt-web = { path = "../owt-stack/crates/owt-web" }
 owt-runtime = { path = "../owt-stack/crates/owt-runtime" }
 ```
 
-**The repository is private**, so fetching it needs a token with read access to it:
-
-- **CI:** an `OWT_STACK_TOKEN` secret (organization or repository), passed to the
-  reusable workflow with `secrets: inherit`.
-- **Image builds:** the same token as a BuildKit secret, `owt_stack_token`
-  (`templates/Dockerfile` shows the step that mounts it). In both, the token is in
-  the environment of `cargo fetch` alone, which runs none of the dependencies' code;
-  the build that follows runs their build scripts and proc macros without it.
+**The repository is public:** `cargo fetch` needs no token in CI, in image builds or
+on a workstation, and an app that still passes an `OWT_STACK_TOKEN` secret to the
+reusable workflows can drop it. The crates are not on crates.io; the tagged git
+source above is the way to depend on them, and the lockfile pins the commit.
 
 ## Wiring an app
 
@@ -659,9 +655,9 @@ jobs:
 Image builds run on GitHub-hosted runners: the ARC runners have no Docker daemon.
 
 **Image:** copy `templates/Dockerfile` (and `templates/dockerignore` as
-`.dockerignore`) and set `BIN` and `PORT`. `image.yml` passes `OWT_STACK_TOKEN` to the
-build as the BuildKit secret the Dockerfile mounts. Distroless has no shell: keep a
-debian-slim runtime if operations `oc exec` shell tools into the pod.
+`.dockerignore`) and set `BIN` and `PORT`. The build fetches owt-stack like any other
+git dependency; no secret is mounted. Distroless has no shell: keep a debian-slim
+runtime if operations `oc exec` shell tools into the pod.
 
 **OpenShift:**
 
@@ -810,3 +806,9 @@ request updates every version: the workspace `Cargo.toml`, `Cargo.lock`,
 `package.json` and the tags in this README (between `x-release-please` markers). A new
 reference to the version needs a marker too, outside `.github/workflows/`: GitHub lets
 no workflow's default token change a workflow file, so those carry no version.
+
+## Licence
+
+MIT or Apache-2.0, at your option (`LICENSE-MIT`, `LICENSE-APACHE`): the Rust
+convention, and compatible with an app under any licence, copyleft included. A
+contribution is offered under both. Security reports: `SECURITY.md`.
