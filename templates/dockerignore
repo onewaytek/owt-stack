@@ -8,8 +8,8 @@ target
 node_modules
 *.pem
 *.key
-# Credentials a developer's checkout may hold, now that builds fetch a private
-# repository with a token.
+# Credentials a developer's checkout may hold; the registry cache would export
+# them with the layer.
 .npmrc
 .netrc
 .git-credentials

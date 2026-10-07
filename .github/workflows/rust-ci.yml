@@ -12,8 +12,9 @@ name: Rust CI
 # Image builds and releases do not belong here: the ARC runners are rootless with no
 # Docker daemon, so they run on GitHub-hosted runners in the app's own workflow.
 #
-# This repository is private, so the calling repository must be in the same
-# organization and this repository's Actions settings must allow access from it.
+# This repository is public, so any repository may call this workflow; the ARC scale
+# set it runs on belongs to the onewaytek organization, so a caller elsewhere sets
+# RUNS_ON to runners of its own.
 #
 # The runners are inside the cluster's network, so a pull request from a fork runs
 # nothing here: its code is not ours to run there. Actions are pinned to commits (a
@@ -74,10 +75,6 @@ on:
         description: File naming the Node version for the stylesheet job; empty for 22.
         type: string
         default: ""
-    secrets:
-      OWT_STACK_TOKEN:
-        description: Read access to onewaytek/owt-stack, to fetch the git dependency.
-        required: false
 
 # The jobs read the repository and nothing else.
 permissions:
@@ -86,9 +83,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
-  # Fetch git dependencies with the git CLI, so the insteadOf rewrite below (the
-  # token for this private repository) applies.
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   rust:
@@ -145,21 +139,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # The token for this private repository exists in this step's environment and
-      # nowhere else: not in a git config file, and not when the tests, build scripts
-      # and proc macros below run. They find the checkout in CARGO_HOME and fetch
-      # nothing. Secrets can't appear in a step's `if:`, so the test is in the shell.
+      # Its own step, so a pin the lockfile can't satisfy fails here by name.
       - name: Fetch dependencies
-        env:
-          OWT_STACK_TOKEN: ${{ secrets.OWT_STACK_TOKEN }}
-        shell: bash
-        run: |
-          if [ -n "$OWT_STACK_TOKEN" ]; then
-            export GIT_CONFIG_COUNT=1 \
-              GIT_CONFIG_KEY_0="url.https://x-access-token:${OWT_STACK_TOKEN}@github.com/onewaytek/owt-stack.insteadOf" \
-              GIT_CONFIG_VALUE_0="https://github.com/onewaytek/owt-stack"
-          fi
-          cargo fetch --locked
+        run: cargo fetch --locked
       - name: Install the gate's tools
         if: ${{ inputs.check-command != '' }}
         uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26

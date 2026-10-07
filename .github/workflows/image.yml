@@ -39,10 +39,6 @@ on:
       digest:
         description: The pushed image's digest.
         value: ${{ jobs.image.outputs.digest }}
-    secrets:
-      OWT_STACK_TOKEN:
-        description: Read access to onewaytek/owt-stack, passed to the build as the BuildKit secret owt_stack_token.
-        required: false
 
 permissions:
   contents: read
@@ -119,7 +115,3 @@ jobs:
           build-args: VERSION=${{ env.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Mounted only for the step that fetches dependencies (templates/Dockerfile);
-          # it reaches no layer. Unset, the build runs but cannot fetch owt-stack.
-          secrets: |
-            owt_stack_token=${{ secrets.OWT_STACK_TOKEN }}
