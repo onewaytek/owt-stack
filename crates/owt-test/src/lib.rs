@@ -7,6 +7,8 @@
 //! * [`golden`]: rendered pages compared with snapshots on disk, modulo layout and
 //!   escaping style.
 //! * [`fragment`]: a page and its htmx fragment render one element the same way.
+//! * [`assets`]: the browser fetches nothing from another origin; vendored files match
+//!   their pins.
 //!
 //! Requests carry no `Origin` and no `Sec-Fetch-Site`, so cross-origin protection
 //! treats them as a non-browser client and lets them through; set the headers on a
@@ -17,6 +19,7 @@
     reason = "test harness: a panic is a test failure"
 )]
 
+pub mod assets;
 pub mod fragment;
 pub mod golden;
 
