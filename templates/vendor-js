@@ -13,14 +13,33 @@
 set -euo pipefail
 cd "${1:-$(git rev-parse --show-toplevel)}"
 [ -f vendor.pins ] || { echo "no vendor.pins here" >&2; exit 1; }
+for tool in curl openssl; do
+  command -v "$tool" >/dev/null || { echo "vendor-js needs $tool" >&2; exit 1; }
+done
 
 sri() { printf 'sha384-%s' "$(openssl dgst -sha384 -binary "$1" | openssl base64 -A)"; }
 
+tmp=""
+trap 'rm -f "$tmp"' EXIT
 fail=0
-while read -r dest url want _; do
-  case "$dest" in ''|'#'*) continue ;; esac
+count=0
+# `|| [ -n "$line" ]`: a last line without a newline is still a pin.
+while IFS= read -r line || [ -n "$line" ]; do
+  line=${line%%#*}            # trailing comments
+  line=${line//$'\r'/}        # CRLF
+  read -r dest url want extra <<<"$line" || true
+  [ -n "${dest:-}" ] || continue
+  if [ -z "${want:-}" ] || [ -n "${extra:-}" ] || [[ $want != sha384-* ]]; then
+    echo "  malformed pin: $line"; fail=1; continue
+  fi
+  case "/$dest/" in
+    //*|*/../*) echo "  $dest: must stay inside the repository"; fail=1; continue ;;
+  esac
+  count=$((count + 1))
   tmp=$(mktemp)
-  curl -fsSL -o "$tmp" "$url"
+  if ! curl -fsSL -o "$tmp" "$url"; then
+    echo "  $dest: download failed ($url)"; rm -f "$tmp"; fail=1; continue
+  fi
   got=$(sri "$tmp")
   if [ "$got" != "$want" ]; then
     printf '  %s: hash mismatch\n    pinned %s\n    got    %s\n' "$dest" "$want" "$got"
@@ -31,5 +50,6 @@ while read -r dest url want _; do
   echo "  $dest <- $url"
 done < vendor.pins
 
-[ "$fail" -eq 0 ] || { echo "FAILED: the mismatched files were left as they were" >&2; exit 1; }
-echo "every vendored file matches its pin"
+[ "$fail" -eq 0 ] || { echo "FAILED: the files above that failed were left as they were" >&2; exit 1; }
+[ "$count" -gt 0 ] || { echo "vendor.pins pins nothing" >&2; exit 1; }
+echo "all $count vendored files match their pins"

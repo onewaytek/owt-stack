@@ -439,7 +439,10 @@ Three tests hold it, one call each:
 # let d = std::env::temp_dir().join(format!("owt-readme-assets-{}", std::process::id()));
 # std::fs::create_dir_all(d.join("templates")).unwrap();
 # std::fs::create_dir_all(d.join("static")).unwrap();
-# std::fs::write(d.join("vendor.pins"), "").unwrap();
+# std::fs::write(d.join("templates/base.html"), "<script src=\"/static/htmx.min.js\"></script>").unwrap();
+# std::fs::write(d.join("static/htmx.min.js"), "htmx").unwrap();
+# let pin = owt_test::assets::sri(b"htmx");
+# std::fs::write(d.join("vendor.pins"), format!("static/htmx.min.js https://unpkg.com/htmx.org {pin}\n")).unwrap();
 # std::env::set_current_dir(&d).unwrap();
 use owt_test::assets;
 
