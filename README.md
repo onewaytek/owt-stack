@@ -55,8 +55,11 @@ A shared crate is only shared while the majors agree: an app that names `axum`, 
 `askama` or `redis` directly must use the major in this workspace's `Cargo.toml`.
 
 An app that names `sqlx` uses its `tls-rustls-aws-lc-rs` feature, not `tls-rustls`
-(which means ring). With both rustls backends compiled in, rustls cannot pick one, and
-the first `rediss://` connection panics.
+(which means ring). With both rustls backends compiled in (or none), rustls cannot pick
+one, and the first `rediss://` connection would panic; `Bus::redis` installs aws-lc-rs
+as the process's provider if none is set, and an app that connects to a `rediss://`
+Redis before or without the bus (a lease's `ConnectionManager`, say) calls
+`owt_bus::ensure_crypto_provider()` first.
 
 **Developing against a local checkout:** patch the git source in the app's
 `.cargo/config.toml` (not committed) instead of editing `Cargo.toml`:
@@ -72,7 +75,9 @@ owt-runtime = { path = "../owt-stack/crates/owt-runtime" }
 - **CI:** an `OWT_STACK_TOKEN` secret (organization or repository), passed to the
   reusable workflow with `secrets: inherit`.
 - **Image builds:** the same token as a BuildKit secret, `owt_stack_token`
-  (`templates/Dockerfile` shows the step that mounts it).
+  (`templates/Dockerfile` shows the step that mounts it). In both, the token is in
+  the environment of `cargo fetch` alone, which runs none of the dependencies' code;
+  the build that follows runs their build scripts and proc macros without it.
 
 ## Wiring an app
 
@@ -399,6 +404,7 @@ impl owt_bus::Message for Msg {
 }
 
 # async fn demo(redis_url: &str) -> anyhow::Result<()> {
+owt_bus::ensure_crypto_provider(); // before any rediss:// connection
 let publisher = redis::aio::ConnectionManager::new(redis::Client::open(redis_url)?).await?;
 let options = owt_bus::Options { metrics: Some(owt_bus::MetricNames::prefixed("myapp")), ..Default::default() };
 let bus: owt_bus::Bus<Topic, Msg> = owt_bus::Bus::redis(redis_url, publisher, "myapp", options)?;
@@ -467,7 +473,13 @@ exclude each other. Record runs with `JobMetrics::prefixed("myapp")`
 
 A leased job keeps its lease while its replica lives as long as the TTL outlasts the
 period plus jitter: the lease is renewed at each tick, during a run, and when the run
-ends.
+ends. A lease is a Redis key: a Redis that evicts under memory pressure (as a cache
+does) can drop it, and until the holder's next renewal fails (a third of the TTL) two
+replicas may run the job. Work that must never run twice gets a `noeviction` Redis,
+and checks `held.is_lost()` before each owner-only step.
+
+A run's panic, in the future or in the closure that builds it, is one failed tick;
+the loop goes on.
 
 ### Front-end assets
 
@@ -743,8 +755,33 @@ The router example under "Wiring an app" composes the layers; beyond it:
 ## Working on owt-stack
 
 `just check` is the gate (fmt, clippy over every crate and feature, the tests with the
-README doctests, `cargo audit`), and CI runs the same command. `owt-bus`'s Redis test
-runs when `REDIS_URL` is set and is skipped otherwise.
+README doctests, `cargo audit`), and CI runs the same command. The Redis tests run when
+`REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
+`DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL
+whose certificate the system trusts (`SSL_CERT_FILE=ca.crt` for a test CA; the test's
+header says how to run such a Redis). Each is skipped otherwise; CI sets the first two.
+
+**Tests come in four kinds**, and a change to anything that reads what a client sent
+adds to the first:
+
+- *Properties* (`crates/*/tests/properties.rs`, `owt-bus/tests/model.rs`): what must
+  hold for every input, with proptest looking for the one where it does not. A
+  failure writes its seed to a `.proptest-regressions` file beside the test; commit
+  it, so the case is retried for ever.
+- *The composed app* (`owt-web/tests/hardened_app.rs`): the layers in the README's
+  order, and the sign-in story end to end (fixation, revocation, an outage, a
+  replayed cookie).
+- *Unit tests* beside the code, for what needs its private parts.
+- *Mutation testing*, on demand: `cargo mutants -p owt-web` (or `-p owt-auth`, which
+  takes an hour) lists the changes to the code no test notices. A missed mutant in
+  a check that guards something is a missing test.
+- *Fuzzing*, on demand (`fuzz/`, not a workspace member): coverage-guided libFuzzer
+  targets over what reads client bytes (the origin check, `X-Forwarded-For`, session
+  unsealing, `RequestInfo::at`, redirect targets, stored hashes), each asserting an
+  invariant, not just the absence of a panic. Needs nightly and a C++ compiler:
+  `cd fuzz && cargo +nightly fuzz run csrf_same_origin -- -max_total_time=300`, or
+  the same inside `docker.io/rustlang/rust:nightly` with the checkout mounted. A
+  finding lands in `fuzz/artifacts/`; turn it into a unit test beside the code.
 
 **Keep this README's instructions current.** A change to a public API, a template, the
 workflow's inputs or how an app adopts something updates the matching section here in

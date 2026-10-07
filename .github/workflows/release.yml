@@ -94,9 +94,10 @@ jobs:
         if: ${{ inputs.uv }}
       - name: Install semantic-release
         # Outside the checkout, so the app's package.json and lockfile are neither
-        # consulted nor touched.
+        # consulted nor touched. No lifecycle scripts: the packages below need none,
+        # and this job's token can write to the repository.
         run: |
-          npm install --prefix "$RUNNER_TEMP/semrel" --no-audit --no-fund --no-save \
+          npm install --prefix "$RUNNER_TEMP/semrel" --no-audit --no-fund --no-save --ignore-scripts \
             semantic-release@25.0.9 \
             @semantic-release/exec@7.1.0 \
             @semantic-release/git@11.0.1 \

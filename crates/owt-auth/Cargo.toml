@@ -25,6 +25,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 axum = { workspace = true, features = ["tokio", "http1", "json"] }
 rsa.workspace = true
 

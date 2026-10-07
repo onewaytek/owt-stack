@@ -137,6 +137,11 @@ struct Config {
 /// About the most a browser stores for one cookie, name and attributes included.
 const MAX_COOKIE_BYTES: usize = 4096;
 
+/// A `Set-Cookie` of this many bytes is one browsers drop without a word.
+fn oversized(encoded_len: usize) -> bool {
+    encoded_len > MAX_COOKIE_BYTES
+}
+
 /// The longest a session lasts, however often it is re-sealed, unless
 /// [`Sessions::absolute_lifetime`] says otherwise (or `max_age` is longer).
 pub const ABSOLUTE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -298,7 +303,7 @@ impl<T: SessionData> Sessions<T> {
             .max_age(cookie::time::Duration::seconds(max_age))
             .build();
         let encoded = c.encoded().to_string();
-        if encoded.len() > MAX_COOKIE_BYTES {
+        if oversized(encoded.len()) {
             // Browsers drop it without a word, and every later change with it.
             tracing::warn!(
                 cookie = %self.inner.cookie,
@@ -544,6 +549,42 @@ mod tests {
         assert_eq!(s.unseal(&s.seal("abc", &Data::default())), None);
     }
 
+    /// A seal is a shape as well as a signature. One made by an older build without
+    /// `i`, or by anything that is not this library, is no session even under the
+    /// right key: a missing field never defaults to "began at zero" or "began now".
+    #[test]
+    fn a_correctly_sealed_payload_of_another_shape_is_no_session() {
+        let s = sessions();
+        let seal_plain = |plain: &str| {
+            let mut jar = cookie::CookieJar::new();
+            jar.private_mut(&s.inner.key)
+                .add(Cookie::new("sid", plain.to_owned()));
+            jar.get("sid").unwrap().value().to_owned()
+        };
+        let far = now() + 3000;
+        for plain in [
+            format!(r#"{{"k":"abc","x":{far}}}"#),
+            format!(r#"{{"k":"abc","i":{}}}"#, now()),
+            format!(r#"{{"x":{far},"i":{}}}"#, now()),
+            format!(r#"{{"k":"abc","x":"{far}","i":{}}}"#, now()),
+            format!(r#"{{"k":"abc","x":{far},"i":-1}}"#),
+            "[]".to_owned(),
+            "null".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(s.unseal(&seal_plain(&plain)), None, "{plain} opened");
+        }
+        let whole = format!(r#"{{"k":"abc","x":{far},"i":{}}}"#, now());
+        assert!(s.unseal(&seal_plain(&whole)).is_some(), "the control case");
+    }
+
+    #[test]
+    fn the_cookie_size_warning_starts_past_four_kilobytes() {
+        assert!(!oversized(0));
+        assert!(!oversized(MAX_COOKIE_BYTES));
+        assert!(oversized(MAX_COOKIE_BYTES + 1));
+    }
+
     #[test]
     fn keys_must_be_long_enough() {
         use base64::Engine;
@@ -740,5 +781,107 @@ mod tests {
         let (id, data) = s.unseal(set.value()).unwrap();
         assert_ne!(id, "abc");
         assert_eq!(data, Data::default());
+    }
+
+    #[test]
+    fn ids_are_random_and_well_formed() {
+        let ids: std::collections::HashSet<String> = (0..2000).map(|_| new_id()).collect();
+        assert_eq!(ids.len(), 2000, "an id repeated");
+        for id in &ids {
+            assert_eq!(id.len(), 32);
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            );
+        }
+        // Every character of the alphabet turns up, at every position's worth of
+        // draws: a generator stuck on part of it would not get here.
+        let seen: std::collections::HashSet<u8> = ids.iter().flat_map(|i| i.bytes()).collect();
+        assert_eq!(seen.len(), 36);
+    }
+
+    #[test]
+    fn the_handle_reports_what_it_holds() {
+        let s = Session::<Data>::default();
+        assert_eq!((s.id(), s.issued(), s.is_modified()), (None, None, false));
+        let id = s.ensure_id();
+        assert_eq!(id.len(), 32);
+        assert_eq!(s.id().as_deref(), Some(id.as_str()));
+        assert_eq!(s.ensure_id(), id, "it keeps the id it has");
+        assert!(s.is_modified());
+
+        let s = Session::<Data>::default();
+        s.cycle_id();
+        let first = s.id().unwrap();
+        s.cycle_id();
+        assert_ne!(s.id().unwrap(), first, "cycling replaces the id");
+        s.update(|d| d.user = Some(3));
+        s.flush();
+        assert_eq!(s.read(|d| d.user), None);
+        assert_ne!(s.id().unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn the_layer_tells_handlers_the_id_and_when_the_session_began() {
+        let s = sessions();
+        let began = now() - 600;
+        let cookie = format!(
+            "sid={}",
+            s.seal_begun("abc", began, &Data { user: Some(7) })
+        );
+        let app =
+            Router::new()
+                .route(
+                    "/",
+                    get(|sess: Session<Data>| async move {
+                        format!("{:?} {:?}", sess.id(), sess.issued())
+                    }),
+                )
+                .route(
+                    "/touch",
+                    get(|sess: Session<Data>| async move { sess.update(|d| d.user = Some(8)) }),
+                )
+                .layer(from_fn_with_state(s.clone(), Sessions::<Data>::layer));
+        let res = get_with(app.clone(), "/", Some(&cookie)).await;
+        assert_eq!(text(res).await, format!("Some(\"abc\") Some({began})"));
+        // A change re-seals it under the same id and the same beginning.
+        let res = get_with(app, "/touch", Some(&cookie)).await;
+        let set = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        let resealed = Cookie::parse_encoded(set).unwrap();
+        assert_eq!(resealed.name(), s.cookie_name());
+        assert_eq!(s.cookie_name(), "sid");
+        let opened = s.unseal_presented(resealed.value()).unwrap();
+        assert_eq!((opened.id.as_str(), opened.issued), ("abc", began));
+        assert_eq!(opened.data, Data { user: Some(8) });
+    }
+
+    #[test]
+    fn a_seal_lapses_after_max_age_and_not_before() {
+        let s = Sessions::<Data>::new(Key::generate(), "sid", Duration::from_secs(1), true);
+        let v = s.seal("abc", &Data::default());
+        assert!(s.unseal(&v).is_some(), "good for its max_age");
+        std::thread::sleep(Duration::from_millis(2100));
+        assert_eq!(s.unseal(&v), None);
+    }
+
+    #[test]
+    fn the_absolute_lifetime_ends_on_the_second() {
+        assert_eq!(ABSOLUTE_LIFETIME, Duration::from_secs(2_592_000), "30 days");
+        let s = sessions().absolute_lifetime(Duration::from_secs(7200));
+        let lenient = s.clone().absolute_lifetime(ABSOLUTE_LIFETIME);
+        let data = Data::default();
+        // Begun exactly its lifetime ago: over. (If the clock ticks between the two
+        // lines it is a second further over.)
+        let on_the_dot = lenient.seal_begun("abc", now() - 7200, &data);
+        assert_eq!(s.unseal(&on_the_dot), None);
+        let a_minute_left = lenient.seal_begun("abc", now() - 7140, &data);
+        assert!(s.unseal(&a_minute_left).is_some());
+        // The default never undercuts a longer max_age.
+        let year = Duration::from_secs(365 * 86_400);
+        let long = Sessions::<Data>::new(Key::generate(), "sid", year, true);
+        assert!(
+            long.unseal(&long.seal_begun("abc", now() - 200 * 86_400, &data))
+                .is_some()
+        );
     }
 }

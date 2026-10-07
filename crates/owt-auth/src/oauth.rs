@@ -363,6 +363,24 @@ mod tests {
         assert!(client(twitch()).begin().unwrap().1.verifier.is_none());
     }
 
+    /// A pending login stored by an older build, without the provider it was begun
+    /// with, does not load as "any provider": the mix-up check needs the field, so a
+    /// session carrying such a value has no pending login and begins again.
+    #[test]
+    fn a_stored_pending_login_without_its_provider_does_not_load() {
+        let (_, pending) = client(google()).begin().unwrap();
+        let whole = serde_json::to_value(&pending).unwrap();
+        assert!(serde_json::from_value::<Pending>(whole.clone()).is_ok());
+        for field in ["provider", "state"] {
+            let mut partial = whole.clone();
+            partial.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<Pending>(partial).is_err(),
+                "a pending login loaded without {field}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn complete_trades_the_code_for_an_identity() {
         let fake = axum::Router::new()
@@ -416,5 +434,81 @@ mod tests {
         let mut c = client(google());
         c.client_secret = "hunter2-secret".into();
         assert!(!format!("{c:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn debug_output_still_says_which() {
+        let c = client(google());
+        let shown = format!("{c:?}");
+        assert!(shown.contains("google") && shown.contains("cid"), "{shown}");
+        let (_, pending) = c.begin().unwrap();
+        let shown = format!("{pending:?}");
+        assert!(shown.contains("google"), "{shown}");
+        assert!(!shown.contains(&pending.state));
+        assert!(!shown.contains(pending.verifier.as_deref().unwrap()));
+    }
+
+    /// A token endpoint that redirects would be sent the client secret again,
+    /// wherever it pointed: the client must not follow.
+    #[tokio::test]
+    async fn the_exchange_follows_no_redirect() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let followed = Arc::new(AtomicUsize::new(0));
+        let f = followed.clone();
+        let fake = axum::Router::new()
+            .route(
+                "/token",
+                post(|| async { axum::response::Redirect::temporary("/elsewhere") }),
+            )
+            .route(
+                "/elsewhere",
+                post(move |body: String| {
+                    f.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert!(!body.contains("client_secret"), "the secret followed");
+                        Json(serde_json::json!({"access_token": "t"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, fake).await });
+        let c = client(Provider {
+            token_url: format!("{base}/token"),
+            userinfo_url: format!("{base}/userinfo"),
+            ..google()
+        });
+        let (_, pending) = c.begin().unwrap();
+        let outcome = c
+            .complete(&http_client().unwrap(), &pending, &pending.state, "abc")
+            .await;
+        assert!(outcome.is_err());
+        assert_eq!(followed.load(Ordering::SeqCst), 0);
+    }
+
+    /// A provider that never answers costs ten seconds, not a connection for ever.
+    #[tokio::test]
+    async fn the_exchange_gives_up_on_a_silent_provider() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // Accepts and says nothing.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let c = client(Provider {
+            token_url: format!("{base}/token"),
+            ..google()
+        });
+        let (_, pending) = c.begin().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = c
+            .complete(&http_client().unwrap(), &pending, &pending.state, "abc")
+            .await;
+        assert!(matches!(outcome, Err(Error::Http(e)) if e.is_timeout()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
     }
 }

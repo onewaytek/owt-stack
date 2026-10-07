@@ -562,4 +562,148 @@ mod tests {
         assert_eq!(v.verify::<Claims>(&good).await.unwrap().sub, "agent-7");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
+
+    /// Every character of a token is covered by its signature or is the signature:
+    /// change any one, to anything, and it is no token.
+    #[tokio::test]
+    async fn any_edit_to_a_token_voids_it() {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.";
+        let idp = idp().await;
+        let v = verifier(&idp);
+        let good = token(&idp, "k1", "kynestro", 60);
+        v.verify::<Claims>(&good).await.unwrap();
+        for at in 0..good.len() {
+            // Three replacements per position, spread over the alphabet.
+            for step in [1, 23, 47] {
+                let was = ALPHABET
+                    .iter()
+                    .position(|c| *c == good.as_bytes()[at])
+                    .unwrap();
+                let to = ALPHABET[(was + step) % ALPHABET.len()];
+                let mut edited = good.clone().into_bytes();
+                edited[at] = to;
+                let edited = String::from_utf8(edited).unwrap();
+                assert!(
+                    v.verify::<Claims>(&edited).await.is_err(),
+                    "position {at} of {} accepted {:?}",
+                    good.len(),
+                    to as char
+                );
+            }
+        }
+        // Nor a token with its signature cut off, or another token's signature.
+        let (signed, _signature) = good.rsplit_once('.').unwrap();
+        assert!(v.verify::<Claims>(&format!("{signed}.")).await.is_err());
+        let other = token(&idp, "k1", "kynestro", 61);
+        let grafted = format!("{signed}.{}", other.rsplit_once('.').unwrap().1);
+        assert!(v.verify::<Claims>(&grafted).await.is_err());
+    }
+
+    /// A claim the verifier requires cannot be left out, and the issuer and audience
+    /// cannot be near misses.
+    #[tokio::test]
+    async fn required_claims_and_exact_names() {
+        let idp = idp().await;
+        let v = verifier(&idp);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sign = |claims: serde_json::Value| {
+            let mut h = Header::new(Algorithm::RS256);
+            h.kid = Some("k1".into());
+            jsonwebtoken::encode(&h, &claims, &idp.key).unwrap()
+        };
+        let whole = serde_json::json!({
+            "sub": "agent-7", "iss": "https://idp.test", "aud": "kynestro", "exp": now + 60,
+        });
+        v.verify::<Claims>(&sign(whole.clone())).await.unwrap();
+        for missing in ["sub", "iss", "aud", "exp"] {
+            let mut claims = whole.clone();
+            claims.as_object_mut().unwrap().remove(missing);
+            assert!(
+                v.verify::<Claims>(&sign(claims)).await.is_err(),
+                "without {missing}"
+            );
+        }
+        for (claim, near) in [
+            ("iss", serde_json::json!("https://idp.test/")),
+            ("iss", serde_json::json!("https://idp.test.evil.example")),
+            ("iss", serde_json::json!("http://idp.test")),
+            ("aud", serde_json::json!("kynestro2")),
+            ("aud", serde_json::json!("KYNESTRO")),
+            ("aud", serde_json::json!(["other", "another"])),
+            ("exp", serde_json::json!(now - 6)),
+            ("exp", serde_json::json!("never")),
+        ] {
+            let mut claims = whole.clone();
+            claims[claim] = near.clone();
+            assert!(
+                v.verify::<Claims>(&sign(claims)).await.is_err(),
+                "{claim} = {near}"
+            );
+        }
+        // An audience list that includes this service is this service's token.
+        let mut listed = whole.clone();
+        listed["aud"] = serde_json::json!(["other", "kynestro"]);
+        v.verify::<Claims>(&sign(listed)).await.unwrap();
+    }
+
+    /// A cold verifier under a burst asks the provider once: one caller fetches and
+    /// the rest wait for its answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_on_a_cold_verifier_fetches_the_keys_once() {
+        let idp = idp().await;
+        let v = verifier(&idp);
+        let good = token(&idp, "k1", "kynestro", 60);
+        let forged = token(&idp, "nobody", "kynestro", 60);
+        let tasks: Vec<_> = (0..64)
+            .map(|i| {
+                let (v, t) = (
+                    v.clone(),
+                    if i % 2 == 0 {
+                        good.clone()
+                    } else {
+                        forged.clone()
+                    },
+                );
+                tokio::spawn(async move { v.verify::<Claims>(&t).await.is_ok() })
+            })
+            .collect();
+        let mut accepted = 0;
+        for t in tasks {
+            accepted += usize::from(t.await.unwrap());
+        }
+        assert_eq!(accepted, 32, "the good tokens, and only them");
+        assert_eq!(idp.fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn key_urls_are_https_or_this_machine() {
+        for ok in [
+            "https://keys.example/jwks",
+            "http://127.0.0.1:8080/jwks",
+            "http://localhost/jwks",
+            "http://[::1]:9/jwks",
+        ] {
+            assert!(safe_url(ok), "{ok}");
+        }
+        for bad in [
+            "http://keys.example/jwks",
+            "http://127.0.0.1.evil.example/jwks",
+            "ftp://127.0.0.1/jwks",
+            "file:///etc/passwd",
+            "//keys.example/jwks",
+            "",
+        ] {
+            assert!(!safe_url(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_refresh_interval_is_a_minute() {
+        let v = Verifier::new(reqwest::Client::new(), "i", "a", "http://127.0.0.1:9/jwks");
+        assert_eq!(v.min_refresh(), Duration::from_secs(60));
+    }
 }

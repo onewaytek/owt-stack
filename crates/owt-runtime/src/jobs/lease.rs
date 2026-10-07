@@ -10,6 +10,13 @@
 //! or ownership flaps between replicas. A Redis error is "not held": a replica that
 //! can't reach Redis does the leased work nowhere, rather than everywhere.
 //!
+//! A lease is only as durable as its key. A Redis that evicts under memory pressure
+//! (`allkeys-lru`, as a cache is run; `volatile-*` too, since leases carry a TTL)
+//! can drop a live lease, and the next replica to tick takes it while the old
+//! holder's run goes on until its next renewal fails: up to a third of the TTL of
+//! two owners. Work whose exclusivity matters wants a Redis with `noeviction`, or
+//! one of its own, and a run that checks [`Held`] before each owner-only step.
+//!
 //! Lifted from epicpartygame-rs's per-session clock and loop leases.
 
 use std::sync::Arc;
@@ -208,6 +215,7 @@ impl Jobs {
             tracing::warn!(job = name, ?ttl, period = ?every.period, "lease TTL does not outlast the period; ownership will flap");
         }
         let this = self.clone();
+        let task = Arc::new(task);
         self.spawn(async move {
             let mut first = true;
             while this.wait(every, std::mem::take(&mut first)).await {
@@ -225,7 +233,8 @@ impl Jobs {
                     ttl,
                     held.lost.clone(),
                 ));
-                let outcome = this.run(name, task(held.clone())).await;
+                let (task, run_held) = (task.clone(), held.clone());
+                let outcome = this.run(name, move || task(run_held)).await;
                 renewer.abort();
                 // The renewer last ran up to a third of the TTL ago, and the wait for
                 // the next tick is the period plus jitter: without this renewal, a TTL

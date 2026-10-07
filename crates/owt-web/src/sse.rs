@@ -69,4 +69,22 @@ mod tests {
             "data: hi\ndata: retry: 99999999\n\n"
         );
     }
+
+    #[test]
+    fn the_response_is_a_stream_no_cache_or_proxy_holds() {
+        use axum::http::header;
+        let r = super::response(axum::body::Body::empty());
+        assert_eq!(r.status(), axum::http::StatusCode::OK);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(r.headers()["x-accel-buffering"], "no");
+    }
+
+    #[test]
+    fn the_heartbeat_is_a_named_event() {
+        assert!(
+            super::HEARTBEAT.starts_with("event: heartbeat\n")
+                && super::HEARTBEAT.ends_with("\n\n")
+        );
+    }
 }

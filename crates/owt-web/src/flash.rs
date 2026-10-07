@@ -250,4 +250,24 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn plain_text_at_the_character_limit_is_not_cut_for_bytes() {
+        // A space is one byte in JSON, not an escaped control character.
+        for filler in [" ", "a", "~", "'"] {
+            let exact = filler.repeat(MAX_CHARS);
+            assert_eq!(bounded(exact.clone()), exact, "{filler:?}");
+        }
+        assert_eq!(json_len(' '), 1);
+        assert_eq!(json_len('\u{1f}'), 6);
+        assert_eq!(json_len('\n'), 2);
+        // The table agrees with serde_json for every character it could meet.
+        for c in (0..=0x2100u32)
+            .filter_map(char::from_u32)
+            .chain(['😀', '\u{10ffff}'])
+        {
+            let json = serde_json::to_string(&c.to_string()).unwrap();
+            assert_eq!(json_len(c), json.len() - 2, "{c:?}");
+        }
+    }
 }

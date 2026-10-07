@@ -199,4 +199,87 @@ mod tests {
             started.elapsed()
         );
     }
+
+    /// Legacy Django hashes are not verified any more (0.3 dropped them). A row that
+    /// still holds one must match nothing, the empty password included, and must
+    /// not be honoured as a PBKDF2 request: an iteration count of `4294967295`
+    /// would otherwise hold a permit, and a core, for most of an hour.
+    #[tokio::test]
+    async fn django_hashes_match_nothing_and_cost_nothing() {
+        let digest = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let started = std::time::Instant::now();
+        for stored in [
+            "pbkdf2_sha256$1$salt$".to_owned(),
+            "pbkdf2_sha256$1000$saltsaltsalt$".to_owned(),
+            "pbkdf2_sha256$1$$".to_owned(),
+            "pbkdf2_sha256$1$salt$AA==".to_owned(),
+            format!("pbkdf2_sha256$4294967295$salt${digest}"),
+            format!("pbkdf2_sha256$10000001$salt${digest}"),
+            format!("pbkdf2_sha256$1000000$salt${digest}"),
+            "md5$salt$900150983cd24fb0d6963f7d28e17f72".to_owned(),
+            "sha1$salt$a9993e364706816aba3e25717850c26c9cd0d89d".to_owned(),
+        ] {
+            assert!(!verify("anything", &stored).await, "{stored:?} matched");
+            assert!(
+                !verify("", &stored).await,
+                "{stored:?} matched the empty password"
+            );
+            assert!(
+                needs_rehash(&stored),
+                "{stored:?} was not flagged for rehash"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a legacy hash was derived rather than refused: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A caller that gives up (a request timeout, a closed connection) must not free
+    /// its permit while its hash still runs: that is the memory bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_check_keeps_its_permit_until_the_hash_ends() {
+        let stored = hash("correct horse").await.unwrap();
+        let semaphore = PERMITS.get().unwrap();
+        let task = tokio::spawn(async move { verify("correct horse", &stored).await });
+        // Wait until some check holds a permit (other tests share the semaphore, and
+        // any of them holding one only makes the bound below easier to see).
+        let total = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(MAX_DEFAULT_CONCURRENCY);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while semaphore.available_permits() == total {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no check ever started"
+            );
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+        // The blocking hash cannot be cancelled; right after the abort it is still
+        // running, so its permit must still be out.
+        assert!(
+            semaphore.available_permits() < total,
+            "the permit was freed while the hash ran on"
+        );
+    }
+
+    #[test]
+    fn only_weaker_parameters_ask_for_a_rehash() {
+        let tail = "c29tZXNhbHRzb21lc2FsdA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let with = |m: u32, t: u32, p: u32| format!("$argon2id$v=19$m={m},t={t},p={p}${tail}");
+        assert!(!needs_rehash(&with(19456, 2, 1)), "today's parameters");
+        // Stronger in any dimension is left alone.
+        assert!(!needs_rehash(&with(65536, 2, 1)));
+        assert!(!needs_rehash(&with(19456, 3, 1)));
+        assert!(!needs_rehash(&with(19456, 2, 4)));
+        assert!(!needs_rehash(&with(65536, 3, 4)));
+        // Weaker in any one is replaced, however strong the others.
+        assert!(needs_rehash(&with(19455, 2, 1)));
+        assert!(needs_rehash(&with(19456, 1, 1)));
+        assert!(needs_rehash(&with(65536, 1, 4)));
+        assert!(needs_rehash(&with(1024, 9, 4)));
+    }
 }

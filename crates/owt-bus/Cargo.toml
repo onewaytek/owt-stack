@@ -12,13 +12,16 @@ anyhow.workspace = true
 futures.workspace = true
 metrics.workspace = true
 redis.workspace = true
+# To install a crypto provider before the first rediss:// connection (see
+# `Bus::redis`); redis itself leaves the choice to the app.
+rustls.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# Only to check that the workspace compiles in one rustls crypto backend.
-rustls = { version = "0.23", default-features = false, features = ["std"] }
+proptest.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

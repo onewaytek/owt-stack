@@ -260,6 +260,7 @@ impl<T: Topic, M: Message> Bus<T, M> {
         options: Options,
     ) -> anyhow::Result<Self> {
         let bus = Self::with(options, Some(publisher.clone()), &format!("{prefix}:"));
+        ensure_crypto_provider();
         let client = redis::Client::open(url)?;
         tokio::spawn(heartbeat(
             publisher,
@@ -504,6 +505,19 @@ impl<T: Topic, M: Message> Drop for Subscription<T, M> {
     }
 }
 
+/// rustls needs one process-wide crypto provider before the first `rediss://`
+/// handshake. It picks one itself only when exactly one backend is compiled in; an
+/// app whose dependencies bring both ring and aws-lc-rs, or neither, would otherwise
+/// panic on its first TLS connection to the Redis. Call this before building a
+/// connection (`Bus::redis` does) and before [`redis::aio::ConnectionManager::new`]
+/// on a `rediss://` client made elsewhere. Installing after another provider is in
+/// place is a no-op.
+pub fn ensure_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt;
@@ -669,11 +683,10 @@ mod tests {
 
     #[test]
     fn rediss_can_build_its_tls_config() {
-        // redis builds `rustls::ClientConfig::builder()`, which panics when more than
-        // one crypto backend is compiled in and none was installed. sqlx's
-        // `tls-rustls` means ring and reqwest's means aws-lc-rs, so the workspace
-        // names sqlx's aws-lc-rs feature; `cargo test --workspace` unifies features
-        // as an app using every crate would.
+        // redis builds `rustls::ClientConfig::builder()`, which panics unless a
+        // provider is installed or exactly one backend is compiled in. Built alone,
+        // this crate compiles in none; an app may compile in two.
+        ensure_crypto_provider();
         let _ = rustls::ClientConfig::builder();
     }
 }

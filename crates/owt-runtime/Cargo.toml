@@ -39,6 +39,7 @@ tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 url.workspace = true
 redis = { workspace = true, features = ["script"] }
+proptest.workspace = true
 
 [lints]
 workspace = true

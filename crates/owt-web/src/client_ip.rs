@@ -42,18 +42,19 @@ impl Source {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.trim().parse().ok()),
             Self::ForwardedFor { proxies } => {
-                // Several headers are one list, in order.
-                let entries: Vec<&str> = headers
+                // Several headers are one list, in order. Split as bytes: a proxy
+                // may append to the line the client sent, and bytes there that are
+                // not text must not hide the entry the proxy added.
+                let entries: Vec<&[u8]> = headers
                     .get_all("x-forwarded-for")
                     .iter()
-                    .filter_map(|v| v.to_str().ok())
-                    .flat_map(|v| v.split(','))
-                    .map(str::trim)
+                    .flat_map(|v| v.as_bytes().split(|b| *b == b','))
                     .collect();
                 entries
                     .len()
                     .checked_sub((*proxies).max(1))
-                    .and_then(|i| entries[i].parse().ok())
+                    .and_then(|i| std::str::from_utf8(entries[i]).ok())
+                    .and_then(|entry| entry.trim().parse().ok())
             }
         };
         found.unwrap_or(peer)

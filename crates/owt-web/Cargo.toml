@@ -26,6 +26,7 @@ unicode-normalization.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 http-body-util.workspace = true
 tokio.workspace = true
 tower.workspace = true
