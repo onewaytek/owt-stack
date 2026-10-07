@@ -1,0 +1,62 @@
+# Coverage-guided fuzzing of what reads client bytes (nightly: `cargo +nightly fuzz`).
+# Not a workspace member: libfuzzer-sys and the sanitizer build stay out of the gate.
+# See README "Working on owt-stack".
+[package]
+name = "owt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+axum = { version = "0.8", default-features = false }
+owt-web = { path = "../crates/owt-web" }
+owt-auth = { path = "../crates/owt-auth" }
+serde = { version = "1", features = ["derive"] }
+url = "2"
+
+[[bin]]
+name = "csrf_same_origin"
+path = "fuzz_targets/csrf_same_origin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_ip"
+path = "fuzz_targets/client_ip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_unseal"
+path = "fuzz_targets/session_unseal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_at"
+path = "fuzz_targets/request_at.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stored_hash"
+path = "fuzz_targets/stored_hash.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redirect_local"
+path = "fuzz_targets/redirect_local.rs"
+test = false
+doc = false
+bench = false

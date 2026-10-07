@@ -115,4 +115,36 @@ mod tests {
             .is_near(5)
         );
     }
+
+    #[test]
+    fn navigation_follows_the_numbers() {
+        let one = Pager {
+            number: 1,
+            pages: 1,
+        };
+        assert!(!one.is_paginated());
+        assert!(!one.has_previous() && !one.has_next());
+        assert_eq!((one.previous(), one.next()), (0, 2));
+        let two = Pager {
+            number: 1,
+            pages: 2,
+        };
+        assert!(two.is_paginated());
+        assert!(!two.has_previous() && two.has_next());
+        let middle = Pager {
+            number: 5,
+            pages: 9,
+        };
+        assert!(middle.has_previous() && middle.has_next());
+        assert_eq!((middle.previous(), middle.next()), (4, 6));
+        assert_eq!(
+            middle.numbers().collect::<Vec<_>>(),
+            (1..=9).collect::<Vec<_>>()
+        );
+        // Near: this page and its neighbours, nothing further.
+        let near: Vec<usize> = (0..=9).filter(|n| middle.is_near(*n)).collect();
+        assert_eq!(near, vec![4, 5, 6]);
+        let first: Vec<usize> = (0..=9).filter(|n| two.is_near(*n)).collect();
+        assert_eq!(first, vec![0, 1, 2]);
+    }
 }

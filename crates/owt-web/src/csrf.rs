@@ -60,7 +60,8 @@ impl CrossOrigin {
     }
 
     /// Also accept unsafe requests from these origins (`scheme://host[:port]`; a
-    /// trailing slash is ignored).
+    /// trailing slash is ignored). An empty entry (an unset variable split on commas)
+    /// trusts nothing: it would otherwise match an empty `Origin` header.
     #[must_use]
     pub fn trust<I, S>(mut self, origins: I) -> Self
     where
@@ -71,7 +72,8 @@ impl CrossOrigin {
         all.extend(
             origins
                 .into_iter()
-                .map(|o| o.as_ref().trim_end_matches('/').to_owned()),
+                .map(|o| o.as_ref().trim().trim_end_matches('/').to_owned())
+                .filter(|o| !o.is_empty()),
         );
         self.trusted = all.into();
         self
@@ -79,7 +81,9 @@ impl CrossOrigin {
 
     /// Don't check requests to one of `prefixes` or below it (webhooks signed another
     /// way, say). A prefix matches whole path segments: `/hooks` covers `/hooks` and
-    /// `/hooks/github`, not `/hooks-admin`.
+    /// `/hooks/github`, not `/hooks-admin`. An empty entry, or `/` alone, bypasses
+    /// nothing: either would cover every path, and an empty entry is what an unset
+    /// variable split on commas yields.
     #[must_use]
     pub fn bypass<I, S>(mut self, prefixes: I) -> Self
     where
@@ -87,7 +91,12 @@ impl CrossOrigin {
         S: Into<String>,
     {
         let mut all: Vec<String> = self.bypass.to_vec();
-        all.extend(prefixes.into_iter().map(Into::into));
+        all.extend(
+            prefixes
+                .into_iter()
+                .map(Into::into)
+                .filter(|p| !p.trim().trim_end_matches('/').is_empty()),
+        );
         self.bypass = all.into();
         self
     }
@@ -273,6 +282,38 @@ mod tests {
         assert_eq!(c.check(&Method::GET, "/anything", &h), Ok(()));
         assert_eq!(
             c.check(&Method::DELETE, "/anything", &h),
+            Err(Refusal::CrossSite)
+        );
+    }
+
+    /// Found by the fuzzer: `trust([""])` matched an empty `Origin` header, and
+    /// `bypass([""])` or `bypass(["/"])` covered every path. Both are what an unset
+    /// comma-separated variable yields, and neither may weaken the check.
+    #[test]
+    fn empty_trust_and_bypass_entries_change_nothing() {
+        let c = CrossOrigin::new()
+            .trust(["", " ", "/", "//"])
+            .bypass(["", " ", "/", "//"]);
+        let h = headers(&[("origin", ""), ("host", "a.test")]);
+        assert_eq!(c.same_origin(&h), Err(Refusal::OriginMismatch));
+        let h = headers(&[("sec-fetch-site", "cross-site"), ("origin", "")]);
+        assert_eq!(c.same_origin(&h), Err(Refusal::CrossSite));
+        assert_eq!(
+            c.check(&Method::POST, "/anything", &h),
+            Err(Refusal::CrossSite)
+        );
+        assert_eq!(c.check(&Method::POST, "/", &h), Err(Refusal::CrossSite));
+        // The entries that do mean something still work beside them.
+        let c = c.trust(["https://partner.test"]).bypass(["/hooks"]);
+        let h = headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://partner.test"),
+        ]);
+        assert_eq!(c.same_origin(&h), Ok(()));
+        let h = headers(&[("sec-fetch-site", "cross-site")]);
+        assert_eq!(c.check(&Method::POST, "/hooks/x", &h), Ok(()));
+        assert_eq!(
+            c.check(&Method::POST, "/hooks-admin", &h),
             Err(Refusal::CrossSite)
         );
     }

@@ -54,6 +54,10 @@ mod tests {
     fn helpers() {
         assert_eq!(slugify("Hello  World Foo"), "hello-world-foo");
         assert_eq!(slugify("Crème Brûlée!"), "creme-brulee");
+        // Punctuation is dropped, not turned into a dash.
+        assert_eq!(slugify("a.b"), "ab");
+        assert_eq!(slugify("rock & roll"), "rock-roll");
+        assert_eq!(slugify("--x--"), "x");
         assert_eq!(truncate_words("Hello  World Foo", 2), "Hello World …");
         assert_eq!(
             linebreaks("a\nb\n\n<c>"),

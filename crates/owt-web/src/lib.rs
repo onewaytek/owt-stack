@@ -62,3 +62,25 @@ pub fn render(t: &impl Template) -> Result<Html<String>> {
 pub async fn healthz() -> &'static str {
     "ok"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Template)]
+    #[template(source = "<p>{{ name }}</p>", ext = "html")]
+    struct Greeting<'a> {
+        name: &'a str,
+    }
+
+    #[test]
+    fn render_escapes_and_returns_the_body() {
+        let html = render(&Greeting { name: "<b>" }).unwrap();
+        assert_eq!(html.0, "<p>&#60;b&#62;</p>");
+    }
+
+    #[tokio::test]
+    async fn healthz_answers_ok() {
+        assert_eq!(healthz().await, "ok");
+    }
+}

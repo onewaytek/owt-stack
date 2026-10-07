@@ -137,6 +137,11 @@ struct Config {
 /// About the most a browser stores for one cookie, name and attributes included.
 const MAX_COOKIE_BYTES: usize = 4096;
 
+/// A `Set-Cookie` of this many bytes is one browsers drop without a word.
+fn oversized(encoded_len: usize) -> bool {
+    encoded_len > MAX_COOKIE_BYTES
+}
+
 /// The longest a session lasts, however often it is re-sealed, unless
 /// [`Sessions::absolute_lifetime`] says otherwise (or `max_age` is longer).
 pub const ABSOLUTE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -298,7 +303,7 @@ impl<T: SessionData> Sessions<T> {
             .max_age(cookie::time::Duration::seconds(max_age))
             .build();
         let encoded = c.encoded().to_string();
-        if encoded.len() > MAX_COOKIE_BYTES {
+        if oversized(encoded.len()) {
             // Browsers drop it without a word, and every later change with it.
             tracing::warn!(
                 cookie = %self.inner.cookie,
@@ -571,6 +576,13 @@ mod tests {
         }
         let whole = format!(r#"{{"k":"abc","x":{far},"i":{}}}"#, now());
         assert!(s.unseal(&seal_plain(&whole)).is_some(), "the control case");
+    }
+
+    #[test]
+    fn the_cookie_size_warning_starts_past_four_kilobytes() {
+        assert!(!oversized(0));
+        assert!(!oversized(MAX_COOKIE_BYTES));
+        assert!(oversized(MAX_COOKIE_BYTES + 1));
     }
 
     #[test]
