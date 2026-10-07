@@ -81,9 +81,11 @@ impl RequestInfo {
             ser.append_pair(key, v);
         }
         let query = ser.finish();
-        if query.is_empty() {
+        if query.is_empty() && !self.path.is_empty() {
             self.path.clone()
         } else {
+            // `?` alone keeps the current path with no query; with no path known (a
+            // `RequestInfo` built by hand), it is the only link that still means that.
             format!("?{query}")
         }
     }
@@ -159,6 +161,11 @@ mod tests {
             RequestInfo::at("/games/?page=2").query_with("page", None),
             "/games/",
             "nothing left: the path, not `?`"
+        );
+        assert_eq!(
+            RequestInfo::default().query_with("page", None),
+            "?",
+            "no path known: never an empty href, which would keep the query"
         );
     }
 

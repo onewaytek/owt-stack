@@ -358,6 +358,12 @@ impl ErrorBody<'static> {
                 "That took too long",
                 "The page did not finish in time. Please try again.",
             ),
+            // `owt_web::Error::Unavailable`: a dependency is down, not a fault in the
+            // app, so the words say "shortly", not "our side".
+            StatusCode::SERVICE_UNAVAILABLE => (
+                "Back in a moment",
+                "Part of the service is unavailable right now. Please try again shortly.",
+            ),
             s if s.is_client_error() => (
                 "That request could not be handled",
                 "Something in the request was not right.",
@@ -593,6 +599,13 @@ mod tests {
                 .render()
                 .unwrap()
                 .contains("could not be handled")
+        );
+        let html = ErrorBody::for_status(StatusCode::SERVICE_UNAVAILABLE)
+            .render()
+            .unwrap();
+        assert!(
+            html.contains("<h1>Back in a moment</h1>") && html.contains("try again shortly"),
+            "{html}"
         );
     }
 
