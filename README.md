@@ -588,6 +588,13 @@ jobs:
 ```
 <!-- x-release-please-end -->
 
+The checks run on the `arc-openshift-k8s` scale set unless the repository or
+organization variable `RUNS_ON` names other runners, as JSON (`"ubuntu-latest"`). A
+public repository should: self-hosted runners in the cluster are no place for code
+anyone can propose. Off ARC the services are at their names (`postgres`, `redis`)
+rather than localhost; `DATABASE_URL` and `REDIS_URL` follow, so build on those
+rather than naming a host.
+
 **Releasing an app:** this is how an *app* releases, with semantic-release through the
 reusable `release.yml`. owt-stack releases itself differently, with release-please
 (see "Working on owt-stack"). Conventional commits decide an app's version: `feat` is

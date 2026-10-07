@@ -32,7 +32,10 @@ on:
         type: string
         default: "18"
       redis:
-        description: Start a Redis for the tests (REDIS_URL=redis://127.0.0.1:6379).
+        description: >-
+          Start a Redis for the tests (REDIS_URL=redis://127.0.0.1:6379 on ARC,
+          redis://redis:6379 elsewhere; extra-env should build on REDIS_URL rather
+          than name the host).
         type: boolean
         default: false
       sqlx-check:
@@ -92,6 +95,12 @@ jobs:
     # used. Job and service containers share one pod, so services are on localhost,
     # Docker health-check options don't apply, and there are no `ports:` (a hostPort,
     # which every OpenShift SCC rejects).
+    #
+    # Anywhere else (RUNS_ON naming other runners, e.g. GitHub-hosted for a public
+    # repository) the job container and the services are separate containers on one
+    # Docker network, so the services are at their names, not localhost. SERVICES_HOST
+    # picks between the two; it, DATABASE_URL and REDIS_URL are in every step's
+    # environment.
     container: ${{ inputs.container }}
     services:
       postgres:
@@ -103,8 +112,9 @@ jobs:
       redis:
         image: ${{ inputs.redis && 'redis:8-alpine' || '' }}
     env:
-      DATABASE_URL: ${{ inputs.database != '' && format('postgres://postgres:postgres@127.0.0.1:5432/{0}', inputs.database) || '' }}
-      REDIS_URL: ${{ inputs.redis && 'redis://127.0.0.1:6379' || '' }}
+      ON_ARC: ${{ contains(vars.RUNS_ON || 'arc-', 'arc-') }}
+      DATABASE_URL: ${{ inputs.database != '' && format('postgres://postgres:postgres@{0}:5432/{1}', contains(vars.RUNS_ON || 'arc-', 'arc-') && '127.0.0.1' || 'postgres', inputs.database) || '' }}
+      REDIS_URL: ${{ inputs.redis && format('redis://{0}:6379', contains(vars.RUNS_ON || 'arc-', 'arc-') && '127.0.0.1' || 'redis') || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,16 +133,17 @@ jobs:
           REDIS: ${{ inputs.redis }}
         shell: bash
         run: |
-          ports=()
-          [ -n "$DATABASE" ] && ports+=(5432)
-          [ "$REDIS" = "true" ] && ports+=(6379)
+          local=$([ "$ON_ARC" = "true" ] && echo 1 || echo 0)
+          addrs=()
+          [ -n "$DATABASE" ] && addrs+=("$([ $local = 1 ] && echo 127.0.0.1 || echo postgres)/5432")
+          [ "$REDIS" = "true" ] && addrs+=("$([ $local = 1 ] && echo 127.0.0.1 || echo redis)/6379")
           for _ in $(seq 60); do
             ok=1
-            for p in "${ports[@]}"; do (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null || ok=0; done
+            for a in "${addrs[@]}"; do (echo > "/dev/tcp/$a") 2>/dev/null || ok=0; done
             [ $ok = 1 ] && exit 0
             sleep 1
           done
-          echo "services on ${ports[*]} did not accept connections within 60s" >&2
+          echo "services ${addrs[*]} did not accept connections within 60s" >&2
           exit 1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
