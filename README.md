@@ -22,7 +22,8 @@ Outside the crates:
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime (with `templates/dockerignore`) |
-| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS, NetworkPolicies |
+| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
+| `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
 | `tailwind/owt.css` | font stacks and htmx state variants (`htmx-request:opacity-50`) |
 
 Every Rust example below is compiled by `cargo test` (the `readme` crate includes this
@@ -573,6 +574,24 @@ oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
 The ImageStream polls ghcr for the channel's tag (`rc` or `latest`), and the
 Deployment's trigger rolls out each new digest. App-specific environment is a patch
 on the Deployment.
+
+**Backups come with it.** The database takes a volume snapshot nightly
+(`BACKUP_SCHEDULE`, CNPG's six-field cron, seconds first) and once at first apply, and
+a CronJob prunes snapshots older than `BACKUP_KEEP_DAYS` (14) while always keeping the
+newest `BACKUP_KEEP_AT_LEAST` (3) completed ones, so backups that silently stop are
+not all aged out on schedule. Restore by bootstrapping a new Cluster from one of the
+Backups (`bootstrap.recovery.backup.name`), then point the app at it.
+
+**Monitoring** needs more than the namespace (`monitoring-edit`, and user-workload
+monitoring enabled on the cluster), so it is a template of its own, for a cluster
+admin to apply:
+
+```sh
+oc process -f templates/openshift/monitoring.yaml -p NAME=myapp -p NAMESPACE=myapp | oc apply -f -
+```
+
+It scrapes the app's `/metrics` and the CNPG instances' Postgres exporter, and opens
+the exporter's port to Prometheus alone.
 
 **Tailwind:** depend on the npm half and import it after Tailwind:
 
