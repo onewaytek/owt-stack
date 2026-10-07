@@ -9,7 +9,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
-| `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement |
+| `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
 
 Outside the crates:
 
@@ -21,6 +21,7 @@ Outside the crates:
 | `.github/workflows/image.yml` | reusable image build for a released tag, pushed to ghcr with the channel's floating tags |
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
+| `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime (with `templates/dockerignore`) |
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS, NetworkPolicies |
 | `tailwind/owt.css` | font stacks and htmx state variants (`htmx-request:opacity-50`) |
@@ -467,6 +468,44 @@ exclude each other. Record runs with `JobMetrics::prefixed("myapp")`
 A leased job keeps its lease while its replica lives as long as the TTL outlasts the
 period plus jitter: the lease is renewed at each tick, during a run, and when the run
 ends.
+
+### Front-end assets
+
+The browser fetches nothing from another origin: whatever another origin serves runs
+with the page's authority, and a page that needs public internet from the browser
+breaks where there is none. Every asset is served by the app, by one of two routes:
+
+- **From a CDN, hash-pinned:** list each file in `vendor.pins` at the repository root
+  (`path url sha384-…`) and run `templates/vendor-js`, the only thing that downloads.
+  It refuses any mismatch; to upgrade, change the URL and paste the hash it reports.
+- **Built from npm:** `package-lock.json` is the integrity record, and the gate
+  rebuilds and diffs the output.
+
+Three tests hold it, one call each:
+
+```rust
+# fn main() {
+# let d = std::env::temp_dir().join(format!("owt-readme-assets-{}", std::process::id()));
+# std::fs::create_dir_all(d.join("templates")).unwrap();
+# std::fs::create_dir_all(d.join("static")).unwrap();
+# std::fs::write(d.join("templates/base.html"), "<script src=\"/static/htmx.min.js\"></script>").unwrap();
+# std::fs::write(d.join("static/htmx.min.js"), "htmx").unwrap();
+# let pin = owt_test::assets::sri(b"htmx");
+# std::fs::write(d.join("vendor.pins"), format!("static/htmx.min.js https://unpkg.com/htmx.org {pin}\n")).unwrap();
+# std::env::set_current_dir(&d).unwrap();
+use owt_test::assets;
+
+// No template loads a script, style, font or image from elsewhere.
+assets::assert_no_remote_assets("templates");
+// Every vendored file is byte-for-byte what its pin says.
+assets::assert_vendored_files_match_pins("vendor.pins");
+// No shipped script names a source map that isn't shipped.
+assets::assert_no_dangling_source_maps("static");
+# }
+```
+
+This is what makes a strict Content-Security-Policy (`headers::Csp`) enforceable:
+nothing legitimate is left for it to block.
 
 ### Tests
 

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Download the vendored browser files vendor.pins lists, refusing any hash mismatch.
+# Copy to the app's scripts/ (or run from owt-stack) and keep vendor.pins at the
+# repository root:
+#
+#   # path                        url                                                   sri
+#   static/vendor/htmx.min.js     https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js     sha384-…
+#
+# To upgrade: change the URL's version, run this, and paste the hash it reports into
+# the pin. This is the only thing that talks to a CDN; it runs by hand, and the app's
+# tests (owt_test::assets) re-derive every pin from disk, so an edited file fails
+# them even when this never ran.
+set -euo pipefail
+cd "${1:-$(git rev-parse --show-toplevel)}"
+[ -f vendor.pins ] || { echo "no vendor.pins here" >&2; exit 1; }
+for tool in curl openssl; do
+  command -v "$tool" >/dev/null || { echo "vendor-js needs $tool" >&2; exit 1; }
+done
+
+sri() { printf 'sha384-%s' "$(openssl dgst -sha384 -binary "$1" | openssl base64 -A)"; }
+
+tmp=""
+trap 'rm -f "$tmp"' EXIT
+fail=0
+count=0
+# `|| [ -n "$line" ]`: a last line without a newline is still a pin.
+while IFS= read -r line || [ -n "$line" ]; do
+  line=${line%%#*}            # trailing comments
+  line=${line//$'\r'/}        # CRLF
+  read -r dest url want extra <<<"$line" || true
+  [ -n "${dest:-}" ] || continue
+  if [ -z "${want:-}" ] || [ -n "${extra:-}" ] || [[ $want != sha384-* ]]; then
+    echo "  malformed pin: $line"; fail=1; continue
+  fi
+  case "/$dest/" in
+    //*|*/../*) echo "  $dest: must stay inside the repository"; fail=1; continue ;;
+  esac
+  count=$((count + 1))
+  tmp=$(mktemp)
+  if ! curl -fsSL -o "$tmp" "$url"; then
+    echo "  $dest: download failed ($url)"; rm -f "$tmp"; fail=1; continue
+  fi
+  got=$(sri "$tmp")
+  if [ "$got" != "$want" ]; then
+    printf '  %s: hash mismatch\n    pinned %s\n    got    %s\n' "$dest" "$want" "$got"
+    rm -f "$tmp"; fail=1; continue
+  fi
+  mkdir -p "$(dirname "$dest")"
+  mv "$tmp" "$dest"; chmod 644 "$dest"
+  echo "  $dest <- $url"
+done < vendor.pins
+
+[ "$fail" -eq 0 ] || { echo "FAILED: the files above that failed were left as they were" >&2; exit 1; }
+[ "$count" -gt 0 ] || { echo "vendor.pins pins nothing" >&2; exit 1; }
+echo "all $count vendored files match their pins"
