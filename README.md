@@ -5,8 +5,8 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 
 | Crate | What an app gets |
 |---|---|
-| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
-| `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
+| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
+| `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement |
@@ -265,6 +265,55 @@ The fragment's cache policy is a required argument; use `no-store` for anything 
 differs per person. A response that sets the session cookie is `no-store` whatever it
 asked for, so a public fragment never hands one person's session to a cache. Test that page and fragment agree with `owt_test::fragment`
 (below).
+
+### Caching
+
+Every response falls in one cache class, chosen with `CachePolicy` rather than written
+as a string. A public policy never goes on per-person content or on a response that
+sets a cookie: the edge would serve it to everyone.
+
+```rust,no_run
+use std::time::{Duration, SystemTime};
+use axum::response::{Html, IntoResponse, Response};
+use owt_runtime::cache::{Cache, Expiry, Options};
+use owt_web::cache::CachePolicy;
+
+# fn render(_: &[u8]) -> String { String::new() }
+# fn compute() -> Vec<u8> { Vec::new() }
+/// A world map that changes only when the simulation ticks.
+async fn map(cache: Cache, next_tick: SystemTime) -> Response {
+    let key = "map:v3:world-7";
+    let bytes = match cache.get(key).await {
+        Some(hit) => hit,
+        None => {
+            let fresh = compute();
+            // Never awaited: the response isn't held up by the cache write.
+            cache.set_detached(vec![(key.into(), fresh.clone())], Expiry::At(next_tick));
+            fresh
+        }
+    };
+    let until = next_tick.duration_since(SystemTime::now()).unwrap_or_default();
+    // The edge keeps it to the tick; browsers a minute at most.
+    (CachePolicy::public_until(until, Duration::from_secs(60)), Html(render(&bytes))).into_response()
+}
+
+# async fn demo() -> anyhow::Result<()> {
+// At startup: connects in the background; unset REDIS_URL means no cache at all.
+let cache = match owt_runtime::env::var("REDIS_URL") {
+    Some(url) => Cache::connect(&url, "myapp", Options::default())?,
+    None => Cache::disabled(),
+};
+# let _ = cache; Ok(()) }
+```
+
+- **Policies:** `immutable()` for fingerprinted bytes, `public(d)` with `.edge(s_maxage)`
+  and `.stale_while_revalidate(w)`, `public_until(remaining, browser_cap)`, and
+  `no_store()`. A policy is a response part, and `Fragment::new` takes one through
+  `.into()`.
+- **Keys never need deleting:** a key carries what produced the value (a fingerprint,
+  a format version: `Expiry::Lru`) or expires when the value stops being true
+  (`Expiry::At`); `Expiry::For` is for values that may merely be a little stale. A
+  Redis that is absent, slow (over 100 ms) or failing is a miss.
 
 ### Authentication
 
