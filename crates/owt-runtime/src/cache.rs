@@ -27,7 +27,9 @@ use tokio::sync::OnceCell;
 pub enum Expiry {
     /// Content-addressed: never stale; left to `maxmemory-policy allkeys-lru`.
     Lru,
-    /// Until this moment, exactly (a tick, a scheduled publish).
+    /// Until this moment, exactly (a tick, a scheduled publish), by Redis's clock:
+    /// keep the app's and Redis's clocks in sync (NTP), or expiry shifts by their
+    /// skew. A moment already past writes nothing.
     At(SystemTime),
     /// For this long.
     For(Duration),
@@ -54,12 +56,22 @@ impl Default for Options {
     }
 }
 
+/// Milliseconds, clamped to what Redis accepts (an i64): `For(Duration::MAX)` caches
+/// for ~292 million years rather than failing its whole batch.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(i64::MAX as u64 / 2)
+}
+
 /// The cache. Cheap to clone; [`Cache::disabled`] is always correct.
 #[derive(Clone, Default)]
 pub struct Cache {
     /// `None`: disabled. An unset cell: configured, not connected yet.
     conn: Option<Arc<OnceCell<ConnectionManager>>>,
     prefix: Arc<str>,
+    /// The most any one round trip may take, reconnecting included.
+    budget: Duration,
 }
 
 impl std::fmt::Debug for Cache {
@@ -68,6 +80,7 @@ impl std::fmt::Debug for Cache {
             .field("enabled", &self.conn.is_some())
             .field("connected", &self.is_connected())
             .field("prefix", &self.prefix)
+            .field("budget", &self.budget)
             .finish()
     }
 }
@@ -81,17 +94,26 @@ impl Cache {
 
     /// Start connecting to `url` in the background and return at once. Every key is
     /// stored under `<prefix>:`, so several apps (or test runs) can share a Redis.
-    /// Once established, the connection reconnects on its own.
+    /// Once established, the connection reconnects on its own; until it has, every
+    /// call returns within the response budget as a miss. The background attempts
+    /// stop when the last clone of the cache is dropped.
     ///
-    /// Must be called inside a Tokio runtime.
+    /// # Panics
+    /// Outside a Tokio runtime.
     pub fn connect(url: &str, prefix: &str, options: Options) -> anyhow::Result<Self> {
         let client = redis::Client::open(url)?;
         let cell = Arc::new(OnceCell::new());
-        let slot = cell.clone();
+        let slot = Arc::downgrade(&cell);
         tokio::spawn(async move {
+            // The manager's own reconnect is bounded too, but the request path does
+            // not rely on it: every call is wrapped in the budget (`within`). Without
+            // that, a call during an outage waits out the manager's whole retry
+            // schedule, 9 s against a refused port and 23 s against a silent one.
             let config = ConnectionManagerConfig::new()
                 .set_response_timeout(Some(options.response_timeout))
-                .set_connection_timeout(Some(options.connect_timeout));
+                .set_connection_timeout(Some(options.connect_timeout))
+                .set_number_of_retries(2)
+                .set_max_delay(Duration::from_secs(1));
             let mut backoff = Duration::from_millis(500);
             loop {
                 match client
@@ -99,11 +121,16 @@ impl Cache {
                     .await
                 {
                     Ok(manager) => {
-                        let _ = slot.set(manager);
+                        if let Some(slot) = slot.upgrade() {
+                            let _ = slot.set(manager);
+                        }
                         tracing::info!("redis cache connected");
                         return;
                     }
                     Err(err) => {
+                        if slot.strong_count() == 0 {
+                            return;
+                        }
                         tracing::warn!(error = %err, retry_in = ?backoff, "redis unavailable; serving uncached");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(options.max_backoff);
@@ -114,6 +141,7 @@ impl Cache {
         Ok(Self {
             conn: Some(cell),
             prefix: Arc::from(format!("{prefix}:")),
+            budget: options.response_timeout,
         })
     }
 
@@ -141,15 +169,18 @@ impl Cache {
             return Vec::new();
         }
         let prefixed: Vec<String> = keys.iter().map(|k| self.key(k)).collect();
-        match redis::cmd("MGET")
-            .arg(&prefixed)
-            .query_async::<Vec<Option<Vec<u8>>>>(&mut conn)
-            .await
-        {
-            Ok(values) if values.len() == keys.len() => values,
-            Ok(_) => misses(),
-            Err(err) => {
+        let mut cmd = redis::cmd("MGET");
+        cmd.arg(&prefixed);
+        let query = cmd.query_async::<Vec<Option<Vec<u8>>>>(&mut conn);
+        match tokio::time::timeout(self.budget, query).await {
+            Ok(Ok(values)) if values.len() == keys.len() => values,
+            Ok(Ok(_)) => misses(),
+            Ok(Err(err)) => {
                 tracing::warn!(error = %err, "redis MGET failed; treating as a miss");
+                misses()
+            }
+            Err(_) => {
+                tracing::debug!(budget = ?self.budget, "redis MGET over budget; treating as a miss");
                 misses()
             }
         }
@@ -169,44 +200,49 @@ impl Cache {
         if entries.is_empty() {
             return;
         }
+        // Every expiry is part of its SET (PX, PXAT), so a dropped connection can't
+        // leave a value written without the TTL that bounds it.
         let mut pipe = redis::pipe();
+        let mut any = false;
         for (key, value) in entries {
-            let key = self.key(&key);
+            let mut cmd = redis::cmd("SET");
+            cmd.arg(self.key(&key)).arg(value);
             match expiry {
-                Expiry::Lru => {
-                    pipe.set(&key, value).ignore();
-                }
+                Expiry::Lru => {}
                 Expiry::For(ttl) => {
-                    let ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX).max(1);
-                    pipe.cmd("SET")
-                        .arg(&key)
-                        .arg(value)
-                        .arg("PX")
-                        .arg(ms)
-                        .ignore();
+                    cmd.arg("PX").arg(millis(ttl).max(1));
                 }
                 Expiry::At(at) => {
-                    // Milliseconds: EXPIREAT's whole seconds would truncate the moment
-                    // and expire a value up to a second early.
-                    let unix_ms = at
-                        .duration_since(UNIX_EPOCH)
-                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                    pipe.set(&key, value)
-                        .ignore()
-                        .cmd("PEXPIREAT")
-                        .arg(&key)
-                        .arg(unix_ms)
-                        .ignore();
+                    // A moment already past: the value is stale before it's written.
+                    let Ok(unix) = at.duration_since(UNIX_EPOCH) else {
+                        continue;
+                    };
+                    if at <= SystemTime::now() {
+                        continue;
+                    }
+                    // Milliseconds: whole seconds would truncate the moment and
+                    // expire a value up to a second early.
+                    cmd.arg("PXAT").arg(millis(unix));
                 }
             }
+            pipe.add_command(cmd).ignore();
+            any = true;
         }
-        if let Err(err) = pipe.query_async::<()>(&mut conn).await {
-            tracing::warn!(error = %err, "redis write failed; ignoring");
+        if !any {
+            return;
+        }
+        match tokio::time::timeout(self.budget, pipe.query_async::<()>(&mut conn)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(error = %err, "redis write failed; ignoring"),
+            Err(_) => tracing::debug!(budget = ?self.budget, "redis write over budget; dropped"),
         }
     }
 
     /// Write entries without holding up the caller: the response that computed them
     /// is not held hostage to the cache write.
+    ///
+    /// # Panics
+    /// Outside a Tokio runtime.
     pub fn set_detached(&self, entries: Vec<(String, Vec<u8>)>, expiry: Expiry) {
         if self.manager().is_none() || entries.is_empty() {
             return;
@@ -258,9 +294,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(c.is_connected());
+        let minute = Expiry::For(Duration::from_secs(60));
         c.set(
             vec![("a".into(), b"1".to_vec()), ("b".into(), b"2".to_vec())],
-            Expiry::Lru,
+            minute,
         )
         .await;
         assert_eq!(
@@ -287,5 +324,157 @@ mod tests {
         assert_eq!(c.get("moment").await, Some(b"m".to_vec()));
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(c.get("moment").await, None, "At expires at the moment");
+    }
+
+    /// Values that can't be stored aren't: a moment already past writes nothing, and
+    /// an absurd lifetime is clamped instead of failing the batch it is in.
+    #[tokio::test]
+    async fn past_moments_write_nothing_and_huge_lifetimes_still_store() {
+        let Some(url) = crate::env::var("REDIS_URL") else {
+            return;
+        };
+        let c = connected(&url, &format!("owt-cache-edges-{}", std::process::id())).await;
+        c.set(
+            vec![("past".into(), b"p".to_vec())],
+            Expiry::At(SystemTime::now() - Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(c.get("past").await, None);
+        c.set(
+            vec![
+                ("huge".into(), b"h".to_vec()),
+                ("also".into(), b"a".to_vec()),
+            ],
+            Expiry::For(Duration::MAX),
+        )
+        .await;
+        assert_eq!(
+            c.mget(&["huge".into(), "also".into()]).await,
+            vec![Some(b"h".to_vec()), Some(b"a".to_vec())]
+        );
+        c.set(
+            vec![
+                ("huge".into(), b"h".to_vec()),
+                ("also".into(), b"a".to_vec()),
+            ],
+            Expiry::For(Duration::from_millis(1)),
+        )
+        .await;
+    }
+
+    async fn connected(url: &str, prefix: &str) -> Cache {
+        let c = Cache::connect(url, prefix, Options::default()).unwrap();
+        for _ in 0..100 {
+            if c.is_connected() {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("never connected to {url}");
+    }
+
+    /// What the proxy in front of Redis does with connections.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Forward,
+        /// Accept, then hang up at once: a Redis that refuses.
+        Refuse,
+        /// Accept and never answer: a Redis behind a dead network path.
+        Blackhole,
+    }
+
+    /// A TCP proxy to `upstream` whose behaviour can be switched mid-test; switching
+    /// away from Forward cuts the connections already open.
+    async fn proxy(upstream: std::net::SocketAddr) -> (u16, tokio::sync::watch::Sender<Mode>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::watch::channel(Mode::Forward);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut rx = rx.clone();
+                tokio::spawn(async move {
+                    let now = *rx.borrow_and_update();
+                    match now {
+                        Mode::Refuse => {}
+                        Mode::Blackhole => {
+                            let _ = rx.changed().await;
+                            std::future::pending::<()>().await;
+                        }
+                        Mode::Forward => {
+                            let Ok(mut out) = tokio::net::TcpStream::connect(upstream).await else {
+                                return;
+                            };
+                            tokio::select! {
+                                _ = tokio::io::copy_bidirectional(&mut inbound, &mut out) => {}
+                                _ = rx.changed() => {}
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (port, tx)
+    }
+
+    /// A Redis that goes away after the cache connected costs each call its budget,
+    /// not the connection manager's reconnect schedule (which was 9 s against a
+    /// refused port and 23 s against a silent one), and the cache recovers.
+    #[tokio::test]
+    async fn an_outage_after_connecting_costs_each_call_its_budget() {
+        let Some(url) = crate::env::var("REDIS_URL") else {
+            return;
+        };
+        let parsed = url::Url::parse(&url).unwrap();
+        let upstream = format!(
+            "{}:{}",
+            parsed.host_str().unwrap(),
+            parsed.port().unwrap_or(6379)
+        );
+        let upstream = tokio::net::lookup_host(upstream)
+            .await
+            .unwrap()
+            .next()
+            .unwrap();
+        let (port, mode) = proxy(upstream).await;
+        let db = parsed.path().trim_start_matches('/');
+        let via = format!("redis://127.0.0.1:{port}/{db}");
+        let c = connected(&via, &format!("owt-cache-outage-{}", std::process::id())).await;
+        c.set(
+            vec![("k".into(), b"v".to_vec())],
+            Expiry::For(Duration::from_secs(60)),
+        )
+        .await;
+        assert_eq!(c.get("k").await, Some(b"v".to_vec()));
+
+        let budget = Options::default().response_timeout + Duration::from_millis(150);
+        for broken in [Mode::Refuse, Mode::Blackhole] {
+            mode.send(broken).unwrap();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                assert_eq!(c.get("k").await, None);
+                c.set(
+                    vec![("w".into(), b"w".to_vec())],
+                    Expiry::For(Duration::from_secs(1)),
+                )
+                .await;
+                assert!(
+                    started.elapsed() < budget * 2,
+                    "a get and a set took {:?}",
+                    started.elapsed()
+                );
+            }
+            mode.send(Mode::Forward).unwrap();
+            let healed = std::time::Instant::now();
+            while c.get("k").await.is_none() {
+                assert!(
+                    healed.elapsed() < Duration::from_secs(15),
+                    "never recovered"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 }

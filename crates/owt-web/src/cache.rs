@@ -64,6 +64,11 @@ impl CachePolicy {
     /// The same for everyone until `remaining` from now: the edge keeps it that long,
     /// a browser at most `browser_cap` of it, so a person sees the change within the
     /// cap of it happening and the edge never serves it past the moment.
+    ///
+    /// A browser counts the edge copy's age (the `Age` header) against its cap, so
+    /// once the edge's copy is older than the cap, browsers revalidate with the edge
+    /// on every view: cheap, and still correct, but less browser caching than the
+    /// cap suggests.
     pub fn public_until(remaining: Duration, browser_cap: Duration) -> Self {
         Self(Kind::Public {
             browser: remaining.min(browser_cap),
@@ -86,7 +91,8 @@ impl CachePolicy {
     }
 
     /// Serve a stale copy for up to `window` while fetching a fresh one in the
-    /// background. No effect on [`immutable`](Self::immutable) or
+    /// background. Browsers honour it too (RFC 5861), so a person may see a copy up
+    /// to `window` stale. No effect on [`immutable`](Self::immutable) or
     /// [`no_store`](Self::no_store).
     pub fn stale_while_revalidate(self, window: Duration) -> Self {
         match self.0 {
@@ -110,25 +116,31 @@ impl CachePolicy {
     pub fn header_value(self) -> HeaderValue {
         use std::fmt::Write;
         match self.0 {
-            Kind::Immutable => HeaderValue::from_static("public, max-age=31536000, immutable"),
+            Kind::Immutable => HeaderValue::from_static(crate::assets::IMMUTABLE),
             Kind::NoStore => HeaderValue::from_static("no-store"),
             Kind::Public {
                 browser,
                 edge,
                 stale,
             } => {
-                let mut v = format!("public, max-age={}", browser.as_secs());
+                let mut v = format!("public, max-age={}", delta(browser));
                 if let Some(e) = edge {
-                    let _ = write!(v, ", s-maxage={}", e.as_secs());
+                    let _ = write!(v, ", s-maxage={}", delta(e));
                 }
                 if let Some(w) = stale {
-                    let _ = write!(v, ", stale-while-revalidate={}", w.as_secs());
+                    let _ = write!(v, ", stale-while-revalidate={}", delta(w));
                 }
                 // Digits, letters, commas and spaces only, so this never falls back.
                 HeaderValue::from_str(&v).unwrap_or(HeaderValue::from_static("no-store"))
             }
         }
     }
+}
+
+/// Whole seconds, rounded down (an edge never keeps a response past its moment) and
+/// capped at 2^31, the largest delta-seconds RFC 9111 (1.2.2) asks caches to read.
+fn delta(d: Duration) -> u64 {
+    d.as_secs().min(1 << 31)
 }
 
 impl From<CachePolicy> for HeaderValue {
@@ -203,6 +215,14 @@ mod tests {
             CachePolicy::immutable()
         );
         assert!(!CachePolicy::no_store().is_public() && CachePolicy::public(s(1)).is_public());
+        assert_eq!(
+            CachePolicy::public(Duration::MAX).header_value(),
+            "public, max-age=2147483648"
+        );
+        assert_eq!(
+            CachePolicy::immutable().header_value(),
+            crate::assets::IMMUTABLE
+        );
     }
 
     #[test]
