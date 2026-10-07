@@ -9,6 +9,9 @@
 //!   (`HX-Push-Url`), so history, reload and shared links land on the whole page,
 //!   never the bare fragment. It is `noindex`, and it takes its cache policy as an
 //!   argument: a fragment cannot ship without one.
+//! * The handler re-paths its request to the page once
+//!   ([`RequestInfo::for_page`]) and renders from that: pagination links, navigation
+//!   and the push URL then all name the page, with nothing else to keep in step.
 //! * [`reselect`] goes on the page: should a stale client htmx-request the page URL,
 //!   htmx swaps only the fragment's element out of it instead of nesting a page.
 //! * Render both from one loader and have the page include the fragment's partial;
@@ -22,6 +25,8 @@ use std::fmt::Write as _;
 use askama::Template;
 use axum::http::{HeaderName, HeaderValue, header};
 use axum::response::{Html, IntoResponse, Response};
+
+use crate::request::RequestInfo;
 
 const HX_PUSH_URL: HeaderName = HeaderName::from_static("hx-push-url");
 const HX_RESELECT: HeaderName = HeaderName::from_static("hx-reselect");
@@ -52,11 +57,13 @@ impl Fragment {
         Ok(Self::new(crate::render(t)?.0, cache_control))
     }
 
-    /// The page this fragment shows a state of: htmx records it in history
-    /// (`HX-Push-Url`). Non-ASCII characters (a decoded path segment, say) are
-    /// percent-encoded; a control character is an error. Build the query with
-    /// [`RequestInfo::query_with`](crate::request::RequestInfo::query_with).
-    pub fn page(mut self, url: &str) -> crate::Result<Self> {
+    /// The page this fragment shows a state of: htmx records its path and query in
+    /// history (`HX-Push-Url`). `page` is the fragment's request re-pathed to the
+    /// page, [`RequestInfo::for_page`], the same value the fragment rendered from, so
+    /// the URL pushed is the one its links name. Non-ASCII characters (a decoded path
+    /// segment, say) are percent-encoded; a control character is an error.
+    pub fn page(mut self, page: &RequestInfo) -> crate::Result<Self> {
+        let url = page.full_path.as_str();
         let mut encoded = String::with_capacity(url.len());
         for c in url.chars() {
             if c.is_ascii() {
@@ -110,7 +117,7 @@ mod tests {
             "<div id=v></div>",
             HeaderValue::from_static("public, max-age=60"),
         )
-        .page("/worlds/1?x=2&y=3")
+        .page(&RequestInfo::at("/worlds/1/view?x=2&y=3").for_page("/worlds/1"))
         .unwrap()
         .into_response();
         let h = r.headers();
@@ -120,11 +127,11 @@ mod tests {
         assert!(h.get(header::VARY).is_none(), "nothing varies by request");
         assert!(
             Fragment::new("", HeaderValue::from_static("no-store"))
-                .page("/bad\nurl")
+                .page(&RequestInfo::at("/bad\nurl"))
                 .is_err()
         );
         let r = Fragment::new("", HeaderValue::from_static("no-store"))
-            .page("/worlds/Zürich?q=é")
+            .page(&RequestInfo::at("/worlds/Zürich?q=é"))
             .unwrap()
             .into_response();
         assert_eq!(r.headers()["hx-push-url"], "/worlds/Z%C3%BCrich?q=%C3%A9");

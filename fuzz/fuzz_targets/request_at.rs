@@ -12,6 +12,11 @@ fuzz_target!(|input: (&str, &str, Option<&str>)| {
     assert!(!info.full_path.starts_with("//"), "{uri:?} -> {:?}", info.full_path);
     let _ = info.query_value(key);
     let with = info.query_with(key, value);
-    assert!(!with.starts_with("//"), "{uri:?} -> {with:?}");
+    assert!(with.starts_with('?'), "{uri:?} -> {with:?}");
+    let link = info.url_with(key, value);
+    assert!(!link.starts_with("//"), "{uri:?} -> {link:?}");
+    let page = info.for_page(key);
+    assert!(!page.path.starts_with("//"), "{key:?} -> {:?}", page.path);
+    assert_eq!(page.query, info.query);
     let _ = info.is_under(key);
 });
