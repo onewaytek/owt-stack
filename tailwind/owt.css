@@ -130,14 +130,16 @@
   .owt-errorpage {
     @apply mx-auto max-w-prose px-4 py-16 text-center;
   }
-  .owt-errorpage-code {
-    @apply text-sm font-medium tracking-widest text-owt-muted;
-  }
   .owt-errorpage h1 {
     @apply mt-2 text-3xl font-semibold text-owt-ink;
   }
   .owt-errorpage p {
     @apply mt-4 text-owt-muted;
+  }
+  /* The status line is a <p> too; scoped under the section so it outranks the rule
+     above and keeps its own margin. */
+  .owt-errorpage .owt-errorpage-code {
+    @apply mt-0 text-sm font-medium tracking-widest text-owt-muted;
   }
   .owt-errorpage a {
     @apply text-owt-accent underline;

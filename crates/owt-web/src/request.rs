@@ -68,7 +68,9 @@ impl RequestInfo {
     }
 
     /// This request's query with `key` set to `value` (or removed, for `None`), as
-    /// `?...`: pagination and filter links that keep the rest of the query.
+    /// `?...`: pagination and filter links that keep the rest of the query. When
+    /// nothing is left, the path alone: an unfiltered page then has one URL (and one
+    /// cache entry), not `/items` and `/items?`.
     #[must_use]
     pub fn query_with(&self, key: &str, value: Option<&str>) -> String {
         let mut ser = url::form_urlencoded::Serializer::new(String::new());
@@ -78,7 +80,12 @@ impl RequestInfo {
         if let Some(v) = value {
             ser.append_pair(key, v);
         }
-        format!("?{}", ser.finish())
+        let query = ser.finish();
+        if query.is_empty() {
+            self.path.clone()
+        } else {
+            format!("?{query}")
+        }
     }
 
     /// The current path is `prefix` or below it: navigation's "you are here".
@@ -148,6 +155,11 @@ mod tests {
             "?state=active&state=done&page=4"
         );
         assert_eq!(r.query_with("page", None), "?state=active&state=done");
+        assert_eq!(
+            RequestInfo::at("/games/?page=2").query_with("page", None),
+            "/games/",
+            "nothing left: the path, not `?`"
+        );
     }
 
     #[tokio::test]

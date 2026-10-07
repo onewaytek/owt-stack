@@ -566,7 +566,10 @@ assert!(body.contains("<h1>Page not found</h1>"));
 # Ok(()) }
 ```
 
-An app with a look of its own sets the tokens once:
+An app with a look of its own sets the tokens once. A dark theme is the same tokens
+again under a media query or a class: `@theme` emits them as custom properties on
+`:root`, and the components read the properties, so whatever redeclares them nearer
+the element wins.
 
 ```css
 @import "tailwindcss" source(none);
@@ -578,7 +581,27 @@ An app with a look of its own sets the tokens once:
   --color-owt-on-accent: white;
   --radius-owt: 0.75rem;
 }
+/* Dark: follow the system, or `:root[data-theme="dark"]` for a switch the app owns. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-owt-ink: var(--color-slate-100);
+    --color-owt-muted: var(--color-slate-400);
+    --color-owt-surface: var(--color-slate-900);
+    --color-owt-line: var(--color-slate-700);
+    --color-owt-accent: var(--color-emerald-400);
+    --color-owt-on-accent: var(--color-slate-950);
+    --color-owt-success-soft: var(--color-green-950);
+    --color-owt-info-soft: var(--color-blue-950);
+    --color-owt-warning-soft: var(--color-yellow-950);
+    --color-owt-danger-soft: var(--color-red-950);
+  }
+}
 ```
+
+Two forms on one page with a field of the same name give each its own `id`
+(`Field::text("email", "Email").id("invite-email")`), so labels and
+`aria-describedby` stay attached to the right input. Page links drop `?page=1`, so
+the first page of a list has one URL.
 
 ### Tests
 

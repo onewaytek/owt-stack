@@ -53,18 +53,22 @@ impl<S: std::fmt::Display> HtmlSafe for Errors<'_, S> {}
 /// (`aria-invalid`, `aria-describedby`).
 #[derive(Template, Clone, Debug)]
 #[template(
-    source = r#"<div class="owt-field">
-<label class="owt-label" for="{{ name }}">{{ label }}</label>
-<input class="owt-input{% if error.is_some() %} owt-input-invalid{% endif %}" id="{{ name }}" name="{{ name }}" type="{{ kind }}"{% if kind != "password" && !value.is_empty() %} value="{{ value }}"{% endif %}{% if !autocomplete.is_empty() %} autocomplete="{{ autocomplete }}"{% endif %}{% if required %} required{% endif %}{% if autofocus %} autofocus{% endif %}{% if error.is_some() %} aria-invalid="true" aria-describedby="{{ name }}-error"{% else if !hint.is_empty() %} aria-describedby="{{ name }}-hint"{% endif %}>
-{% if let Some(e) = error %}<p class="owt-field-error" id="{{ name }}-error">{{ e }}</p>
-{% else if !hint.is_empty() %}<p class="owt-hint" id="{{ name }}-hint">{{ hint }}</p>
+    source = r#"{% let id = self.dom_id() %}<div class="owt-field">
+<label class="owt-label" for="{{ id }}">{{ label }}</label>
+<input class="owt-input{% if error.is_some() %} owt-input-invalid{% endif %}" id="{{ id }}" name="{{ name }}" type="{{ kind }}"{% if kind != "password" && !value.is_empty() %} value="{{ value }}"{% endif %}{% if !autocomplete.is_empty() %} autocomplete="{{ autocomplete }}"{% endif %}{% if required %} required{% endif %}{% if autofocus %} autofocus{% endif %}{% if error.is_some() %} aria-invalid="true" aria-describedby="{{ id }}-error"{% else if !hint.is_empty() %} aria-describedby="{{ id }}-hint"{% endif %}>
+{% if let Some(e) = error %}<p class="owt-field-error" id="{{ id }}-error">{{ e }}</p>
+{% else if !hint.is_empty() %}<p class="owt-hint" id="{{ id }}-hint">{{ hint }}</p>
 {% endif %}</div>
 "#,
     ext = "html"
 )]
 pub struct Field<'a> {
-    /// The input's `name` and `id`.
+    /// The input's `name`, and its `id` unless [`Field::id`] sets one.
     pub name: &'a str,
+    /// The element `id`, when it must differ from the name: two forms on one page
+    /// with a field of the same name would otherwise share ids, and the label's
+    /// `for` and `aria-describedby` would point at the first. Empty: the name.
+    pub id: &'a str,
     /// The label's text.
     pub label: &'a str,
     /// The input's `type`: `text`, `email`, `password`, `url`, `number`…
@@ -90,6 +94,7 @@ impl<'a> Field<'a> {
     pub fn new(kind: &'a str, name: &'a str, label: &'a str) -> Self {
         Self {
             name,
+            id: "",
             label,
             kind,
             value: "",
@@ -118,6 +123,23 @@ impl<'a> Field<'a> {
     #[must_use]
     pub fn password(name: &'a str, label: &'a str, autocomplete: &'a str) -> Self {
         Self::new("password", name, label).autocomplete(autocomplete)
+    }
+
+    /// An element `id` other than the name (see [`Field::id`]).
+    #[must_use]
+    pub fn id(mut self, id: &'a str) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// The `id` the markup carries: the one set, else the name.
+    #[must_use]
+    pub fn dom_id(&self) -> &'a str {
+        if self.id.is_empty() {
+            self.name
+        } else {
+            self.id
+        }
     }
 
     /// What was typed.
@@ -224,10 +246,12 @@ impl<'a> Pagination<'a> {
         }
     }
 
-    /// The link to page `n`.
+    /// The link to page `n`. Page 1 drops the parameter, so the first page has one
+    /// URL (what the list is reached by) rather than a second one for caches to hold.
     #[must_use]
     pub fn href(&self, n: usize) -> String {
-        self.request.query_with(self.param, Some(&n.to_string()))
+        let value = (n != 1).then(|| n.to_string());
+        self.request.query_with(self.param, value.as_deref())
     }
 
     /// The row, in order: what the template prints. Empty for one page.
@@ -264,10 +288,12 @@ impl<'a> Pagination<'a> {
         if p.number > 3 {
             items.push(gap.clone());
         }
-        for n in p.numbers() {
+        // The pages within one of this one, inside the range: `Pager::is_near`, without
+        // walking every page to find three.
+        for n in p.number.saturating_sub(1).max(1)..=(p.number + 1).min(p.pages) {
             if n == p.number {
                 items.push(page(n, Kind::Current));
-            } else if p.is_near(n) {
+            } else {
                 items.push(page(n, Kind::Page));
             }
         }
@@ -398,6 +424,21 @@ mod tests {
         assert!(html.contains(r#"<input class="owt-input" id="username" name="username" type="text" value="a&#34;b" autocomplete="username" required autofocus aria-describedby="username-hint">"#), "{html}");
         assert!(html.contains(r#"<p class="owt-hint" id="username-hint">Letters and digits.</p>"#));
 
+        // A second form on the page: its own id, the same name, the wiring follows.
+        let html = Field::text("username", "Username")
+            .id("invite-username")
+            .hint("Who to invite.")
+            .render()
+            .unwrap();
+        assert!(
+            html.contains(r#"<label class="owt-label" for="invite-username">"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"id="invite-username" name="username""#));
+        assert!(html.contains(r#"aria-describedby="invite-username-hint""#));
+        assert!(html.contains(r#"<p class="owt-hint" id="invite-username-hint">"#));
+        assert!(!html.contains(r#"id="username""#));
+
         let html = Field::email("email", "Email")
             .value("x")
             .hint("hidden by the error")
@@ -468,7 +509,7 @@ mod tests {
             hrefs,
             [
                 "?q=cats&#38;page=4",
-                "?q=cats&#38;page=1",
+                "?q=cats", // page 1 has no second URL
                 "?q=cats&#38;page=4",
                 "?q=cats&#38;page=6",
                 "?q=cats&#38;page=10",
@@ -506,8 +547,12 @@ mod tests {
         )
         .render()
         .unwrap();
-        let texts: Vec<String> = links(&html).into_iter().map(|(_, t)| t).collect();
+        let got = links(&html);
+        let texts: Vec<&str> = got.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(texts, ["‹Previous page", "1", "2"], "{html}");
+        // No query left for page 1: the path itself, not `?`.
+        assert_eq!(got[1].0, "/items");
+        assert_eq!(got[2].0, "?page=2");
         assert_eq!(
             Pagination::new(
                 Pager {
