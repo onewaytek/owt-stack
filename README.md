@@ -23,6 +23,7 @@ Outside the crates:
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime (with `templates/dockerignore`) |
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
+| `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
 | `tailwind/owt.css` | font stacks and htmx state variants (`htmx-request:opacity-50`) |
 
@@ -576,11 +577,37 @@ Deployment's trigger rolls out each new digest. App-specific environment is a pa
 on the Deployment.
 
 **Backups come with it.** The database takes a volume snapshot nightly
-(`BACKUP_SCHEDULE`, CNPG's six-field cron, seconds first) and once at first apply, and
-a CronJob prunes snapshots older than `BACKUP_KEEP_DAYS` (14) while always keeping the
-newest `BACKUP_KEEP_AT_LEAST` (3) completed ones, so backups that silently stop are
-not all aged out on schedule. Restore by bootstrapping a new Cluster from one of the
-Backups (`bootstrap.recovery.backup.name`), then point the app at it.
+(`BACKUP_SCHEDULE`, CNPG's six-field cron, seconds first) and once at first apply.
+They are offline by default (`BACKUP_ONLINE=false`): Postgres stops for the seconds an
+LVM snapshot takes, because an online snapshot is only consistent with a WAL archive,
+which these clusters don't have. A CronJob (`PRUNE_SCHEDULE`, after the backup) prunes
+snapshots older than `BACKUP_KEEP_DAYS` (14) but always keeps the newest
+`BACKUP_KEEP_AT_LEAST` (3) completed ones, so backups that silently stop are not all
+aged out on schedule; a prune that fails fails its Job.
+
+These snapshots live in the same volume group, on the same node: they undo a bad
+migration or a dropped table, not the loss of the disk. Off-node copies need object
+storage and a WAL archive (CNPG's barman plugin), app by app.
+
+**Restoring:** delete the broken Cluster (`oc delete cluster <name>-db`; its Backups
+and their snapshots survive, since nothing owns them), then re-create it from a
+Backup with the same name, so the Deployment's secrets and the NetworkPolicy still
+fit:
+
+```yaml
+bootstrap:
+  recovery:
+    backup: {name: <name>-db-nightly-20261007020000}
+    database: <name>
+    owner: <name>
+```
+
+`templates/openshift/restore-drill.sh <namespace>` proves the arrangement end to end
+on throwaway clusters: it backs one up, restores it into another and checks the data.
+Run it (it needs a namespace admin) whenever how backups are taken changes.
+
+An app that already has hand-written backup objects under the same names
+(`<name>-db-nightly`, `<name>-backup-prune`) replaces them by applying this template.
 
 **Monitoring** needs more than the namespace (`monitoring-edit`, and user-workload
 monitoring enabled on the cluster), so it is a template of its own, for a cluster
