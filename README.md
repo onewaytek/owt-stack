@@ -78,6 +78,13 @@ owt-runtime = { path = "../owt-stack/crates/owt-runtime" }
   (`templates/Dockerfile` shows the step that mounts it). In both, the token is in
   the environment of `cargo fetch` alone, which runs none of the dependencies' code;
   the build that follows runs their build scripts and proc macros without it.
+- **The stylesheet package** (`@onewaytek/owt-stack` from npm, below) is the same
+  repository, so `npm ci` needs the same token. `package-lock.json` records it by its
+  ssh URL; rust-ci.yml's stylesheet job and the template Dockerfile rewrite that
+  and the https form to https with the token, and run `npm ci --ignore-scripts`
+  so no dependency's code runs beside it. On a workstation without an ssh key for
+  GitHub, have git use https (and its credential helper) instead:
+  `git config --global url."https://github.com/onewaytek/".insteadOf "ssh://git@github.com/onewaytek/"`.
 
 ## Wiring an app
 

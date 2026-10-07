@@ -76,7 +76,9 @@ on:
         default: ""
     secrets:
       OWT_STACK_TOKEN:
-        description: Read access to onewaytek/owt-stack, to fetch the git dependency.
+        description: >-
+          Read access to onewaytek/owt-stack, to fetch the git dependencies: the
+          crates (cargo) and the stylesheet package (npm).
         required: false
 
 # The jobs read the repository and nothing else.
@@ -211,7 +213,21 @@ jobs:
           node-version: ${{ inputs.node-version-file == '' && '22' || '' }}
           node-version-file: ${{ inputs.node-version-file }}
           cache: npm
-      - run: npm ci
+      # @onewaytek/owt-stack is a private git package; package-lock.json records it
+      # by its ssh URL. The token rewrites both forms to https for this step only,
+      # and --ignore-scripts keeps every dependency's code from running beside it.
+      - name: npm ci
+        env:
+          OWT_STACK_TOKEN: ${{ secrets.OWT_STACK_TOKEN }}
+        shell: bash
+        run: |
+          if [ -n "$OWT_STACK_TOKEN" ]; then
+            to="https://x-access-token:${OWT_STACK_TOKEN}@github.com/onewaytek/owt-stack"
+            export GIT_CONFIG_COUNT=2 \
+              GIT_CONFIG_KEY_0="url.${to}.insteadOf" GIT_CONFIG_VALUE_0="ssh://git@github.com/onewaytek/owt-stack" \
+              GIT_CONFIG_KEY_1="url.${to}.insteadOf" GIT_CONFIG_VALUE_1="https://github.com/onewaytek/owt-stack"
+          fi
+          npm ci --ignore-scripts
       - name: Build the stylesheet
         env:
           CSS_SCRIPT: ${{ inputs.css-script }}

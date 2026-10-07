@@ -31,9 +31,23 @@ ARG CSS_SCRIPT=css:build
 
 FROM node:22-bookworm-slim AS css
 ARG CSS_SCRIPT
+# git: npm clones @onewaytek/owt-stack, a private git package, with it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --no-audit --no-fund
+# The same token as the cargo fetch below, the same way. package-lock.json records
+# the package by its ssh URL, so both forms are rewritten to https. --ignore-scripts:
+# no dependency's code runs while the token is in the environment.
+RUN --mount=type=secret,id=owt_stack_token,required=false \
+    if [ -s /run/secrets/owt_stack_token ]; then \
+      to="https://x-access-token:$(cat /run/secrets/owt_stack_token)@github.com/onewaytek/owt-stack"; \
+      export GIT_CONFIG_COUNT=2 \
+        GIT_CONFIG_KEY_0="url.${to}.insteadOf" GIT_CONFIG_VALUE_0="ssh://git@github.com/onewaytek/owt-stack" \
+        GIT_CONFIG_KEY_1="url.${to}.insteadOf" GIT_CONFIG_VALUE_1="https://github.com/onewaytek/owt-stack"; \
+    fi; \
+    npm ci --ignore-scripts --no-audit --no-fund
 COPY . .
 RUN npm run ${CSS_SCRIPT}
 
