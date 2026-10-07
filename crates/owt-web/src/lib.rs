@@ -12,6 +12,7 @@
 //! | [`flash`] | messages shown once, on the next page, carried in the session |
 //! | [`request`] | what a page template reads about its request: path, query, htmx |
 //! | [`assets`] | content-fingerprinted static URLs with an `immutable` cache policy |
+//! | [`cache`] | `Cache-Control` as a typed policy: immutable, public (browser and edge), until a moment, no-store |
 //! | [`headers`] | security headers, a nonce-based content security policy, private-by-default caching, `noindex` |
 //! | [`redirect`] | `?next=` targets that stay on this site |
 //! | [`client_ip`] | the client's address behind proxies, by configuration |
@@ -22,6 +23,7 @@
 //! | [`pager`], [`text`] | page arithmetic; slugs, word truncation, paragraphs |
 
 pub mod assets;
+pub mod cache;
 pub mod client_ip;
 pub mod csrf;
 pub mod error;
