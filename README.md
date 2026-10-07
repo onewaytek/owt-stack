@@ -5,7 +5,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 
 | Crate | What an app gets |
 |---|---|
-| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers |
+| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
@@ -514,6 +514,71 @@ assets::assert_no_dangling_source_maps("static");
 
 This is what makes a strict Content-Security-Policy (`headers::Csp`) enforceable:
 nothing legitimate is left for it to block.
+
+### Shared components
+
+The pieces every page renders the same way are Askama templates compiled into
+`owt-web`, embedded in a page as values: `{{ alerts }}`, `{{ field }}`. Their markup
+carries only `owt-*` classes, which `tailwind/owt.css` defines over semantic tokens
+(`--color-owt-ink`, `--color-owt-accent`, `--color-owt-danger`, `--radius-owt`…) with
+plain defaults; an app redeclares any of them in its own `@theme` after the import and
+the components take its look. Nothing to copy, and the app's stylesheet need not scan
+the library (it cannot: Tailwind sees the app's templates only, which is why the
+components name no utility class).
+
+```rust
+# fn main() -> askama::Result<()> {
+use askama::Template;
+use owt_web::flash::{Flash, Level};
+use owt_web::pager::Pager;
+use owt_web::request::RequestInfo;
+use owt_web::ui::{Alerts, ErrorBody, Errors, Field, Pagination};
+
+// A page names the components as fields and writes `{{ alerts }}` where they go.
+#[derive(Template)]
+#[template(source = r#"<form method="post">{{ alerts }}{{ errors }}{{ username }}{{ password }}</form>{{ pages }}"#, ext = "html")]
+struct SignIn<'a> {
+    alerts: Alerts<'a>,
+    errors: Errors<'a, String>,
+    username: Field<'a>,
+    password: Field<'a>,
+    pages: Pagination<'a>,
+}
+
+let flashes = [Flash(Level::Info, "You were signed out.".into())];
+let refused = vec!["That username and password don't match an account.".to_owned()];
+let request = RequestInfo::at("/people?page=2");
+let page = SignIn {
+    alerts: Alerts { flashes: &flashes },
+    errors: Errors { errors: &refused },
+    username: Field::text("username", "Username").value("ada").autocomplete("username").required().autofocus(),
+    // A password field never echoes its value.
+    password: Field::password("password", "Password", "current-password").required(),
+    pages: Pagination::new(Pager { number: 2, pages: 7 }, &request), // links keep the rest of the query
+};
+let html = page.render()?;
+assert!(html.contains(r#"<div class="owt-alert owt-alert-info" role="status">"#));
+assert!(html.contains(r#"href="?page=3""#)); // query-only: the page keeps its path
+
+// The body of a 404 or 500, for the app's error shell (see `error_pages`).
+let body = ErrorBody::for_status(axum::http::StatusCode::NOT_FOUND).render()?;
+assert!(body.contains("<h1>Page not found</h1>"));
+# Ok(()) }
+```
+
+An app with a look of its own sets the tokens once:
+
+```css
+@import "tailwindcss" source(none);
+@import "@onewaytek/owt-stack/tailwind/owt.css";
+@source "../templates";
+@theme {
+  --color-owt-ink: var(--color-slate-900);
+  --color-owt-accent: var(--color-emerald-700);
+  --color-owt-on-accent: white;
+  --radius-owt: 0.75rem;
+}
+```
 
 ### Tests
 

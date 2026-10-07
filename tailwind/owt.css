@@ -1,13 +1,18 @@
 /* What every owt-stack app's stylesheet starts from. Import it after Tailwind:
 
      @import "tailwindcss" source(none);
-     @import "../path/to/owt-stack/tailwind/owt.css";
+     @import "@onewaytek/owt-stack/tailwind/owt.css";
      @source "../templates";
 
-   It defines no colours: each app keeps its own palette. It holds what is the same
-   everywhere: the system font stacks, and variants for the classes htmx puts on
-   elements while a request is in flight, so markup can say
-   `htmx-request:opacity-50` instead of hand-written CSS. */
+   It holds what is the same everywhere: the system font stacks, variants for the
+   classes htmx puts on elements while a request is in flight (so markup can say
+   `htmx-request:opacity-50` instead of hand-written CSS), and the `owt-*` classes the
+   shared components (`owt_web::ui`) are built from.
+
+   The components are styled through semantic tokens, declared below with plain
+   defaults. An app sets its own look by redeclaring any of them in its own `@theme`
+   after this import; it writes none of the components' CSS. The app's palette is
+   otherwise its own: nothing here names a colour of the app's. */
 
 @theme {
   --font-sans:
@@ -16,6 +21,24 @@
   --font-mono:
     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New",
     monospace;
+
+  /* Semantic tokens: text, quiet text, a surface, a line, the accent and text on it,
+     and the four outcome colours with a soft background each. */
+  --color-owt-ink: #0f172a;
+  --color-owt-muted: #64748b;
+  --color-owt-surface: #ffffff;
+  --color-owt-line: #cbd5e1;
+  --color-owt-accent: #1d4ed8;
+  --color-owt-on-accent: #ffffff;
+  --color-owt-success: #166534;
+  --color-owt-success-soft: #f0fdf4;
+  --color-owt-info: #1e40af;
+  --color-owt-info-soft: #eff6ff;
+  --color-owt-warning: #854d0e;
+  --color-owt-warning-soft: #fefce8;
+  --color-owt-danger: #991b1b;
+  --color-owt-danger-soft: #fef2f2;
+  --radius-owt: 0.375rem;
 }
 
 /* On the element issuing the request (or its hx-indicator), and anything inside it. */
@@ -35,4 +58,88 @@
 .htmx-request .htmx-indicator,
 .htmx-request.htmx-indicator {
   opacity: 1;
+}
+
+/* The shared components (owt_web::ui). Their markup carries only these classes, and
+   the app's stylesheet never scans the library, so every rule they need is here. */
+@layer components {
+  .owt-sr {
+    @apply sr-only;
+  }
+
+  /* Alerts: flash messages and a form's error list. */
+  .owt-alert {
+    @apply rounded-(--radius-owt) border px-3 py-2 text-sm;
+  }
+  .owt-alert li + li {
+    @apply mt-1;
+  }
+  .owt-alert-success {
+    @apply border-owt-success/30 bg-owt-success-soft text-owt-success;
+  }
+  .owt-alert-info {
+    @apply border-owt-info/30 bg-owt-info-soft text-owt-info;
+  }
+  .owt-alert-warning {
+    @apply border-owt-warning/30 bg-owt-warning-soft text-owt-warning;
+  }
+  .owt-alert-error {
+    @apply border-owt-danger/30 bg-owt-danger-soft text-owt-danger;
+  }
+
+  /* A form field. */
+  .owt-field {
+    @apply flex flex-col gap-1;
+  }
+  .owt-label {
+    @apply text-sm font-medium text-owt-ink;
+  }
+  .owt-input {
+    @apply w-full rounded-(--radius-owt) border border-owt-line bg-owt-surface px-3 py-2 text-owt-ink;
+    @apply focus:border-owt-accent focus:ring-2 focus:ring-owt-accent/30 focus:outline-none;
+  }
+  .owt-input-invalid {
+    @apply border-owt-danger;
+  }
+  .owt-hint {
+    @apply text-xs text-owt-muted;
+  }
+  .owt-field-error {
+    @apply text-xs text-owt-danger;
+  }
+
+  /* Pagination. */
+  .owt-pager {
+    @apply flex flex-wrap items-center justify-center gap-2 text-sm;
+  }
+  .owt-pager > a,
+  .owt-pager > span {
+    @apply inline-flex min-h-10 min-w-10 items-center justify-center rounded-(--radius-owt) border border-owt-line px-2;
+  }
+  .owt-pager > a {
+    @apply text-owt-ink hover:bg-owt-line/40;
+  }
+  .owt-pager > .owt-pager-current {
+    @apply border-owt-accent bg-owt-accent text-owt-on-accent;
+  }
+  .owt-pager > .owt-pager-gap {
+    @apply border-transparent text-owt-muted;
+  }
+
+  /* An error page's body. */
+  .owt-errorpage {
+    @apply mx-auto max-w-prose px-4 py-16 text-center;
+  }
+  .owt-errorpage-code {
+    @apply text-sm font-medium tracking-widest text-owt-muted;
+  }
+  .owt-errorpage h1 {
+    @apply mt-2 text-3xl font-semibold text-owt-ink;
+  }
+  .owt-errorpage p {
+    @apply mt-4 text-owt-muted;
+  }
+  .owt-errorpage a {
+    @apply text-owt-accent underline;
+  }
 }

@@ -37,6 +37,7 @@ pub mod request;
 pub mod session;
 pub mod sse;
 pub mod text;
+pub mod ui;
 
 pub use error::{Error, ErrorPage, Result};
 
