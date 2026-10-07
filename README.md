@@ -8,6 +8,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
+| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; one-time sign-in links |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
 
@@ -41,6 +42,7 @@ owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.3.0" }
 # As needed:
 owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.3.0" }
 owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.3.0" }
+owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.3.0" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
@@ -192,8 +194,11 @@ the handler and write `<script nonce="{{ nonce }}">`.
 
 Handlers return `owt_web::Result`. `NotFound` and internal errors carry a marker that
 the `error::error_pages` middleware swaps for the app's own pages; database errors are
-logged and never shown. An app may keep its own error enum in its domain's words and
-convert it with `impl From<AppError> for owt_web::Error`.
+logged and never shown. `Error::unavailable(..)` is the 503 for a request the app
+could not answer *for now* (a dependency down), distinct from a 500 fault in its code;
+it is marked for the app's page too and carries `Retry-After`.
+An app may keep its own error enum in its domain's words and convert it with
+`impl From<AppError> for owt_web::Error`.
 
 A page's context carries the request (`RequestInfo`) and the flash messages, and
 derefs to the request, so templates write `layout.path` and `layout.url_with(..)` (a
@@ -380,6 +385,91 @@ let verifier = jwt::Verifier::discover(http, "https://sso.example/realms/x", "my
 let claims: jwt::Claims = verifier.verify("eyJ...").await?;
 # let _ = claims; Ok(()) }
 ```
+
+### Accounts
+
+`owt-accounts` is the sign-in every app wrote over the pieces above: an `accounts`
+table with a session epoch, `authenticate` with the decoy check and rehash, a
+walled extractor, sign-out everywhere. The app keeps its pages (the sign-in form is
+its template), its extra columns (`ALTER TABLE accounts ADD COLUMN …` in a migration
+of its own) and the choice of flows (self-signup or not, which providers, whether
+links are minted).
+
+**Tables:** write `owt_accounts::migrations::ALL[0].sql` to
+`migrations/0001_owt_accounts.sql`, first, since the app's tables reference
+`accounts(id)`; a test calls `owt_accounts::migrations::assert_installed("migrations")`
+so an edited or missing copy fails the build. sqlx keeps one ledger per database, which
+is why the library does not run a migrator of its own. A shipped migration never
+changes (sqlx would refuse the re-copied file at deploy, its checksum differing from
+the applied one): a later release appends a new entry to `ALL`, which the app copies
+as its next file, and a test here pins each file's SHA-256.
+
+**Logins:** a username is one token without `@`; an email always has one. So a login
+is never both, and nobody can register a username equal to someone else's email to
+shadow their sign-in. The table's `CHECK` enforces it on writes made around the
+library.
+
+```rust,no_run
+# async fn demo(
+#     pool: sqlx::PgPool, session: owt_web::session::Session<owt_accounts::session::Data>,
+#     ip: std::net::IpAddr, login: &str, given: &str, who: owt_auth::oauth::Identity,
+# ) -> anyhow::Result<()> {
+use axum::{Router, middleware::from_fn_with_state, routing::get};
+use owt_accounts::{Accounts, Maybe, New, Signed, Staff, identities, links, session, store};
+use owt_auth::throttle::Throttle;
+
+// Once per request, inside the session layer (`Sessions::layer`, above): load the
+// signed-in account if its epoch still matches. The extractors read it from the
+// request, so a handler and a page-chrome helper cost one query between them.
+let accounts = Accounts::new(pool.clone(), "/login");
+async fn home(Maybe(me): Maybe) -> String { me.map_or("hello".into(), |a| a.username) }
+async fn settings(Signed(me): Signed) -> String { me.username } // anonymous: 303 /login?next=…
+async fn admin(Staff(me): Staff) -> String { me.username } // signed in, not staff: 403
+// Database down: `Maybe` reads as anonymous, `Signed` and `Staff` answer 503 (the
+// sign-in page could not help), and the cookie keeps its signature for when it is back.
+let app: Router = Router::new()
+    .route("/", get(home))
+    .route("/settings", get(settings))
+    .route("/admin", get(admin))
+    .layer(from_fn_with_state(accounts, Accounts::load::<session::Data>));
+
+// Sign-in: throttle, authenticate (by username or email; an unknown login costs a
+// real check; an old hash is replaced), then the session: new id, account and epoch.
+let throttle = Throttle::default(); // in the app's state
+if throttle.sign_in(ip, login)
+    && let Some(account) = store::authenticate(&pool, login, given).await?
+{
+    session::sign_in(&session, &account);
+}
+session::sign_out(&session); // this session
+session::sign_out_everywhere(&pool, &session).await?; // every session: the epoch moves
+
+// Accounts: normalized, password rules checked (`owt_accounts::password`), a taken
+// username or email refused by the constraint, so two racing sign-ups cannot both win.
+let ada = store::create(&pool, New {
+    username: "Ada", email: "ada@example.com", password: Some("correct horse battery"), is_staff: false,
+}).await?;
+store::set_password(&pool, &ada, "a different passphrase").await?; // same rules; signs out everywhere
+store::set_staff(&pool, ada.id, true).await?; // revoking signs out; granting does not
+
+// A provider's identity (from `oauth::Client::complete`) becomes an account per policy:
+// linked already, matched by a verified email, created, or unknown.
+let welcome = identities::Welcome { match_verified_email: true, create: true };
+if let Some(account) = identities::arrive(&pool, "google", &who, welcome).await?.account() {
+    session::sign_in(&session, account);
+}
+
+// A one-time sign-in link, minted by an operator; only its SHA-256 is stored. The
+// lifetime is capped at `links::MAX_TTL`.
+let minted = links::mint(&pool, ada.id, std::time::Duration::from_secs(900), "new account").await?;
+let _url = format!("https://app.example/login/link/{}", minted.token);
+let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Refused::Link when spent
+# let _ = app; Ok(()) }
+```
+
+A refusal (`owt_accounts::Refused`) carries the sentence the person reads; a handler
+matches `Error::Refused` to re-render the form with it, and the `From` into
+`owt_web::Error` answers 422 with the same text.
 
 ### Realtime fan-out
 

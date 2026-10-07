@@ -103,8 +103,10 @@ async fn a_file_that_changes_is_never_served_immutable_under_its_old_hash() {
 
 #[tokio::test]
 async fn error_pages_replace_marked_bodies_and_only_those() {
-    let draw = |status: StatusCode| {
-        (status == StatusCode::NOT_FOUND).then(|| Html("<h1>Nothing here</h1>".to_owned()))
+    let draw = |status: StatusCode| match status {
+        StatusCode::NOT_FOUND => Some(Html("<h1>Nothing here</h1>".to_owned())),
+        StatusCode::SERVICE_UNAVAILABLE => Some(Html("<h1>Back in a moment</h1>".to_owned())),
+        _ => None,
     };
     let app = Router::new()
         .route("/gone", get(|| async { Err::<(), _>(Error::NotFound) }))
@@ -115,6 +117,10 @@ async fn error_pages_replace_marked_bodies_and_only_those() {
         .route(
             "/refused",
             get(|| async { Err::<(), _>(Error::forbidden()) }),
+        )
+        .route(
+            "/later",
+            get(|| async { Err::<(), _>(Error::unavailable("down")) }),
         )
         .route(
             "/plain404",
@@ -147,6 +153,21 @@ async fn error_pages_replace_marked_bodies_and_only_those() {
         (status, body.as_str()),
         (StatusCode::FORBIDDEN, "Forbidden")
     );
+    // The drawn page keeps the response's headers: a 503 still says when to come back.
+    let (status, headers, body) = call(&app, get_req("/later")).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "<h1>Back in a moment</h1>")
+    );
+    assert_eq!(headers[header::RETRY_AFTER], "5");
+    assert_eq!(headers.get_all(header::CONTENT_TYPE).iter().count(), 1);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+
     let (_, _, body) = call(&app, get_req("/plain404")).await;
     assert_eq!(
         body, "an API's own 404",

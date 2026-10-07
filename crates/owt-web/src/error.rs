@@ -39,6 +39,11 @@ pub enum Error {
     /// 303 to this location: sign-in walls and the like.
     #[error("redirect to {0}")]
     Redirect(String),
+    /// 503: the request was fine and the service could not answer it for now (a
+    /// dependency is down). Unlike a 500 it says "try again shortly", and it is not
+    /// a fault in the app's code.
+    #[error("{0}")]
+    Unavailable(Cow<'static, str>),
     /// A database error; `RowNotFound` maps to 404, anything else to 500.
     #[error(transparent)]
     Db(#[from] sqlx::Error),
@@ -64,6 +69,11 @@ impl Error {
         Self::Unprocessable(msg.into())
     }
 
+    /// 503 with `msg`.
+    pub fn unavailable(msg: impl Into<Cow<'static, str>>) -> Self {
+        Self::Unavailable(msg.into())
+    }
+
     /// 303 to `login` with `?next=<next>`. The sign-in handler must pass what comes
     /// back through [`crate::redirect::local`] before redirecting to it.
     #[must_use]
@@ -85,6 +95,7 @@ impl Error {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Redirect(_) => StatusCode::SEE_OTHER,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Db(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -94,8 +105,8 @@ impl Error {
 #[derive(Clone, Copy, Debug)]
 pub struct ErrorPage;
 
-fn marked(status: StatusCode, body: &'static str) -> Response {
-    let mut r = (status, plain(body)).into_response();
+fn marked(status: StatusCode, body: impl Into<String>) -> Response {
+    let mut r = (status, plain(body.into())).into_response();
     r.extensions_mut().insert(ErrorPage);
     r
 }
@@ -114,6 +125,15 @@ impl IntoResponse for Error {
             | Self::BadRequest(m)
             | Self::Unprocessable(m) => (status, plain(m.into_owned())).into_response(),
             Self::Redirect(to) => Redirect::to(&to).into_response(),
+            // Marked, so the app's shell draws it like its 500; `Retry-After` so a
+            // client that honours it (and a cache) comes back, not away.
+            Self::Unavailable(m) => {
+                tracing::warn!(reason = %m, "service unavailable");
+                let mut r = marked(status, m.into_owned());
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+                r
+            }
             Self::Db(e) => {
                 tracing::error!(error = ?e, "database error");
                 marked(status, "Server error")
@@ -127,7 +147,9 @@ impl IntoResponse for Error {
 }
 
 /// Middleware body: replace a marked response's body with `page(status)`, if the app
-/// draws one for that status. Wire it with `from_fn` and a closure:
+/// draws one for that status. The response's other headers stay (a 503's
+/// `Retry-After`, a cookie an inner layer set); only the body and its type change.
+/// Wire it with `from_fn` and a closure:
 ///
 /// ```ignore
 /// .layer(from_fn(move |req, next| error_pages(req, next, draw)))
@@ -142,7 +164,15 @@ where
     }
     let status = resp.status();
     match page(status) {
-        Some(html) => (status, html).into_response(),
+        Some(html) => {
+            let mut drawn = (status, html).into_response();
+            for (name, value) in resp.headers() {
+                if name != header::CONTENT_TYPE && name != header::CONTENT_LENGTH {
+                    drawn.headers_mut().append(name, value.clone());
+                }
+            }
+            drawn
+        }
         None => resp,
     }
 }
@@ -166,15 +196,32 @@ mod tests {
             Error::unprocessable("x").status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        assert_eq!(
+            Error::unavailable("x").status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[test]
-    fn only_404_and_500_are_marked_for_pages() {
+    fn only_404_500_and_503_are_marked_for_pages() {
         let marked = |e: Error| e.into_response().extensions().get::<ErrorPage>().is_some();
         assert!(marked(Error::NotFound));
         assert!(marked(Error::Internal(anyhow::anyhow!("x"))));
+        assert!(marked(Error::unavailable("later")));
         assert!(!marked(Error::forbidden()));
         assert!(!marked(Error::bad_request("no")));
+    }
+
+    #[test]
+    fn unavailable_says_when_to_come_back() {
+        let r = Error::unavailable("later").into_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
     }
 
     #[test]

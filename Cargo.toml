@@ -62,6 +62,7 @@ url = "2.5"
 owt-web = { path = "crates/owt-web" }
 owt-runtime = { path = "crates/owt-runtime" }
 owt-auth = { path = "crates/owt-auth" }
+owt-accounts = { path = "crates/owt-accounts" }
 owt-bus = { path = "crates/owt-bus" }
 owt-test = { path = "crates/owt-test" }
 

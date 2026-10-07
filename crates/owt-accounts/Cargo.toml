@@ -1,0 +1,31 @@
+[package]
+name = "owt-accounts"
+description = "Accounts and sign-in flows the onewaytek apps share: the accounts table and its migration, credentials with a decoy check and rehash, sessions revoked by epoch, the signed-in extractors, linked provider identities, and one-time sign-in links."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = { workspace = true, features = ["tokio", "http1", "form", "query"] }
+base64.workspace = true
+owt-auth.workspace = true
+owt-web.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, features = ["derive", "macros", "json"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+owt-runtime.workspace = true
+owt-test.workspace = true
+tokio.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true
