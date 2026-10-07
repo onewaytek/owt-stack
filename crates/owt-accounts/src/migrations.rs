@@ -37,11 +37,6 @@ pub const ALL: &[Migration] = &[Migration {
 const SHIPPED_SHA256: &[&str] =
     &["743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4"];
 
-/// For this crate's own tests only. Do not run it against an app's database: sqlx
-/// keeps one migration ledger per database, and this one would fight the app's.
-#[doc(hidden)]
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;
 /// panics naming the first that is not. Call it from a test.
 ///

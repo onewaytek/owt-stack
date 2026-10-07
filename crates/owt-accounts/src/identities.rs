@@ -225,16 +225,20 @@ fn username_base(identity: &owt_auth::oauth::Identity) -> String {
     }
 }
 
-/// Create an account named `base`, or `base2`, `base3`… if taken, or `base` with a
-/// random suffix after that. The email is dropped if another account takes it
+/// Create an account named `base`, or `base2`, `base3`… if taken, then `base` with
+/// a fresh random suffix for as long as those are taken too (each has one chance in
+/// 36⁸ of colliding, so in practice the first one lands; there is no candidate after
+/// which this gives up or panics). The email is dropped if another account takes it
 /// first: [`arrive`] checked it was free, but two first sign-ins with one address
 /// can race, and the loser still gets an account (without the email, as an
 /// unverified one would).
 async fn create_for(pool: &PgPool, base: &str, mut email: &str) -> Result<Account> {
     let mut candidates = std::iter::once(base.to_owned())
         .chain((2..=20).map(|n| format!("{base}{n}")))
-        .chain(std::iter::once(format!("{base}-{}", random_suffix())));
-    let mut username = candidates.next().expect("the base is always there");
+        .chain(std::iter::repeat_with(|| {
+            format!("{base}-{}", random_suffix())
+        }));
+    let mut username = candidates.next().expect("the iterator is endless");
     loop {
         let new = New {
             username: &username,
@@ -244,9 +248,7 @@ async fn create_for(pool: &PgPool, base: &str, mut email: &str) -> Result<Accoun
         };
         match store::create(pool, new).await {
             Err(crate::Error::Refused(Refused::UsernameTaken(_))) => {
-                username = candidates
-                    .next()
-                    .expect("the random candidate is always there");
+                username = candidates.next().expect("the iterator is endless");
             }
             Err(crate::Error::Refused(Refused::EmailTaken(_))) if !email.is_empty() => {
                 email = "";

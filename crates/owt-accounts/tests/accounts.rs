@@ -13,6 +13,11 @@ use owt_web::session::{Session, Sessions};
 use sqlx::PgPool;
 use sqlx::postgres::PgConnectOptions;
 
+/// The crate's migrations as a migrator, for these tests alone. The crate exports
+/// none: sqlx keeps one migration ledger per database, so an app installs the files
+/// through its own migrator (see `owt_accounts::migrations`).
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 struct Db {
     pool: PgPool,
     schema: String,
@@ -38,7 +43,7 @@ impl Db {
             .connect_with(opts.options([("search_path", schema.as_str())]))
             .await
             .unwrap();
-        owt_accounts::migrations::MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
         Some(Self {
             pool,
             schema,
@@ -372,6 +377,7 @@ async fn an_outage_answers_503_at_the_wall_and_keeps_the_cookie() {
     let r = client.get("/private").await;
     assert_eq!(r.status, 503, "{}", r.text());
     assert!(r.text().contains("try again"));
+    assert_eq!(r.header("retry-after"), Some("5"));
     assert_eq!(client.get("/staff").await.status, 503);
     assert_eq!(client.get("/whoami").await.text(), "anonymous");
     let (_, data) = sessions

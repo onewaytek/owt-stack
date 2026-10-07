@@ -105,8 +105,8 @@ impl Error {
 #[derive(Clone, Copy, Debug)]
 pub struct ErrorPage;
 
-fn marked(status: StatusCode, body: &'static str) -> Response {
-    let mut r = (status, plain(body)).into_response();
+fn marked(status: StatusCode, body: impl Into<String>) -> Response {
+    let mut r = (status, plain(body.into())).into_response();
     r.extensions_mut().insert(ErrorPage);
     r
 }
@@ -125,9 +125,14 @@ impl IntoResponse for Error {
             | Self::BadRequest(m)
             | Self::Unprocessable(m) => (status, plain(m.into_owned())).into_response(),
             Self::Redirect(to) => Redirect::to(&to).into_response(),
+            // Marked, so the app's shell draws it like its 500; `Retry-After` so a
+            // client that honours it (and a cache) comes back, not away.
             Self::Unavailable(m) => {
                 tracing::warn!(reason = %m, "service unavailable");
-                (status, plain(m.into_owned())).into_response()
+                let mut r = marked(status, m.into_owned());
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+                r
             }
             Self::Db(e) => {
                 tracing::error!(error = ?e, "database error");
@@ -188,12 +193,25 @@ mod tests {
     }
 
     #[test]
-    fn only_404_and_500_are_marked_for_pages() {
+    fn only_404_500_and_503_are_marked_for_pages() {
         let marked = |e: Error| e.into_response().extensions().get::<ErrorPage>().is_some();
         assert!(marked(Error::NotFound));
         assert!(marked(Error::Internal(anyhow::anyhow!("x"))));
+        assert!(marked(Error::unavailable("later")));
         assert!(!marked(Error::forbidden()));
         assert!(!marked(Error::bad_request("no")));
+    }
+
+    #[test]
+    fn unavailable_says_when_to_come_back() {
+        let r = Error::unavailable("later").into_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("5")
+        );
     }
 
     #[test]

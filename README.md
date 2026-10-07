@@ -193,7 +193,8 @@ the handler and write `<script nonce="{{ nonce }}">`.
 Handlers return `owt_web::Result`. `NotFound` and internal errors carry a marker that
 the `error::error_pages` middleware swaps for the app's own pages; database errors are
 logged and never shown. `Error::unavailable(..)` is the 503 for a request the app
-could not answer *for now* (a dependency down), distinct from a 500 fault in its code.
+could not answer *for now* (a dependency down), distinct from a 500 fault in its code;
+it is marked for the app's page too and carries `Retry-After`.
 An app may keep its own error enum in its domain's words and convert it with
 `impl From<AppError> for owt_web::Error`.
 
