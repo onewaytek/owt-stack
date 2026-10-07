@@ -286,4 +286,30 @@ mod tests {
         assert!(account_key(&long).len() <= MAX_ACCOUNT_KEY_BYTES);
         assert!(account_key(&"é".repeat(100_000)).len() <= MAX_ACCOUNT_KEY_BYTES);
     }
+
+    #[test]
+    fn account_keys_are_cut_on_a_character() {
+        // The cut falls inside a two-byte character.
+        let odd = format!("a{}", "é".repeat(300));
+        let key = account_key(&odd);
+        assert_eq!(key.len(), MAX_ACCOUNT_KEY_BYTES - 1);
+        assert!(odd.starts_with(&key));
+        // Lower-casing lengthens these (two bytes to three), so the second cut runs,
+        // and it too falls inside a character.
+        let growing = "\u{130}".repeat(300);
+        let key = account_key(&growing);
+        assert!(key.len() <= MAX_ACCOUNT_KEY_BYTES && key.len() > MAX_ACCOUNT_KEY_BYTES - 3);
+        assert!(key.starts_with("i\u{307}"));
+        // Here the second cut falls inside a character (the first does not): two
+        // bytes of ASCII, then three-byte pairs, and 256 lands in the middle of a
+        // pair's two-byte mark.
+        let key = account_key(&format!("aa{growing}"));
+        assert_eq!(key.len(), MAX_ACCOUNT_KEY_BYTES - 1);
+        assert!(
+            key.ends_with('i'),
+            "the mark that did not fit is dropped whole"
+        );
+        assert_eq!(account_key("  Ann\t"), "ann");
+        assert!(format!("{:?}", Throttle::default()).contains("Throttle"));
+    }
 }

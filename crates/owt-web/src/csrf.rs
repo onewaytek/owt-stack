@@ -116,6 +116,15 @@ impl CrossOrigin {
     /// The origin test alone, whatever the method and path.
     pub fn same_origin(&self, headers: &HeaderMap) -> Result<(), Refusal> {
         let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        // A header that is present and unreadable (bytes no browser sends) is not an
+        // absent one: absence is what lets a non-browser client through.
+        let unreadable = |name: &str| headers.get(name).is_some_and(|v| v.to_str().is_err());
+        if unreadable("sec-fetch-site") {
+            return Err(Refusal::CrossSite);
+        }
+        if unreadable(header::ORIGIN.as_str()) {
+            return Err(Refusal::OriginMismatch);
+        }
         let origin = get(header::ORIGIN.as_str());
         if let Some(site) = get("sec-fetch-site") {
             return if matches!(site, "same-origin" | "none") || self.trusted(origin) {

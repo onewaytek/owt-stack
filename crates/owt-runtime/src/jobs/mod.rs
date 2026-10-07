@@ -216,10 +216,12 @@ impl Jobs {
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let this = self.clone();
+        let task = Arc::new(task);
         self.spawn(async move {
             let mut first = true;
             while this.wait(every, std::mem::take(&mut first)).await {
-                let outcome = this.run(name, task()).await;
+                let task = task.clone();
+                let outcome = this.run(name, move || task()).await;
                 tracing::trace!(job = name, outcome = outcome.as_str(), "job tick");
             }
             tracing::debug!(job = name, "job stopped");
@@ -244,12 +246,14 @@ impl Jobs {
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let this = self.clone();
+        let task = Arc::new(task);
         self.spawn(async move {
             let mut first = true;
             while this.wait(every, std::mem::take(&mut first)).await {
                 let outcome = match try_lock(&pool, lock_id).await {
                     Ok(Some(mut conn)) => {
-                        let outcome = this.run(name, task()).await;
+                        let task = task.clone();
+                        let outcome = this.run(name, move || task()).await;
                         let unlocked =
                             sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
                                 .bind(lock_id)
@@ -281,13 +285,16 @@ impl Jobs {
     }
 
     /// Run one tick of `task` as its own task, so a panic is a failed run, not a dead
-    /// loop. Records the outcome and the time.
-    async fn run<Fut>(&self, name: &'static str, fut: Fut) -> Outcome
+    /// loop. The closure that builds the future runs inside that task too: a panic
+    /// there (a config read, an `unwrap`) is the app's code failing like any other.
+    /// Records the outcome and the time.
+    async fn run<F, Fut>(&self, name: &'static str, make: F) -> Outcome
     where
+        F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let started = Instant::now();
-        let outcome = match tokio::spawn(fut).await {
+        let outcome = match tokio::spawn(async move { make().await }).await {
             Ok(Ok(())) => Outcome::Ran,
             Ok(Err(e)) => {
                 tracing::error!(job = name, error = ?e, "background job failed");
@@ -312,7 +319,7 @@ impl Jobs {
         let delay = if first {
             every.spread()
         } else {
-            every.period + every.spread()
+            every.period.saturating_add(every.spread())
         };
         tokio::select! {
             () = self.shutdown.cancelled() => false,

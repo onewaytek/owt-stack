@@ -44,6 +44,28 @@ async fn a_failed_or_panicking_run_does_not_stop_the_loop() {
     jobs.stopped().await;
 }
 
+/// The closure that builds a run's future is the app's code too (it reads config,
+/// clones handles, unwraps what it expects to exist). A panic there, before any
+/// future exists, must be one failed tick and not the end of the loop.
+#[tokio::test(start_paused = true)]
+async fn a_panic_building_the_run_does_not_stop_the_loop() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let jobs = Jobs::new(CancellationToken::new());
+    let r = runs.clone();
+    jobs.every_replica(
+        "brittle",
+        Every::new(Duration::from_secs(1)).jitter(Duration::ZERO),
+        move || {
+            let n = r.fetch_add(1, SeqCst);
+            assert_ne!(n, 0, "building the first run panics");
+            async { Ok(()) }
+        },
+    );
+    until(|| runs.load(SeqCst) >= 3).await;
+    jobs.shutdown().cancel();
+    jobs.stopped().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn the_period_holds_and_jitter_only_adds() {
     let at = Arc::new(Mutex::new(Vec::<Instant>::new()));
@@ -207,6 +229,50 @@ async fn a_panicking_singleton_releases_its_lock() {
         .fetch_one(&mut *conn)
         .await
         .unwrap();
+}
+
+/// The closure that builds a singleton's run is called while the advisory lock is
+/// held. If a panic there escaped, the lock's connection would go back to the pool
+/// with the session-level lock still on it, and every replica would skip the job
+/// until that pooled connection happened to close.
+#[tokio::test]
+async fn a_panic_building_a_singleton_run_does_not_leak_its_lock() {
+    let Some(pool) = pool().await else { return };
+    let id = lock_id();
+    let shutdown = CancellationToken::new();
+    let (bad, good) = (Jobs::new(shutdown.clone()), Jobs::new(shutdown.clone()));
+    let every = Every::new(Duration::from_millis(30)).jitter(Duration::ZERO);
+    let bad_ticks = Arc::new(AtomicUsize::new(0));
+    let b = bad_ticks.clone();
+    bad.singleton("brittle", every, pool.clone(), id, move || {
+        let n = b.fetch_add(1, SeqCst);
+        assert!(n == usize::MAX, "building the run panics, lock in hand");
+        async { Ok(()) }
+    });
+    // Let the brittle replica take the lock and panic first.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        bad_ticks.load(SeqCst) > 0,
+        "the brittle replica never ticked"
+    );
+    let good_runs = Arc::new(AtomicUsize::new(0));
+    let g = good_runs.clone();
+    good.singleton("steady", every, pool.clone(), id, move || {
+        g.fetch_add(1, SeqCst);
+        async { Ok(()) }
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    shutdown.cancel();
+    bad.stopped().await;
+    good.stopped().await;
+    assert!(
+        good_runs.load(SeqCst) > 0,
+        "the lock leaked into the pool: the healthy replica never ran"
+    );
+    assert!(
+        bad_ticks.load(SeqCst) > 1,
+        "the brittle loop died at its first panic"
+    );
 }
 
 // ---------------------------------------------------------------------- leases

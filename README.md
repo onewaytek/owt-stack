@@ -71,7 +71,9 @@ owt-runtime = { path = "../owt-stack/crates/owt-runtime" }
 - **CI:** an `OWT_STACK_TOKEN` secret (organization or repository), passed to the
   reusable workflow with `secrets: inherit`.
 - **Image builds:** the same token as a BuildKit secret, `owt_stack_token`
-  (`templates/Dockerfile` shows the step that mounts it).
+  (`templates/Dockerfile` shows the step that mounts it). In both, the token is in
+  the environment of `cargo fetch` alone, which runs none of the dependencies' code;
+  the build that follows runs their build scripts and proc macros without it.
 
 ## Wiring an app
 
@@ -417,7 +419,13 @@ exclude each other. Record runs with `JobMetrics::prefixed("myapp")`
 
 A leased job keeps its lease while its replica lives as long as the TTL outlasts the
 period plus jitter: the lease is renewed at each tick, during a run, and when the run
-ends.
+ends. A lease is a Redis key: a Redis that evicts under memory pressure (as a cache
+does) can drop it, and until the holder's next renewal fails (a third of the TTL) two
+replicas may run the job. Work that must never run twice gets a `noeviction` Redis,
+and checks `held.is_lost()` before each owner-only step.
+
+A run's panic, in the future or in the closure that builds it, is one failed tick;
+the loop goes on.
 
 ### Tests
 
@@ -657,6 +665,21 @@ The router example under "Wiring an app" composes the layers; beyond it:
 `just check` is the gate (fmt, clippy over every crate and feature, the tests with the
 README doctests, `cargo audit`), and CI runs the same command. `owt-bus`'s Redis test
 runs when `REDIS_URL` is set and is skipped otherwise.
+
+**Tests come in four kinds**, and a change to anything that reads what a client sent
+adds to the first:
+
+- *Properties* (`crates/*/tests/properties.rs`, `owt-bus/tests/model.rs`): what must
+  hold for every input, with proptest looking for the one where it does not. A
+  failure writes its seed to a `.proptest-regressions` file beside the test; commit
+  it, so the case is retried for ever.
+- *The composed app* (`owt-web/tests/hardened_app.rs`): the layers in the README's
+  order, and the sign-in story end to end (fixation, revocation, an outage, a
+  replayed cookie).
+- *Unit tests* beside the code, for what needs its private parts.
+- *Mutation testing*, on demand: `cargo mutants -p owt-web` (or `-p owt-auth`, which
+  takes an hour) lists the changes to the code no test notices. A missed mutant in
+  a check that guards something is a missing test.
 
 **Keep this README's instructions current.** A change to a public API, a template, the
 workflow's inputs or how an app adopts something updates the matching section here in

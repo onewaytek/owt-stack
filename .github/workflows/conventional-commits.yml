@@ -42,5 +42,5 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: >-
-          npx --yes -p @commitlint/cli@21.2.3 -p @commitlint/config-conventional@21.2.3
+          npx --yes --ignore-scripts -p @commitlint/cli@21.2.3 -p @commitlint/config-conventional@21.2.3
           commitlint --from "$BASE" --to "$HEAD" --verbose
