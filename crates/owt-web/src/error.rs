@@ -147,7 +147,9 @@ impl IntoResponse for Error {
 }
 
 /// Middleware body: replace a marked response's body with `page(status)`, if the app
-/// draws one for that status. Wire it with `from_fn` and a closure:
+/// draws one for that status. The response's other headers stay (a 503's
+/// `Retry-After`, a cookie an inner layer set); only the body and its type change.
+/// Wire it with `from_fn` and a closure:
 ///
 /// ```ignore
 /// .layer(from_fn(move |req, next| error_pages(req, next, draw)))
@@ -162,7 +164,15 @@ where
     }
     let status = resp.status();
     match page(status) {
-        Some(html) => (status, html).into_response(),
+        Some(html) => {
+            let mut drawn = (status, html).into_response();
+            for (name, value) in resp.headers() {
+                if name != header::CONTENT_TYPE && name != header::CONTENT_LENGTH {
+                    drawn.headers_mut().append(name, value.clone());
+                }
+            }
+            drawn
+        }
         None => resp,
     }
 }
