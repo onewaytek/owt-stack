@@ -8,7 +8,10 @@
 //! A signature whose epoch no longer matches (signed out everywhere, password
 //! changed, deactivated) is dropped from the session, so the cookie stops carrying
 //! it. A database error leaves the request anonymous and the cookie as it was: an
-//! outage must neither admit a revoked session nor sign everyone out.
+//! outage must neither admit a revoked session nor sign everyone out. [`Signed`] and
+//! [`Staff`] then answer 503 rather than sending the visitor to a sign-in page where
+//! signing in would fail too; [`Maybe`] reads as anonymous, since page chrome has
+//! nothing better to show.
 
 // The extractors answer from the extensions without awaiting; the trait is async.
 #![allow(clippy::unused_async_trait_impl)]
@@ -51,29 +54,40 @@ impl Accounts {
         next: Next,
     ) -> Response {
         let session = req.extensions().get::<Session<T>>().cloned();
-        let account = match session.as_ref().and_then(|s| s.read(SignedData::signature)) {
-            None => None,
+        let loaded = match session.as_ref().and_then(|s| s.read(SignedData::signature)) {
+            None => Loaded::Anonymous,
             Some(signature) => {
                 match store::by_id_in_epoch(&this.pool, signature.account, signature.epoch).await {
-                    Ok(Some(account)) => Some(account),
+                    Ok(Some(account)) => Loaded::Account(account),
                     Ok(None) => {
                         // Revoked: the cookie must stop carrying it.
                         if let Some(session) = &session {
                             session.update(|data| data.set_signature(None));
                         }
-                        None
+                        Loaded::Anonymous
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "the session's account could not be read");
-                        None
+                        Loaded::Unknown
                     }
                 }
             }
         };
-        req.extensions_mut().insert(Maybe(account));
+        req.extensions_mut().insert(loaded);
         req.extensions_mut().insert(SignInAt(this.sign_in.clone()));
         next.run(req).await
     }
+}
+
+/// What the layer found out, kept in the request's extensions.
+#[derive(Clone, Debug)]
+enum Loaded {
+    /// No signature, or a revoked one.
+    Anonymous,
+    /// A signature whose epoch still stands.
+    Account(Account),
+    /// A signature the database could not be asked about.
+    Unknown,
 }
 
 /// Where the sign-in page is, for the extractors' redirect.
@@ -87,10 +101,13 @@ pub struct Maybe(pub Option<Account>);
 
 impl Maybe {
     /// The account the request's extensions hold, or none if the layer is not
-    /// installed.
+    /// installed or could not read it.
     #[must_use]
     pub fn of(extensions: &axum::http::Extensions) -> Self {
-        extensions.get::<Self>().cloned().unwrap_or_default()
+        match extensions.get::<Loaded>() {
+            Some(Loaded::Account(account)) => Self(Some(account.clone())),
+            Some(Loaded::Anonymous | Loaded::Unknown) | None => Self(None),
+        }
     }
 }
 
@@ -102,7 +119,15 @@ impl<S: Send + Sync> FromRequestParts<S> for Maybe {
     }
 }
 
+/// The sentence a walled page answers with while the database is unreachable.
+const UNAVAILABLE: &str = "Signing in is unavailable for a moment. Please try again shortly.";
+
+/// The wall an anonymous visitor meets: the sign-in redirect, or 503 when the
+/// database could not say who they are, since the sign-in page would fail them too.
 fn wall(parts: &Parts) -> Error {
+    if matches!(parts.extensions.get::<Loaded>(), Some(Loaded::Unknown)) {
+        return Error::unavailable(UNAVAILABLE);
+    }
     let next = parts.uri.path_and_query().map_or("/", |p| p.as_str());
     let login = parts
         .extensions

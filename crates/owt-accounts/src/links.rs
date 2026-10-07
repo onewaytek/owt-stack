@@ -26,7 +26,12 @@ fn digest(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-/// Mint a link for `account_id`, good for `ttl`, with `reason` for the audit trail.
+/// The longest a link lives: a century. A `ttl` beyond it is capped here rather
+/// than taken to Postgres, where `now() + interval` overflows the timestamp range.
+pub const MAX_TTL: Duration = Duration::from_secs(100 * 366 * 24 * 60 * 60);
+
+/// Mint a link for `account_id`, good for `ttl` (at most [`MAX_TTL`]), with `reason`
+/// for the audit trail.
 pub async fn mint(
     db: impl PgExecutor<'_>,
     account_id: i64,
@@ -42,7 +47,8 @@ pub async fn mint(
     )
     .bind(digest(&token))
     .bind(account_id)
-    .bind(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX))
+    // A century of seconds fits an i64 many times over; the cast is lossless.
+    .bind(ttl.min(MAX_TTL).as_secs().cast_signed())
     .bind(reason)
     .execute(db)
     .await?;

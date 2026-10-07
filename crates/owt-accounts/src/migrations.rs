@@ -5,6 +5,12 @@
 //! its `migrations/` directory, under a version of its choosing (first: the app's
 //! tables reference `accounts`), and a test calls [`assert_installed`] so an edited
 //! or missing copy fails the build rather than the deploy.
+//!
+//! **A shipped migration is frozen.** sqlx records each applied file's checksum, and
+//! `migrate run` refuses a file whose checksum changed. An app re-copies these files
+//! when it upgrades, so a changed byte here (a comment, even) would fail every app's
+//! next deploy against a database that applied the old text. Every change to the
+//! schema is a new file appended to [`ALL`]; a test pins each file's SHA-256.
 
 use std::path::Path;
 
@@ -17,13 +23,23 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-/// Every migration, in order.
+/// Every migration, in order. Append; never edit a shipped entry (see the module
+/// docs).
 pub const ALL: &[Migration] = &[Migration {
     name: "owt_accounts",
     sql: include_str!("../migrations/0001_accounts.sql"),
 }];
 
-/// For this crate's own tests: the migrations as a migrator.
+/// The SHA-256 of each of [`ALL`], in order, as released. A changed digest means a
+/// shipped migration was edited, which breaks every app's next deploy: revert it and
+/// write the change as a new file, pinned here as a new entry.
+#[cfg(test)]
+const SHIPPED_SHA256: &[&str] =
+    &["743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4"];
+
+/// For this crate's own tests only. Do not run it against an app's database: sqlx
+/// keeps one migration ledger per database, and this one would fight the app's.
+#[doc(hidden)]
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;
@@ -81,7 +97,33 @@ pub fn assert_installed(dir: impl AsRef<Path>) {
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::*;
+
+    #[test]
+    fn shipped_migrations_are_frozen() {
+        assert_eq!(
+            ALL.len(),
+            SHIPPED_SHA256.len(),
+            "pin each migration's SHA-256 in SHIPPED_SHA256, in order"
+        );
+        for (migration, pinned) in ALL.iter().zip(SHIPPED_SHA256) {
+            let digest = Sha256::digest(migration.sql.as_bytes());
+            let hex = digest.iter().fold(String::new(), |mut s, b| {
+                use std::fmt::Write;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+            assert_eq!(
+                &hex, pinned,
+                "the shipped `{}` migration changed. Apps re-copy it and sqlx then refuses \
+                 the file at deploy, so revert the edit and write the change as a new \
+                 migration file (then pin that one)",
+                migration.name
+            );
+        }
+    }
 
     #[test]
     fn an_exact_copy_passes_and_an_edited_one_is_named() {

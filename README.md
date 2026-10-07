@@ -192,8 +192,10 @@ the handler and write `<script nonce="{{ nonce }}">`.
 
 Handlers return `owt_web::Result`. `NotFound` and internal errors carry a marker that
 the `error::error_pages` middleware swaps for the app's own pages; database errors are
-logged and never shown. An app may keep its own error enum in its domain's words and
-convert it with `impl From<AppError> for owt_web::Error`.
+logged and never shown. `Error::unavailable(..)` is the 503 for a request the app
+could not answer *for now* (a dependency down), distinct from a 500 fault in its code.
+An app may keep its own error enum in its domain's words and convert it with
+`impl From<AppError> for owt_web::Error`.
 
 A page's context carries the request (`RequestInfo`) and the flash messages, and
 derefs to the request, so templates write `layout.path` and `layout.query_with(..)`.
@@ -382,7 +384,15 @@ links are minted).
 `migrations/0001_owt_accounts.sql`, first, since the app's tables reference
 `accounts(id)`; a test calls `owt_accounts::migrations::assert_installed("migrations")`
 so an edited or missing copy fails the build. sqlx keeps one ledger per database, which
-is why the library does not run a migrator of its own.
+is why the library does not run a migrator of its own. A shipped migration never
+changes (sqlx would refuse the re-copied file at deploy, its checksum differing from
+the applied one): a later release appends a new entry to `ALL`, which the app copies
+as its next file, and a test here pins each file's SHA-256.
+
+**Logins:** a username is one token without `@`; an email always has one. So a login
+is never both, and nobody can register a username equal to someone else's email to
+shadow their sign-in. The table's `CHECK` enforces it on writes made around the
+library.
 
 ```rust,no_run
 # async fn demo(
@@ -400,6 +410,8 @@ let accounts = Accounts::new(pool.clone(), "/login");
 async fn home(Maybe(me): Maybe) -> String { me.map_or("hello".into(), |a| a.username) }
 async fn settings(Signed(me): Signed) -> String { me.username } // anonymous: 303 /login?next=…
 async fn admin(Staff(me): Staff) -> String { me.username } // signed in, not staff: 403
+// Database down: `Maybe` reads as anonymous, `Signed` and `Staff` answer 503 (the
+// sign-in page could not help), and the cookie keeps its signature for when it is back.
 let app: Router = Router::new()
     .route("/", get(home))
     .route("/settings", get(settings))
@@ -422,7 +434,7 @@ session::sign_out_everywhere(&pool, &session).await?; // every session: the epoc
 let ada = store::create(&pool, New {
     username: "Ada", email: "ada@example.com", password: Some("correct horse battery"), is_staff: false,
 }).await?;
-store::set_password(&pool, ada.id, "a different passphrase").await?; // signs out everywhere
+store::set_password(&pool, &ada, "a different passphrase").await?; // same rules; signs out everywhere
 store::set_staff(&pool, ada.id, true).await?; // revoking signs out; granting does not
 
 // A provider's identity (from `oauth::Client::complete`) becomes an account per policy:
@@ -432,7 +444,8 @@ if let Some(account) = identities::arrive(&pool, "google", &who, welcome).await?
     session::sign_in(&session, account);
 }
 
-// A one-time sign-in link, minted by an operator; only its SHA-256 is stored.
+// A one-time sign-in link, minted by an operator; only its SHA-256 is stored. The
+// lifetime is capped at `links::MAX_TTL`.
 let minted = links::mint(&pool, ada.id, std::time::Duration::from_secs(900), "new account").await?;
 let _url = format!("https://app.example/login/link/{}", minted.token);
 let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Refused::Link when spent

@@ -37,8 +37,9 @@ pub use store::{Account, New, normalize};
 /// who filled the form.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Refused {
-    /// The username is empty, too long, or has whitespace or control characters.
-    #[error("Enter a username: up to 150 characters, with no spaces.")]
+    /// The username is empty, too long, or has an `@`, whitespace or control
+    /// characters.
+    #[error("Enter a username: up to 150 characters, with no spaces and no “@”.")]
     Username,
     /// The email is not one address.
     #[error("Enter a valid email address.")]

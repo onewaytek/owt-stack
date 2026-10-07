@@ -144,8 +144,11 @@ async fn create_normalizes_refuses_duplicates_and_authenticate_opens_by_name_or_
     db.drop().await;
 }
 
+/// With self-signup, a username shaped like someone else's email would shadow their
+/// sign-in by email (the squatter's hash would be checked). No username has an `@`,
+/// in the library and in the table's constraint.
 #[tokio::test]
-async fn a_username_equal_to_another_accounts_email_opens_its_own_account() {
+async fn a_username_is_never_an_address_so_no_account_shadows_anothers_email() {
     let db = db!();
     let owner = store::create(
         &db.pool,
@@ -153,43 +156,53 @@ async fn a_username_equal_to_another_accounts_email_opens_its_own_account() {
     )
     .await
     .unwrap();
-    let squatter = store::create(
+    let err = store::create(
         &db.pool,
         new("shared@example.com", "", Some("lemon and ginger")),
     )
     .await
-    .unwrap();
-    let opened = store::authenticate(&db.pool, "shared@example.com", "lemon and ginger")
+    .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::Username));
+    let around_the_library = sqlx::query("INSERT INTO accounts (username) VALUES ('x@y')")
+        .execute(&db.pool)
+        .await
+        .unwrap_err();
+    assert!(
+        around_the_library
+            .as_database_error()
+            .is_some_and(sqlx::error::DatabaseError::is_check_violation),
+        "{around_the_library}"
+    );
+    let opened = store::authenticate(&db.pool, "shared@example.com", "tea and biscuits")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(opened.id, squatter.id);
-    let opened = store::authenticate(&db.pool, "shared@example.com", "tea and biscuits")
-        .await
-        .unwrap();
-    assert!(
-        opened.is_none(),
-        "the email login is shadowed, not opened by the owner's password"
-    );
-    assert_eq!(
-        store::by_email(&db.pool, "shared@example.com")
-            .await
-            .unwrap()
-            .unwrap()
-            .id,
-        owner.id
-    );
+    assert_eq!(opened.id, owner.id);
     db.drop().await;
 }
 
 #[tokio::test]
 async fn changing_the_password_deactivating_or_demoting_moves_the_epoch() {
     let db = db!();
-    let a = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
-        .await
-        .unwrap();
+    let a = store::create(
+        &db.pool,
+        new("ada", "ada@example.com", Some("correct horse battery")),
+    )
+    .await
+    .unwrap();
+    // A change meets the same rules as a sign-up, the similarity rule included.
+    for like in ["ada-forever", "ADA.example"] {
+        let err = store::set_password(&db.pool, &a, like).await.unwrap_err();
+        assert!(
+            matches!(
+                err.refused(),
+                Some(owt_accounts::Refused::Password(p)) if p.contains(&owt_accounts::password::Problem::Similar)
+            ),
+            "{like}: {err}"
+        );
+    }
     assert!(
-        store::set_password(&db.pool, a.id, "another good passphrase")
+        store::set_password(&db.pool, &a, "another good passphrase")
             .await
             .unwrap()
     );
@@ -238,8 +251,12 @@ async fn changing_the_password_deactivating_or_demoting_moves_the_epoch() {
         back.session_epoch, row.session_epoch,
         "re-activating changes no session"
     );
+    let gone = store::Account {
+        id: 999_999,
+        ..back
+    };
     assert!(
-        !store::set_password(&db.pool, 999_999, "another good passphrase")
+        !store::set_password(&db.pool, &gone, "another good passphrase")
             .await
             .unwrap()
     );
@@ -332,6 +349,35 @@ async fn the_layer_loads_the_account_walls_the_private_pages_and_drops_a_revoked
     let (_, data) = sessions.unseal(&resealed).expect("still a session");
     assert_eq!(session::Signed::signature(&data), None);
     assert_eq!(client.get("/private").await.status, 303);
+    db.drop().await;
+}
+
+/// With the database unreachable the layer can say neither "signed in" nor "revoked":
+/// the walled pages answer 503 (the sign-in page could not help), the open ones see
+/// an anonymous visitor, and the cookie keeps its signature for when it is back.
+#[tokio::test]
+async fn an_outage_answers_503_at_the_wall_and_keeps_the_cookie() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(app(&db, &sessions, Router::new()));
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let sealed = cookie_for(&sessions, &ada);
+    client.set_cookie("s", &sealed);
+    assert_eq!(client.get("/private").await.text(), "private for ada");
+
+    // The layer holds a clone of the pool; closing it fails every query from here on.
+    db.pool.close().await;
+    let r = client.get("/private").await;
+    assert_eq!(r.status, 503, "{}", r.text());
+    assert!(r.text().contains("try again"));
+    assert_eq!(client.get("/staff").await.status, 503);
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    let (_, data) = sessions
+        .unseal(&client.cookie("s").unwrap())
+        .expect("still a session");
+    assert_eq!(data.account, Some(ada.id), "the signature is not dropped");
     db.drop().await;
 }
 
@@ -478,7 +524,7 @@ async fn an_identity_arrives_by_link_then_by_verified_email_then_by_creation() {
         .await
         .unwrap_err();
     assert_eq!(err.refused(), Some(&owt_accounts::Refused::LastWayIn));
-    store::set_password(&db.pool, other.id, "a passphrase of her own")
+    store::set_password(&db.pool, &other, "a passphrase of her own")
         .await
         .unwrap();
     assert!(identities::unlink(&db.pool, other.id, only).await.unwrap());
@@ -490,6 +536,25 @@ async fn an_identity_arrives_by_link_then_by_verified_email_then_by_creation() {
         .await
         .unwrap();
     assert_eq!(arrival, identities::Arrival::Unknown);
+
+    // Its email is still taken (the unique index covers inactive rows) but no longer
+    // matched (by_email reads active ones): the same race as two first sign-ins with
+    // one address. The newcomer gets an account without the email, not a refusal.
+    let arrival = identities::arrive(
+        &db.pool,
+        "github",
+        &identity("h1", Some("ada@example.com"), true),
+        open,
+    )
+    .await
+    .unwrap();
+    let identities::Arrival::Created(third) = arrival else {
+        panic!("{arrival:?}")
+    };
+    assert_eq!(
+        (third.username.as_str(), third.email.as_str()),
+        ("adalovelace3", "")
+    );
     db.drop().await;
 }
 
@@ -518,6 +583,17 @@ async fn a_sign_in_link_opens_once_within_its_lifetime() {
         .await
         .unwrap();
     assert!(links::redeem(&db.pool, &expired.token, "x").await.is_err());
+    // An absurd lifetime is capped, not an "interval out of range" from Postgres.
+    let forever = links::mint(&db.pool, ada.id, Duration::MAX, "forever")
+        .await
+        .unwrap();
+    assert_eq!(
+        links::redeem(&db.pool, &forever.token, "x")
+            .await
+            .unwrap()
+            .id,
+        ada.id
+    );
 
     let voided = links::mint(&db.pool, ada.id, Duration::from_secs(600), "reset")
         .await

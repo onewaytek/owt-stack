@@ -5,8 +5,10 @@
 CREATE TABLE accounts (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     -- Stored lower-cased and trimmed; owt_accounts::normalize does it before every
-    -- lookup, so the constraint only guards writes made around the library.
-    username text NOT NULL UNIQUE CHECK (username = lower(btrim(username)) AND username <> ''),
+    -- lookup, so the constraint only guards writes made around the library. Never an
+    -- address: a login is a username or an email, and no value may be both.
+    username text NOT NULL UNIQUE
+        CHECK (username = lower(btrim(username)) AND username <> '' AND position('@' IN username) = 0),
     -- Optional; also a way to sign in. Unique where present, case-insensitively.
     email text NOT NULL DEFAULT '',
     -- Argon2 PHC string. Empty: no password opens this account (a provider identity

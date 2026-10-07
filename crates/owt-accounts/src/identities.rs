@@ -226,15 +226,16 @@ fn username_base(identity: &owt_auth::oauth::Identity) -> String {
 }
 
 /// Create an account named `base`, or `base2`, `base3`… if taken, or `base` with a
-/// random suffix after that.
-async fn create_for(pool: &PgPool, base: &str, email: &str) -> Result<Account> {
+/// random suffix after that. The email is dropped if another account takes it
+/// first: [`arrive`] checked it was free, but two first sign-ins with one address
+/// can race, and the loser still gets an account (without the email, as an
+/// unverified one would).
+async fn create_for(pool: &PgPool, base: &str, mut email: &str) -> Result<Account> {
     let mut candidates = std::iter::once(base.to_owned())
         .chain((2..=20).map(|n| format!("{base}{n}")))
         .chain(std::iter::once(format!("{base}-{}", random_suffix())));
+    let mut username = candidates.next().expect("the base is always there");
     loop {
-        let username = candidates
-            .next()
-            .expect("the random candidate is always there");
         let new = New {
             username: &username,
             email,
@@ -242,7 +243,14 @@ async fn create_for(pool: &PgPool, base: &str, email: &str) -> Result<Account> {
             is_staff: false,
         };
         match store::create(pool, new).await {
-            Err(crate::Error::Refused(Refused::UsernameTaken(_))) => {}
+            Err(crate::Error::Refused(Refused::UsernameTaken(_))) => {
+                username = candidates
+                    .next()
+                    .expect("the random candidate is always there");
+            }
+            Err(crate::Error::Refused(Refused::EmailTaken(_))) if !email.is_empty() => {
+                email = "";
+            }
             other => return other,
         }
     }

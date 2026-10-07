@@ -39,6 +39,11 @@ pub enum Error {
     /// 303 to this location: sign-in walls and the like.
     #[error("redirect to {0}")]
     Redirect(String),
+    /// 503: the request was fine and the service could not answer it for now (a
+    /// dependency is down). Unlike a 500 it says "try again shortly", and it is not
+    /// a fault in the app's code.
+    #[error("{0}")]
+    Unavailable(Cow<'static, str>),
     /// A database error; `RowNotFound` maps to 404, anything else to 500.
     #[error(transparent)]
     Db(#[from] sqlx::Error),
@@ -64,6 +69,11 @@ impl Error {
         Self::Unprocessable(msg.into())
     }
 
+    /// 503 with `msg`.
+    pub fn unavailable(msg: impl Into<Cow<'static, str>>) -> Self {
+        Self::Unavailable(msg.into())
+    }
+
     /// 303 to `login` with `?next=<next>`. The sign-in handler must pass what comes
     /// back through [`crate::redirect::local`] before redirecting to it.
     #[must_use]
@@ -85,6 +95,7 @@ impl Error {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Redirect(_) => StatusCode::SEE_OTHER,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Db(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -114,6 +125,10 @@ impl IntoResponse for Error {
             | Self::BadRequest(m)
             | Self::Unprocessable(m) => (status, plain(m.into_owned())).into_response(),
             Self::Redirect(to) => Redirect::to(&to).into_response(),
+            Self::Unavailable(m) => {
+                tracing::warn!(reason = %m, "service unavailable");
+                (status, plain(m.into_owned())).into_response()
+            }
             Self::Db(e) => {
                 tracing::error!(error = ?e, "database error");
                 marked(status, "Server error")
@@ -165,6 +180,10 @@ mod tests {
         assert_eq!(
             Error::unprocessable("x").status(),
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            Error::unavailable("x").status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 

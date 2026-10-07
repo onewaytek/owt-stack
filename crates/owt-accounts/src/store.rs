@@ -32,12 +32,16 @@ pub fn normalize(name: &str) -> String {
     name.trim().to_lowercase()
 }
 
+/// One token, no `@`. A login is a username or an email, so the two must not
+/// overlap: a username shaped like an address could be registered as a squatter's
+/// and shadow the real owner's email at sign-in. Every email has an `@` and no
+/// username does, so no login is ever both.
 fn valid_username(username: &str) -> bool {
     !username.is_empty()
         && username.chars().count() <= MAX_USERNAME_CHARS
         && !username
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
+            .any(|c| c == '@' || c.is_whitespace() || c.is_control())
 }
 
 /// One address: something before one `@`, something after, no whitespace. The
@@ -131,11 +135,10 @@ pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
 /// it refuses: that is what bounds guessing.
 pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<Option<Account>> {
     let login = normalize(login);
-    // A username may equal another account's email: the username match wins.
+    // At most one row: no username has an `@`, every email does, and each is unique.
     let row = sqlx::query_as::<_, (i64, String)>(
         "SELECT id, password_hash FROM accounts
-         WHERE is_active AND (username = $1 OR (email <> '' AND email = $1))
-         ORDER BY username = $1 DESC LIMIT 1",
+         WHERE is_active AND (username = $1 OR (email <> '' AND email = $1))",
     )
     .bind(&login)
     .fetch_optional(pool)
@@ -235,10 +238,16 @@ pub async fn has_password(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<bool
         .map(|has| has.unwrap_or(false))
 }
 
-/// Replace the password and sign the account out everywhere. `false` when there is
-/// no such account. Refuses a password that breaks a rule.
-pub async fn set_password(db: impl PgExecutor<'_>, id: i64, password: &str) -> Result<bool> {
-    let problems = password::check(password, &[]);
+/// Replace `account`'s password and sign it out everywhere. `false` when the row is
+/// gone. Refuses a password that breaks a rule, the similarity rule included: the
+/// account is passed, not its id, so its username and email are there to check
+/// against.
+pub async fn set_password(
+    db: impl PgExecutor<'_>,
+    account: &Account,
+    password: &str,
+) -> Result<bool> {
+    let problems = password::check(password, &[&account.username, &account.email]);
     if !problems.is_empty() {
         return Err(Refused::Password(problems).into());
     }
@@ -249,7 +258,7 @@ pub async fn set_password(db: impl PgExecutor<'_>, id: i64, password: &str) -> R
         "UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1 WHERE id = $2",
     )
     .bind(&hash)
-    .bind(id)
+    .bind(account.id)
     .execute(db)
     .await?;
     Ok(done.rows_affected() == 1)
@@ -323,10 +332,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn usernames_are_one_token_of_bounded_length() {
+    fn usernames_are_one_token_of_bounded_length_and_never_an_address() {
         assert!(valid_username("alice"));
-        assert!(valid_username("alice@example.com"));
         assert!(valid_username("ünïcödé"));
+        assert!(valid_username("alice.example.com"));
+        assert!(!valid_username("alice@example.com"));
+        assert!(!valid_username("@alice"));
         assert!(!valid_username(""));
         assert!(!valid_username("two words"));
         assert!(!valid_username("tab\there"));
