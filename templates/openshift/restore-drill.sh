@@ -54,7 +54,9 @@ EOF
 }
 
 psql_in() { # cluster, sql
-  oc_ns exec "$1-1" -c postgres -- psql -d app -v ON_ERROR_STOP=1 -qAtc "$2"
+  # As postgres: the pod runs under a random OpenShift UID, which peer authentication
+  # maps to postgres alone.
+  oc_ns exec "$1-1" -c postgres -- psql -U postgres -d app -v ON_ERROR_STOP=1 -qAtc "$2"
 }
 
 echo "== source cluster ($NS/$SRC, online=$ONLINE)"
