@@ -207,7 +207,6 @@ mod tests {
     #[tokio::test]
     async fn django_hashes_match_nothing_and_cost_nothing() {
         let digest = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        let started = std::time::Instant::now();
         for stored in [
             "pbkdf2_sha256$1$salt$".to_owned(),
             "pbkdf2_sha256$1000$saltsaltsalt$".to_owned(),
@@ -219,6 +218,12 @@ mod tests {
             "md5$salt$900150983cd24fb0d6963f7d28e17f72".to_owned(),
             "sha1$salt$a9993e364706816aba3e25717850c26c9cd0d89d".to_owned(),
         ] {
+            // Refused at the parse, so no key derivation runs for it: a wall-clock
+            // bound here would say the same thing, and fail under a loaded machine.
+            assert!(
+                PasswordHash::new(&stored).is_err(),
+                "{stored:?} parsed as a PHC string"
+            );
             assert!(!verify("anything", &stored).await, "{stored:?} matched");
             assert!(
                 !verify("", &stored).await,
@@ -229,11 +234,6 @@ mod tests {
                 "{stored:?} was not flagged for rehash"
             );
         }
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "a legacy hash was derived rather than refused: {:?}",
-            started.elapsed()
-        );
     }
 
     /// A caller that gives up (a request timeout, a closed connection) must not free
