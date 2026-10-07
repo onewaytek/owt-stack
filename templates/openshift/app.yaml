@@ -51,6 +51,37 @@ parameters:
   - name: METRICS_NAMESPACE
     description: The namespace whose Prometheus scrapes the metrics port.
     value: openshift-user-workload-monitoring
+  - name: SNAPSHOT_CLASS
+    description: >-
+      The VolumeSnapshotClass backups use (`oc get volumesnapshotclass`). Named,
+      because none is annotated as the default and CNPG asks for the default.
+    value: lvms-vg1
+  - name: BACKUP_SCHEDULE
+    description: >-
+      When the nightly backup runs. CNPG cron has six fields and leads with seconds:
+      a five-field line parses and means something else entirely.
+    value: "0 0 2 * * *"
+  - name: BACKUP_KEEP_DAYS
+    description: Backups older than this are pruned...
+    value: "14"
+  - name: BACKUP_KEEP_AT_LEAST
+    description: >-
+      ...but never the newest this many completed ones, so backups that stop
+      running are not all aged out and deleted on schedule.
+    value: "3"
+  - name: PRUNE_SCHEDULE
+    description: >-
+      When pruning runs (a five-field Kubernetes cron, UTC unless the cluster says
+      otherwise). After the nightly backup, so the floor counts tonight's: move it
+      with BACKUP_SCHEDULE.
+    value: "30 3 * * *"
+  - name: BACKUP_ONLINE
+    description: >-
+      Snapshot a running Postgres ("true") or stop it for the seconds the snapshot
+      takes ("false"). Online snapshots need a WAL archive to restore (the WAL from
+      the backup's start to its end is not in the snapshot), which these clusters
+      do not have, so the default is offline.
+    value: "false"
   - name: CNPG_NAMESPACE
     description: >-
       The namespace the CloudNativePG operator runs in (openshift-operators when
@@ -214,6 +245,150 @@ objects:
       resources:
         requests: {cpu: 100m, memory: 256Mi}
         limits: {memory: 512Mi}
+      # How backups are taken. This only makes one possible: nothing is taken until
+      # the ScheduledBackup below names the cluster.
+      backup:
+        volumeSnapshot:
+          className: ${SNAPSHOT_CLASS}
+          # Offline (cold) by default: with no WAL archive, an online snapshot lacks
+          # the WAL needed to make it consistent, and restores from it fail. On one
+          # instance this stops Postgres for the snapshot's few seconds, nightly.
+          online: ${{BACKUP_ONLINE}}
+          # Deleting a Backup takes its VolumeSnapshot with it, so the prune below
+          # reclaims disk instead of merely forgetting.
+          snapshotOwnerReference: backup
+
+  # Backups, nightly. A Cluster with `spec.backup` and no schedule looks exactly like
+  # a working arrangement until somebody needs a restore.
+  - apiVersion: postgresql.cnpg.io/v1
+    kind: ScheduledBackup
+    metadata:
+      name: ${NAME}-db-nightly
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      schedule: ${BACKUP_SCHEDULE}
+      # One at apply time too, so a fresh install is covered from the first day.
+      immediate: true
+      # The Backup outlives the ScheduledBackup that made it: editing the schedule
+      # must not delete the archive.
+      backupOwnerReference: none
+      cluster:
+        name: ${NAME}-db
+      method: volumeSnapshot
+
+  # Retention is a job, not a field: CNPG's `retentionPolicy` is barman-only and does
+  # nothing for volume snapshots. Without this, every snapshot ever taken stays in
+  # the volume group until it is full, and a full volume group stops the database
+  # rather than the backups.
+  - apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: ${NAME}-backup-prune
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: ${NAME}-backup-prune
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    rules:
+      # Backups and nothing else: the blast radius of a scheduled `oc delete` is this
+      # Role. A Backup's VolumeSnapshot goes with it through its ownerReference, so
+      # no permission on volumesnapshots is needed, or wanted.
+      - apiGroups: ["postgresql.cnpg.io"]
+        resources: ["backups"]
+        verbs: ["list", "delete"]
+  - apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: ${NAME}-backup-prune
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: ${NAME}-backup-prune
+    subjects:
+      - kind: ServiceAccount
+        name: ${NAME}-backup-prune
+  - apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: ${NAME}-backup-prune
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      # After the nightly backup, so the floor counts tonight's.
+      schedule: ${PRUNE_SCHEDULE}
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 3
+      startingDeadlineSeconds: 300
+      jobTemplate:
+        spec:
+          backoffLimit: 0
+          template:
+            spec:
+              serviceAccountName: ${NAME}-backup-prune
+              restartPolicy: Never
+              containers:
+                - name: prune
+                  image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+                  resources:
+                    requests: {cpu: 50m, memory: 128Mi}
+                    limits: {cpu: 200m, memory: 256Mi}
+                  securityContext:
+                    runAsNonRoot: true
+                    allowPrivilegeEscalation: false
+                    capabilities: {drop: [ALL]}
+                    seccompProfile: {type: RuntimeDefault}
+                  # Values reach the script through the environment: the template
+                  # substitutes ${PARAMETERS}, so the script itself uses none.
+                  env:
+                    - {name: CLUSTER, value: "${NAME}-db"}
+                    - {name: KEEP_DAYS, value: "${BACKUP_KEEP_DAYS}"}
+                    - {name: KEEP_AT_LEAST, value: "${BACKUP_KEEP_AT_LEAST}"}
+                  # bash, with pipefail and each step's output in a file: a prune that
+                  # fails (RBAC, the API, a parse error) must fail the Job. A Job that
+                  # completes having pruned nothing is how the volume group fills.
+                  command:
+                    - /bin/bash
+                    - -c
+                    - |
+                      set -euo pipefail
+                      oc get backups.postgresql.cnpg.io -o json > /tmp/backups.json
+                      python3 - /tmp/backups.json > /tmp/doomed <<'PY'
+                      import datetime, json, os, sys
+                      keep_days = int(os.environ["KEEP_DAYS"])
+                      keep_at_least = int(os.environ["KEEP_AT_LEAST"])
+                      cluster = os.environ["CLUSTER"]
+                      now = datetime.datetime.now(datetime.timezone.utc)
+                      with open(sys.argv[1]) as f:
+                          items = json.load(f)["items"]
+                      mine = [b for b in items
+                              if ((b.get("spec") or {}).get("cluster") or {}).get("name") == cluster]
+                      # A failed backup holds nothing, so it never counts towards
+                      # the floor: three failures must not let the last good one go.
+                      done = sorted(
+                          (b for b in mine if (b.get("status") or {}).get("phase") == "completed"),
+                          key=lambda b: b["metadata"]["creationTimestamp"], reverse=True)
+                      protected = {b["metadata"]["name"] for b in done[:keep_at_least]}
+                      for b in mine:
+                          if b["metadata"]["name"] in protected:
+                              continue
+                          # The image runs python 3.9, whose fromisoformat reads no Z.
+                          stamp = b["metadata"]["creationTimestamp"].replace("Z", "+00:00")
+                          if (now - datetime.datetime.fromisoformat(stamp)).days >= keep_days:
+                              print(b["metadata"]["name"])
+                      PY
+                      echo "pruning $(wc -l < /tmp/doomed) of $CLUSTER's backups"
+                      while read -r doomed; do
+                        [ -n "$doomed" ] || continue
+                        echo "deleting $doomed"
+                        oc delete backups.postgresql.cnpg.io "$doomed"
+                      done < /tmp/doomed
 
   # Who may connect. Without these, every pod in every namespace can reach the app
   # (around the Route), its metrics and its database. A pod selected by a policy

@@ -1,0 +1,77 @@
+# Prometheus scraping for an app deployed from app.yaml, through OpenShift's
+# user-workload monitoring: the app's /metrics (its `metrics` port, 9464) and the
+# CloudNativePG instances' Postgres metrics (9187).
+#
+#   oc process -f monitoring.yaml -p NAME=pets -p NAMESPACE=pets | oc apply -f -
+#
+# Separate from app.yaml because applying it needs more than the namespace: creating
+# ServiceMonitors and PodMonitors takes the `monitoring-edit` role, and user-workload
+# monitoring must be enabled on the cluster (cluster-monitoring-config's
+# enableUserWorkload). A namespace admin without it applies app.yaml alone, and
+# hands this to a cluster admin.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: owt-app-monitoring
+  annotations:
+    description: Prometheus scraping for an owt-stack app and its Postgres.
+parameters:
+  - name: NAME
+    description: The app's name, as given to app.yaml.
+    required: true
+  - name: NAMESPACE
+    required: true
+  - name: INTERVAL
+    description: How often Prometheus scrapes.
+    value: 30s
+  - name: METRICS_NAMESPACE
+    description: The namespace whose Prometheus scrapes, as given to app.yaml.
+    value: openshift-user-workload-monitoring
+objects:
+  # The app's own metrics: the Service's `metrics` port, which app.yaml's
+  # NetworkPolicy already opens to METRICS_NAMESPACE.
+  - apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: ${NAME}
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      selector:
+        matchLabels: {app: "${NAME}"}
+      endpoints:
+        - port: metrics
+          path: /metrics
+          interval: ${INTERVAL}
+
+  # Postgres, from each CloudNativePG instance's exporter.
+  - apiVersion: monitoring.coreos.com/v1
+    kind: PodMonitor
+    metadata:
+      name: ${NAME}-db
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      selector:
+        matchLabels: {cnpg.io/cluster: "${NAME}-db"}
+      podMetricsEndpoints:
+        - port: metrics
+          interval: ${INTERVAL}
+
+  # app.yaml's database NetworkPolicy opens only Postgres and the operator's status
+  # port; the exporter needs its own rule, for Prometheus alone.
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME}-db-metrics
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      podSelector:
+        matchLabels: {cnpg.io/cluster: "${NAME}-db"}
+      policyTypes: [Ingress]
+      ingress:
+        - from:
+            - namespaceSelector:
+                matchLabels: {kubernetes.io/metadata.name: "${METRICS_NAMESPACE}"}
+          ports: [{port: 9187}]
