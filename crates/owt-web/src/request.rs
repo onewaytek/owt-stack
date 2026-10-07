@@ -68,9 +68,8 @@ impl RequestInfo {
     }
 
     /// This request's query with `key` set to `value` (or removed, for `None`), as
-    /// `?...`: pagination and filter links that keep the rest of the query. When
-    /// nothing is left, the path alone: an unfiltered page then has one URL (and one
-    /// cache entry), not `/items` and `/items?`.
+    /// `?...`: the rest of the query kept. Always begins with `?`, so it appends to a
+    /// path; `?` alone when nothing is left. For a link, see [`Self::url_with`].
     #[must_use]
     pub fn query_with(&self, key: &str, value: Option<&str>) -> String {
         let mut ser = url::form_urlencoded::Serializer::new(String::new());
@@ -80,13 +79,47 @@ impl RequestInfo {
         if let Some(v) = value {
             ser.append_pair(key, v);
         }
-        let query = ser.finish();
-        if query.is_empty() && !self.path.is_empty() {
+        format!("?{}", ser.finish())
+    }
+
+    /// A link to this page with `key` set to `value` (or removed, for `None`): the
+    /// path and the rest of the query, `/items?q=cats&page=4`. When nothing is left of
+    /// the query, the path alone, so an unfiltered page has one URL (and one cache
+    /// entry), not `/items` and `/items?`. Pagination and filter links.
+    ///
+    /// Root-relative, so it means the same wherever it is rendered, a page or a
+    /// fragment swapped into one; a fragment handler calls [`Self::for_page`] first.
+    /// With no path known (a `RequestInfo` built by hand), the query alone, `?`
+    /// keeping the current path.
+    #[must_use]
+    pub fn url_with(&self, key: &str, value: Option<&str>) -> String {
+        let query = self.query_with(key, value);
+        if self.path.is_empty() {
+            query
+        } else if query == "?" {
             self.path.clone()
         } else {
-            // `?` alone keeps the current path with no query; with no path known (a
-            // `RequestInfo` built by hand), it is the only link that still means that.
-            format!("?{query}")
+            format!("{}{query}", self.path)
+        }
+    }
+
+    /// This request, as the page at `path` sees it: the path swapped, the query and
+    /// the htmx flags kept. A fragment handler (`GET /items/rows?page=2`) re-paths the
+    /// request to its page (`/items`) once and renders from that, so pagination links,
+    /// navigation's "you are here" and [`Fragment::page`](crate::fragment::Fragment::page)
+    /// all speak of the page, never the bare fragment. Leading slashes collapse to one,
+    /// as in [`Self::at`]; a query in `path` is dropped.
+    #[must_use]
+    pub fn for_page(&self, path: &str) -> Self {
+        let path = path.split_once('?').map_or(path, |(p, _)| p);
+        let uri = match self.full_path.split_once('?') {
+            Some((_, query)) => format!("{path}?{query}"),
+            None => path.to_owned(),
+        };
+        Self {
+            is_htmx: self.is_htmx,
+            is_boosted: self.is_boosted,
+            ..Self::at(&uri)
         }
     }
 
@@ -158,14 +191,70 @@ mod tests {
         );
         assert_eq!(r.query_with("page", None), "?state=active&state=done");
         assert_eq!(
-            RequestInfo::at("/games/?page=2").query_with("page", None),
+            r.url_with("page", Some("4")),
+            "/games/?state=active&state=done&page=4"
+        );
+    }
+
+    #[test]
+    fn a_link_with_nothing_left_of_the_query_is_the_path() {
+        let r = RequestInfo::at("/games/?page=2");
+        assert_eq!(
+            r.query_with("page", None),
+            "?",
+            "a query always begins with `?`"
+        );
+        assert_eq!(
+            r.url_with("page", None),
             "/games/",
             "nothing left: the path, not `?`"
         );
+        assert_eq!(r.url_with("page", Some("3")), "/games/?page=3");
         assert_eq!(
-            RequestInfo::default().query_with("page", None),
+            RequestInfo::default().url_with("page", None),
             "?",
             "no path known: never an empty href, which would keep the query"
+        );
+        assert_eq!(
+            RequestInfo::default().url_with("page", Some("2")),
+            "?page=2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fragment_request_re_pathed_to_its_page() {
+        let (mut parts, ()) = Request::get("/items/rows?q=cats&page=2")
+            .header("hx-request", "true")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let fragment = RequestInfo::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        let page = fragment.for_page("/items");
+        assert_eq!(
+            (page.path.as_str(), page.full_path.as_str()),
+            ("/items", "/items?q=cats&page=2")
+        );
+        assert_eq!(page.query, fragment.query);
+        assert!(page.is_htmx && !page.is_boosted, "the htmx flags stay");
+        assert_eq!(page.url_with("page", None), "/items?q=cats");
+        assert_eq!(page.url_with("page", Some("3")), "/items?q=cats&page=3");
+        assert!(page.is_under("/items") && !page.is_under("/items/rows"));
+        assert_eq!(
+            RequestInfo::at("/rows").for_page("/items").full_path,
+            "/items"
+        );
+        assert_eq!(
+            RequestInfo::at("/rows?a=1")
+                .for_page("/items?b=2")
+                .full_path,
+            "/items?a=1",
+            "a query in the page path is dropped"
+        );
+        assert_eq!(
+            RequestInfo::at("/rows").for_page("//evil.example/x").path,
+            "/evil.example/x"
         );
     }
 

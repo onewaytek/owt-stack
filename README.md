@@ -194,7 +194,8 @@ logged and never shown. An app may keep its own error enum in its domain's words
 convert it with `impl From<AppError> for owt_web::Error`.
 
 A page's context carries the request (`RequestInfo`) and the flash messages, and
-derefs to the request, so templates write `layout.path` and `layout.query_with(..)`.
+derefs to the request, so templates write `layout.path` and `layout.url_with(..)` (a
+link to this page with one query parameter changed, the rest kept).
 
 ```rust
 use askama::Template;
@@ -221,7 +222,7 @@ impl std::ops::Deref for Layout {
 #[derive(Template)]
 #[template(ext = "html", source = r#"
 {%- for m in layout.messages %}<p class="{{ m.level().as_str() }}">{{ m.text() }}</p>{% endfor -%}
-<a href="{{ layout.query_with("page", Some("2")) }}">Next</a>"#)]
+<a href="{{ layout.url_with("page", Some("2")) }}">Next</a>"#)]
 struct Games { layout: Layout }
 
 async fn games(request: RequestInfo, session: Session<SessionData>) -> owt_web::Result<Html<String>> {
@@ -239,27 +240,38 @@ async fn save(session: Session<SessionData>) -> axum::response::Redirect {
 A fragment lives at a URL of its own, never the page's URL negotiated on
 `HX-Request`: a CDN that ignores `Vary` (Cloudflare) would serve one variant for the
 other. Render both from one loader, and have the page `{% include %}` the fragment's
-partial.
+partial. The fragment handler re-paths its request to the page once
+(`request.for_page("/map")`) and renders from that: the links the loader builds
+(pagination, `url_with`), navigation's "you are here" and the URL pushed to history
+then all name the page, never the bare fragment, and `Fragment::page` takes that
+re-pathed request so there is no second copy of the page's URL to keep in step.
 
 ```rust
 use askama::Template;
 use axum::{http::HeaderValue, response::{IntoResponse, Response}};
-use owt_web::fragment::{Fragment, reselect};
+use owt_web::{fragment::{Fragment, reselect}, request::RequestInfo};
 
 #[derive(Template)]
 #[template(ext = "html", source = r#"<section id="viewport">{{ x }},{{ y }}</section>"#)]
 struct Viewport { x: i64, y: i64 }
 
+/// The one loader: `request` is the page's, whichever URL asked.
+fn viewport(request: &RequestInfo) -> Viewport {
+    let at = |k| request.query_value(k).and_then(|v| v.parse().ok()).unwrap_or(0);
+    Viewport { x: at("x"), y: at("y") }
+}
+
 /// `GET /map?x=..&y=..`: the whole page.
-async fn page() -> owt_web::Result<Response> {
-    let body = owt_web::render(&Viewport { x: 1, y: 2 })?;
+async fn page(request: RequestInfo) -> owt_web::Result<Response> {
+    let body = owt_web::render(&viewport(&request))?;
     // A stale client that htmx-requests this URL swaps only #viewport out of it.
     Ok(([reselect("#viewport")], body).into_response())
 }
 
-/// `GET /map/view?x=..&y=..`: the fragment, recorded in history as the page's URL.
-async fn view() -> owt_web::Result<Fragment> {
-    Fragment::render(&Viewport { x: 1, y: 2 }, HeaderValue::from_static("no-store"))?.page("/map?x=1&y=2")
+/// `GET /map/view?x=..&y=..`: the fragment, recorded in history as `/map?x=..&y=..`.
+async fn view(request: RequestInfo) -> owt_web::Result<Fragment> {
+    let request = request.for_page("/map");
+    Fragment::render(&viewport(&request), HeaderValue::from_static("no-store"))?.page(&request)
 }
 ```
 
@@ -558,7 +570,8 @@ let page = SignIn {
 };
 let html = page.render()?;
 assert!(html.contains(r#"<div class="owt-alert owt-alert-info" role="status">"#));
-assert!(html.contains(r#"href="?page=3""#)); // query-only: the page keeps its path
+assert!(html.contains(r#"href="/people?page=3""#)); // root-relative: the same link in a fragment
+assert!(html.contains(r#"href="/people""#)); // page 1 has one URL, not `/people?page=1`
 
 // The body of a 404 or 500, for the app's error shell (see `error_pages`).
 let body = ErrorBody::for_status(axum::http::StatusCode::NOT_FOUND).render()?;

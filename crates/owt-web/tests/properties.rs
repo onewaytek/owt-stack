@@ -222,8 +222,25 @@ proptest! {
             i.query.iter().filter(|(k, _)| *k != key).cloned().collect::<Vec<_>>()
         };
         prop_assert_eq!(others(&again), others(&info));
-        let without = RequestInfo::at(&format!("/x{}", info.query_with(&key, None)));
+        let without_query = info.query_with(&key, None);
+        prop_assert!(without_query.starts_with('?'));
+        let without = RequestInfo::at(&format!("/x{without_query}"));
         prop_assert_eq!(without.query_value(&key), None);
+        // A link is the path and that query, and reads back as the same request.
+        for value in [Some(value.as_str()), None] {
+            let link = info.url_with(&key, value);
+            prop_assert!(!link.starts_with("//"), "{link:?}");
+            prop_assert!(link.starts_with(&info.path), "{link:?}");
+            prop_assert!(!link.ends_with('?') || info.path.is_empty(), "{link:?}");
+            let linked = RequestInfo::at(&link);
+            prop_assert_eq!(&linked.path, &info.path);
+            prop_assert_eq!(linked.query_value(&key), value);
+            prop_assert_eq!(others(&linked), others(&info));
+        }
+        // Re-pathed to a page, only the path changes.
+        let page = info.for_page("/p");
+        prop_assert_eq!(page.path.as_str(), "/p");
+        prop_assert_eq!(&page.query, &info.query);
     }
 
     /// Text made into paragraphs holds no markup but the paragraphs' own.
@@ -268,7 +285,7 @@ proptest! {
     #[test]
     fn a_fragments_page_url_is_a_header_or_an_error(url in hostile()) {
         let fragment = owt_web::fragment::Fragment::new("", HeaderValue::from_static("no-store"));
-        if let Ok(fragment) = fragment.page(&url) {
+        if let Ok(fragment) = fragment.page(&RequestInfo::at(&url)) {
             let response = fragment.into_response();
             let pushed = response.headers()["hx-push-url"].as_bytes();
             prop_assert!(pushed.iter().all(|b| (0x20..0x7f).contains(b) || *b == b'\t'));

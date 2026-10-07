@@ -213,6 +213,12 @@ pub struct Item {
 
 /// Page links for a [`Pager`]: previous, first, a gap, the pages near this one, a
 /// gap, last, next; the rest of the query string kept. Nothing for one page.
+///
+/// Links are root-relative (`/items?q=cats&page=4`), built with
+/// [`RequestInfo::url_with`], so they are the same links in a page and in a fragment
+/// swapped into it. A fragment handler renders from the request re-pathed to its
+/// page with [`RequestInfo::for_page`]; otherwise page 1, which has no query to
+/// carry, would link to the bare fragment.
 #[derive(Template, Clone, Debug)]
 #[template(
     source = r#"{% if pager.is_paginated() %}<nav class="owt-pager" aria-label="Pages">
@@ -251,7 +257,7 @@ impl<'a> Pagination<'a> {
     #[must_use]
     pub fn href(&self, n: usize) -> String {
         let value = (n != 1).then(|| n.to_string());
-        self.request.query_with(self.param, value.as_deref())
+        self.request.url_with(self.param, value.as_deref())
     }
 
     /// The row, in order: what the template prints. Empty for one page.
@@ -514,12 +520,12 @@ mod tests {
         assert_eq!(
             hrefs,
             [
-                "?q=cats&#38;page=4",
-                "?q=cats", // page 1 has no second URL
-                "?q=cats&#38;page=4",
-                "?q=cats&#38;page=6",
-                "?q=cats&#38;page=10",
-                "?q=cats&#38;page=6",
+                "/items?q=cats&#38;page=4",
+                "/items?q=cats", // page 1 has no second URL
+                "/items?q=cats&#38;page=4",
+                "/items?q=cats&#38;page=6",
+                "/items?q=cats&#38;page=10",
+                "/items?q=cats&#38;page=6",
             ],
             "{html}"
         );
@@ -558,7 +564,7 @@ mod tests {
         assert_eq!(texts, ["‹Previous page", "1", "2"], "{html}");
         // No query left for page 1: the path itself, not `?`.
         assert_eq!(got[1].0, "/items");
-        assert_eq!(got[2].0, "?page=2");
+        assert_eq!(got[2].0, "/items?page=2");
         assert_eq!(
             Pagination::new(
                 Pager {
@@ -570,6 +576,27 @@ mod tests {
             .render()
             .unwrap(),
             ""
+        );
+    }
+
+    #[test]
+    fn pagination_in_a_fragment_links_to_the_page() {
+        // Rendered by `GET /items/rows?page=2`, re-pathed to the page it belongs to.
+        let request = RequestInfo::at("/items/rows?page=2").for_page("/items");
+        let html = Pagination::new(
+            Pager {
+                number: 2,
+                pages: 3,
+            },
+            &request,
+        )
+        .render()
+        .unwrap();
+        let hrefs: Vec<String> = links(&html).into_iter().map(|(h, _)| h).collect();
+        assert_eq!(
+            hrefs,
+            ["/items", "/items", "/items?page=3", "/items?page=3"],
+            "page 1 is the page, never the bare fragment: {html}"
         );
     }
 
