@@ -422,6 +422,9 @@ use owt_auth::throttle::Throttle;
 // signed-in account if its epoch still matches. The extractors read it from the
 // request, so a handler and a page-chrome helper cost one query between them.
 let accounts = Accounts::new(pool.clone(), "/login");
+// `?next=` is the URL the client asked for, prefix included under `Router::nest`. An
+// app whose pages sit under prefixes with a sign-in page each (`/en/login`,
+// `/es/login`) installs the layer on each nested router with its own path.
 async fn home(Maybe(me): Maybe) -> String { me.map_or("hello".into(), |a| a.username) }
 async fn settings(Signed(me): Signed) -> String { me.username } // anonymous: 303 /login?next=…
 async fn admin(Staff(me): Staff) -> String { me.username } // signed in, not staff: 403

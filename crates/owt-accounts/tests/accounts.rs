@@ -1,4 +1,5 @@
-//! The crate against a real Postgres (`DATABASE_URL`); skipped without it. Each
+//! The crate against a real Postgres (`DATABASE_URL`); skipped without it, but for
+//! the nested-router wall test, which asks nothing of the database. Each
 //! test takes a schema of its own, so they run in parallel and leave nothing.
 
 use std::sync::Arc;
@@ -615,4 +616,38 @@ async fn a_sign_in_link_opens_once_within_its_lifetime() {
         .unwrap();
     assert!(stored.iter().all(|d| d.len() == 32));
     db.drop().await;
+}
+
+/// The wall under `Router::nest` names the whole path in `?next=`, prefix included.
+/// No database is asked: an anonymous request makes no query, so the pool never
+/// connects, and this test runs without `DATABASE_URL`.
+#[tokio::test]
+async fn the_wall_under_a_nested_router_keeps_the_prefix_in_next() {
+    async fn private(_: Signed) -> &'static str {
+        "hi"
+    }
+    async fn staff(_: Staff) -> &'static str {
+        "hi"
+    }
+    let pool = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+    let app = Router::new()
+        .nest(
+            "/es",
+            Router::new()
+                .route("/profile", get(private))
+                .route("/admin", get(staff)),
+        )
+        .layer(from_fn_with_state(
+            Accounts::new(pool, "/es/login"),
+            Accounts::load::<Data>,
+        ));
+    let client = owt_test::Client::new(app);
+    let r = client.get("/es/profile?tab=2").await;
+    assert_eq!(r.status, 303);
+    assert_eq!(
+        r.location(),
+        Some("/es/login?next=%2Fes%2Fprofile%3Ftab%3D2")
+    );
+    let r = client.get("/es/admin").await;
+    assert_eq!(r.location(), Some("/es/login?next=%2Fes%2Fadmin"));
 }
