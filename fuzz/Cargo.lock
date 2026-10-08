@@ -1600,7 +1600,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "owt-auth"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "owt-fuzz"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arbitrary",
  "axum",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "owt-web"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "askama",
