@@ -37,18 +37,18 @@ file as its docs), so an API change that breaks these instructions fails CI.
 <!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.0" }
-owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.0" }
+owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
+owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
 # As needed:
-owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.0" }
-owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.0" }
-owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.0" }
+owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
+owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
+owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
 
 [dev-dependencies]
-owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.0" }
+owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
 ```
 <!-- x-release-please-end -->
 
@@ -777,7 +777,7 @@ audit, sqlx, clippy and test steps.
 ```yaml
 jobs:
   checks:
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.4.0
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.4.1
     with:
       check-command: just check
       database: myapp        # empty for no Postgres
@@ -821,12 +821,12 @@ jobs:
   release:
     needs: ci
     permissions: {contents: write, issues: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/release.yml@v0.4.0
+    uses: onewaytek/owt-stack/.github/workflows/release.yml@v0.4.1
   image:
     needs: release
     if: needs.release.outputs.version != ''
     permissions: {contents: read, packages: write}
-    uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.4.0
+    uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.4.1
     with: {version: "${{ needs.release.outputs.version }}"}
     secrets: inherit
 ```
@@ -849,14 +849,14 @@ jobs:
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.4.0
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.4.1
     with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}"}
 # in release.yml
   sync-rc:
     needs: release
     if: github.ref_name == 'main'
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.4.0
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.4.1
     with: {source: main, dispatch-release: false}
 ```
 <!-- x-release-please-end -->
@@ -927,7 +927,7 @@ the exporter's port to Prometheus alone.
 
 <!-- x-release-please-start-version -->
 ```json
-"devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.4.0" }
+"devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.4.1" }
 ```
 <!-- x-release-please-end -->
 

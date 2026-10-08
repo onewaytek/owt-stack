@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1](https://github.com/onewaytek/owt-stack/compare/v0.4.0...v0.4.1) (2026-10-08)
+
+
+### Features
+
+* **web:** `Fragment::replace` rewrites the history entry instead of pushing ([#23](https://github.com/onewaytek/owt-stack/issues/23)) ([acf18bc](https://github.com/onewaytek/owt-stack/commit/acf18bcfdfcf23bb283f381db460631d5bd1012f))
+
+
+### Bug Fixes
+
+* **accounts:** the sign-in wall keeps a nest prefix in `?next=` ([#22](https://github.com/onewaytek/owt-stack/issues/22)) ([2b4db77](https://github.com/onewaytek/owt-stack/commit/2b4db77b4b6fb266482db84f75fa7902eab0b860))
+
 ## [0.4.0](https://github.com/onewaytek/owt-stack/compare/v0.3.0...v0.4.0) (2026-10-07)
 
 
