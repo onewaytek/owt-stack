@@ -282,6 +282,12 @@ async fn view(request: RequestInfo) -> owt_web::Result<Fragment> {
 }
 ```
 
+`Fragment::page` pushes a history entry, for a step a person would want Back to undo.
+A fragment fetched while someone types or adjusts a filter uses `Fragment::replace`
+with the same re-pathed request, so the address bar follows the typing while Back
+leaves the page rather than retracing every request. htmx reads these headers before
+the element's `hx-push-url` and `hx-replace-url`, so the choice is the handler's.
+
 The fragment's cache policy is a required argument; use `no-store` for anything that
 differs per person. A response that sets the session cookie is `no-store` whatever it
 asked for, so a public fragment never hands one person's session to a cache. Test that page and fragment agree with `owt_test::fragment`
