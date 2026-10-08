@@ -18,7 +18,7 @@
 //! | [`client_ip`] | the client's address behind proxies, by configuration |
 //! | [`limits`] | a response deadline and a request body cap |
 //! | [`htmx`] | `axum-htmx`'s extractors and responders, re-exported |
-//! | [`fragment`] | htmx fragments at their own URLs: `HX-Push-Url`, `HX-Reselect`, no `Vary` |
+//! | [`fragment`] | htmx fragments at their own URLs: `HX-Push-Url` or `HX-Replace-Url`, `HX-Reselect`, no `Vary` |
 //! | [`sse`] | event framing and the stream response |
 //! | [`pager`], [`text`] | page arithmetic; slugs, word truncation, paragraphs |
 

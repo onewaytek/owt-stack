@@ -280,15 +280,21 @@ proptest! {
         prop_assert_eq!(pager.has_next(), pager.number < pager.pages);
     }
 
-    /// A push URL either becomes a header or is refused; it never panics, and what
-    /// it sends is plain ASCII.
+    /// A history URL, pushed or replaced, either becomes its header or is refused; it
+    /// never panics, what it sends is plain ASCII, and both ways send the same bytes.
     #[test]
     fn a_fragments_page_url_is_a_header_or_an_error(url in hostile()) {
-        let fragment = owt_web::fragment::Fragment::new("", HeaderValue::from_static("no-store"));
-        if let Ok(fragment) = fragment.page(&RequestInfo::at(&url)) {
-            let response = fragment.into_response();
-            let pushed = response.headers()["hx-push-url"].as_bytes();
-            prop_assert!(pushed.iter().all(|b| (0x20..0x7f).contains(b) || *b == b'\t'));
+        use owt_web::fragment::Fragment;
+        let page = RequestInfo::at(&url);
+        let new = || Fragment::new("", HeaderValue::from_static("no-store"));
+        let pushed = new().page(&page).map(IntoResponse::into_response);
+        let replaced = new().replace(&page).map(IntoResponse::into_response);
+        prop_assert_eq!(pushed.is_ok(), replaced.is_ok());
+        if let (Ok(pushed), Ok(replaced)) = (pushed, replaced) {
+            let sent = pushed.headers()["hx-push-url"].as_bytes();
+            prop_assert!(sent.iter().all(|b| (0x20..0x7f).contains(b) || *b == b'\t'));
+            prop_assert_eq!(sent, replaced.headers()["hx-replace-url"].as_bytes());
+            prop_assert!(replaced.headers().get("hx-push-url").is_none());
         }
     }
 }

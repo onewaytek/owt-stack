@@ -6,9 +6,14 @@
 //! every header here is the same for every client, and both URLs stay cacheable.
 //!
 //! * [`Fragment`] answers the fragment URL. It names the page the fragment belongs to
-//!   (`HX-Push-Url`), so history, reload and shared links land on the whole page,
-//!   never the bare fragment. It is `noindex`, and it takes its cache policy as an
-//!   argument: a fragment cannot ship without one.
+//!   ([`Fragment::page`] pushes a history entry, [`Fragment::replace`] rewrites the
+//!   current one), so history, reload and shared links land on the whole page, never
+//!   the bare fragment. It is `noindex`, and it takes its cache policy as an argument:
+//!   a fragment cannot ship without one. Push for a step a person would want Back
+//!   to undo (a page, a tab, opening an item); replace for refining what is already
+//!   on screen (typing in a search box, a filter), or Back walks through every
+//!   keystroke. htmx reads these headers before the element's `hx-push-url` and
+//!   `hx-replace-url`, so the choice is the handler's.
 //! * The handler re-paths its request to the page once
 //!   ([`RequestInfo::for_page`]) and renders from that: pagination links, navigation
 //!   and the push URL then all name the page, with nothing else to keep in step.
@@ -29,17 +34,19 @@ use axum::response::{Html, IntoResponse, Response};
 use crate::request::RequestInfo;
 
 const HX_PUSH_URL: HeaderName = HeaderName::from_static("hx-push-url");
+const HX_REPLACE_URL: HeaderName = HeaderName::from_static("hx-replace-url");
 const HX_RESELECT: HeaderName = HeaderName::from_static("hx-reselect");
 const X_ROBOTS_TAG: HeaderName = HeaderName::from_static("x-robots-tag");
 
 /// A fragment response. Build it with [`Fragment::render`], then name its page with
-/// [`Fragment::page`] if swapping it should move the address bar.
+/// [`Fragment::page`] or [`Fragment::replace`] if swapping it should move the
+/// address bar.
 #[derive(Debug)]
 #[must_use]
 pub struct Fragment {
     body: String,
     cache: HeaderValue,
-    page: Option<HeaderValue>,
+    history: Option<(HeaderName, HeaderValue)>,
 }
 
 impl Fragment {
@@ -48,7 +55,7 @@ impl Fragment {
         Self {
             body: body.into(),
             cache: cache_control,
-            page: None,
+            history: None,
         }
     }
 
@@ -57,12 +64,25 @@ impl Fragment {
         Ok(Self::new(crate::render(t)?.0, cache_control))
     }
 
-    /// The page this fragment shows a state of: htmx records its path and query in
-    /// history (`HX-Push-Url`). `page` is the fragment's request re-pathed to the
-    /// page, [`RequestInfo::for_page`], the same value the fragment rendered from, so
-    /// the URL pushed is the one its links name. Non-ASCII characters (a decoded path
-    /// segment, say) are percent-encoded; a control character is an error.
-    pub fn page(mut self, page: &RequestInfo) -> crate::Result<Self> {
+    /// The page this fragment shows a state of: htmx records its path and query as a
+    /// new history entry (`HX-Push-Url`), so Back returns to the state before. `page`
+    /// is the fragment's request re-pathed to the page, [`RequestInfo::for_page`], the
+    /// same value the fragment rendered from, so the URL pushed is the one its links
+    /// name. Non-ASCII characters (a decoded path segment, say) are percent-encoded;
+    /// a control character is an error.
+    pub fn page(self, page: &RequestInfo) -> crate::Result<Self> {
+        self.history(HX_PUSH_URL, page)
+    }
+
+    /// Like [`Fragment::page`], but htmx rewrites the current history entry
+    /// (`HX-Replace-Url`) instead of adding one: for a fragment fetched while someone
+    /// types or adjusts a filter, so Back leaves the page rather than retracing every
+    /// request. The later of `page` and `replace` wins.
+    pub fn replace(self, page: &RequestInfo) -> crate::Result<Self> {
+        self.history(HX_REPLACE_URL, page)
+    }
+
+    fn history(mut self, header: HeaderName, page: &RequestInfo) -> crate::Result<Self> {
         let url = page.full_path.as_str();
         let mut encoded = String::with_capacity(url.len());
         for c in url.chars() {
@@ -78,7 +98,7 @@ impl Fragment {
         let v = HeaderValue::from_str(&encoded).map_err(|_| {
             crate::Error::Internal(anyhow::anyhow!("page URL is not a header value: {url:?}"))
         })?;
-        self.page = Some(v);
+        self.history = Some((header, v));
         Ok(self)
     }
 }
@@ -89,8 +109,8 @@ impl IntoResponse for Fragment {
         let h = r.headers_mut();
         h.insert(header::CACHE_CONTROL, self.cache);
         h.insert(X_ROBOTS_TAG, HeaderValue::from_static("noindex"));
-        if let Some(url) = self.page {
-            h.insert(HX_PUSH_URL, url);
+        if let Some((name, url)) = self.history {
+            h.insert(name, url);
         }
         r
     }
@@ -137,6 +157,38 @@ mod tests {
         assert_eq!(r.headers()["hx-push-url"], "/worlds/Z%C3%BCrich?q=%C3%A9");
         let plain = Fragment::new("x", HeaderValue::from_static("no-store")).into_response();
         assert!(plain.headers().get("hx-push-url").is_none());
+        assert!(plain.headers().get("hx-replace-url").is_none());
+    }
+
+    #[test]
+    fn a_fragment_may_replace_the_history_entry_instead() {
+        let typed = RequestInfo::at("/search/results?q=psal").for_page("/search");
+        let r = Fragment::new("<ol id=r></ol>", HeaderValue::from_static("no-store"))
+            .replace(&typed)
+            .unwrap()
+            .into_response();
+        let h = r.headers();
+        assert_eq!(h["hx-replace-url"], "/search?q=psal");
+        assert!(
+            h.get("hx-push-url").is_none(),
+            "one history header, never both"
+        );
+        assert_eq!(h["x-robots-tag"], "noindex");
+        assert_eq!(h["cache-control"], "no-store");
+        // The later call decides.
+        let r = Fragment::new("", HeaderValue::from_static("no-store"))
+            .page(&typed)
+            .unwrap()
+            .replace(&typed)
+            .unwrap()
+            .into_response();
+        assert!(r.headers().get("hx-push-url").is_none());
+        assert_eq!(r.headers()["hx-replace-url"], "/search?q=psal");
+        assert!(
+            Fragment::new("", HeaderValue::from_static("no-store"))
+                .replace(&RequestInfo::at("/bad\nurl"))
+                .is_err()
+        );
     }
 
     #[test]
