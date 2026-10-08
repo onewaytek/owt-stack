@@ -16,9 +16,10 @@ port), and they learn how to use it from `README.md`. So:
   change an app must adapt to is `type!:` with a `BREAKING CHANGE:` footer saying what
   the app changes; it becomes the release's upgrade notes.
 - **Never bump versions or tag by hand.** release-please owns `version` in
-  `Cargo.toml`, `Cargo.lock`, `package.json`, `fuzz/Cargo.toml`, `fuzz/Cargo.lock` and
-  the README's tags, through its release pull request. A new mention of the version goes between
-  `<!-- x-release-please-start-version -->` and `<!-- x-release-please-end -->` (or
+  `Cargo.toml`, `Cargo.lock`, `package.json`, `fuzz/Cargo.toml`, `fuzz/Cargo.lock`
+  and the README's tags, through its release pull request. A new mention of the
+  version goes between `<!-- x-release-please-start-version -->` and
+  `<!-- x-release-please-end -->` (or
   ends its line with `x-release-please-version`). Never in `.github/workflows/`: the
   default token cannot change a workflow file, and the release pull request fails.
 - Gate: `just check` (the root `justfile`); CI runs the same command. With

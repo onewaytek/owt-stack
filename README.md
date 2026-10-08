@@ -1031,7 +1031,7 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 **Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org)**
 (`feat(web): …`, `fix(auth): …`, `docs: …`), checked on every pull request. Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
-`tailwind`, `deps`.
+`tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it
@@ -1049,9 +1049,9 @@ changelog's "Breaking changes", so the upgrade notes write themselves. The relea
 request updates every version: the workspace `Cargo.toml`, `Cargo.lock`,
 `package.json`, the fuzz crate's `Cargo.toml` and `Cargo.lock` (not a workspace
 member, so it tracks the release on its own) and the tags in this README (between
-`x-release-please` markers). A new
-reference to the version needs a marker too, outside `.github/workflows/`: GitHub lets
-no workflow's default token change a workflow file, so those carry no version.
+`x-release-please` markers). A new reference to the version needs a marker too,
+outside `.github/workflows/`: GitHub lets no workflow's default token change a
+workflow file, so those carry no version.
 
 ## Licence
 
