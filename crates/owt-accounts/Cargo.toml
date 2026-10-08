@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum = { workspace = true, features = ["tokio", "http1", "form", "query"] }
+axum = { workspace = true, features = ["tokio", "http1", "form", "query", "original-uri"] }
 base64.workspace = true
 owt-auth.workspace = true
 owt-web.workspace = true

@@ -16,7 +16,7 @@
 // The extractors answer from the extensions without awaiting; the trait is async.
 #![allow(clippy::unused_async_trait_impl)]
 
-use axum::extract::{FromRequestParts, Request, State};
+use axum::extract::{FromRequestParts, OriginalUri, Request, State};
 use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -124,11 +124,20 @@ const UNAVAILABLE: &str = "Signing in is unavailable for a moment. Please try ag
 
 /// The wall an anonymous visitor meets: the sign-in redirect, or 503 when the
 /// database could not say who they are, since the sign-in page would fail them too.
+///
+/// `?next=` is the URI the client sent (`OriginalUri`): under `Router::nest`,
+/// `parts.uri` has had the prefix removed, and a visitor sent back to `/profile`
+/// instead of `/es/profile` lands on a 404 or another page. Only its path and
+/// query, so an absolute-form request target cannot put a host into `next`.
 fn wall(parts: &Parts) -> Error {
     if matches!(parts.extensions.get::<Loaded>(), Some(Loaded::Unknown)) {
         return Error::unavailable(UNAVAILABLE);
     }
-    let next = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+    let uri = parts
+        .extensions
+        .get::<OriginalUri>()
+        .map_or(&parts.uri, |u| &u.0);
+    let next = uri.path_and_query().map_or("/", |p| p.as_str());
     let login = parts
         .extensions
         .get::<SignInAt>()

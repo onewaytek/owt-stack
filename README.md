@@ -422,6 +422,9 @@ use owt_auth::throttle::Throttle;
 // signed-in account if its epoch still matches. The extractors read it from the
 // request, so a handler and a page-chrome helper cost one query between them.
 let accounts = Accounts::new(pool.clone(), "/login");
+// `?next=` is the URL the client asked for, prefix included under `Router::nest`. An
+// app whose pages sit under prefixes with a sign-in page each (`/en/login`,
+// `/es/login`) installs the layer on each nested router with its own path.
 async fn home(Maybe(me): Maybe) -> String { me.map_or("hello".into(), |a| a.username) }
 async fn settings(Signed(me): Signed) -> String { me.username } // anonymous: 303 /login?next=…
 async fn admin(Staff(me): Staff) -> String { me.username } // signed in, not staff: 403
@@ -1031,7 +1034,7 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 **Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org)**
 (`feat(web): …`, `fix(auth): …`, `docs: …`), checked on every pull request. Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
-`tailwind`, `deps`, `release` (release-please and its configuration).
+`accounts`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it
