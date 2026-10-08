@@ -10,7 +10,7 @@
 //!   any mismatch. [`assert_vendored_files_match_pins`] re-derives each pin from
 //!   disk, so an edited file is caught even though the script never ran;
 //! * **built from npm:** the lockfile is the integrity record. An app that commits
-//!   the built files should rebuild and diff them in its gate (kynestro does);
+//!   the built files should rebuild and diff them in its gate;
 //!   nothing here does it for you.
 //!
 //! [`assert_no_remote_assets`] is the invariant itself: it fails on the next

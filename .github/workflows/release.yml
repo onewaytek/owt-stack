@@ -21,7 +21,7 @@ name: App release (reusable)
 # is major, and anything else releases nothing. The tag is `vX.Y.Z`, and a GitHub
 # release carries the generated notes.
 #
-# An app whose code reads its own version (kynestro serves it to MCP clients) sets
+# An app whose code reads its own version (to report it to its clients, say) sets
 # `version-command` and `version-files`: the command writes the version into those
 # files, and they are committed back with the release (`chore(release): vX.Y.Z
 # [skip ci]`), so the tag and the files agree.

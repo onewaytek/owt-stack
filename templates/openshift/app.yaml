@@ -3,8 +3,8 @@
 # the app's name has to reach places Kustomize's name transformers don't (the image
 # trigger annotation, the ImageStreamTag, the CNPG-minted Secret's name):
 #
-#   oc process -f app.yaml -p NAME=pets -p NAMESPACE=pets \
-#     -p IMAGE=ghcr.io/onewaytek/pets -p CHANNEL=rc -p PORT=3000 | oc apply -f -
+#   oc process -f app.yaml -p NAME=myapp -p NAMESPACE=myapp \
+#     -p IMAGE=ghcr.io/onewaytek/myapp -p CHANNEL=rc -p PORT=8000 | oc apply -f -
 #
 # Deploys are pull-based. The cluster API is on RFC1918 and nothing in CI pushes to
 # it: CI publishes ghcr.io/<org>/<app>:<channel>, the ImageStream re-imports it on
@@ -29,7 +29,7 @@ parameters:
   - name: NAMESPACE
     required: true
   - name: IMAGE
-    description: The image repository, without a tag (ghcr.io/onewaytek/pets).
+    description: The image repository, without a tag (ghcr.io/onewaytek/myapp).
     required: true
   - name: CHANNEL
     description: The floating tag to follow (rc, or latest for stable releases).
