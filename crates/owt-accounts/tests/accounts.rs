@@ -1,5 +1,5 @@
-//! The crate against a real Postgres (`DATABASE_URL`); skipped without it, but for
-//! the nested-router wall test, which asks nothing of the database. Each
+//! The crate against a real Postgres (`DATABASE_URL`); skipped without it, except
+//! for the nested-router wall test, which asks nothing of the database. Each
 //! test takes a schema of its own, so they run in parallel and leave nothing.
 
 use std::sync::Arc;

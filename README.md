@@ -1034,7 +1034,7 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 **Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org)**
 (`feat(web): …`, `fix(auth): …`, `docs: …`), checked on every pull request. Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
-`tailwind`, `deps`, `release` (release-please and its configuration).
+`accounts`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it
