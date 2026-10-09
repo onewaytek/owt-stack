@@ -1,6 +1,6 @@
 {
   "name": "@onewaytek/owt-stack",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "description": "The stylesheet half of owt-stack. Apps depend on it as \"@onewaytek/owt-stack\": \"github:onewaytek/owt-stack#<tag>\" and import \"@onewaytek/owt-stack/tailwind/owt.css\".",
   "files": [

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.2](https://github.com/onewaytek/owt-stack/compare/v0.4.1...v0.4.2) (2026-10-09)
+
+
+### Features
+
+* **change:** change requests from a site's own pages ([#27](https://github.com/onewaytek/owt-stack/issues/27)) ([eb7b369](https://github.com/onewaytek/owt-stack/commit/eb7b369c55c066c6feadc148da945ad07d737b2f))
+* **templates:** build every stage from Red Hat Hummingbird images ([#25](https://github.com/onewaytek/owt-stack/issues/25)) ([87c3ed1](https://github.com/onewaytek/owt-stack/commit/87c3ed1a9839b0980c13818efe10b34b6462c090))
+
+
+### Bug Fixes
+
+* **ci:** pull the service images through mirror.gcr.io ([#29](https://github.com/onewaytek/owt-stack/issues/29)) ([3fad97a](https://github.com/onewaytek/owt-stack/commit/3fad97a6a1dd740d11bb0a226e40b7b68e43694f))
+
 ## [0.4.1](https://github.com/onewaytek/owt-stack/compare/v0.4.0...v0.4.1) (2026-10-08)
 
 
