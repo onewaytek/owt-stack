@@ -2,7 +2,7 @@
 # user-workload monitoring: the app's /metrics (its `metrics` port, 9464) and the
 # CloudNativePG instances' Postgres metrics (9187).
 #
-#   oc process -f monitoring.yaml -p NAME=pets -p NAMESPACE=pets | oc apply -f -
+#   oc process -f monitoring.yaml -p NAME=myapp -p NAMESPACE=myapp | oc apply -f -
 #
 # Separate from app.yaml because applying it needs more than the namespace: creating
 # ServiceMonitors and PodMonitors takes the `monitoring-edit` role, and user-workload

@@ -5,7 +5,7 @@ name: Rust CI
 #   jobs:
 #     ci:
 #       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@vX.Y.Z  # the release the app uses
-#       with: {database: pets, redis: true}
+#       with: {database: myapp, redis: true}
 #
 # Runs on the arc-openshift-k8s ARC scale set (override with the RUNS_ON
 # repository or organization variable, a JSON string such as '"ubuntu-latest"').

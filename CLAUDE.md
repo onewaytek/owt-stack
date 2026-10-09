@@ -1,8 +1,11 @@
 # Working on owt-stack
 
-Three apps build on this repository (epicpartygame-rs, pets, and kynestro after its
-port), and they learn how to use it from `README.md`. So:
+Private apps build on this repository, and they learn how to use it from
+`README.md`. So:
 
+- **Never name the private apps.** This repository is public: no app's name, repository
+  or domain in code, comments, tests, docs, commit messages or pull requests. Say "an
+  app"; an example uses `myapp`.
 - **Keep the README's instructions current.** A change to a public API, a template,
   the reusable workflow's inputs, or how an app adopts something updates the matching
   README section in the same pull request.

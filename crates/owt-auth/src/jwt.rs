@@ -348,18 +348,17 @@ mod tests {
         let v = Verifier::new(
             reqwest::Client::new(),
             "https://idp.test",
-            "kynestro",
+            "my-app",
             &format!("{}/jwks", idp.base),
         );
-        let claims: Claims = v.verify(&token(&idp, "k1", "kynestro", 60)).await.unwrap();
+        let claims: Claims = v.verify(&token(&idp, "k1", "my-app", 60)).await.unwrap();
         assert_eq!(claims.sub, "agent-7");
         assert!(matches!(
             v.verify::<Claims>(&token(&idp, "k1", "other", 60)).await,
             Err(Error::Invalid(_))
         ));
         assert!(matches!(
-            v.verify::<Claims>(&token(&idp, "k1", "kynestro", -60))
-                .await,
+            v.verify::<Claims>(&token(&idp, "k1", "my-app", -60)).await,
             Err(Error::Invalid(_))
         ));
         assert!(v.verify::<Claims>("not.a.token").await.is_err());
@@ -371,15 +370,15 @@ mod tests {
         let v = Verifier::new(
             reqwest::Client::new(),
             "https://idp.test",
-            "kynestro",
+            "my-app",
             &format!("{}/jwks", idp.base),
         );
-        v.verify::<Claims>(&token(&idp, "k1", "kynestro", 60))
+        v.verify::<Claims>(&token(&idp, "k1", "my-app", 60))
             .await
             .unwrap();
         for _ in 0..5 {
             assert!(matches!(
-                v.verify::<Claims>(&token(&idp, "forged", "kynestro", 60))
+                v.verify::<Claims>(&token(&idp, "forged", "my-app", 60))
                     .await,
                 Err(Error::UnknownKey)
             ));
@@ -408,7 +407,7 @@ mod tests {
         Verifier::new(
             reqwest::Client::new(),
             "https://idp.test",
-            "kynestro",
+            "my-app",
             &format!("{}/jwks", idp.base),
         )
     }
@@ -416,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn tokens_not_yet_valid_are_refused() {
         let idp = idp().await;
-        let early = token_with(&idp, "k1", "kynestro", 600, 300, Algorithm::RS256);
+        let early = token_with(&idp, "k1", "my-app", 600, 300, Algorithm::RS256);
         assert!(matches!(
             verifier(&idp).verify::<Claims>(&early).await,
             Err(Error::Invalid(_))
@@ -427,7 +426,7 @@ mod tests {
     async fn the_algorithm_must_be_accepted_and_the_keys_own() {
         let idp = idp().await;
         // The key is published for RS256; the same RSA key signs a valid RS384 token.
-        let other = token_with(&idp, "k1", "kynestro", 60, 0, Algorithm::RS384);
+        let other = token_with(&idp, "k1", "my-app", 60, 0, Algorithm::RS384);
         assert!(matches!(
             verifier(&idp).verify::<Claims>(&other).await,
             Err(Error::Algorithm(Algorithm::RS384))
@@ -435,7 +434,7 @@ mod tests {
         let narrowed = verifier(&idp).algorithms(&[Algorithm::ES256, Algorithm::HS256]);
         assert!(matches!(
             narrowed
-                .verify::<Claims>(&token(&idp, "k1", "kynestro", 60))
+                .verify::<Claims>(&token(&idp, "k1", "my-app", 60))
                 .await,
             Err(Error::Algorithm(Algorithm::RS256))
         ));
@@ -462,12 +461,12 @@ mod tests {
         };
         let v = verifier(&idp);
         assert!(matches!(
-            v.verify::<Claims>(&token(&idp, "k1", "kynestro", 60)).await,
+            v.verify::<Claims>(&token(&idp, "k1", "my-app", 60)).await,
             Err(Error::Keys(_))
         ));
         for _ in 0..5 {
             assert!(matches!(
-                v.verify::<Claims>(&token(&idp, "k1", "kynestro", 60)).await,
+                v.verify::<Claims>(&token(&idp, "k1", "my-app", 60)).await,
                 Err(Error::UnknownKey)
             ));
         }
@@ -536,17 +535,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let flaky = format!("http://{}/jwks", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let v = Verifier::new(
-            reqwest::Client::new(),
-            "https://idp.test",
-            "kynestro",
-            &flaky,
-        );
+        let v = Verifier::new(reqwest::Client::new(), "https://idp.test", "my-app", &flaky);
         let v = Verifier::with(Config {
             retry_after_failure: Duration::from_millis(200),
             ..v.0.config.clone()
         });
-        let good = token(&idp, "k1", "kynestro", 60);
+        let good = token(&idp, "k1", "my-app", 60);
         assert!(matches!(
             v.verify::<Claims>(&good).await,
             Err(Error::Keys(_))
@@ -571,7 +565,7 @@ mod tests {
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.";
         let idp = idp().await;
         let v = verifier(&idp);
-        let good = token(&idp, "k1", "kynestro", 60);
+        let good = token(&idp, "k1", "my-app", 60);
         v.verify::<Claims>(&good).await.unwrap();
         for at in 0..good.len() {
             // Three replacements per position, spread over the alphabet.
@@ -595,7 +589,7 @@ mod tests {
         // Nor a token with its signature cut off, or another token's signature.
         let (signed, _signature) = good.rsplit_once('.').unwrap();
         assert!(v.verify::<Claims>(&format!("{signed}.")).await.is_err());
-        let other = token(&idp, "k1", "kynestro", 61);
+        let other = token(&idp, "k1", "my-app", 61);
         let grafted = format!("{signed}.{}", other.rsplit_once('.').unwrap().1);
         assert!(v.verify::<Claims>(&grafted).await.is_err());
     }
@@ -616,7 +610,7 @@ mod tests {
             jsonwebtoken::encode(&h, &claims, &idp.key).unwrap()
         };
         let whole = serde_json::json!({
-            "sub": "agent-7", "iss": "https://idp.test", "aud": "kynestro", "exp": now + 60,
+            "sub": "agent-7", "iss": "https://idp.test", "aud": "my-app", "exp": now + 60,
         });
         v.verify::<Claims>(&sign(whole.clone())).await.unwrap();
         for missing in ["sub", "iss", "aud", "exp"] {
@@ -631,8 +625,8 @@ mod tests {
             ("iss", serde_json::json!("https://idp.test/")),
             ("iss", serde_json::json!("https://idp.test.evil.example")),
             ("iss", serde_json::json!("http://idp.test")),
-            ("aud", serde_json::json!("kynestro2")),
-            ("aud", serde_json::json!("KYNESTRO")),
+            ("aud", serde_json::json!("my-app2")),
+            ("aud", serde_json::json!("MY-APP")),
             ("aud", serde_json::json!(["other", "another"])),
             ("exp", serde_json::json!(now - 6)),
             ("exp", serde_json::json!("never")),
@@ -646,7 +640,7 @@ mod tests {
         }
         // An audience list that includes this service is this service's token.
         let mut listed = whole.clone();
-        listed["aud"] = serde_json::json!(["other", "kynestro"]);
+        listed["aud"] = serde_json::json!(["other", "my-app"]);
         v.verify::<Claims>(&sign(listed)).await.unwrap();
     }
 
@@ -656,8 +650,8 @@ mod tests {
     async fn a_burst_on_a_cold_verifier_fetches_the_keys_once() {
         let idp = idp().await;
         let v = verifier(&idp);
-        let good = token(&idp, "k1", "kynestro", 60);
-        let forged = token(&idp, "nobody", "kynestro", 60);
+        let good = token(&idp, "k1", "my-app", 60);
+        let forged = token(&idp, "nobody", "my-app", 60);
         let tasks: Vec<_> = (0..64)
             .map(|i| {
                 let (v, t) = (

@@ -17,7 +17,7 @@
 //! two owners. Work whose exclusivity matters wants a Redis with `noeviction`, or
 //! one of its own, and a run that checks [`Held`] before each owner-only step.
 //!
-//! Lifted from epicpartygame-rs's per-session clock and loop leases.
+//! Lifted from an app's per-session clock and loop leases.
 
 use std::sync::Arc;
 use std::time::Duration;
