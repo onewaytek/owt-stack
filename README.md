@@ -23,7 +23,7 @@ Outside the crates:
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
-| `templates/Dockerfile` | cargo-chef, an npm Tailwind stage, distroless non-root runtime (with `templates/dockerignore`) |
+| `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
@@ -865,8 +865,14 @@ Image builds run on GitHub-hosted runners: the ARC runners have no Docker daemon
 
 **Image:** copy `templates/Dockerfile` (and `templates/dockerignore` as
 `.dockerignore`) and set `BIN` and `PORT`. The build fetches owt-stack like any other
-git dependency; no secret is mounted. Distroless has no shell: keep a debian-slim
-runtime if operations `oc exec` shell tools into the pod.
+git dependency; no secret is mounted. Every stage starts from a Red Hat Hummingbird
+image on `registry.access.redhat.com` (`hi/nodejs:22`, `hi/rust:1`,
+`hi/core-runtime:2`), which needs no login. The runtime runs as uid 65532 and keeps
+`sh` and coreutils for `oc exec`; the build fails if `sh`, `timeout` or `env` stop
+running. The names are fully qualified, so a local `podman build` works without a
+registry prompt. An app on the earlier distroless template moves by copying the
+template again; one with its own runtime stage changes `FROM` and `USER nonroot`
+(to `USER 65532`).
 
 **OpenShift:**
 
