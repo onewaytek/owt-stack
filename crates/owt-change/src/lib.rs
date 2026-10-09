@@ -43,6 +43,9 @@ pub const TITLE_MAX: usize = 200;
 /// The longest description an admin may write.
 pub const DESCRIPTION_MAX: usize = 5_000;
 
+/// The most of the tracker's reply that is read.
+const REPLY_MAX: usize = 16 * 1024;
+
 /// How long the tracker gets to answer before the admin is told to try again.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -362,11 +365,10 @@ async fn forward(http: &reqwest::Client, config: &Config, request: &ChangeReques
             "This site's key for change requests was refused. Tell whoever runs the site.",
         );
     }
-    let sentence = response
-        .json::<serde_json::Value>()
+    let sentence = read_capped(response)
         .await
-        .ok()
-        .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|v| v.get("error")?.as_str().map(|e| clip(e, 500)));
     match (status.as_u16(), sentence) {
         (422, Some(sentence)) => answer(StatusCode::UNPROCESSABLE_ENTITY, &sentence),
         (503, Some(sentence)) => answer(StatusCode::SERVICE_UNAVAILABLE, &sentence),
@@ -375,6 +377,19 @@ async fn forward(http: &reqwest::Client, config: &Config, request: &ChangeReques
             answer(StatusCode::BAD_GATEWAY, AGAIN)
         }
     }
+}
+
+/// The tracker's reply, or `None` past [`REPLY_MAX`] bytes: a sentence is short, and
+/// a misconfigured endpoint must not have the site buffer whatever it sends.
+async fn read_capped(mut response: reqwest::Response) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len() + chunk.len() > REPLY_MAX {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
 }
 
 #[derive(Deserialize)]

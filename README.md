@@ -493,6 +493,8 @@ work tracker.
   the admin's session; the site's server forwards under its key from a Secret.
 - **Who asked comes from the session.** `requested_by` is filled by the server
   (`Admin::requester`), so a browser cannot name somebody else.
+- **Only the page's origin and path are sent.** Its query and fragment, which can
+  carry a search or a sign-in token, stay in the browser.
 - **Off unless configured.** With neither `CHANGE_REQUESTS_URL` nor
   `CHANGE_REQUESTS_KEY` set, the routes answer 404 and the button renders nothing.
   One without the other fails at start.
@@ -504,9 +506,12 @@ use axum::Router;
 use owt_change::{ChangeRequests, Config};
 
 let changes = ChangeRequests::new(Config::from_env()?, http); // in the app's state
-// `POST /change-requests` and `GET /change.js`, for staff (`owt_accounts::Staff`):
-// nest them inside the accounts layer and behind `CrossOrigin`.
-let app: Router = Router::new().nest("/staff", changes.routes::<owt_accounts::Staff, ()>());
+// `POST /change-requests` and `GET /change.js`, for staff (`owt_accounts::Staff`).
+// Merge them into a router the accounts layer wraps (where the app's staff pages
+// are), behind `CrossOrigin`: outside the layer nobody is signed in, and every
+// request is walled.
+let staff_pages: Router = Router::new(); // the app's own, under the accounts layer
+let app: Router = Router::new().nest("/staff", staff_pages.merge(changes.routes::<owt_accounts::Staff, ()>()));
 
 // In the page shell, for a staff viewer: `{{ change_button }}` is the script tag.
 #[derive(Template)]

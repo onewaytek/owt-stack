@@ -150,7 +150,9 @@
       const body = {
         title: title.value,
         description: detail.value,
-        page_url: location.href,
+        // Origin and path only: a query or fragment can carry a search, a sign-in
+        // link's token or an OAuth code, none of which the tracker should hold.
+        page_url: location.origin + location.pathname,
         element: { selector: selectorOf(picked), text: about },
         selection,
         viewport: `${window.innerWidth}x${window.innerHeight}`,
@@ -163,13 +165,17 @@
           headers: { "content-type": "application/json", accept: "application/json" },
           body: JSON.stringify(body),
         });
-        if (response.ok) {
+        // Only the endpoint's own JSON counts: an expired session is redirected to
+        // the sign-in page, which fetch follows to a 200.
+        const json = (response.headers.get("content-type") || "").startsWith("application/json");
+        const reply = json ? await response.json().catch(() => null) : null;
+        if (response.ok && reply && reply.sent === true) {
           status.textContent = "Sent. Thank you!";
           setTimeout(close, 1500);
           return;
         }
-        const reply = await response.json().catch(() => null);
-        if (reply && typeof reply.error === "string") sentence = reply.error;
+        if (!json) sentence = "You've been signed out. Sign in again in another tab, then press Send.";
+        else if (reply && typeof reply.error === "string") sentence = reply.error;
       } catch (_) {
         // Offline or blocked: the default sentence says what to do.
       }

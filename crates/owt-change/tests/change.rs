@@ -44,7 +44,8 @@ impl Admin for TestAdmin {
 type Seen = Arc<Mutex<Vec<(Option<String>, ChangeRequest)>>>;
 
 /// A tracker that records what it is sent and answers by the title: "refuse" is a
-/// 422 with a sentence, "key" a 401, "boom" a 500; anything else is filed.
+/// 422 with a sentence, "key" a 401, "boom" a 500, "huge" a 422 past the reply cap;
+/// anything else is filed.
 async fn tracker() -> (Server, Seen) {
     let seen = Seen::default();
     let log = seen.clone();
@@ -67,6 +68,10 @@ async fn tracker() -> (Server, Seen) {
                         ),
                         "key" => (StatusCode::UNAUTHORIZED, Json(json!({"error": "no"}))),
                         "boom" => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({}))),
+                        "huge" => (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(json!({"error": "x".repeat(64 * 1024)})),
+                        ),
                         _ => (StatusCode::CREATED, Json(json!({"id": 7}))),
                     }
                 }
@@ -185,6 +190,11 @@ async fn the_trackers_sentence_reaches_the_admin() {
             .unwrap()
             .contains("key for change requests was refused")
     );
+
+    // A reply past the cap is not read, let alone relayed.
+    let huge = send(&client, Some("ana"), draft("huge")).await;
+    assert_eq!(huge.status, StatusCode::BAD_GATEWAY);
+    assert!(huge.text().len() < 1024);
 
     let boom = send(&client, Some("ana"), draft("boom")).await;
     assert_eq!(boom.status, StatusCode::BAD_GATEWAY);
