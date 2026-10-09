@@ -102,15 +102,17 @@ jobs:
     # picks between the two; it, DATABASE_URL and REDIS_URL are in every step's
     # environment.
     container: ${{ inputs.container }}
+    # Docker Hub's official images through Google's mirror: the runners share an
+    # address, and Docker Hub's anonymous pull limit failed CI at it.
     services:
       postgres:
-        image: ${{ inputs.database != '' && format('postgres:{0}-alpine', inputs.postgres-major) || '' }}
+        image: ${{ inputs.database != '' && format('mirror.gcr.io/library/postgres:{0}-alpine', inputs.postgres-major) || '' }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: ${{ inputs.database }}
       redis:
-        image: ${{ inputs.redis && 'redis:8-alpine' || '' }}
+        image: ${{ inputs.redis && 'mirror.gcr.io/library/redis:8-alpine' || '' }}
     env:
       ON_ARC: ${{ contains(vars.RUNS_ON || 'arc-', 'arc-') }}
       DATABASE_URL: ${{ inputs.database != '' && format('postgres://postgres:postgres@{0}:5432/{1}', contains(vars.RUNS_ON || 'arc-', 'arc-') && '127.0.0.1' || 'postgres', inputs.database) || '' }}
