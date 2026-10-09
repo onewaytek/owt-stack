@@ -9,6 +9,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; one-time sign-in links |
+| `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
 
@@ -27,7 +28,7 @@ Outside the crates:
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
-| `tailwind/owt.css` | font stacks and htmx state variants (`htmx-request:opacity-50`) |
+| `tailwind/owt.css` | font stacks, htmx state variants (`htmx-request:opacity-50`), and the `owt-*` classes the shared components and the change-request button use |
 
 Every Rust example below is compiled by `cargo test` (the `readme` crate includes this
 file as its docs), so an API change that breaks these instructions fails CI.
@@ -43,6 +44,7 @@ owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
 owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
 owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
 owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
+owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.1" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
@@ -479,6 +481,81 @@ let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Ref
 A refusal (`owt_accounts::Refused`) carries the sentence the person reads; a handler
 matches `Error::Refused` to re-render the form with it, and the `From` into
 `owt_web::Error` answers 422 with the same text.
+
+### Change requests
+
+`owt-change` lets a site's signed-in admins ask for a change from the page itself. A
+floating "Request a change" button lets them point at the part of the page they mean
+and say what should change. The site's server forwards that, with who asked, to a
+work tracker.
+
+- **The browser never holds a credential.** It posts to the site, same origin, with
+  the admin's session; the site's server forwards under its key from a Secret.
+- **Who asked comes from the session.** `requested_by` is filled by the server
+  (`Admin::requester`), so a browser cannot name somebody else.
+- **Only the page's origin and path are sent.** Its query and fragment, which can
+  carry a search or a sign-in token, stay in the browser.
+- **Off unless configured.** With neither `CHANGE_REQUESTS_URL` nor
+  `CHANGE_REQUESTS_KEY` set, the routes answer 404 and the button renders nothing.
+  One without the other fails at start.
+
+```rust,no_run
+# fn demo(http: reqwest::Client) -> Result<(), owt_change::ConfigError> {
+use askama::Template;
+use axum::Router;
+use owt_change::{ChangeRequests, Config};
+
+let changes = ChangeRequests::new(Config::from_env()?, http); // in the app's state
+// `POST /change-requests` and `GET /change.js`, for staff (`owt_accounts::Staff`).
+// Merge them into a router the accounts layer wraps (where the app's staff pages
+// are), behind `CrossOrigin`: outside the layer nobody is signed in, and every
+// request is walled.
+let staff_pages: Router = Router::new(); // the app's own, under the accounts layer
+let app: Router = Router::new().nest("/staff", staff_pages.merge(changes.routes::<owt_accounts::Staff, ()>()));
+
+// In the page shell, for a staff viewer: `{{ change_button }}` is the script tag.
+#[derive(Template)]
+#[template(source = "<body>…{{ change_button }}</body>", ext = "html")]
+struct Shell<'a> { change_button: owt_change::Button<'a> }
+let viewer_is_staff = true;
+let _ = Shell { change_button: changes.button("/staff", viewer_is_staff) };
+# let _ = app; Ok(()) }
+```
+
+An app without `owt-accounts` implements `owt_change::Admin` on its own extractor and
+names it in `routes::<MyAdmin, _>()`.
+
+**The button** is `change.js`, served by the routes, immutable under its `?v=` hash. It
+runs under the default Content-Security-Policy: no inline script, no style
+attributes, its DOM built with `textContent`, styled by `owt-change-*` classes in
+`tailwind/owt.css`. A press enters pick mode: the element under the pointer is
+outlined, a click or tap picks it, and Esc cancels. It works on phones, where there
+is no right-click. A dialog then asks for a title and the detail.
+
+**The protocol** is `owt_change::ChangeRequest`, posted as JSON with
+`Authorization: Bearer <key>`:
+
+```json
+{
+  "title": "Show prices at 20px on phones",
+  "description": "They are hard to read on my phone.",
+  "page_url": "https://myapp.example/menu",
+  "element": { "selector": "main > h1", "text": "Opening hours" },
+  "selection": "",
+  "viewport": "390x844",
+  "user_agent": "Mozilla/5.0 …",
+  "requested_by": { "username": "ana", "email": "ana@myapp.example" }
+}
+```
+
+The tracker answers `2xx` when it filed the request. Otherwise it answers with
+`{"error": "<a sentence for the admin>"}`:
+
+| The tracker answers | The admin sees |
+|---|---|
+| 422 or 503 | the tracker's sentence |
+| 401 or 403 | a sentence saying the site's key was refused (the site logs a warning) |
+| anything else, or no answer within 10 s | "Try again in a minute" |
 
 ### Realtime fan-out
 
@@ -1046,7 +1123,7 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 **Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org)**
 (`feat(web): …`, `fix(auth): …`, `docs: …`), checked on every pull request. Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
-`accounts`, `tailwind`, `deps`, `release` (release-please and its configuration).
+`accounts`, `change`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it

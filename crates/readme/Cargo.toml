@@ -15,6 +15,7 @@ cookie.workspace = true
 owt-accounts.workspace = true
 owt-auth.workspace = true
 owt-bus.workspace = true
+owt-change.workspace = true
 owt-runtime = { workspace = true, features = ["redis"] }
 owt-test.workspace = true
 owt-web.workspace = true

@@ -65,6 +65,7 @@ owt-auth = { path = "crates/owt-auth" }
 owt-accounts = { path = "crates/owt-accounts" }
 owt-bus = { path = "crates/owt-bus" }
 owt-test = { path = "crates/owt-test" }
+owt-change = { path = "crates/owt-change" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
