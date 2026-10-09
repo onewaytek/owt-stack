@@ -2245,6 +2245,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "owt-change"
+version = "0.4.1"
+dependencies = [
+ "askama",
+ "axum",
+ "owt-accounts",
+ "owt-test",
+ "owt-web",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "owt-runtime"
 version = "0.4.1"
 dependencies = [
@@ -2894,6 +2913,7 @@ dependencies = [
  "owt-accounts",
  "owt-auth",
  "owt-bus",
+ "owt-change",
  "owt-runtime",
  "owt-test",
  "owt-web",

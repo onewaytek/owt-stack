@@ -144,4 +144,51 @@
   .owt-errorpage a {
     @apply text-owt-accent underline;
   }
+
+  /* owt-change: the floating button, picking a part of the page, the dialog. */
+  .owt-change-button {
+    @apply fixed right-4 bottom-4 z-50 rounded-full bg-owt-accent px-4 py-2 text-sm font-medium text-owt-on-accent shadow-lg;
+    @apply focus:ring-2 focus:ring-owt-accent/30 focus:outline-none;
+  }
+  .owt-change-picking,
+  .owt-change-picking * {
+    @apply cursor-crosshair;
+  }
+  .owt-change-target {
+    @apply outline-2 outline-offset-2 outline-owt-accent;
+  }
+  .owt-change-dialog {
+    @apply m-auto w-[calc(100%-2rem)] max-w-md rounded-(--radius-owt) border border-owt-line bg-owt-surface p-4 text-owt-ink shadow-xl;
+  }
+  .owt-change-dialog::backdrop {
+    @apply bg-owt-ink/30;
+  }
+  .owt-change-dialog form > * + * {
+    @apply mt-3;
+  }
+  .owt-change-heading {
+    @apply text-lg font-semibold;
+  }
+  .owt-change-detail {
+    @apply min-h-28;
+  }
+  .owt-change-status:empty {
+    @apply hidden;
+  }
+  .owt-change-status {
+    @apply text-sm;
+  }
+  .owt-change-actions {
+    @apply flex justify-end gap-2;
+  }
+  .owt-change-cancel,
+  .owt-change-send {
+    @apply rounded-(--radius-owt) px-3 py-2 text-sm font-medium;
+  }
+  .owt-change-cancel {
+    @apply border border-owt-line text-owt-ink hover:bg-owt-line/40;
+  }
+  .owt-change-send {
+    @apply bg-owt-accent text-owt-on-accent disabled:opacity-50;
+  }
 }

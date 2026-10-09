@@ -1,0 +1,29 @@
+[package]
+name = "owt-change"
+description = "Change requests from a site's own pages: a floating button for its signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+askama.workspace = true
+axum = { workspace = true, features = ["tokio", "http1", "json", "query"] }
+owt-accounts.workspace = true
+owt-web.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+askama.workspace = true
+owt-test.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
