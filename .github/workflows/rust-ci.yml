@@ -78,6 +78,13 @@ on:
         description: File naming the Node version for the stylesheet job; empty for 22.
         type: string
         default: ""
+      ref:
+        description: >-
+          The commit to check; empty for the one that started the workflow. A checked
+          promotion passes promote-rc.yml's candidate, so rc moves only to a merge
+          that passed.
+        type: string
+        default: ""
 
 # The jobs read the repository and nothing else.
 permissions:
@@ -120,8 +127,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           # Later steps run the repository's code; leave it no token to find.
           persist-credentials: false
+      # Branches built beside each other each take the next free number, and git
+      # merges two files with one version without a conflict; sqlx then fails at the
+      # second on a fresh database. Up and down halves share a version.
+      - name: Migration versions are unique
+        shell: bash
+        run: |
+          [ -d migrations ] || exit 0
+          dup=$(ls migrations | sed -E 's/\.(up|down)\.sql$/.sql/' \
+            | sed -nE 's/^0*([0-9]+)_(.*)\.sql$/\1 \2/p' \
+            | sort -u | awk '{ n[$1]++ } n[$1] == 2 { print $1 }')
+          [ -z "$dup" ] && exit 0
+          for v in $dup; do
+            echo "::error::more than one migration has version $v: $(ls migrations | grep -E "^0*${v}_" | tr '\n' ' ')"
+          done
+          echo "Renumber the later one after the highest version on the branch it merges into." >&2
+          exit 1
       - name: Extra environment
         if: ${{ inputs.extra-env != '' }}
         env:
@@ -200,6 +224,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

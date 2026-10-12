@@ -21,7 +21,8 @@ Outside the crates:
 | `.github/workflows/release-please.yml`, `conventional-commits.yml` | this repository's releases: Conventional Commits checked on every pull request, versions and the changelog by release-please |
 | `.github/workflows/release.yml` | reusable releases from conventional commits: stable on `main`, prereleases on `rc`, optional version write-back and changelog |
 | `.github/workflows/image.yml` | reusable image build for a released tag, pushed to ghcr with the channel's floating tags |
-| `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease |
+| `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease, or into `rc-candidate` for checking first |
+| `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
@@ -918,16 +919,31 @@ jobs:
   `image.yml` from a `workflow_dispatch` with `floating-tags: false`.
 - **The rc channel** (optional): on each same-repository PR into `main`, once its
   checks pass, merge the PR into `rc` and cut a prerelease. After each stable
-  release, merge `main` back into `rc`.
+  release, merge `main` back into `rc`. A PR's checks run on the PR alone, so two
+  PRs in flight can each pass and break `rc` together: two migrations taking one
+  number merge without a conflict. Checking the merge first closes that. The merge
+  goes to `rc-candidate`, the app's checks run on it, and `rc` fast-forwards to it
+  only if they pass and `rc` hasn't moved since. `rust-ci.yml` also fails on two
+  migrations with one version.
 
 ```yaml
-# in pr.yml
-  promote:
+# in pr.yml, with concurrency: {group: promote-rc, cancel-in-progress: false}
+  candidate:
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
     permissions: {contents: write, actions: write, pull-requests: write}
     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.4.2
-    with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}"}
+    with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}", candidate: true}
+  check-rc:
+    needs: candidate
+    if: needs.candidate.outputs.changed == 'true'
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.4.2
+    with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
+  promote:
+    needs: [candidate, check-rc]
+    permissions: {contents: write, actions: write}
+    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@v0.4.2
+    with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
 # in release.yml
   sync-rc:
     needs: release
