@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/onewaytek/owt-stack/compare/v0.4.2...v0.4.3) (2026-10-12)
+
+
+### Features
+
+* **ci:** check the merge before rc moves ([#30](https://github.com/onewaytek/owt-stack/issues/30)) ([6c20eaa](https://github.com/onewaytek/owt-stack/commit/6c20eaa1955517faccb1b39a27a7044b7469aa36))
+
 ## [0.4.2](https://github.com/onewaytek/owt-stack/compare/v0.4.1...v0.4.2) (2026-10-09)
 
 
