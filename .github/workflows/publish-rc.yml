@@ -1,0 +1,78 @@
+name: Publish rc
+
+# Reusable: the second half of a checked promotion (promote-rc.yml has the whole
+# caller). promote-rc.yml with `candidate: true` pushed a merge to `rc-candidate`;
+# once the app's checks pass on that commit, this moves rc to it and starts its
+# prerelease. rc only fast-forwards: if it moved while the candidate was checked,
+# the candidate was checked against something rc no longer is, and this fails
+# rather than publish it. Promote again.
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: The checked candidate (promote-rc.yml's `sha` output).
+        type: string
+        required: true
+      base:
+        description: The rc commit the candidate was merged onto (its `base` output).
+        type: string
+        default: ""
+      dispatch-release:
+        description: Start the app's release workflow on rc.
+        type: boolean
+        default: true
+      release-workflow:
+        description: The app's release workflow file, dispatched on rc.
+        type: string
+        default: release.yml
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: ${{ github.repository_owner == 'onewaytek' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Move rc to the candidate
+        env:
+          SHA: ${{ inputs.sha }}
+          BASE: ${{ inputs.base }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/rc-candidate:refs/remotes/origin/rc-candidate"
+          git fetch --no-tags origin "+refs/heads/rc:refs/remotes/origin/rc" 2>/dev/null || true
+          now=$(git rev-parse -q --verify refs/remotes/origin/rc || true)
+          if [ "$now" != "$BASE" ]; then
+            echo "::error::rc moved while the candidate was checked (from ${BASE:-nothing} to ${now}); promote again"
+            exit 1
+          fi
+          git cat-file -e "${SHA}^{commit}"
+          if [ -n "$BASE" ] && ! git merge-base --is-ancestor "$BASE" "$SHA"; then
+            echo "::error::${SHA} does not descend from rc (${BASE})"
+            exit 1
+          fi
+          # No force: a writer that moved rc since the fetch makes this fail.
+          git push origin "${SHA}:refs/heads/rc"
+          git push --force-with-lease="rc-candidate:${SHA}" origin :refs/heads/rc-candidate || true
+      - name: Release rc
+        if: ${{ inputs.dispatch-release }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          WORKFLOW: ${{ inputs.release-workflow }}
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: process.env.WORKFLOW,
+              ref: "rc",
+            });

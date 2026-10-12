@@ -30,6 +30,30 @@ name: Promote to rc
 #
 # A push made with the workflow's own token starts no workflow, so the rc release is
 # started by dispatching the app's release workflow, which a workflow_dispatch may.
+#
+# A branch's own checks don't check rc: two branches built beside each other can each
+# pass and still break rc together (two migrations taking one number merge without a
+# conflict). With `candidate: true` the merge goes to `rc-candidate` instead, nothing
+# is released, and the outputs name it; the app runs its checks on that commit
+# (rust-ci.yml's `ref`) and publish-rc.yml then moves rc to it. The calling workflow
+# holds a concurrency group, so one candidate is checked at a time:
+#
+#   concurrency: {group: promote-rc, cancel-in-progress: false}
+#   jobs:
+#     candidate:
+#       permissions: {contents: write, actions: write, pull-requests: write}
+#       uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@vX.Y.Z
+#       with: {source: "${{ inputs.source }}", candidate: true}
+#     check:
+#       needs: candidate
+#       if: needs.candidate.outputs.changed == 'true'
+#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@vX.Y.Z
+#       with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as in the app's CI
+#     publish:
+#       needs: [candidate, check]
+#       permissions: {contents: write, actions: write}
+#       uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@vX.Y.Z
+#       with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
 
 on:
   workflow_call:
@@ -50,6 +74,22 @@ on:
         description: The app's release workflow file, dispatched on rc.
         type: string
         default: release.yml
+      candidate:
+        description: >-
+          Push the merge to rc-candidate rather than rc, and release nothing:
+          publish-rc.yml moves rc to it once the app's checks pass on it.
+        type: boolean
+        default: false
+    outputs:
+      changed:
+        description: Whether the merge changed rc ("true" or "false").
+        value: ${{ jobs.promote.outputs.changed }}
+      sha:
+        description: The merge commit (with candidate, the commit to check and publish).
+        value: ${{ jobs.promote.outputs.sha }}
+      base:
+        description: The rc commit merged onto; empty when rc did not exist.
+        value: ${{ jobs.promote.outputs.base }}
 
 permissions:
   contents: read
@@ -63,6 +103,10 @@ jobs:
       contents: write
       actions: write
       pull-requests: write
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+      sha: ${{ steps.merge.outputs.sha }}
+      base: ${{ steps.merge.outputs.base }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,6 +116,7 @@ jobs:
         env:
           SRC: ${{ inputs.source }}
           PR: ${{ inputs.pr }}
+          CANDIDATE: ${{ inputs.candidate }}
         shell: bash
         run: |
           set -euo pipefail
@@ -83,7 +128,8 @@ jobs:
               "+refs/heads/main:refs/remotes/origin/main" \
               "+refs/heads/${SRC}:refs/remotes/origin/${SRC}"
             git fetch --no-tags origin "+refs/heads/rc:refs/remotes/origin/rc" 2>/dev/null || true
-            if git rev-parse -q --verify refs/remotes/origin/rc >/dev/null; then
+            base=$(git rev-parse -q --verify refs/remotes/origin/rc || true)
+            if [ -n "$base" ]; then
               git checkout -q -B rc refs/remotes/origin/rc
             else
               git checkout -q -B rc refs/remotes/origin/main
@@ -99,8 +145,14 @@ jobs:
               echo "rc already contains ${SRC}"
               exit 0
             fi
+            if [ "$CANDIDATE" = true ]; then
+              # Overwritten by the next candidate; only publish-rc.yml moves rc.
+              git push -f origin HEAD:refs/heads/rc-candidate
+              printf 'changed=true\nsha=%s\nbase=%s\n' "$(git rev-parse HEAD)" "$base" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             if git push origin rc; then
-              echo "changed=true" >> "$GITHUB_OUTPUT"
+              printf 'changed=true\nsha=%s\nbase=%s\n' "$(git rev-parse HEAD)" "$base" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "push raced another writer (attempt ${attempt}); retrying"
@@ -109,7 +161,7 @@ jobs:
           echo "could not push rc after 5 attempts" >&2
           exit 1
       - name: Release rc
-        if: ${{ inputs.dispatch-release && steps.merge.outputs.changed == 'true' }}
+        if: ${{ inputs.dispatch-release && !inputs.candidate && steps.merge.outputs.changed == 'true' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           WORKFLOW: ${{ inputs.release-workflow }}
