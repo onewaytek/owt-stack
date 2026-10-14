@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.4](https://github.com/onewaytek/owt-stack/compare/v0.4.3...v0.4.4) (2026-10-14)
+
+
+### Features
+
+* **ci:** use the ARC cargo-cache volume when the job pod has one ([#32](https://github.com/onewaytek/owt-stack/issues/32)) ([b848c61](https://github.com/onewaytek/owt-stack/commit/b848c61101d4e9ce3948f265b38ed642c552b51f))
+
+
+### Bug Fixes
+
+* **deps:** bump actions/setup-node from 7.0.0 to 7.1.0 ([#34](https://github.com/onewaytek/owt-stack/issues/34)) ([7d36f6b](https://github.com/onewaytek/owt-stack/commit/7d36f6b45ffeb786d4aec2dfe8638db594ec7911))
+* **deps:** bump astral-sh/setup-uv from 10.2.0 to 10.3.0 ([#35](https://github.com/onewaytek/owt-stack/issues/35)) ([968b14f](https://github.com/onewaytek/owt-stack/commit/968b14fc9a4dd6e8f3ab08f47f2dd2a5a7af6282))
+* **deps:** bump rustls to 0.23.46 for RUSTSEC-2026-0346..0349 ([#37](https://github.com/onewaytek/owt-stack/issues/37)) ([103122d](https://github.com/onewaytek/owt-stack/commit/103122d4b62c2843c2d563767e01d9e5efe381a8))
+* **deps:** bump taiki-e/install-action from 2.87.26 to 2.87.27 ([#33](https://github.com/onewaytek/owt-stack/issues/33)) ([58a8bea](https://github.com/onewaytek/owt-stack/commit/58a8beaa4ad345d0129a88f4289836779aa2a763))
+* **deps:** bump the patch-and-minor group with 6 updates ([#36](https://github.com/onewaytek/owt-stack/issues/36)) ([decc49a](https://github.com/onewaytek/owt-stack/commit/decc49a8c6151a99117942d9f98b4b68d1acfa6c))
+
 ## [0.4.3](https://github.com/onewaytek/owt-stack/compare/v0.4.2...v0.4.3) (2026-10-12)
 
 
