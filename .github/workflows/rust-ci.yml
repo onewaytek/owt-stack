@@ -175,7 +175,36 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      # On ARC the job pod mounts a persistent volume at /cache (arc-openshift's
+      # cargo-cache.yaml), shared by every job: the registry and git checkouts live
+      # there, and so does a target dir per repository and toolchain, so the GitHub
+      # cache is skipped. cargo locks both, so concurrent jobs are safe. A target dir
+      # is dropped after a week unused, or when it passes 20 GiB.
+      - name: Cargo cache volume
+        id: cache-volume
+        shell: bash
+        run: |
+          if [ ! -w /cache ]; then echo "no /cache volume: using the GitHub cache"; exit 0; fi
+          home="${CARGO_HOME:-$HOME/.cargo}"
+          for d in registry git; do
+            mkdir -p "/cache/cargo/$d"
+            rm -rf "${home:?}/$d"
+            ln -s "/cache/cargo/$d" "$home/$d"
+          done
+          repo="/cache/target/$GITHUB_REPOSITORY"
+          target="$repo/$(rustc -vV | sha256sum | cut -c1-12)"
+          mkdir -p "$target"
+          find "$repo" -mindepth 1 -maxdepth 1 -type d -mtime +7 ! -path "$target" -exec rm -rf {} +
+          if [ "$(du -s --block-size=1G "$target" | cut -f1)" -gt 20 ]; then
+            echo "$target passed 20 GiB: starting it over"
+            rm -rf "$target" && mkdir -p "$target"
+          fi
+          touch "$target"
+          echo "CARGO_TARGET_DIR=$target" >> "$GITHUB_ENV"
+          echo "mounted=true" >> "$GITHUB_OUTPUT"
+          df -h /cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ steps.cache-volume.outputs.mounted != 'true' }}
       # Its own step, so a pin the lockfile can't satisfy fails here by name.
       - name: Fetch dependencies
         run: cargo fetch --locked
