@@ -851,6 +851,12 @@ Postgres and Redis as services, installs `just`, `sqlx-cli` and `cargo-audit`,
 migrates, then runs `check-command`. Without `check-command`, it runs its own fmt,
 audit, sqlx, clippy and test steps.
 
+Its Rust build cache is GitHub's, unless the job pod has a writable volume at `/cache`
+(an ARC pod template can mount one). Then the cargo registry is kept there, shared by
+every job, and target dirs are kept per repository, toolchain and image. Each of those
+has four slots, and a job holds one to itself. Anything unused for a week is removed,
+and a slot past 20 GiB starts over.
+
 <!-- x-release-please-start-version -->
 ```yaml
 jobs:
