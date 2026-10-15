@@ -36,14 +36,17 @@ impl RequestInfo {
     /// The request at `uri` (a path with an optional query), as no client sent it:
     /// error pages, tests, and pages rendered outside a request.
     ///
-    /// Leading slashes collapse to one. `GET //elsewhere.example/` is a path to the
-    /// server and another host to a browser, so a link built from it (the 404 page's
-    /// "sign in and come back") would leave the site.
+    /// Leading slashes and backslashes collapse to one slash. `GET //elsewhere.example/`
+    /// (or `/\elsewhere.example/`, which a browser reads the same way) is a path to
+    /// the server and another host to a browser, so a link built from it (the 404
+    /// page's "sign in and come back") would leave the site.
     #[must_use]
     pub fn at(uri: &str) -> Self {
-        let uri = match uri.strip_prefix("//") {
-            Some(rest) => &format!("/{}", rest.trim_start_matches('/')),
-            None => uri,
+        let rest = uri.trim_start_matches(['/', '\\']);
+        let uri = if rest.len() < uri.len() {
+            &format!("/{rest}")
+        } else {
+            uri
         };
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
         Self {
@@ -168,6 +171,26 @@ mod tests {
     use axum::http::Request;
 
     use super::*;
+
+    /// No link built from the path leaves the site, whatever slashes it starts with.
+    #[test]
+    fn leading_slashes_and_backslashes_collapse() {
+        for (raw, path) in [
+            ("//evil.example/x?page=2", "/evil.example/x"),
+            ("/\\evil.example/x?page=2", "/evil.example/x"),
+            ("\\\\evil.example/x", "/evil.example/x"),
+            ("/\\/evil.example/x", "/evil.example/x"),
+            ("/games/", "/games/"),
+        ] {
+            let r = RequestInfo::at(raw);
+            assert_eq!(r.path, path, "{raw}");
+            let link = r.url_with("page", Some("3"));
+            assert!(
+                link.starts_with('/') && !link[1..].starts_with(['/', '\\']),
+                "{raw} -> {link}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn reads_path_query_and_htmx_headers() {

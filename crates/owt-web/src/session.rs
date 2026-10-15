@@ -59,7 +59,36 @@ pub fn new_id() -> String {
 }
 
 /// The session secret as a cookie key: base64 of at least 64 random bytes.
+///
+/// The secret is everything: whoever holds it seals a session for any account. Give
+/// each app, in each environment, a secret of its own; a staging copy of
+/// production's lets a staging account's cookie open production as the account with
+/// the same id. [`key_for`] derives a key per app and environment, so a shared
+/// secret is not also a shared key.
 pub fn key_from_base64(secret: &str) -> anyhow::Result<Key> {
+    Ok(Key::from(&secret_bytes(secret)?))
+}
+
+/// The key for sessions of `purpose` (the app and its environment, such as
+/// `myapp/production` or the namespace it runs in), derived from the secret with
+/// HKDF-SHA256. Two deployments whose purposes differ cannot open each other's
+/// cookies even if they were given the same secret. Changing the purpose signs
+/// everyone out, as changing the secret does.
+pub fn key_for(secret: &str, purpose: &str) -> anyhow::Result<Key> {
+    anyhow::ensure!(
+        !purpose.trim().is_empty(),
+        "a session key's purpose is empty"
+    );
+    let master = secret_bytes(secret)?;
+    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(b"owt-web session key v1"), &master);
+    let mut key = [0u8; 64];
+    hkdf.expand(purpose.as_bytes(), &mut key)
+        .map_err(|_| anyhow::anyhow!("HKDF-SHA256 refused a 64-byte key"))?;
+    Ok(Key::from(&key))
+}
+
+/// The secret's bytes: base64 of at least 64.
+fn secret_bytes(secret: &str) -> anyhow::Result<Vec<u8>> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(secret.trim())
@@ -69,7 +98,7 @@ pub fn key_from_base64(secret: &str) -> anyhow::Result<Key> {
         "the session secret must be at least 64 bytes (it is {})",
         bytes.len()
     );
-    Ok(Key::from(&bytes))
+    Ok(bytes)
 }
 
 /// How sessions are sealed and where they travel. Cheap to clone; hold one in the
@@ -197,7 +226,9 @@ impl<T: SessionData> Sessions<T> {
     }
 
     /// Also open sessions sealed with `key`, the secret before a rotation. Drop it
-    /// once `max_age` has passed since the rotation.
+    /// once `max_age` has passed since the rotation. Never after a compromise: a
+    /// rotation because the old secret leaked must not open what it sealed, since its
+    /// holder can seal any session, for any account, with any dates.
     #[must_use]
     pub fn also_open_with(mut self, key: Key) -> Self {
         Arc::make_mut(&mut self.inner).old_keys.push(key);
@@ -325,7 +356,9 @@ impl<T: SessionData> Sessions<T> {
     /// Middleware body, for `from_fn_with_state(sessions, Sessions::layer)`: open the
     /// request's session, expose it to handlers as [`Session<T>`], and seal it afresh
     /// into the response if anything changed it. A response that sets the cookie is
-    /// never cacheable.
+    /// never cacheable. A server error (5xx, the `Limits` timeout's 503 included)
+    /// keeps the session the request came with: a handler that signed someone in and
+    /// then failed, or timed out, leaves them as they were.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
         let session = Session::<T>::default();
         let (mut refused, mut unchecked) = (false, false);
@@ -347,12 +380,13 @@ impl<T: SessionData> Sessions<T> {
         }
         req.extensions_mut().insert(session.clone());
         let mut response = next.run(req).await;
+        let failed = response.status().is_server_error();
         let changed = {
             let inner = session.inner();
             // A handler that saw no session because it could not be checked must not
             // replace the cookie with the empty one it was shown, unless it replaced
             // the session outright: a sign-out or sign-in during an outage stands.
-            (inner.modified && (!unchecked || inner.replaced)).then(|| {
+            (inner.modified && !failed && (!unchecked || inner.replaced)).then(|| {
                 (
                     inner.id.clone().unwrap_or_else(new_id),
                     inner.issued.unwrap_or_else(now),
@@ -592,6 +626,77 @@ mod tests {
         assert!(key_from_base64(&b64(64)).is_ok());
         assert!(key_from_base64(&b64(32)).is_err());
         assert!(key_from_base64("not base64!").is_err());
+    }
+
+    /// One secret, two purposes: neither opens the other's cookies.
+    #[test]
+    fn a_key_for_one_purpose_opens_nothing_of_another() {
+        use base64::Engine;
+        let secret = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
+        let at = |purpose| {
+            Sessions::<Data>::new(
+                key_for(&secret, purpose).unwrap(),
+                "__Host-session",
+                Duration::from_secs(3600),
+                true,
+            )
+        };
+        let (prod, staging) = (at("myapp/production"), at("myapp/staging"));
+        let sealed = staging.seal("abc", &Data { user: Some(1) });
+        assert_eq!(prod.unseal(&sealed), None);
+        assert!(staging.unseal(&sealed).is_some());
+        assert!(
+            at("myapp/production")
+                .unseal(&prod.seal("x", &Data::default()))
+                .is_some()
+        );
+        assert!(key_for(&secret, " ").is_err());
+        assert!(key_for("short", "myapp").is_err());
+    }
+
+    /// A handler that changes the session and then fails (or is timed out) leaves
+    /// the browser's session as it was.
+    #[tokio::test]
+    async fn a_server_error_seals_nothing() {
+        let s = sessions();
+        let app = Router::new()
+            .route(
+                "/fail",
+                get(|sess: Session<Data>| async move {
+                    sess.cycle_id();
+                    sess.update(|d| d.user = Some(1));
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }),
+            )
+            .route(
+                "/unavailable",
+                get(|sess: Session<Data>| async move {
+                    sess.update(|d| d.user = Some(2));
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }),
+            )
+            .route(
+                "/refused",
+                get(|sess: Session<Data>| async move {
+                    sess.update(|d| d.user = Some(3));
+                    axum::http::StatusCode::FORBIDDEN
+                }),
+            )
+            .layer(from_fn_with_state(s.clone(), Sessions::<Data>::layer));
+        for path in ["/fail", "/unavailable"] {
+            let res = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert!(res.headers().get(header::SET_COOKIE).is_none(), "{path}");
+        }
+        // A 4xx is an answer, not a failure: its change stands.
+        let res = app
+            .oneshot(Request::get("/refused").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(res.headers().get(header::SET_COOKIE).is_some());
     }
 
     #[tokio::test]

@@ -62,6 +62,13 @@ impl CrossOrigin {
     /// Also accept unsafe requests from these origins (`scheme://host[:port]`; a
     /// trailing slash is ignored). An empty entry (an unset variable split on commas)
     /// trusts nothing: it would otherwise match an empty `Origin` header.
+    ///
+    /// # Panics
+    ///
+    /// On an entry that is not an `http(s)` origin: `null` (which any sandboxed
+    /// frame or `data:` page sends, from any site), a wildcard, a bare host, or a URL
+    /// with a path, query, fragment or credentials. Each would trust far more than
+    /// meant, or silently nothing.
     #[must_use]
     pub fn trust<I, S>(mut self, origins: I) -> Self
     where
@@ -73,7 +80,11 @@ impl CrossOrigin {
             origins
                 .into_iter()
                 .map(|o| o.as_ref().trim().trim_end_matches('/').to_owned())
-                .filter(|o| !o.is_empty()),
+                .filter(|o| !o.is_empty())
+                .map(|o| match origin_of(&o) {
+                    Some(origin) => origin,
+                    None => panic!("not an http(s) origin to trust: {o:?}"),
+                }),
         );
         self.trusted = all.into();
         self
@@ -190,6 +201,20 @@ fn authority(u: &url::Url) -> String {
     }
 }
 
+/// `scheme://host[:port]` as a browser writes it in `Origin`, for an `http(s)` URL
+/// with nothing else in it; `None` for anything else.
+fn origin_of(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    let bare = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|h| !h.contains('*'))
+        && matches!(url.path(), "" | "/")
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    bare.then(|| url.origin().ascii_serialization())
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderValue;
@@ -289,6 +314,32 @@ mod tests {
     /// Found by the fuzzer: `trust([""])` matched an empty `Origin` header, and
     /// `bypass([""])` or `bypass(["/"])` covered every path. Both are what an unset
     /// comma-separated variable yields, and neither may weaken the check.
+    /// `null` would trust every sandboxed frame on the web; a wildcard or a bare
+    /// host would trust nothing and look as if it did.
+    #[test]
+    fn a_trusted_origin_must_be_one() {
+        for bad in [
+            "null",
+            "https://*.example.com",
+            "example.com",
+            "https://example.com/app",
+            "https://example.com?x",
+            "https://u:p@example.com",
+            "ftp://example.com",
+        ] {
+            let refused = std::panic::catch_unwind(|| CrossOrigin::new().trust([bad]));
+            assert!(refused.is_err(), "{bad}");
+        }
+        let c = CrossOrigin::new().trust(["https://Partner.test:8443/"]);
+        let h = headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://partner.test:8443"),
+        ]);
+        assert_eq!(c.same_origin(&h), Ok(()));
+        let h = headers(&[("sec-fetch-site", "cross-site"), ("origin", "null")]);
+        assert_eq!(c.same_origin(&h), Err(Refusal::CrossSite));
+    }
+
     #[test]
     fn empty_trust_and_bypass_entries_change_nothing() {
         let c = CrossOrigin::new()

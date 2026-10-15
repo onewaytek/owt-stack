@@ -184,7 +184,8 @@ pub fn router(key: cookie::Key, assets: Assets, trusted: &[String], pool: sqlx::
                 }
             }
         });
-    // Enforce once the browser console is quiet.
+    // Report-only while the browser console is read for violations; enforcing
+    // (drop `report_only`) is a step before launch, since report-only blocks nothing.
     let csp = Csp::new().report_only(true);
     let routes = Router::new().route("/healthz", get(owt_web::healthz));
     // ... the app's routes ...
@@ -209,8 +210,21 @@ pub fn router(key: cookie::Key, assets: Assets, trusted: &[String], pool: sqlx::
 Templates put the request's nonce on inline scripts: take `owt_web::headers::Nonce` in
 the handler and write `<script nonce="{{ nonce }}">`.
 
-- **Session key:** `owt_web::session::key_from_base64(&env::required("SESSION_SECRET")?)`,
-  at least 64 random bytes. Changing it signs everyone out.
+- **Session key:** `owt_web::session::key_for(&env::required("SESSION_SECRET")?, &purpose)`,
+  from at least 64 random bytes, where `purpose` names the app and its environment
+  (`myapp/production`, or `myapp/` plus the pod's namespace from the downward API).
+  Whoever holds the key seals a session for any account, so the secret is unique to
+  each app and environment, and the purpose makes a copied secret (staging given
+  production's) a different key anyway: otherwise a staging account's cookie opens
+  production as the account with the same id. Changing either signs everyone out.
+  `key_from_base64` uses the secret as the key directly. After a leak, rotate
+  without `also_open_with`: the old key must open nothing.
+- **Failed requests change no session:** a 5xx response (the `Limits` timeout's
+  included) carries no `Set-Cookie`, so a handler that signed someone in and then
+  failed leaves them as they were.
+- **Trusted origins** (`CrossOrigin::trust`) are `scheme://host[:port]`; anything
+  else (`null`, a wildcard, a bare host, a path) panics at start rather than trusting
+  every sandboxed frame or silently nothing.
 - **Static URLs:** `Assets::new("static", "/static").watch(cfg!(debug_assertions))`;
   templates call a function that returns `assets.url("css/app.css")`, which carries
   the content hash and is served `immutable`.
@@ -1578,6 +1592,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
   transaction-mode pooler (PgBouncer) the check lands on another server connection,
   so every run longer than `jobs::LOCK_CHECK` is aborted: give singletons a direct
   connection.
+- `CrossOrigin::trust` panics on an entry that is not an `http(s)` origin; blank
+  entries are still ignored.
+- A 5xx response no longer seals session changes.
+- `session::key_for` is new; moving to it from `key_from_base64` signs everyone out
+  once.
 
 ## Upgrading from 0.1
 
