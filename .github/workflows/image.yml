@@ -85,7 +85,8 @@ jobs:
         if: ${{ env.CHANNEL == 'stable' }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin main
+          # fetch-depth 0 fetched every branch already; a fetch here would need
+          # credentials, which the checkout does not keep.
           if ! git merge-base --is-ancestor HEAD origin/main; then
             echo "v${VERSION} is not on main: refusing to build a stable image of it" >&2
             exit 1

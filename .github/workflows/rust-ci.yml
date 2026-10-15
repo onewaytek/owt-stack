@@ -231,27 +231,37 @@ jobs:
             rm -rf "$target" && mkdir -p "$target"
           fi
           home="${CARGO_HOME:-$HOME/.cargo}"
-          # Shared: the index, the downloaded .crate archives (checked below) and git
-          # databases. Not shared: the extracted sources and git checkouts, which
-          # cargo trusts once extracted and never re-checks; every job on the scale
-          # set can write /cache, so each job extracts its own from the archives.
-          mkdir -p "$home/registry" "$home/git" /cache/cargo/registry/index \
+          # Shared: the index and git databases (git checks its own objects). Not
+          # shared: the .crate archives cargo builds from, the extracted sources and
+          # git checkouts, which cargo never re-checks once it has them; every job on
+          # the scale set can write /cache. An archive comes from the shared copy
+          # only into this job's own cache, and only if its SHA-256, taken of that
+          # private copy (after the copy, so no other job can swap it between check
+          # and use), is the lockfile's. Anything else (another lockfile's crates,
+          # `cargo install`'s) is downloaded and verified by cargo. The slot's release
+          # adds this job's archives back for the next.
+          mkdir -p "$home/registry/cache" "$home/git" /cache/cargo/registry/index \
             /cache/cargo/registry/cache /cache/cargo/git/db
-          for f in registry/index registry/cache git/db .package-cache .package-cache-mutate; do
-            rm -rf "${home:?}/$f"
+          for f in registry/index git/db .package-cache .package-cache-mutate; do
+            rm -rf "${home:?}/${f:?}"
             ln -s "/cache/cargo/$f" "$home/$f"
           done
-          # A cached archive whose SHA-256 is not the lockfile's is someone else's
-          # writing: delete it, and cargo downloads and verifies a fresh one.
           if [ -f Cargo.lock ]; then
-            awk '/^\[\[package\]\]/{n="";v="";c=""} /^name = /{n=$3} /^version = /{v=$3}
+            awk '{ sub(/\r$/, "") }
+                 /^\[\[package\]\]/{n="";v="";c=""} /^name = /{n=$3} /^version = /{v=$3}
                  /^checksum = /{c=$3; gsub(/"/,"",n); gsub(/"/,"",v); gsub(/"/,"",c); print n"-"v".crate", c}' Cargo.lock |
             while read -r file sum; do
+              case "$file" in */*|.*) continue ;; esac
               for f in /cache/cargo/registry/cache/*/"$file"; do
                 [ -f "$f" ] || continue
-                if [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$sum" ]; then
-                  echo "::warning::$f does not match Cargo.lock; removing it"
-                  rm -f "$f"
+                mine="$home/registry/cache/$(basename "$(dirname "$f")")"
+                mkdir -p "$mine"
+                cp "$f" "${mine:?}/${file:?}.part" 2>/dev/null || continue
+                if [ "$(sha256sum "${mine:?}/${file:?}.part" | cut -d' ' -f1)" = "$sum" ]; then
+                  mv "${mine:?}/${file:?}.part" "${mine:?}/${file:?}"
+                else
+                  echo "::warning::$f does not match Cargo.lock; downloading it afresh"
+                  rm -f "${mine:?}/${file:?}.part"
                 fi
               done
             done
@@ -311,7 +321,11 @@ jobs:
         env:
           CLAIM: ${{ steps.cache-volume.outputs.claim }}
         shell: bash
-        run: rmdir "$CLAIM"
+        run: |
+          # This job's verified archives, for the next job to check and copy.
+          home="${CARGO_HOME:-$HOME/.cargo}"
+          cp -rn "$home/registry/cache/." /cache/cargo/registry/cache/ 2>/dev/null || true
+          rmdir "$CLAIM"
 
   css:
     if: ${{ inputs.css-script != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}

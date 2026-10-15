@@ -127,9 +127,15 @@ jobs:
           set -euo pipefail
           if [ "$GITHUB_REF_NAME" = rc ]; then
             # Unreviewed code: nothing in it may configure or extend the release.
-            rm -rf .releaserc* release.config.* node_modules
-            if [ -f package.json ] && node -e 'process.exit("release" in require("./package.json") ? 0 : 1)'; then
-              echo "package.json has a semantic-release 'release' key; rc releases use the generated configuration only" >&2
+            # semantic-release finds its configuration with cosmiconfig, which first
+            # reads a "meta" configuration (package.json, package.yaml,
+            # .config/config.*: JavaScript among them, run as it loads) that can add
+            # search places of its own; then .releaserc*, .config/releaserc*,
+            # release.config.*. All of them go, and node_modules a plugin could load
+            # from.
+            rm -rf .releaserc* release.config.* .config package.yaml node_modules
+            if [ -f package.json ] && node -e 'const p = require("./package.json"); process.exit("release" in p || "cosmiconfig" in p ? 0 : 1)'; then
+              echo "package.json configures semantic-release or cosmiconfig; rc releases use the generated configuration only" >&2
               exit 1
             fi
           fi
@@ -138,9 +144,13 @@ jobs:
             exit 0
           fi
           node - <<'JS' > "$RUNNER_TEMP/releaserc.json"
-          const files = (process.env.VERSION_FILES || "").split(/\s+/).filter(Boolean);
-          const changelog = process.env.CHANGELOG === "true";
-          const command = process.env.VERSION_COMMAND || "";
+          // On rc no repository code runs at all: no version command (it would be
+          // a child of the process holding the token, which can read its parent's
+          // environment), and nothing committed back. A prerelease needs neither.
+          const rc = process.env.GITHUB_REF_NAME === "rc";
+          const files = rc ? [] : (process.env.VERSION_FILES || "").split(/\s+/).filter(Boolean);
+          const changelog = !rc && process.env.CHANGELOG === "true";
+          const command = rc ? "" : (process.env.VERSION_COMMAND || "");
           const plugins = [
             ["@semantic-release/commit-analyzer", { preset: "conventionalcommits" }],
             ["@semantic-release/release-notes-generator", { preset: "conventionalcommits" }],

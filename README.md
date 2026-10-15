@@ -919,10 +919,12 @@ jobs:
   "pyproject.toml uv.lock", changelog: true, uv: true}`. The files are committed back
   as `chore(release): vX.Y.Z [skip ci]`. The command runs in bash, without the
   release's token.
-- **rc is unreviewed code,** so on rc the release ignores the repository's own
-  semantic-release configuration (a `release` key in package.json fails the run) and
-  any committed `node_modules`, installs its tooling away from the checkout's `.npmrc`,
-  and fails unless the version is a prerelease; `image.yml` builds a stable image only
+- **rc is unreviewed code,** so on rc the release removes everything in the checkout
+  that could configure semantic-release (`.releaserc*`, `release.config.*`, `.config/`,
+  `package.yaml`, `node_modules`; a `release` or `cosmiconfig` key in package.json
+  fails the run), runs no `version-command` and commits nothing back, installs its
+  tooling away from the checkout's `.npmrc`, and fails unless the version is a
+  prerelease; `image.yml` builds a stable image only
   from a tag on `main`. Add a tag ruleset on `v*` in the repository settings so tags
   are created by the release job alone.
 - **Images** are tagged `X.Y.Z`, plus `X.Y` and `latest` (and `X` from 1.0) for a
