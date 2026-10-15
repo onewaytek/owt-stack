@@ -178,7 +178,12 @@ jobs:
       # On ARC the job pod can mount a persistent volume at /cache, shared by every job
       # of every repository on the scale set. When it does, the cargo registry and git
       # checkouts live there, with cargo's package-cache locks beside them so jobs in
-      # other pods take turns. Target dirs live there too, keyed by repository,
+      # other pods take turns. Every repository's jobs on the scale set can write the
+      # volume, so a job trusts only what it can check: archives against Cargo.lock,
+      # sources extracted afresh. Target dirs (whose artifacts cannot be checked) are
+      # the residual risk: give each repository a volume of its own, or none, where
+      # one repository's CI must not be able to affect another's. Target dirs live
+      # there too, keyed by repository,
       # toolchain and image. Each key has a few slots, and a job claims one for itself
       # (released by "Release the cache slot"): sqlx prepare and the 20 GiB reset
       # work outside cargo's own lock, so a target dir is never shared by two jobs at
@@ -226,11 +231,31 @@ jobs:
             rm -rf "$target" && mkdir -p "$target"
           fi
           home="${CARGO_HOME:-$HOME/.cargo}"
-          mkdir -p "$home"
-          for f in registry git .package-cache .package-cache-mutate; do
+          # Shared: the index, the downloaded .crate archives (checked below) and git
+          # databases. Not shared: the extracted sources and git checkouts, which
+          # cargo trusts once extracted and never re-checks; every job on the scale
+          # set can write /cache, so each job extracts its own from the archives.
+          mkdir -p "$home/registry" "$home/git" /cache/cargo/registry/index \
+            /cache/cargo/registry/cache /cache/cargo/git/db
+          for f in registry/index registry/cache git/db .package-cache .package-cache-mutate; do
             rm -rf "${home:?}/$f"
             ln -s "/cache/cargo/$f" "$home/$f"
           done
+          # A cached archive whose SHA-256 is not the lockfile's is someone else's
+          # writing: delete it, and cargo downloads and verifies a fresh one.
+          if [ -f Cargo.lock ]; then
+            awk '/^\[\[package\]\]/{n="";v="";c=""} /^name = /{n=$3} /^version = /{v=$3}
+                 /^checksum = /{c=$3; gsub(/"/,"",n); gsub(/"/,"",v); gsub(/"/,"",c); print n"-"v".crate", c}' Cargo.lock |
+            while read -r file sum; do
+              for f in /cache/cargo/registry/cache/*/"$file"; do
+                [ -f "$f" ] || continue
+                if [ "$(sha256sum "$f" | cut -d' ' -f1)" != "$sum" ]; then
+                  echo "::warning::$f does not match Cargo.lock; removing it"
+                  rm -f "$f"
+                fi
+              done
+            done
+          fi
           find . -path ./.git -prune -o -exec touch -h {} +
           # The index's stat data is stale now; refresh it so plumbing like
           # `git diff-index --quiet HEAD` doesn't see every file as changed.

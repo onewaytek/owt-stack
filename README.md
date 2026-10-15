@@ -911,8 +911,7 @@ jobs:
     if: needs.release.outputs.version != ''
     permissions: {contents: read, packages: write}
     uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.4.4
-    with: {version: "${{ needs.release.outputs.version }}"}
-    secrets: inherit
+    with: {version: "${{ needs.release.outputs.version }}"}   # needs only its own token
 ```
 
 - **An app whose code reads its version** writes it into its files with the release:
@@ -920,6 +919,12 @@ jobs:
   "pyproject.toml uv.lock", changelog: true, uv: true}`. The files are committed back
   as `chore(release): vX.Y.Z [skip ci]`. The command runs in bash, without the
   release's token.
+- **rc is unreviewed code,** so on rc the release ignores the repository's own
+  semantic-release configuration (a `release` key in package.json fails the run) and
+  any committed `node_modules`, installs its tooling away from the checkout's `.npmrc`,
+  and fails unless the version is a prerelease; `image.yml` builds a stable image only
+  from a tag on `main`. Add a tag ruleset on `v*` in the repository settings so tags
+  are created by the release job alone.
 - **Images** are tagged `X.Y.Z`, plus `X.Y` and `latest` (and `X` from 1.0) for a
   stable release, or `rc` for a prerelease. Rebuild an existing tag by calling
   `image.yml` from a `workflow_dispatch` with `floating-tags: false`.

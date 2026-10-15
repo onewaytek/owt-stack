@@ -75,7 +75,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: v${{ env.VERSION }}
+          fetch-depth: 0
           persist-credentials: false
+
+      # A stable image (X.Y, latest) is what production follows: its tag must be on
+      # main, which only reviewed changes reach. A tag pushed from anywhere else (an
+      # rc branch carrying unreviewed code) gets no stable image.
+      - name: A stable tag is on main
+        if: ${{ env.CHANNEL == 'stable' }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "v${VERSION} is not on main: refusing to build a stable image of it" >&2
+            exit 1
+          fi
 
       - name: Resolve tags
         id: tags
