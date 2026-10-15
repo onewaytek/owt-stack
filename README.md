@@ -389,11 +389,14 @@ let who = google.complete(&http, &pending, state, code).await?;
 // The person is (`google.provider.key()`, `who.uid`). `who.email` is contact data:
 // never look an account up by it (see "Accounts" below).
 println!("{} <{:?}>", who.uid, who.email);
-// Any OIDC issuer: its subjects are keyed by the issuer, not the `sso` id.
+// Any OIDC issuer: its subjects are keyed by the issuer, not the `sso` id. The
+// issuer and endpoints must be https (http only on localhost); `complete` refuses an
+// ID token whose `iss`, `aud` or `sub` is not this issuer, this client and the
+// user-info subject.
 let _sso = oauth::oidc("sso", "SSO", "https://sso.example/realms/x",
     "https://sso.example/realms/x/protocol/openid-connect/auth",
     "https://sso.example/realms/x/protocol/openid-connect/token",
-    "https://sso.example/realms/x/protocol/openid-connect/userinfo");
+    "https://sso.example/realms/x/protocol/openid-connect/userinfo")?;
 
 // Machine clients with an IdP's token: signature, algorithm, issuer, audience,
 // expiry and not-before.
@@ -426,7 +429,28 @@ changes at the provider and can pass to someone else (a recycled workplace mailb
 re-registered domain, an issuer that vouches loosely), so a newcomer whose verified
 email matches an account is still a stranger: they get a new account without the
 address (or `Unknown` without self-signup). A person adds a provider to their account
-by signing in to it first and calling `identities::link` from that session.
+by signing in to it first and calling `identities::link` from that session. Two first
+sign-ins with one identity at once (a callback opened twice) wait for each other and
+resolve to one account.
+
+An OIDC issuer is operator configuration, never a tenant's or a visitor's input: it
+is the namespace its subjects are trusted in, so two configurations naming one issuer
+share people. `identities::list` returns `Linked::provider` as stored, the issuer's
+URL for an OIDC provider and the id (`google`) for a preset; match it against
+`Provider::key()`, not `Provider::id`.
+
+**Upgrading from 0.4 with an OIDC provider:** identities used to be stored under the
+provider's id (`sso`) and are now stored under its issuer. Before deploying the new
+version, rewrite them, or every existing person signing in with it is a stranger
+(a second, empty account with self-signup on; refused without):
+
+```sql
+UPDATE account_identities SET provider = 'https://sso.example/realms/x'
+ WHERE provider = 'sso';
+```
+
+The issuer is written as `oidc` stores it, without a trailing `/`. Rows for `google`,
+`discord` and `twitch` are unchanged.
 
 **Logins:** a username is one token without `@`; an email always has one. So a login
 is never both, and nobody can register a username equal to someone else's email to

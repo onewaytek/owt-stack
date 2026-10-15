@@ -458,6 +458,7 @@ fn sso(issuer: &str) -> oauth::Provider {
         "https://sso.example/t",
         "https://sso.example/u",
     )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -502,15 +503,15 @@ async fn an_identity_arrives_by_its_subject_or_creates_an_account() {
     assert_eq!(again, identities::Arrival::Known(ada.clone()));
 
     // An empty subject is nobody, whatever the email says.
-    let arrival = identities::arrive(
+    let err = identities::arrive(
         &db.pool,
         &oauth::google(),
         &identity("", Some("ada@example.com"), true),
         open,
     )
     .await
-    .unwrap();
-    assert_eq!(arrival, identities::Arrival::Unknown);
+    .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::NoSubject));
     let err = identities::link(
         &db.pool,
         ada.id,
@@ -767,4 +768,49 @@ async fn the_wall_under_a_nested_router_keeps_the_prefix_in_next() {
     );
     let r = client.get("/es/admin").await;
     assert_eq!(r.location(), Some("/es/login?next=%2Fes%2Fadmin"));
+}
+
+/// A callback opened twice at once: both first sign-ins with one identity resolve to
+/// the one account, and no second account is left that nothing signs in to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_first_sign_ins_make_one_account() {
+    let db = db!();
+    let open = identities::Welcome { create: true };
+    // Every connection open first, so the racers start together.
+    let mut warm = Vec::new();
+    for _ in 0..4 {
+        warm.push(db.pool.acquire().await.unwrap());
+    }
+    drop(warm);
+    for round in 0..10 {
+        let who = identity(
+            &format!("race-{round}"),
+            Some(&format!("r{round}@example.com")),
+            true,
+        );
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(4));
+        let mut racing = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let (pool, who, start) = (db.pool.clone(), who.clone(), start.clone());
+            racing.spawn(async move {
+                start.wait().await;
+                identities::arrive(&pool, &oauth::google(), &who, open).await
+            });
+        }
+        let mut accounts = std::collections::BTreeSet::new();
+        while let Some(arrival) = racing.join_next().await {
+            accounts.insert(arrival.unwrap().unwrap().account().unwrap().id);
+        }
+        assert_eq!(accounts.len(), 1, "round {round}: {accounts:?}");
+        let account = store::by_id(&db.pool, *accounts.first().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account.email, format!("r{round}@example.com"));
+    }
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 10);
 }

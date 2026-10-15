@@ -12,7 +12,7 @@
 
 use owt_auth::oauth::{Identity, Provider};
 use serde_json::Value;
-use sqlx::{PgExecutor, PgPool};
+use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 
 use crate::store::{self, Account, New};
 use crate::{Refused, Result};
@@ -164,9 +164,18 @@ impl Arrival {
     }
 }
 
+/// The first key of the advisory lock [`arrive`] takes per identity (the second is a
+/// hash of the identity). Two-key advisory locks do not overlap one-key ones, so an
+/// app's own `pg_advisory_lock(bigint)` cannot contend with it.
+const ARRIVAL_LOCK: i32 = 0x6f77_7401;
+
 /// Resolve a provider's identity to an account, per `welcome`: by its subject, never
 /// its email. Refreshes the identity's claims. A deactivated account resolves to
-/// [`Arrival::Unknown`].
+/// [`Arrival::Unknown`]; an identity with an empty subject is [`Refused::NoSubject`].
+///
+/// One transaction, under a lock on the identity: two first sign-ins with it at once
+/// (a callback opened twice) resolve to one account, the second finding what the
+/// first created, rather than leaving an account no identity reaches.
 pub async fn arrive(
     pool: &PgPool,
     provider: &Provider,
@@ -174,29 +183,40 @@ pub async fn arrive(
     welcome: Welcome,
 ) -> Result<Arrival> {
     if identity.uid.is_empty() {
-        return Ok(Arrival::Unknown);
+        return Err(Refused::NoSubject.into());
     }
-    if let Some(linked) = find(pool, provider, &identity.uid).await? {
-        let Some(account) = store::by_id(pool, linked.account_id).await? else {
-            return Ok(Arrival::Unknown);
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(ARRIVAL_LOCK)
+        .bind(format!("{}\n{}", provider.key(), identity.uid))
+        .execute(&mut *tx)
+        .await?;
+    let arrival = if let Some(linked) = find(&mut *tx, provider, &identity.uid).await? {
+        match store::by_id(&mut *tx, linked.account_id).await? {
+            Some(account) => {
+                link(&mut *tx, account.id, provider, identity).await?;
+                Arrival::Known(account)
+            }
+            None => Arrival::Unknown,
+        }
+    } else if welcome.create {
+        let email = identity.email.as_deref().unwrap_or("");
+        // Only a verified email is worth recording, as contact data; an account
+        // holding it already keeps it, and learns nothing of this sign-in.
+        let email = if identity.email_verified && store::by_email(&mut *tx, email).await?.is_none()
+        {
+            email
+        } else {
+            ""
         };
-        link(pool, account.id, provider, identity).await?;
-        return Ok(Arrival::Known(account));
-    }
-    if !welcome.create {
-        return Ok(Arrival::Unknown);
-    }
-    let email = identity.email.as_deref().unwrap_or("");
-    // Only a verified email is worth recording, as contact data; an account holding it
-    // already keeps it, and learns nothing of this sign-in.
-    let email = if identity.email_verified && store::by_email(pool, email).await?.is_none() {
-        email
+        let account = create_for(&mut tx, &username_base(identity), email).await?;
+        link(&mut *tx, account.id, provider, identity).await?;
+        Arrival::Created(account)
     } else {
-        ""
+        Arrival::Unknown
     };
-    let account = create_for(pool, &username_base(identity), email).await?;
-    link(pool, account.id, provider, identity).await?;
-    Ok(Arrival::Created(account))
+    tx.commit().await?;
+    Ok(arrival)
 }
 
 /// A username from what the provider says: the display name, else the email's
@@ -231,8 +251,13 @@ fn username_base(identity: &Identity) -> String {
 /// which this gives up or panics). The email is dropped if another account takes it
 /// first: [`arrive`] checked it was free, but two first sign-ins with one address
 /// can race, and the loser still gets an account (without the email, as an
-/// unverified one would).
-async fn create_for(pool: &PgPool, base: &str, mut email: &str) -> Result<Account> {
+/// unverified one would). Each attempt is a savepoint, so a refused one leaves `tx`
+/// usable.
+async fn create_for(
+    tx: &mut Transaction<'_, Postgres>,
+    base: &str,
+    mut email: &str,
+) -> Result<Account> {
     let mut candidates = std::iter::once(base.to_owned())
         .chain((2..=20).map(|n| format!("{base}{n}")))
         .chain(std::iter::repeat_with(|| {
@@ -246,15 +271,21 @@ async fn create_for(pool: &PgPool, base: &str, mut email: &str) -> Result<Accoun
             password: None,
             is_staff: false,
         };
-        match store::create(pool, new).await {
+        let mut attempt = sqlx::Connection::begin(&mut **tx).await?;
+        match store::create(&mut *attempt, new).await {
+            Ok(account) => {
+                attempt.commit().await?;
+                return Ok(account);
+            }
             Err(crate::Error::Refused(Refused::UsernameTaken(_))) => {
                 username = candidates.next().expect("the iterator is endless");
             }
             Err(crate::Error::Refused(Refused::EmailTaken(_))) if !email.is_empty() => {
                 email = "";
             }
-            other => return other,
+            Err(e) => return Err(e),
         }
+        attempt.rollback().await?;
     }
 }
 

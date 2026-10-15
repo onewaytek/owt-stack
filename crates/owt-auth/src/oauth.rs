@@ -164,7 +164,19 @@ pub fn twitch() -> Provider {
 /// Any `OpenID` Connect provider, from its issuer (`https://sso.example/realms/x`) and
 /// the endpoints its discovery document names. Linked identities are keyed by the
 /// issuer (see [`Provider::key`]), so `id` only names it in URLs.
-#[must_use]
+///
+/// The issuer is operator configuration, never input from a tenant or a visitor: it
+/// is the namespace the provider's subjects are trusted in. [`Client::complete`]
+/// therefore holds the provider to it, refusing an ID token whose `iss` is another
+/// issuer's, whose `aud` is not this client, or whose `sub` is not the user-info
+/// response's.
+///
+/// # Errors
+///
+/// [`Error::Config`] when the issuer or an endpoint is not an absolute `https` URL
+/// (`http` is allowed for `localhost`, `127.0.0.1` and `[::1]`, for development),
+/// carries credentials or a fragment, or (the issuer) a query. A trailing `/` on
+/// the issuer is dropped, so `…/realms/x` and `…/realms/x/` are one key.
 pub fn oidc(
     id: &'static str,
     name: &'static str,
@@ -172,8 +184,19 @@ pub fn oidc(
     authorize: &str,
     token: &str,
     userinfo: &str,
-) -> Provider {
-    Provider {
+) -> Result<Provider, Error> {
+    let issuer = issuer.trim_end_matches('/');
+    if checked_url("issuer", issuer)?.query().is_some() {
+        return Err(Error::Config(format!("the issuer {issuer:?} has a query")));
+    }
+    for (what, url) in [
+        ("authorize", authorize),
+        ("token", token),
+        ("userinfo", userinfo),
+    ] {
+        checked_url(what, url)?;
+    }
+    Ok(Provider {
         id,
         name,
         issuer: Some(issuer.into()),
@@ -184,7 +207,32 @@ pub fn oidc(
         pkce: true,
         client_id_header: false,
         identity: oidc_identity,
+    })
+}
+
+/// An absolute `https` URL (or `http` on the loopback host) with no credentials and
+/// no fragment.
+fn checked_url(what: &str, raw: &str) -> Result<url::Url, Error> {
+    let bad = |why: &str| Error::Config(format!("the {what} URL {raw:?} {why}"));
+    let url = url::Url::parse(raw).map_err(|_| bad("is not an absolute URL"))?;
+    let loopback = match url.host() {
+        None => return Err(bad("has no host")),
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => return Err(bad("is not https")),
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(bad("carries credentials"));
+    }
+    if url.fragment().is_some() {
+        return Err(bad("has a fragment"));
+    }
+    Ok(url)
 }
 
 /// The standard claims of an OIDC user-info response.
@@ -281,6 +329,13 @@ pub enum Error {
     /// The user-info response carried no id.
     #[error("the user-info response had no id")]
     NoIdentity,
+    /// An `OpenID` Connect provider's ID token is missing, unreadable, or not for this
+    /// issuer, this client and the user-info response's subject.
+    #[error("the ID token is not this issuer's, for this client and subject: {0}")]
+    IdToken(&'static str),
+    /// A provider's configuration is unusable (see [`oidc`]).
+    #[error("provider configuration: {0}")]
+    Config(String),
     /// A configured URL is not a URL.
     #[error("bad provider URL: {0}")]
     Url(#[from] url::ParseError),
@@ -350,12 +405,63 @@ impl Client {
             .json()
             .await?;
         let access = token["access_token"].as_str().ok_or(Error::NoToken)?;
+        let id_token = match &self.provider.issuer {
+            Some(issuer) => Some(self.id_token_claims(issuer, &token)?),
+            None => None,
+        };
         let mut req = http.get(&self.provider.userinfo_url).bearer_auth(access);
         if self.provider.client_id_header {
             req = req.header("Client-Id", &self.client_id);
         }
         let info: Value = req.send().await?.error_for_status()?.json().await?;
-        (self.provider.identity)(info).ok_or(Error::NoIdentity)
+        let identity = (self.provider.identity)(info).ok_or(Error::NoIdentity)?;
+        // OIDC Core 5.3.2: the user-info `sub` must be the ID token's.
+        if let Some(claims) = id_token
+            && claims["sub"].as_str() != Some(identity.uid.as_str())
+        {
+            return Err(Error::IdToken("its sub is not the user-info response's"));
+        }
+        Ok(identity)
+    }
+
+    /// The claims of the token response's ID token, once its `iss` is `issuer`, its
+    /// `aud` names this client, and it has not expired. The token came straight from
+    /// the token endpoint over TLS (no redirects followed), which OIDC Core 3.1.3.7
+    /// accepts in place of checking its signature.
+    fn id_token_claims(&self, issuer: &str, token: &Value) -> Result<Value, Error> {
+        let raw = token["id_token"]
+            .as_str()
+            .ok_or(Error::IdToken("the token response has none"))?;
+        let mut parts = raw.split('.');
+        let (Some(_), Some(payload), Some(_), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Error::IdToken("it is not a JWT"));
+        };
+        let claims: Value = URL_SAFE_NO_PAD
+            .decode(payload.trim_end_matches('='))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or(Error::IdToken("its claims are unreadable"))?;
+        if claims["iss"].as_str().map(|i| i.trim_end_matches('/')) != Some(issuer) {
+            return Err(Error::IdToken("its iss is another issuer"));
+        }
+        let for_us = match &claims["aud"] {
+            Value::String(a) => *a == self.client_id,
+            Value::Array(all) => all.iter().any(|a| a.as_str() == Some(&self.client_id)),
+            _ => false,
+        };
+        if !for_us {
+            return Err(Error::IdToken("its aud is not this client"));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        // A minute's leeway for clock skew.
+        if claims["exp"].as_u64().is_none_or(|exp| exp + 60 < now) {
+            return Err(Error::IdToken("it has expired"));
+        }
+        Ok(claims)
     }
 }
 
@@ -468,14 +574,151 @@ mod tests {
         let sso = oidc(
             "sso",
             "SSO",
-            "https://sso.example/realms/x",
+            "https://sso.example/realms/x/",
             "https://sso.example/a",
             "https://sso.example/t",
             "https://sso.example/u",
-        );
+        )
+        .unwrap();
         assert_eq!(sso.key(), "https://sso.example/realms/x");
         let (_, pending) = client(sso).begin().unwrap();
         assert_eq!(pending.provider, "sso");
+    }
+
+    /// An issuer is an https URL, so no OIDC key can be a preset's (`google`), empty,
+    /// or another scheme's; endpoints are https too, so the token's TLS vouches for it.
+    #[test]
+    fn an_issuer_or_endpoint_that_is_not_an_https_url_is_refused() {
+        let ok = "https://sso.example/x";
+        let with = |issuer: &str, token: &str| oidc("sso", "SSO", issuer, ok, token, ok);
+        for issuer in [
+            "",
+            "google",
+            "discord",
+            "/",
+            "sso.example",
+            "http://sso.example",
+            "ftp://sso.example",
+            "https://user:pw@sso.example",
+            "https://sso.example/x?tenant=1",
+            "https://sso.example/x#f",
+        ] {
+            assert!(
+                matches!(with(issuer, ok), Err(Error::Config(_))),
+                "issuer {issuer:?}"
+            );
+        }
+        for token in ["http://sso.example/t", "//sso.example/t", "t"] {
+            assert!(with(ok, token).is_err(), "token {token:?}");
+        }
+        for dev in [
+            "http://localhost:8080/realms/x",
+            "http://127.0.0.1:8080/x",
+            "http://[::1]/x",
+        ] {
+            assert!(with(dev, dev).is_ok(), "{dev}");
+        }
+        assert!(with("http://localhost.evil.example/x", ok).is_err());
+    }
+
+    #[test]
+    fn a_preset_refuses_an_empty_subject() {
+        for (provider, info) in [
+            (google(), serde_json::json!({"sub": ""})),
+            (google(), serde_json::json!({"email": "a@b.c"})),
+            (discord(), serde_json::json!({"id": ""})),
+            (twitch(), serde_json::json!({"data": [{"id": ""}]})),
+            (twitch(), serde_json::json!({"data": []})),
+        ] {
+            assert!((provider.identity)(info).is_none(), "{}", provider.id);
+        }
+        assert!((discord().identity)(serde_json::json!({"id": "7"})).is_some());
+    }
+
+    fn jwt(claims: &Value) -> String {
+        let part = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+        format!(
+            "{}.{}.sig",
+            part(&serde_json::json!({"alg": "RS256"})),
+            part(claims)
+        )
+    }
+
+    /// An OIDC provider is held to its issuer: an ID token from another issuer, for
+    /// another client, about another subject, or stale, refuses the sign-in.
+    #[tokio::test]
+    async fn an_oidc_sign_in_needs_the_issuers_id_token_for_this_client_and_subject() {
+        use std::sync::{Arc, Mutex};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let good = serde_json::json!({
+            "iss": "https://sso.example/realms/x", "aud": ["cid", "other"],
+            "sub": "42", "exp": now + 300,
+        });
+        let id_token: Arc<Mutex<Option<String>>> = Arc::default();
+        let served = id_token.clone();
+        let fake = axum::Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let t = served.lock().unwrap().clone();
+                    async move { Json(serde_json::json!({"access_token": "t", "id_token": t})) }
+                }),
+            )
+            .route(
+                "/userinfo",
+                get(|| async { Json(serde_json::json!({"sub": "42"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, fake).await });
+        let c = client(
+            oidc(
+                "sso",
+                "SSO",
+                "https://sso.example/realms/x",
+                "https://sso.example/a",
+                &format!("{base}/token"),
+                &format!("{base}/userinfo"),
+            )
+            .unwrap(),
+        );
+        let http = http_client().unwrap();
+        let attempt = |token: Option<String>| {
+            *id_token.lock().unwrap() = token;
+            let (c, http) = (c.clone(), http.clone());
+            async move {
+                let (_, pending) = c.begin().unwrap();
+                c.complete(&http, &pending, &pending.state, "abc").await
+            }
+        };
+        assert_eq!(attempt(Some(jwt(&good))).await.unwrap().uid, "42");
+        let mut slash = good.clone();
+        slash["iss"] = "https://sso.example/realms/x/".into();
+        assert!(attempt(Some(jwt(&slash))).await.is_ok());
+        assert!(matches!(attempt(None).await, Err(Error::IdToken(_))));
+        assert!(matches!(
+            attempt(Some("not-a-jwt".into())).await,
+            Err(Error::IdToken(_))
+        ));
+        for (claim, value) in [
+            ("iss", serde_json::json!("https://evil.example/realms/x")),
+            ("iss", Value::Null),
+            ("aud", serde_json::json!("other")),
+            ("aud", serde_json::json!(["other"])),
+            ("sub", serde_json::json!("43")),
+            ("exp", serde_json::json!(now - 3600)),
+            ("exp", Value::Null),
+        ] {
+            let mut bad = good.clone();
+            bad[claim] = value.clone();
+            assert!(
+                matches!(attempt(Some(jwt(&bad))).await, Err(Error::IdToken(_))),
+                "{claim} = {value}"
+            );
+        }
     }
 
     #[test]
