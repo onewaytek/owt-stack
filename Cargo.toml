@@ -27,12 +27,14 @@ governor = { version = "0.10", default-features = false, features = ["std", "das
 html-escape = "0.2"
 http = "1"
 http-body-util = "0.1"
+hyper = { version = "1.11", default-features = false }
+hyper-util = { version = "0.1.21", default-features = false }
 jsonwebtoken = { version = "11", default-features = false }
 metrics = { version = "0.24", default-features = false }
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 metrics-process = "2.4"
 opentelemetry = "0.33"
-opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "tls-aws-lc", "tls-roots", "tls-webpki-roots"] }
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 regex = "1"
 proptest = "1"

@@ -470,3 +470,61 @@ mod leases {
         thief.release("long").await;
     }
 }
+
+/// The lock's session ends mid-run (a failover, an idle timeout): the lock is gone,
+/// so the run is stopped before another replica can start beside it.
+#[tokio::test]
+async fn a_singleton_run_stops_when_its_lock_is_lost() {
+    let Some(pool) = pool().await else { return };
+    let id = lock_id();
+    let shutdown = CancellationToken::new();
+    let jobs = Jobs::new(shutdown.clone());
+    let (started, finished) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (s, f) = (started.clone(), finished.clone());
+    jobs.singleton(
+        "long",
+        Every::new(Duration::from_secs(3600)).jitter(Duration::ZERO),
+        pool.clone(),
+        id,
+        move || {
+            let (s, f) = (s.clone(), f.clone());
+            async move {
+                s.fetch_add(1, SeqCst);
+                tokio::time::sleep(Duration::from_secs(8)).await;
+                f.fetch_add(1, SeqCst);
+                Ok(())
+            }
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(started.load(SeqCst), 1);
+    // End the session holding the lock, as a failover would.
+    let killed: bool = sqlx::query_scalar(
+        "SELECT pg_terminate_backend(pid) FROM pg_locks
+         WHERE locktype = 'advisory' AND granted
+           AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(killed);
+    // The lock is free for the taking, and the run is stopped within a check or two.
+    let mut conn = pool.acquire().await.unwrap();
+    let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert!(free);
+    tokio::time::sleep(owt_runtime::jobs::LOCK_CHECK * 3).await;
+    let _: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(finished.load(SeqCst), 0, "the run went on without its lock");
+    shutdown.cancel();
+    jobs.stopped().await;
+}

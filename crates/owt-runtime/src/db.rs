@@ -36,14 +36,20 @@ impl PoolConfig {
             .acquire_timeout(self.acquire_timeout)
     }
 
-    /// Connect to `url` now: startup fails if the database is unreachable.
+    /// Connect to `url` now: startup fails if the database is unreachable. Warns
+    /// when the connection's TLS is not verified (see [`unverified_tls`]).
     pub async fn connect(&self, url: &str) -> sqlx::Result<PgPool> {
-        self.options().connect(url).await
+        let opts: PgConnectOptions = url.parse()?;
+        warn_if_unverified(&opts);
+        self.options().connect_with(opts).await
     }
 
-    /// A pool that connects on first use: startup survives a slow database.
+    /// A pool that connects on first use: startup survives a slow database. Warns
+    /// as [`PoolConfig::connect`] does.
     pub fn connect_lazy(&self, url: &str) -> sqlx::Result<PgPool> {
-        self.options().connect_lazy(url)
+        let opts: PgConnectOptions = url.parse()?;
+        warn_if_unverified(&opts);
+        Ok(self.options().connect_lazy_with(opts))
     }
 
     /// A second pool on the same database and settings as `pool`, with its own
@@ -53,6 +59,28 @@ impl PoolConfig {
     pub fn reserve_beside(&self, pool: &PgPool) -> PgPool {
         let opts: PgConnectOptions = (*pool.connect_options()).clone();
         self.options().connect_lazy_with(opts)
+    }
+}
+
+/// Whether a connection to anywhere but this machine would go without TLS that
+/// checks the server's certificate and name (`sslmode` other than `verify-full`, which
+/// is also sqlx's default of `prefer`): on a network another workload shares, the
+/// credentials and every query could be read or changed on the way. Set
+/// `PGSSLMODE=verify-full` and `PGSSLROOTCERT` (the `OpenShift` template does).
+#[must_use]
+pub fn unverified_tls(opts: &PgConnectOptions) -> bool {
+    use sqlx::postgres::PgSslMode;
+    let local = matches!(opts.get_host(), "localhost" | "127.0.0.1" | "::1")
+        || opts.get_host().starts_with('/');
+    !local && !matches!(opts.get_ssl_mode(), PgSslMode::VerifyFull)
+}
+
+fn warn_if_unverified(opts: &PgConnectOptions) {
+    if unverified_tls(opts) {
+        tracing::warn!(
+            host = opts.get_host(),
+            "Postgres TLS is not verified (sslmode is not verify-full)"
+        );
     }
 }
 
@@ -78,4 +106,24 @@ pub async fn migrate_locked(
     result?;
     tracing::info!("migrations applied");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_verify_full_counts_as_verified_off_this_machine() {
+        let unverified = |url: &str| unverified_tls(&url.parse().unwrap());
+        assert!(unverified("postgres://u:p@db.example/app"));
+        assert!(unverified("postgres://u:p@db.example/app?sslmode=require"));
+        assert!(unverified(
+            "postgres://u:p@db.example/app?sslmode=verify-ca"
+        ));
+        assert!(!unverified(
+            "postgres://u:p@db.example/app?sslmode=verify-full"
+        ));
+        assert!(!unverified("postgres://u:p@localhost/app"));
+        assert!(!unverified("postgres://u:p@127.0.0.1:5432/app"));
+    }
 }

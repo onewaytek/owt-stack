@@ -108,9 +108,16 @@ async fn main() -> anyhow::Result<()> {
     // Replicas starting together migrate once; the rest wait on the lock.
     owt_runtime::db::migrate_locked(&pool, &MIGRATOR, 8_531_207).await?;
     let bind = env::var("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8000".into());
+    // A request head must arrive within 10 s; a stop drains for up to 20 s
+    // (`serve::serve_with` and `ServeOptions` to change either).
     serve::serve(&bind, router(pool), serve::shutdown_signal()).await
 }
 ```
+
+`PoolConfig::connect` warns at start when the database is not on this machine and
+its TLS is not verified: give the pod `PGSSLMODE=verify-full` and `PGSSLROOTCERT`
+(the OpenShift template does), since sqlx's default (`prefer`) neither requires TLS
+nor checks the server.
 
 The router composes the layers. Order matters: a layer added later wraps the ones
 before it, so cross-origin refusal runs before the session is opened, and the outer
@@ -329,6 +336,7 @@ async fn map(cache: Cache, next_tick: SystemTime) -> Response {
 
 # async fn demo() -> anyhow::Result<()> {
 // At startup: connects in the background; unset REDIS_URL means no cache at all.
+// Keys live under `myapp:c:`, apart from the leases and once-markers under `myapp:`.
 let cache = match owt_runtime::env::var("REDIS_URL") {
     Some(url) => Cache::connect(&url, "myapp", Options::default())?,
     None => Cache::disabled(),
@@ -499,6 +507,9 @@ work tracker.
 - **Off unless configured.** With neither `CHANGE_REQUESTS_URL` nor
   `CHANGE_REQUESTS_KEY` set, the routes answer 404 and the button renders nothing.
   One without the other fails at start.
+- **The key travels encrypted.** `CHANGE_REQUESTS_URL` must be `https`, except to
+  `localhost` or a cluster service (`http://tracker.tools.svc:8080/…`), and may not
+  carry credentials, a query or a fragment.
 
 ```rust,no_run
 # fn demo(http: reqwest::Client) -> Result<(), owt_change::ConfigError> {
@@ -603,7 +614,10 @@ let _first = socket.recv().await;
 ```
 
 `Bus::local` is the same API in one process, for tests. Channel names are a wire
-format between replicas: change them only with every replica.
+format between replicas: change them only with every replica. The prefix is ASCII
+letters, digits, `_`, `.` and `-` (`Bus::redis` refuses others): the subscription is
+the pattern `<prefix>:*`, so a `*`, `?`, `[` or `:` in it would hear other
+deployments' channels.
 
 ### Background jobs
 
@@ -613,7 +627,11 @@ survives a failed or panicking run, and graceful shutdown:
 
 - `every_replica`: idempotent work; the task takes its rows with `SKIP LOCKED`.
 - `singleton`: at most one replica at a time, by a Postgres advisory lock that is
-  tried and skipped, never waited on.
+  tried and skipped, never waited on. The lock lasts as long as its connection, which
+  is checked every `jobs::LOCK_CHECK`: a run whose connection drops (a failover, an
+  idle timeout) is aborted at its next `.await`, as a crash would stop it, before
+  another replica's run can overlap it. It needs a direct connection, not a
+  transaction-mode pooler.
 - `leased` (feature `redis`): one replica, the same one while it lives, by a Redis
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
@@ -1078,11 +1096,28 @@ The router example under "Wiring an app" composes the layers; beyond it:
   state and the provider itself.
 - The bus's Redis is inside the trust boundary: a password or ACL user, a network
   only the app reaches, `rediss://` where the path leaves the node.
-- `Limits` bounds the time to a response, not the time a client takes to send a
-  request: serve behind a proxy that bounds that (the OpenShift router does).
+- `Limits` bounds the time to a response; `serve::serve` bounds the time to a request
+  (its head within 10 s) and to a stop (20 s of draining), on the metrics listener
+  too, which no router fronts. A handler that reads `Body` or `Request` itself is
+  outside `DefaultBodyLimit`; it bounds what it reads.
+- The metrics middleware labels by matched route and by method, an invented method
+  counting as `other`, so no client can grow the label set (each new set is a
+  histogram kept for the life of the process).
 - Start `Csp` in report-only mode and read the browser console before enforcing.
   htmx needs `htmx.config.includeIndicatorStyles = false` (or its
   `inlineStyleNonce`) and no `hx-on:*` attributes, which a nonce cannot cover.
+
+## Upgrading from 0.4
+
+- **The cache starts cold once:** its keys move from `<prefix>:` to `<prefix>:c:`, so
+  no cache key can name a lease. Old keys expire or are evicted on their own.
+- `Bus::redis` refuses a prefix with characters other than ASCII letters, digits,
+  `_`, `.` and `-`, and a zero `beat_every`.
+- `CHANGE_REQUESTS_URL` must be `https` unless it names `localhost` or a cluster
+  service, and may not carry credentials, a query or a fragment.
+- `serve::serve` closes a connection whose request head takes over 10 seconds and
+  stops draining after 20; `serve_with` sets other bounds.
+- `jobs::singleton` aborts a run whose lock connection drops.
 
 ## Upgrading from 0.1
 

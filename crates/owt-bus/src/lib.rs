@@ -253,12 +253,23 @@ impl<T: Topic, M: Message> Bus<T, M> {
     /// Across replicas through the Redis at `url`: `publisher` carries publishes and
     /// the heartbeat; a task of its own holds the pattern subscription and feeds local
     /// subscribers, reconnecting for the life of the process.
+    ///
+    /// # Errors
+    ///
+    /// A `prefix` that is not ASCII letters, digits, `_`, `.` and `-` (the
+    /// subscription is the glob `<prefix>:*`, so `*`, `?`, `[` or `:` in it would
+    /// match other deployments' channels), a zero `beat_every`, or a bad `url`.
     pub fn redis(
         url: &str,
         publisher: redis::aio::ConnectionManager,
         prefix: &str,
         options: Options,
     ) -> anyhow::Result<Self> {
+        checked_prefix(prefix)?;
+        anyhow::ensure!(
+            !options.beat_every.is_zero(),
+            "the bus heartbeat period is zero"
+        );
         let bus = Self::with(options, Some(publisher.clone()), &format!("{prefix}:"));
         ensure_crypto_provider();
         let client = redis::Client::open(url)?;
@@ -353,6 +364,19 @@ impl<T: Topic, M: Message> Bus<T, M> {
     pub fn has_subscribers(&self, topic: T) -> bool {
         self.shared.registry().topics.contains_key(&topic)
     }
+}
+
+/// A prefix the channel glob matches only literally, with nothing nested under it.
+fn checked_prefix(prefix: &str) -> anyhow::Result<()> {
+    let literal = !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    anyhow::ensure!(
+        literal,
+        "a bus prefix is ASCII letters, digits, `_`, `.` and `-`: {prefix:?}"
+    );
+    Ok(())
 }
 
 async fn heartbeat(mut conn: redis::aio::ConnectionManager, channel: String, every: Duration) {
@@ -523,6 +547,18 @@ mod tests {
     use std::fmt;
 
     use super::*;
+
+    /// The subscription is `PSUBSCRIBE <prefix>:*`: a prefix with glob characters, or
+    /// one another deployment's prefix nests under, would hear that deployment.
+    #[test]
+    fn a_prefix_is_matched_literally() {
+        for ok in ["myapp", "my-app_2.staging"] {
+            assert!(checked_prefix(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "*", "my*", "my?app", "[ab]", "staging:x", "my app", "é"] {
+            assert!(checked_prefix(bad).is_err(), "{bad}");
+        }
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     enum Room {

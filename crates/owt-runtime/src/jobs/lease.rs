@@ -40,8 +40,10 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0";
 
-fn millis(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
+/// A TTL in milliseconds as Redis takes it: at least one, and at most what its
+/// signed 64-bit `PX` accepts (a larger one is refused, and the lease never taken).
+fn millis(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX).max(1)
 }
 
 /// This replica's view of the lease table. Cheap to clone.
@@ -211,7 +213,7 @@ impl Jobs {
         Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let lease: Arc<str> = Arc::from(lease.into());
-        if ttl <= every.period + every.jitter {
+        if ttl <= every.period.saturating_add(every.jitter) {
             tracing::warn!(job = name, ?ttl, period = ?every.period, "lease TTL does not outlast the period; ownership will flap");
         }
         let this = self.clone();

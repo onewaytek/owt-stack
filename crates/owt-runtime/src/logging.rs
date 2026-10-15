@@ -58,8 +58,15 @@ pub fn init(opts: &Options) -> Guard {
     {
         use opentelemetry::trace::TracerProvider as _;
         let provider = opts.otel_endpoint.as_ref().and_then(|endpoint| {
+            use opentelemetry_otlp::WithTonicConfig as _;
+            // An https collector is verified against the system's roots (where a
+            // cluster's service CA is installed) and the public web's; without roots
+            // the exporter's default TLS would trust nothing.
+            let tls = opentelemetry_otlp::tonic_types::transport::ClientTlsConfig::new()
+                .with_enabled_roots();
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
+                .with_tls_config(tls)
                 .build()
                 .map_err(|e| eprintln!("OTLP exporter for {endpoint} failed: {e}"))
                 .ok()?;
