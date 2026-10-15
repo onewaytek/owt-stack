@@ -1,0 +1,837 @@
+//! Sign-in with a provider (Google, Discord, Twitch, any OIDC issuer): the routes,
+//! their configuration, and the pieces an app's pages show.
+//!
+//! [`owt_auth::oauth`] speaks the protocol and [`crate::identities`] resolves who
+//! came back; this module is the HTTP glue between them, written once:
+//!
+//! | Route (default path) | What it does |
+//! |---|---|
+//! | `POST /auth/{provider}/start` | Begins: keeps the pending sign-in in the session, sends the browser to the provider. Form fields: `next` (where to land), `connect` (add the provider to the signed-in account instead of signing in). |
+//! | `GET /auth/{provider}/callback` | Ends: checks the state and provider, trades the code, then signs in ([`identities::arrive`]) or links ([`identities::link`]), and redirects. |
+//! | `POST /auth/connections/{id}/remove` | Unlinks one of the signed-in account's identities, never its last way in. |
+//!
+//! Every failure redirects with `?social=<code>` to the sign-in page (or, for a
+//! connect, the connections page); [`outcome`] turns the code into a message for
+//! [`owt_web::ui::Alerts`]. Nothing here renders a page of its own: the app's sign-in
+//! and settings pages embed [`Buttons`] and [`Connections`].
+//!
+//! **Configuration** ([`Providers::from_env`]): `PUBLIC_BASE_URL`, and for each
+//! provider `<PROVIDER>_CLIENT_ID` with `<PROVIDER>_CLIENT_SECRET`. The README's
+//! "Sign-in with a provider" section lists every requirement, at the providers too.
+
+use std::fmt;
+use std::sync::Arc;
+
+use askama::Template;
+use askama::filters::HtmlSafe;
+use axum::Router;
+use axum::extract::{Form, Path, Query, State};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use owt_auth::oauth;
+use owt_web::cache::CachePolicy;
+use owt_web::flash::{Flash, Level};
+use owt_web::redirect;
+use owt_web::session::{Session, SessionData};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+
+use crate::identities::{self, Arrival, Welcome};
+use crate::session::Signed as SignedData;
+use crate::{Maybe, Refused, Signed, session};
+
+/// The variable naming this site's public origin (`https://myapp.example`): the
+/// redirect URI each provider is told is built from it.
+pub const PUBLIC_BASE_URL: &str = "PUBLIC_BASE_URL";
+
+/// The callback path when the app names none; `{provider}` is the provider's id.
+pub const DEFAULT_CALLBACK: &str = "/auth/{provider}/callback";
+/// The start path.
+pub const START: &str = "/auth/{provider}/start";
+/// The path that removes a connection; `{id}` is the identity's row id.
+pub const REMOVE: &str = "/auth/connections/{id}/remove";
+
+/// The presets [`Providers::from_env`] reads, by the variable prefix each uses.
+/// A preset's constructor.
+type Preset = fn() -> oauth::Provider;
+
+const PRESETS: [(&str, Preset); 3] = [
+    ("GOOGLE", oauth::google),
+    ("DISCORD", oauth::discord),
+    ("TWITCH", oauth::twitch),
+];
+
+/// A configuration that cannot be used. Each says which variable to fix, so a
+/// deployment fails at start rather than at someone's first sign-in.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ConfigError {
+    /// A provider's id is set without its secret, or the reverse.
+    #[error("set both {0}_CLIENT_ID and {0}_CLIENT_SECRET, or neither")]
+    Half(String),
+    /// A provider is configured and `PUBLIC_BASE_URL` is not.
+    #[error("{PUBLIC_BASE_URL} must be set when a sign-in provider is configured")]
+    NoBaseUrl,
+    /// `PUBLIC_BASE_URL` is not an origin this can redirect to.
+    #[error(
+        "{PUBLIC_BASE_URL} must be an https origin with no path (http is accepted for localhost): {0}"
+    )]
+    BaseUrl(String),
+    /// The callback path is not a path naming `{provider}`.
+    #[error("the callback path must start with / and contain {{provider}}: {0}")]
+    Callback(String),
+    /// Two providers share an id.
+    #[error("two providers have the id {0}")]
+    Duplicate(String),
+}
+
+/// The providers this site signs in with, and the URLs they were registered with.
+#[derive(Clone)]
+pub struct Providers {
+    clients: Vec<oauth::Client>,
+    base: String,
+    callback: String,
+}
+
+impl fmt::Debug for Providers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Providers")
+            .field("clients", &self.clients)
+            .field("base", &self.base)
+            .field("callback", &self.callback)
+            .finish()
+    }
+}
+
+impl Providers {
+    /// No providers yet, for a site at `public_base_url` whose callback route is
+    /// `callback` ([`DEFAULT_CALLBACK`] unless the providers were registered with
+    /// another).
+    ///
+    /// # Errors
+    ///
+    /// When the URL is not an origin or the callback names no `{provider}`.
+    pub fn new(public_base_url: &str, callback: &str) -> Result<Self, ConfigError> {
+        Ok(Self {
+            clients: Vec::new(),
+            base: origin(public_base_url)?,
+            callback: callback_path(callback)?,
+        })
+    }
+
+    /// Read `PUBLIC_BASE_URL` and the presets' credentials: `GOOGLE_CLIENT_ID` and
+    /// `GOOGLE_CLIENT_SECRET`, and the same for `DISCORD` and `TWITCH`. A provider
+    /// with neither variable is off; none configured is an empty set (no buttons).
+    ///
+    /// # Errors
+    ///
+    /// See [`ConfigError`].
+    pub fn from_env(callback: &str) -> Result<Self, ConfigError> {
+        Self::from_values(env_var, callback)
+    }
+
+    /// [`Providers::from_env`] over `get` instead of the environment.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConfigError`].
+    pub fn from_values(
+        get: impl Fn(&str) -> Option<String>,
+        callback: &str,
+    ) -> Result<Self, ConfigError> {
+        let callback = callback_path(callback)?;
+        let mut found = Vec::new();
+        for (prefix, preset) in PRESETS {
+            let id = get(&format!("{prefix}_CLIENT_ID"));
+            let secret = get(&format!("{prefix}_CLIENT_SECRET"));
+            match (id, secret) {
+                (None, None) => {}
+                (Some(id), Some(secret)) => found.push((preset(), id, secret)),
+                _ => return Err(ConfigError::Half(prefix.to_owned())),
+            }
+        }
+        let base = match get(PUBLIC_BASE_URL) {
+            Some(url) => origin(&url)?,
+            None if found.is_empty() => String::new(),
+            None => return Err(ConfigError::NoBaseUrl),
+        };
+        let mut this = Self {
+            clients: Vec::new(),
+            base,
+            callback,
+        };
+        for (provider, id, secret) in found {
+            this = this.with(provider, id, secret)?;
+        }
+        Ok(this)
+    }
+
+    /// Add `provider` with this site's registration at it: an [`oauth::oidc`]
+    /// issuer, or a preset pointed elsewhere in a test. Its redirect URI is this
+    /// set's [`redirect_uri`](Self::redirect_uri).
+    ///
+    /// # Errors
+    ///
+    /// When a provider with that id is already in the set, or the set has no
+    /// public base URL.
+    pub fn with(
+        mut self,
+        provider: oauth::Provider,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        if self.base.is_empty() {
+            return Err(ConfigError::NoBaseUrl);
+        }
+        if self.get(provider.id).is_some() {
+            return Err(ConfigError::Duplicate(provider.id.to_owned()));
+        }
+        let redirect_uri = self.redirect_uri(provider.id);
+        self.clients.push(oauth::Client {
+            provider,
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri,
+        });
+        Ok(self)
+    }
+
+    /// The redirect URI to register at the provider `id`, exactly:
+    /// `PUBLIC_BASE_URL` followed by the callback path.
+    #[must_use]
+    pub fn redirect_uri(&self, id: &str) -> String {
+        format!("{}{}", self.base, self.callback.replace("{provider}", id))
+    }
+
+    /// The provider `id`, if configured.
+    #[must_use]
+    pub fn get(&self, id: &str) -> Option<&oauth::Client> {
+        self.clients.iter().find(|c| c.provider.id == id)
+    }
+
+    /// The configured providers, in the order added (Google, Discord, Twitch, then
+    /// any [`with`](Self::with)).
+    pub fn iter(&self) -> impl Iterator<Item = &oauth::Client> {
+        self.clients.iter()
+    }
+
+    /// No provider is configured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+
+    /// The origins of the providers' consent pages, for the Content-Security-Policy
+    /// `form-action` directive: the start form's redirect lands there, and a browser
+    /// enforcing `form-action 'self'` refuses it.
+    #[must_use]
+    pub fn form_action_sources(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .clients
+            .iter()
+            .filter_map(|c| url::Url::parse(&c.provider.authorize_url).ok())
+            .map(|u| u.origin().ascii_serialization())
+            .collect();
+        out.dedup();
+        out
+    }
+}
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// `https://host[:port]`, no trailing slash; `http` only for this machine.
+fn origin(raw: &str) -> Result<String, ConfigError> {
+    let bad = || ConfigError::BaseUrl(raw.to_owned());
+    let url = url::Url::parse(raw.trim()).map_err(|_| bad())?;
+    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && local);
+    let bare = matches!(url.path(), "" | "/") && url.query().is_none() && url.fragment().is_none();
+    if !scheme_ok || !bare || url.host_str().is_none() || !url.username().is_empty() {
+        return Err(bad());
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+fn callback_path(raw: &str) -> Result<String, ConfigError> {
+    if raw.starts_with('/') && raw.contains("{provider}") && !raw.contains("//") {
+        Ok(raw.to_owned())
+    } else {
+        Err(ConfigError::Callback(raw.to_owned()))
+    }
+}
+
+/// A sign-in on its way to a provider and back, kept in the session between the two.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Started {
+    /// The state, provider and PKCE verifier sent out.
+    #[serde(rename = "p")]
+    pub pending: oauth::Pending,
+    /// Where to land afterwards; checked to be on this site when used.
+    #[serde(rename = "n", default, skip_serializing_if = "String::is_empty")]
+    pub next: String,
+    /// Adding the provider to the signed-in account, not signing in.
+    #[serde(rename = "c", default, skip_serializing_if = "std::ops::Not::not")]
+    pub connect: bool,
+}
+
+/// Session data that can hold a [`Started`] sign-in as well as the signature. An
+/// app with its own session type adds a field and these two methods; one without
+/// uses [`Data`].
+pub trait Social: SignedData {
+    /// The sign-in in progress, if any.
+    fn started(&self) -> Option<&Started>;
+    /// Keep `started`, or clear it with `None`.
+    fn set_started(&mut self, started: Option<Started>);
+}
+
+/// [`session::Data`](crate::session::Data) with room for a [`Started`] sign-in:
+/// the session type for an app that keeps nothing else in its session.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Data {
+    /// The signature.
+    #[serde(flatten)]
+    pub signed: session::Data,
+    /// The sign-in in progress.
+    #[serde(rename = "o", default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<Started>,
+}
+
+impl SignedData for Data {
+    fn signature(&self) -> Option<session::Signature> {
+        self.signed.signature()
+    }
+
+    fn set_signature(&mut self, signature: Option<session::Signature>) {
+        self.signed.set_signature(signature);
+    }
+}
+
+impl Social for Data {
+    fn started(&self) -> Option<&Started> {
+        self.started.as_ref()
+    }
+
+    fn set_started(&mut self, started: Option<Started>) {
+        self.started = started;
+    }
+}
+
+/// What a `?social=` code means, as a message for [`owt_web::ui::Alerts`]; `None`
+/// for a code this module never sends.
+///
+/// ```
+/// # fn page(info: owt_web::request::RequestInfo) {
+/// let flashes: Vec<_> = owt_accounts::social::outcome(info.query_value("social")).into_iter().collect();
+/// let alerts = owt_web::ui::Alerts { flashes: &flashes };
+/// # let _ = alerts; }
+/// ```
+#[must_use]
+pub fn outcome(code: Option<&str>) -> Option<Flash> {
+    let (level, text) = match code? {
+        "expired" => (
+            Level::Error,
+            "That sign-in expired or was started elsewhere. Please try again.",
+        ),
+        "cancelled" => (Level::Warning, "Sign-in was cancelled at the provider."),
+        "failed" => (
+            Level::Error,
+            "The provider could not complete the sign-in. Please try again.",
+        ),
+        "unknown" => (
+            Level::Error,
+            "No account here uses that sign-in. Sign in another way, then connect it from your settings.",
+        ),
+        "taken" => (
+            Level::Error,
+            "That sign-in is already connected to a different account.",
+        ),
+        "sign-in-first" => (Level::Error, "Sign in before connecting another sign-in."),
+        "connected" => (
+            Level::Success,
+            "Connected. You can sign in with it from now on.",
+        ),
+        "removed" => (Level::Success, "Connection removed."),
+        "last-way-in" => (
+            Level::Error,
+            "That is the only way into your account, so it cannot be removed. Set a password or connect another first.",
+        ),
+        _ => return None,
+    };
+    Some(Flash(level, text.to_owned()))
+}
+
+/// Sign-in with providers, configured. Cheap to clone: keep one in the app's state
+/// for the pages that show [`Buttons`] and [`Connections`], and merge
+/// [`SocialSignIn::routes`] into the router.
+#[derive(Clone)]
+pub struct SocialSignIn(Arc<Inner>);
+
+struct Inner {
+    pool: PgPool,
+    http: reqwest::Client,
+    providers: Providers,
+    welcome: Welcome,
+    sign_in_page: String,
+    connections_page: String,
+    after_sign_in: String,
+}
+
+impl fmt::Debug for SocialSignIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SocialSignIn")
+            .field("providers", &self.0.providers)
+            .field("welcome", &self.0.welcome)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SocialSignIn {
+    /// Sign-in with `providers` over `pool`'s accounts, by `welcome`'s policy for a
+    /// first sign-in. `http` is [`oauth::http_client`]'s client. Pages default to
+    /// `/login` (sign-in), `/account/connections` (settings) and `/` (after).
+    #[must_use]
+    pub fn new(
+        pool: PgPool,
+        http: reqwest::Client,
+        providers: Providers,
+        welcome: Welcome,
+    ) -> Self {
+        Self(Arc::new(Inner {
+            pool,
+            http,
+            providers,
+            welcome,
+            sign_in_page: "/login".into(),
+            connections_page: "/account/connections".into(),
+            after_sign_in: "/".into(),
+        }))
+    }
+
+    fn edit(mut self, f: impl FnOnce(&mut Inner)) -> Self {
+        // Built once at start-up, before any clone exists.
+        if let Some(inner) = Arc::get_mut(&mut self.0) {
+            f(inner);
+        }
+        self
+    }
+
+    /// The app's sign-in page: failures of a sign-in land here with `?social=`.
+    #[must_use]
+    pub fn sign_in_page(self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        self.edit(|i| i.sign_in_page = path)
+    }
+
+    /// The app's page listing [`Connections`]: connects and removals land here.
+    #[must_use]
+    pub fn connections_page(self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        self.edit(|i| i.connections_page = path)
+    }
+
+    /// Where a sign-in lands when the start form gave no `next` on this site.
+    #[must_use]
+    pub fn after_sign_in(self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        self.edit(|i| i.after_sign_in = path)
+    }
+
+    /// The providers.
+    #[must_use]
+    pub fn providers(&self) -> &Providers {
+        &self.0.providers
+    }
+
+    /// The routes, at full paths (merge them; do not nest), for session data `T`.
+    /// Install them inside the session layer and the accounts layer.
+    pub fn routes<T, S>(&self) -> Router<S>
+    where
+        T: Social + SessionData,
+        S: Clone + Send + Sync + 'static,
+    {
+        Router::new()
+            .route(START, post(start::<T>))
+            .route(&self.0.providers.callback, get(callback::<T>))
+            .route(REMOVE, post(remove))
+            .with_state(self.clone())
+    }
+
+    /// The sign-in buttons, one form per provider, landing on `next` afterwards
+    /// (empty: [`after_sign_in`](Self::after_sign_in)). Renders nothing when no
+    /// provider is configured.
+    #[must_use]
+    pub fn buttons<'a>(&'a self, next: &'a str) -> Buttons<'a> {
+        Buttons {
+            items: self.items(|_| true),
+            next,
+            connect: false,
+        }
+    }
+
+    fn items(&self, keep: impl Fn(&str) -> bool) -> Vec<ButtonItem> {
+        self.0
+            .providers
+            .iter()
+            .filter(|c| keep(c.provider.id))
+            .map(|c| ButtonItem {
+                action: START.replace("{provider}", c.provider.id),
+                name: c.provider.name,
+            })
+            .collect()
+    }
+
+    /// The account's connections and the providers it could still connect, for the
+    /// app's settings page.
+    ///
+    /// # Errors
+    ///
+    /// The database.
+    pub async fn connections(&self, account_id: i64) -> sqlx::Result<Connections> {
+        let linked = identities::list(&self.0.pool, account_id).await?;
+        let keys: Vec<&str> = linked.iter().map(|l| l.provider.as_str()).collect();
+        let rows = linked
+            .iter()
+            .map(|l| ConnectionRow {
+                remove: REMOVE.replace("{id}", &l.id.to_string()),
+                provider: self
+                    .0
+                    .providers
+                    .iter()
+                    .find(|c| c.provider.key() == l.provider)
+                    .map_or_else(|| l.provider.clone(), |c| c.provider.name.to_owned()),
+                label: l.label().to_owned(),
+            })
+            .collect();
+        let items = self.items(|id| {
+            self.0
+                .providers
+                .get(id)
+                .is_some_and(|c| !keys.contains(&c.provider.key()))
+        });
+        Ok(Connections { rows, items })
+    }
+}
+
+/// A provider's button.
+#[derive(Clone, Debug)]
+struct ButtonItem {
+    action: String,
+    name: &'static str,
+}
+
+/// The sign-in buttons: `{{ buttons }}` on the sign-in page.
+///
+/// ```html
+/// <div class="owt-actions"><form method="post" action="/auth/google/start"><input type="hidden" name="next" value="/games"><button class="owt-button owt-button-secondary" type="submit">Continue with Google</button></form></div>
+/// ```
+#[derive(Template, Clone, Debug)]
+#[template(
+    source = r#"{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}">{% if !next.is_empty() %}<input type="hidden" name="next" value="{{ next }}">{% endif %}{% if connect %}<input type="hidden" name="connect" value="1">{% endif %}<button class="owt-button owt-button-secondary" type="submit">{% if connect %}Connect {{ b.name }}{% else %}Continue with {{ b.name }}{% endif %}</button></form>{% endfor %}</div>
+{% endif %}"#,
+    ext = "html"
+)]
+pub struct Buttons<'a> {
+    items: Vec<ButtonItem>,
+    next: &'a str,
+    connect: bool,
+}
+impl HtmlSafe for Buttons<'_> {}
+
+/// A connected identity.
+#[derive(Clone, Debug)]
+struct ConnectionRow {
+    remove: String,
+    provider: String,
+    label: String,
+}
+
+/// An account's connections, each with a Remove button, then a Connect button per
+/// provider not yet connected: `{{ connections }}` on the settings page.
+#[derive(Template, Clone, Debug)]
+#[template(
+    source = r#"{% if rows.is_empty() %}<p class="owt-hint">No sign-in connections yet.</p>
+{% else %}<table class="owt-table"><thead><tr><th scope="col">Provider</th><th scope="col">Account there</th><th scope="col"><span class="owt-sr">Actions</span></th></tr></thead><tbody>
+{% for r in rows %}<tr><td>{{ r.provider }}</td><td>{{ r.label }}</td><td><form method="post" action="{{ r.remove }}"><button class="owt-button owt-button-quiet" type="submit">Remove</button></form></td></tr>
+{% endfor %}</tbody></table>
+{% endif %}{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}"><input type="hidden" name="connect" value="1"><button class="owt-button owt-button-secondary" type="submit">Connect {{ b.name }}</button></form>{% endfor %}</div>
+{% endif %}"#,
+    ext = "html"
+)]
+pub struct Connections {
+    rows: Vec<ConnectionRow>,
+    items: Vec<ButtonItem>,
+}
+impl HtmlSafe for Connections {}
+
+/// `path?social=code`.
+fn landing(path: &str, code: &str) -> Response {
+    let sep = if path.contains('?') { '&' } else { '?' };
+    (
+        CachePolicy::no_store(),
+        Redirect::to(&format!("{path}{sep}social={code}")),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct StartForm {
+    #[serde(default)]
+    next: String,
+    #[serde(default)]
+    connect: String,
+}
+
+async fn start<T: Social + SessionData>(
+    State(this): State<SocialSignIn>,
+    session: Session<T>,
+    Maybe(me): Maybe,
+    Path(provider): Path<String>,
+    Form(form): Form<StartForm>,
+) -> owt_web::Result<Response> {
+    let Some(client) = this.0.providers.get(&provider) else {
+        return Err(owt_web::Error::NotFound);
+    };
+    let connect = !form.connect.is_empty();
+    if connect && me.is_none() {
+        return Ok(landing(&this.0.sign_in_page, "sign-in-first"));
+    }
+    let (url, pending) = client
+        .begin()
+        .map_err(|e| owt_web::Error::Internal(e.into()))?;
+    let next = redirect::local_or(Some(&form.next), "").to_owned();
+    session.update(|d| {
+        d.set_started(Some(Started {
+            pending,
+            next,
+            connect,
+        }));
+    });
+    Ok((CachePolicy::no_store(), Redirect::to(&url)).into_response())
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn callback<T: Social + SessionData>(
+    State(this): State<SocialSignIn>,
+    session: Session<T>,
+    Maybe(me): Maybe,
+    Path(provider): Path<String>,
+    Query(q): Query<CallbackQuery>,
+) -> owt_web::Result<Response> {
+    let inner = &this.0;
+    let Some(client) = inner.providers.get(&provider) else {
+        return Err(owt_web::Error::NotFound);
+    };
+    // Taken whatever happens next: a pending sign-in is good for one callback.
+    let started = session.update(|d| {
+        let s = d.started().cloned();
+        d.set_started(None);
+        s
+    });
+    let Some(started) = started else {
+        return Ok(landing(&inner.sign_in_page, "expired"));
+    };
+    let back = if started.connect {
+        inner.connections_page.as_str()
+    } else {
+        inner.sign_in_page.as_str()
+    };
+    if q.error.is_some() {
+        return Ok(landing(back, "cancelled"));
+    }
+    let (Some(state), Some(code)) = (q.state, q.code) else {
+        return Ok(landing(back, "failed"));
+    };
+    let identity = match client
+        .complete(&inner.http, &started.pending, &state, &code)
+        .await
+    {
+        Ok(identity) => identity,
+        Err(oauth::Error::State | oauth::Error::Provider) => {
+            return Ok(landing(back, "expired"));
+        }
+        Err(e) => {
+            tracing::warn!(provider = %provider, error = %e, "a provider sign-in failed");
+            return Ok(landing(back, "failed"));
+        }
+    };
+    if started.connect {
+        let Some(me) = me else {
+            return Ok(landing(&inner.sign_in_page, "sign-in-first"));
+        };
+        return match identities::link(&inner.pool, me.id, &client.provider, &identity).await {
+            Ok(_) => {
+                tracing::info!(account = me.id, provider = %provider, "connected a provider");
+                Ok(landing(&inner.connections_page, "connected"))
+            }
+            Err(e) if e.refused() == Some(&Refused::IdentityTaken) => {
+                Ok(landing(&inner.connections_page, "taken"))
+            }
+            Err(e) if e.refused() == Some(&Refused::NoSubject) => {
+                Ok(landing(&inner.connections_page, "failed"))
+            }
+            Err(e) => Err(e.into()),
+        };
+    }
+    let arrival =
+        identities::arrive(&inner.pool, &client.provider, &identity, inner.welcome).await?;
+    let Some(account) = arrival.account() else {
+        return Ok(landing(&inner.sign_in_page, "unknown"));
+    };
+    session::sign_in(&session, account);
+    tracing::info!(
+        account = account.id,
+        provider = %provider,
+        created = matches!(arrival, Arrival::Created(_)),
+        "signed in with a provider"
+    );
+    let to = redirect::local_or(Some(&started.next), &inner.after_sign_in).to_owned();
+    Ok((CachePolicy::no_store(), Redirect::to(&to)).into_response())
+}
+
+async fn remove(
+    State(this): State<SocialSignIn>,
+    Signed(me): Signed,
+    Path(id): Path<i64>,
+) -> owt_web::Result<Response> {
+    let inner = &this.0;
+    match identities::unlink(&inner.pool, me.id, id).await {
+        Ok(true) => {
+            tracing::info!(account = me.id, identity = id, "removed a connection");
+            Ok(landing(&inner.connections_page, "removed"))
+        }
+        Ok(false) => Err(owt_web::Error::NotFound),
+        Err(e) if e.refused() == Some(&Refused::LastWayIn) => {
+            Ok(landing(&inner.connections_page, "last-way-in"))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn nothing_configured_is_no_providers() {
+        let p = Providers::from_values(env(&[]), DEFAULT_CALLBACK).unwrap();
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn a_provider_needs_both_halves_and_the_public_url() {
+        let half = Providers::from_values(env(&[("GOOGLE_CLIENT_ID", "id")]), DEFAULT_CALLBACK);
+        assert_eq!(half.unwrap_err(), ConfigError::Half("GOOGLE".into()));
+        let no_base = Providers::from_values(
+            env(&[("GOOGLE_CLIENT_ID", "id"), ("GOOGLE_CLIENT_SECRET", "s")]),
+            DEFAULT_CALLBACK,
+        );
+        assert_eq!(no_base.unwrap_err(), ConfigError::NoBaseUrl);
+        let p = Providers::from_values(
+            env(&[
+                ("PUBLIC_BASE_URL", "https://myapp.example/"),
+                ("GOOGLE_CLIENT_ID", "id"),
+                ("GOOGLE_CLIENT_SECRET", "s"),
+                ("TWITCH_CLIENT_ID", "tid"),
+                ("TWITCH_CLIENT_SECRET", "ts"),
+            ]),
+            DEFAULT_CALLBACK,
+        )
+        .unwrap();
+        let ids: Vec<_> = p.iter().map(|c| c.provider.id).collect();
+        assert_eq!(ids, ["google", "twitch"]);
+        assert_eq!(
+            p.get("google").unwrap().redirect_uri,
+            "https://myapp.example/auth/google/callback"
+        );
+        assert_eq!(
+            p.form_action_sources(),
+            ["https://accounts.google.com", "https://id.twitch.tv"]
+        );
+    }
+
+    #[test]
+    fn the_public_url_is_an_https_origin() {
+        for ok in [
+            "https://myapp.example",
+            "https://myapp.example:8443/",
+            "http://localhost:8000",
+        ] {
+            assert!(origin(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://myapp.example",
+            "https://myapp.example/app",
+            "https://myapp.example/?x=1",
+            "myapp.example",
+            "https://user@myapp.example",
+            "",
+        ] {
+            assert!(origin(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_registered_callback_path_can_be_kept() {
+        let p = Providers::new(
+            "https://myapp.example",
+            "/accounts/{provider}/login/callback/",
+        )
+        .unwrap()
+        .with(oauth::discord(), "id", "s")
+        .unwrap();
+        assert_eq!(
+            p.redirect_uri("discord"),
+            "https://myapp.example/accounts/discord/login/callback/"
+        );
+        assert!(Providers::new("https://myapp.example", "/auth/callback").is_err());
+        assert!(Providers::new("https://myapp.example", "auth/{provider}").is_err());
+        assert_eq!(
+            p.with(oauth::discord(), "again", "s").unwrap_err(),
+            ConfigError::Duplicate("discord".into())
+        );
+    }
+
+    #[test]
+    fn every_code_sent_has_a_message() {
+        for code in [
+            "expired",
+            "cancelled",
+            "failed",
+            "unknown",
+            "taken",
+            "sign-in-first",
+            "connected",
+            "removed",
+            "last-way-in",
+        ] {
+            assert!(outcome(Some(code)).is_some(), "{code}");
+        }
+        assert!(outcome(Some("<script>")).is_none());
+        assert!(outcome(None).is_none());
+    }
+
+    #[test]
+    fn the_session_carries_short_names() {
+        let d = Data::default();
+        assert_eq!(serde_json::to_string(&d).unwrap(), "{}");
+    }
+}

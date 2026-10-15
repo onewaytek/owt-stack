@@ -1,6 +1,6 @@
 [package]
 name = "owt-accounts"
-description = "Accounts and sign-in flows the onewaytek apps share: the accounts table and its migration, credentials with a decoy check and rehash, sessions revoked by epoch, the signed-in extractors, linked provider identities, one-time sign-in links, roles, and the staff accounts admin."
+description = "Accounts and sign-in flows the onewaytek apps share: the accounts table and its migration, credentials with a decoy check and rehash, sessions revoked by epoch, the signed-in extractors, linked provider identities, one-time sign-in links, roles, the staff accounts admin, and sign-in with a provider."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,12 +15,14 @@ base64.workspace = true
 owt-auth.workspace = true
 owt-web.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["derive", "macros", "json"] }
 thiserror.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 owt-runtime.workspace = true

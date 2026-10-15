@@ -17,6 +17,8 @@
 //! - [`roles`]: user, staff, and the roles an app declares; the [`roles::Holds`]
 //!   extractor.
 //! - [`admin`]: the staff pages that find and change accounts.
+//! - [`social`]: sign-in with a provider: the routes, their configuration, the
+//!   buttons and the connections list.
 //!
 //! What stays in the app: its pages (the sign-in form is an app's template, with
 //! its look), its extra columns (`ALTER TABLE accounts ADD COLUMN …` in a
@@ -33,6 +35,7 @@ pub mod migrations;
 pub mod password;
 pub mod roles;
 pub mod session;
+pub mod social;
 pub mod store;
 
 pub use layer::{Accounts, Maybe, Signed, Staff};
