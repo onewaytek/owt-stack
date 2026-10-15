@@ -358,7 +358,8 @@ impl<T: SessionData> Sessions<T> {
     /// into the response if anything changed it. A response that sets the cookie is
     /// never cacheable. A server error (5xx, the `Limits` timeout's 503 included)
     /// keeps the session the request came with: a handler that signed someone in and
-    /// then failed, or timed out, leaves them as they were.
+    /// then failed, or timed out, leaves them as they were. A sign-out
+    /// ([`Session::flush`]) stands whatever the response.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
         let session = Session::<T>::default();
         let (mut refused, mut unchecked) = (false, false);
@@ -386,13 +387,17 @@ impl<T: SessionData> Sessions<T> {
             // A handler that saw no session because it could not be checked must not
             // replace the cookie with the empty one it was shown, unless it replaced
             // the session outright: a sign-out or sign-in during an outage stands.
-            (inner.modified && !failed && (!unchecked || inner.replaced)).then(|| {
-                (
-                    inner.id.clone().unwrap_or_else(new_id),
-                    inner.issued.unwrap_or_else(now),
-                    inner.data.clone(),
-                )
-            })
+            // A server error keeps the session the request came with, except a
+            // sign-out: failing after it must not leave someone signed in.
+            (inner.modified && (!failed || inner.flushed) && (!unchecked || inner.replaced)).then(
+                || {
+                    (
+                        inner.id.clone().unwrap_or_else(new_id),
+                        inner.issued.unwrap_or_else(now),
+                        inner.data.clone(),
+                    )
+                },
+            )
         };
         let set = match changed {
             Some((id, issued, data)) => this.set_cookie(&id, issued, &data),
@@ -421,6 +426,9 @@ struct Inner<T> {
     /// The id was replaced ([`Session::cycle_id`], [`Session::flush`]): the handler
     /// means this session, whatever the one presented was.
     replaced: bool,
+    /// Emptied ([`Session::flush`]) and not signed into since: a sign-out, which
+    /// stands even when the response is a server error.
+    flushed: bool,
 }
 
 impl<T: Default> Default for Inner<T> {
@@ -431,6 +439,7 @@ impl<T: Default> Default for Inner<T> {
             data: T::default(),
             modified: false,
             replaced: false,
+            flushed: false,
         }
     }
 }
@@ -515,6 +524,7 @@ impl<T: Default + Clone> Session<T> {
         inner.issued = None;
         inner.modified = true;
         inner.replaced = true;
+        inner.flushed = false;
     }
 
     /// A new id and empty data: at sign-out. The cookie it replaces still opens if
@@ -526,6 +536,7 @@ impl<T: Default + Clone> Session<T> {
         inner.data = T::default();
         inner.modified = true;
         inner.replaced = true;
+        inner.flushed = true;
     }
 }
 
@@ -676,6 +687,13 @@ mod tests {
                 }),
             )
             .route(
+                "/out-then-fail",
+                get(|sess: Session<Data>| async move {
+                    sess.flush();
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }),
+            )
+            .route(
                 "/refused",
                 get(|sess: Session<Data>| async move {
                     sess.update(|d| d.user = Some(3));
@@ -691,6 +709,13 @@ mod tests {
                 .unwrap();
             assert!(res.headers().get(header::SET_COOKIE).is_none(), "{path}");
         }
+        // A sign-out stands even when what follows it fails.
+        let res = app
+            .clone()
+            .oneshot(Request::get("/out-then-fail").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(res.headers().get(header::SET_COOKIE).is_some());
         // A 4xx is an answer, not a failure: its change stands.
         let res = app
             .oneshot(Request::get("/refused").body(Body::empty()).unwrap())

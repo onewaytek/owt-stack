@@ -42,7 +42,11 @@ impl RequestInfo {
     /// page's "sign in and come back") would leave the site.
     #[must_use]
     pub fn at(uri: &str) -> Self {
-        let rest = uri.trim_start_matches(['/', '\\']);
+        // Control characters and spaces too: a browser drops a tab or newline from
+        // a URL, so `/\t/elsewhere.example` is `//elsewhere.example` to it.
+        let rest = uri.trim_start_matches(|c: char| {
+            c == '/' || c == '\\' || c.is_control() || c.is_whitespace()
+        });
         let uri = if rest.len() < uri.len() {
             &format!("/{rest}")
         } else {
@@ -180,6 +184,8 @@ mod tests {
             ("/\\evil.example/x?page=2", "/evil.example/x"),
             ("\\\\evil.example/x", "/evil.example/x"),
             ("/\\/evil.example/x", "/evil.example/x"),
+            ("/\t/evil.example/x", "/evil.example/x"),
+            ("/\n\r/ evil.example/x", "/evil.example/x"),
             ("/games/", "/games/"),
         ] {
             let r = RequestInfo::at(raw);

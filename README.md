@@ -217,11 +217,13 @@ the handler and write `<script nonce="{{ nonce }}">`.
   each app and environment, and the purpose makes a copied secret (staging given
   production's) a different key anyway: otherwise a staging account's cookie opens
   production as the account with the same id. Changing either signs everyone out.
-  `key_from_base64` uses the secret as the key directly. After a leak, rotate
-  without `also_open_with`: the old key must open nothing.
+  `key_from_base64` uses the secret as the key directly; moving to `key_for` with
+  `also_open_with(key_from_base64(…))` for a while keeps everyone signed in, but
+  keeps a shared secret's cross-environment cookies opening for that while too.
+  After a leak, rotate without `also_open_with`: the old key must open nothing.
 - **Failed requests change no session:** a 5xx response (the `Limits` timeout's
   included) carries no `Set-Cookie`, so a handler that signed someone in and then
-  failed leaves them as they were.
+  failed leaves them as they were. A sign-out (`flush`) stands whatever follows.
 - **Trusted origins** (`CrossOrigin::trust`) are `scheme://host[:port]`; anything
   else (`null`, a wildcard, a bare host, a path) panics at start rather than trusting
   every sandboxed frame or silently nothing.
