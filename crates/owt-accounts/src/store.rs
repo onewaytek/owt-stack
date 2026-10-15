@@ -123,14 +123,28 @@ fn taken(e: &sqlx::Error, new: &New<'_>) -> Option<Refused> {
     }
     match db.constraint() {
         Some("accounts_username_key") => Some(Refused::UsernameTaken(normalize(new.username))),
+        Some("accounts_username_skeleton_key") => {
+            Some(Refused::UsernameLookalike(normalize(new.username)))
+        }
         Some("accounts_email_key") => Some(Refused::EmailTaken(normalize(new.email))),
         _ => None,
     }
 }
 
+/// The key two usernames collide on when a reader could not tell them apart: the
+/// Unicode TS #39 confusable skeleton, lower-cased (`paypa1` and `paypal`, Latin
+/// `coco` and Cyrillic `сосо`, `rn` and `m`). Stored beside the username, unique.
+#[must_use]
+pub fn skeleton(username: &str) -> String {
+    unicode_security::confusable_detection::skeleton(username)
+        .collect::<String>()
+        .to_lowercase()
+}
+
 /// Create an account. Refuses an invalid username or email, a password that breaks
-/// a rule, and a username or email another account has (by the constraint, so two
-/// racing sign-ups cannot both win).
+/// a rule, a username or email another account has, and a username too like another
+/// account's ([`skeleton`]): by the constraints, so two racing sign-ups cannot both
+/// win.
 pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
     let username = normalize(new.username);
     if !valid_username(&username) {
@@ -153,13 +167,14 @@ pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
         }
     };
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO accounts (username, email, password_hash, is_staff)
-         VALUES ($1, $2, $3, $4) RETURNING {COLUMNS}"
+        "INSERT INTO accounts (username, username_skeleton, email, password_hash, is_staff)
+         VALUES ($1, $5, $2, $3, $4) RETURNING {COLUMNS}"
     )))
     .bind(&username)
     .bind(&email)
     .bind(&hash)
     .bind(new.is_staff)
+    .bind(skeleton(&username))
     .fetch_one(db)
     .await
     .map_err(|e| match taken(&e, &new) {
@@ -186,10 +201,9 @@ pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
 pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<Option<Account>> {
     let login = normalize(login);
     // At most one row: no username has an `@`, every email does, and each is unique.
-    // `lower(email)` (the stored form already) is what the unique index covers.
     let row = sqlx::query_as::<_, (i64, String)>(
         "SELECT id, password_hash FROM accounts
-         WHERE is_active AND (username = $1 OR (email <> '' AND lower(email) = $1))",
+         WHERE is_active AND (username = $1 OR (email <> '' AND email = $1))",
     )
     .bind(&login)
     .fetch_optional(pool)
@@ -273,7 +287,7 @@ pub async fn by_email(db: impl PgExecutor<'_>, email: &str) -> sqlx::Result<Opti
         return Ok(None);
     }
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM accounts WHERE lower(email) = $1 AND is_active"
+        "SELECT {COLUMNS} FROM accounts WHERE email = $1 AND is_active"
     )))
     .bind(email)
     .fetch_optional(db)
@@ -301,9 +315,9 @@ pub async fn has_password(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<bool
     .map(|has| has.unwrap_or(false))
 }
 
-/// SQL true when the row's password can open it: an Argon2 PHC string, as
-/// [`owt_auth::password::usable`] says (a legacy hash opens nothing).
-pub(crate) const USABLE_PASSWORD: &str = "password_hash LIKE '$argon2%$v=%$m=%,t=%,p=%$%$%'";
+/// SQL true when the row has a password: the table holds an Argon2id hash or
+/// nothing, so a stored hash is one that can open the account.
+pub(crate) const USABLE_PASSWORD: &str = "password_hash <> ''";
 
 /// The signed-in person's own change: `current` must open `account` first, so a
 /// session someone else is holding cannot also take the password (and sign its owner

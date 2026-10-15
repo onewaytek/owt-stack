@@ -418,7 +418,9 @@ async fn create_for(
                 attempt.commit().await?;
                 return Ok(account);
             }
-            Err(crate::Error::Refused(Refused::UsernameTaken(_))) => {
+            Err(crate::Error::Refused(
+                Refused::UsernameTaken(_) | Refused::UsernameLookalike(_),
+            )) => {
                 username = candidates.next().expect("the iterator is endless");
             }
             Err(crate::Error::Refused(Refused::EmailTaken(_))) if !email.is_empty() => {

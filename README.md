@@ -485,16 +485,24 @@ links are minted).
 
 **Tables:** write each of `owt_accounts::migrations::ALL`, in order, to the app's
 `migrations/`. A new app writes them first (`0001_owt_accounts.sql`,
-`0002_owt_accounts_roles.sql`), since its tables reference `accounts(id)`. An app
-that has migrations of its own gives a newly released entry its next unused version
-(`0007_owt_accounts_roles.sql` after its `0006_…`), never a number already applied:
-sqlx refuses a file whose version it ran with other contents. A test calls
+`0002_owt_accounts_roles.sql`, `0003_owt_accounts_constraints.sql`), since its
+tables reference `accounts(id)`. An app that has migrations of its own gives a newly
+released entry its next unused version (`0007_owt_accounts_roles.sql` after its
+`0006_…`), never a number already applied: sqlx refuses a file whose version it ran
+with other contents. A test calls
 `owt_accounts::migrations::assert_installed("migrations")`, which matches the files
 by content, not name, so an edited or missing copy fails the build. sqlx keeps one
 ledger per database, which is why the library does not run a migrator of its own. A
 shipped migration never changes (sqlx would refuse the re-copied file at deploy, its
 checksum differing from the applied one): a later release appends a new entry to
-`ALL`, and a test here pins each file's SHA-256.
+`ALL`, and a test here pins each file's SHA-256. A migration moves the rows
+already there along with the schema, so a database that has run the library for years
+ends in the state a new one starts in. The constraints hold what the library assumes
+(names in stored form, Argon2 hashes or none, links of 30 days at most, non-empty
+subjects), so a row written around it (an import, a console) cannot be one it would
+misread. After the migrations run, at every start, the app calls
+`owt_accounts::migrations::complete(&pool)`: it fills what SQL cannot compute (the
+lookalike key below) for rows that lack it, and does nothing once they all have it.
 
 **Provider identities are found by subject, never by email.** `identities::arrive`
 looks up the provider's key and the identity's subject, and nothing else. An address
@@ -555,9 +563,13 @@ lower-cased (`ＡＤＭＩＮ` is `admin`; a composed and a decomposed `é` are 
 username is letters, digits and combining marks that Unicode's identifier profile
 allows (UTS #39), or `-`, `.` and `_`, starting with a letter or digit, in one
 script: no zero-width or filler characters, no bidirectional controls, no Cyrillic
-`а` inside a Latin `admin`. Rows from before keep their names. A whole-script
-lookalike (`аԁmіn`, all Cyrillic) is still possible: an app that shows usernames
-where impersonation matters shows something else beside them too.
+`а` inside a Latin `admin`. And no new name may look like an existing one: each
+account stores its username's confusable skeleton (`store::skeleton`, Unicode TS #39),
+unique, so `paypa1` beside `paypal`, the all-Cyrillic `сосо` beside `coco`, or `modem`
+beside `modern` is refused (`Refused::UsernameLookalike`); a provider sign-up moves on
+to another name. The skeleton is deliberately broad: `rn` is `m`, `0` is `o`, `1` is
+`l`. Accounts older than the rule that already look like an earlier one keep their
+names; the rule holds every name made after.
 
 **Revocation, and what it does not reach:**
 
@@ -1662,17 +1674,27 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ### Accounts
 
-- New usernames follow the identifier rules above. Logins are NFKC-normalized,
-  which changes nothing for ASCII names; an existing username that NFKC changes
-  (fullwidth letters, a decomposed accent) no longer signs in by username until it is
-  renamed. Before deploying, list them:
-  `SELECT id, username FROM accounts WHERE username <> normalize(lower(username), NFKC)`
-  and rename each (or have its owner sign in by email).
+Copy `0003_owt_accounts_constraints.sql` (`ALL[2]`) into the app's migrations after
+`0002`, and call `owt_accounts::migrations::complete(&pool)` after the migrations run.
+`0003` moves existing rows to the form the library now stores, then adds the
+constraints:
+
+- **Usernames are NFKC-normalized** (a fullwidth `ａｄｍｉｎ` becomes `admin`), since
+  sign-in input is. One that would become another account's name keeps its id as a
+  suffix (`admin-42`); its owner can still sign in by email or a provider.
+- **Emails are NFKC-normalized and lower-cased.** One that would become another
+  account's address is cleared, and one with nothing before its `@` is cleared.
+- **A password hash that is not Argon2 is cleared.** Such a hash never opened the
+  account, so no one loses a way in.
+- **Sign-in links still out for longer than 30 days are cut to 30.**
+- **Identities with an empty provider or subject are deleted.** They matched no one.
+- **A `username_skeleton` column** holds the lookalike key, filled by `complete`.
+
+Also:
+
 - `links::MAX_TTL` is 30 days (it was a century); longer `ttl`s are capped.
 - `store::authenticate` fails a sign-in whose password changed while it was checked.
-- `store::has_password` (and the last-way-in rule) counts only an Argon2 hash: an
-  account holding only a legacy hash has no password, since it opens nothing.
-- `Refused` has a `CurrentPassword` variant.
+- `Refused` has `CurrentPassword` and `UsernameLookalike` variants.
 
 ## Upgrading from 0.1
 

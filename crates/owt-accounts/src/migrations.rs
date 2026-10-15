@@ -11,6 +11,11 @@
 //! when it upgrades, so a changed byte here (a comment, even) would fail every app's
 //! next deploy against a database that applied the old text. Every change to the
 //! schema is a new file appended to [`ALL`]; a test pins each file's SHA-256.
+//!
+//! A migration moves the rows already there as well as the schema, so an app that
+//! has run the library's migrations for a while is in the same state as a new one.
+//! What SQL cannot compute (a username's lookalike key) [`complete`] fills in: call
+//! it after the migrations run, at every start (it does nothing once done).
 
 use std::path::Path;
 
@@ -34,7 +39,58 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_roles",
         sql: include_str!("../migrations/0002_account_roles.sql"),
     },
+    Migration {
+        name: "owt_accounts_constraints",
+        sql: include_str!("../migrations/0003_account_constraints.sql"),
+    },
 ];
+
+/// Finish what [`ALL`] cannot do in SQL: the lookalike key
+/// ([`store::skeleton`](crate::store::skeleton)) of every account made before it was
+/// stored. Run it after the migrations, at each start: it reads nothing but the rows
+/// still missing one, so it is free once done. An old account whose name is a
+/// lookalike of an earlier one keeps it, under a key no other name can take (it
+/// carries the id), so only new names are held to the rule. Returns how many rows it
+/// filled.
+///
+/// # Errors
+///
+/// The database.
+pub async fn complete(pool: &sqlx::PgPool) -> sqlx::Result<u64> {
+    let missing: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, username FROM accounts WHERE username_skeleton IS NULL ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut filled = 0;
+    for (id, username) in missing {
+        let key = crate::store::skeleton(&username);
+        let set = |key: String| {
+            sqlx::query(
+                "UPDATE accounts SET username_skeleton = $2
+                 WHERE id = $1 AND username_skeleton IS NULL",
+            )
+            .bind(id)
+            .bind(key)
+            .execute(pool)
+        };
+        let done = match set(key.clone()).await {
+            Err(e)
+                if e.as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
+            {
+                // `#` is in no username, so no skeleton has one.
+                set(format!("{key}#{id}")).await?
+            }
+            other => other?,
+        };
+        filled += done.rows_affected();
+    }
+    if filled > 0 {
+        tracing::info!(filled, "filled the lookalike keys of existing accounts");
+    }
+    Ok(filled)
+}
 
 /// The SHA-256 of each of [`ALL`], in order, as released. A changed digest means a
 /// shipped migration was edited, which breaks every app's next deploy: revert it and
@@ -43,6 +99,7 @@ pub const ALL: &[Migration] = &[
 const SHIPPED_SHA256: &[&str] = &[
     "743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4",
     "0e6d42a67ddabfb50f56650fe85ff0bc810c4b3230a1115706db467ea27b2338",
+    "1bdb03527bb36d2314329cf13b6ad6cf8456713cc226351eba524d280d67d9cd",
 ];
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;
@@ -136,6 +193,8 @@ mod tests {
         std::fs::write(&file, ALL[0].sql).unwrap();
         let roles = dir.join("0002_owt_accounts_roles.sql");
         std::fs::write(&roles, ALL[1].sql).unwrap();
+        let constraints = dir.join("0003_owt_accounts_constraints.sql");
+        std::fs::write(&constraints, ALL[2].sql).unwrap();
         assert_installed(&dir);
         std::fs::write(&file, format!("{}\n-- edited", ALL[0].sql)).unwrap();
         let err = std::panic::catch_unwind(|| assert_installed(&dir)).unwrap_err();
@@ -149,6 +208,7 @@ mod tests {
         let text = err.downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(text.contains("is not in"), "{text}");
         std::fs::remove_file(&roles).unwrap();
+        std::fs::remove_file(&constraints).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
 }

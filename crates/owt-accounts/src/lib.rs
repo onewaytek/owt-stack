@@ -57,6 +57,10 @@ pub enum Refused {
     /// Another account has that username.
     #[error("There is already an account named “{0}”.")]
     UsernameTaken(String),
+    /// The username is too like another account's to tell apart (see
+    /// [`store::skeleton`]).
+    #[error("“{0}” is too like an existing account's name to tell apart. Choose another.")]
+    UsernameLookalike(String),
     /// Another account has that email.
     #[error("An account already uses the email address “{0}”.")]
     EmailTaken(String),
