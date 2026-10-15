@@ -1883,6 +1883,31 @@ async fn social_fixture(
     (social, client)
 }
 
+/// A second provider (Discord) on the same fake, for mix-up tests.
+async fn two_provider_fixture(db: &Db, sub: Arc<std::sync::Mutex<String>>) -> owt_test::Client {
+    use owt_accounts::social::{self, Providers, SocialSignIn};
+    use owt_auth::oauth;
+    let base = fake_provider(sub).await;
+    let at = |p: oauth::Provider| oauth::Provider {
+        token_url: format!("{base}/token"),
+        userinfo_url: format!("{base}/userinfo"),
+        ..p
+    };
+    let providers = Providers::new("http://localhost:8000", social::DEFAULT_CALLBACK)
+        .unwrap()
+        .with(at(oauth::google()), "cid", "secret")
+        .unwrap()
+        .with(at(oauth::discord()), "did", "secret")
+        .unwrap();
+    let social = SocialSignIn::new(
+        db.pool.clone(),
+        oauth::http_client().unwrap(),
+        providers,
+        identities::Welcome { create: true },
+    );
+    owt_test::Client::new(social_app(db, &social_sessions(), &social))
+}
+
 /// Start at the provider and come back with the state it was sent.
 async fn round_trip(client: &owt_test::Client, fields: &[(&str, &str)]) -> owt_test::Response {
     let r = client.post_form("/auth/google/start", fields).await;
@@ -2029,5 +2054,232 @@ async fn without_self_signup_an_unknown_identity_is_turned_away() {
     let r = round_trip(&client, &[]).await;
     assert_eq!(r.location(), Some("/login?social=unknown"));
     assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    db.drop().await;
+}
+
+/// The session id changes at a provider sign-in (no fixation); a failed callback
+/// uses the pending sign-in up too; a callback at another provider's route is
+/// refused; an overlong `next` is dropped rather than losing the sign-in.
+#[tokio::test]
+async fn a_provider_sign_in_survives_nothing_it_should_not() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let client = two_provider_fixture(&db, sub).await;
+    let sessions = social_sessions();
+    let id_of = |client: &owt_test::Client| {
+        sessions
+            .unseal(&client.cookie("s").expect("a session cookie"))
+            .expect("it opens")
+            .0
+    };
+
+    // Fixation: the anonymous session's id is not the signed-in one's.
+    let r = client.post_form("/auth/google/start", &[]).await;
+    let before = id_of(&client);
+    let state = sent_state(r.location().unwrap());
+    client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+    assert_ne!(id_of(&client), before);
+
+    // A forged state uses the pending sign-in up: the real one cannot follow.
+    client.clear_cookies();
+    let r = client.post_form("/auth/google/start", &[]).await;
+    let state = sent_state(r.location().unwrap());
+    let r = client
+        .get("/auth/google/callback?state=forged&code=abc")
+        .await;
+    assert_eq!(r.location(), Some("/login?social=expired"));
+    let r = client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(r.location(), Some("/login?social=expired"));
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+
+    // Mix-up: begun with Google, returned at Discord's callback with its state.
+    let r = client.post_form("/auth/google/start", &[]).await;
+    let state = sent_state(r.location().unwrap());
+    let r = client
+        .get(&format!("/auth/discord/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(r.location(), Some("/login?social=expired"));
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+
+    // `next`: kept when short and local, dropped when long or elsewhere.
+    for (next, lands) in [
+        ("/games?x=1".to_owned(), "/games?x=1"),
+        (format!("/{}", "a".repeat(2000)), "/"),
+        ("//evil.example/".to_owned(), "/"),
+        ("/\\evil.example/".to_owned(), "/"),
+        ("https://evil.example/".to_owned(), "/"),
+    ] {
+        client.clear_cookies();
+        let r = client
+            .post_form("/auth/google/start", &[("next", &next)])
+            .await;
+        assert!(
+            client.cookie("s").unwrap().len() < 3000,
+            "the cookie grew with next"
+        );
+        let state = sent_state(r.location().unwrap());
+        let r = client
+            .get(&format!("/auth/google/callback?state={state}&code=abc"))
+            .await;
+        assert_eq!(r.location(), Some(lands), "{next}");
+    }
+    db.drop().await;
+}
+
+/// A connect: for the account that began it only, after a recent sign-in, back on
+/// the connections page whatever happens.
+#[tokio::test]
+async fn a_connect_belongs_to_the_account_that_began_it() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (_, client) = social_fixture(&db, sub.clone(), identities::Welcome { create: true }).await;
+    let sessions = social_sessions();
+    round_trip(&client, &[]).await;
+    let ada = store::by_username(&db.pool, "adalovelace")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Someone else signs in on this browser before the consent comes back.
+    *sub.lock().unwrap() = "g2".into();
+    let r = client
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    let state = sent_state(r.location().unwrap());
+    let bob = store::create(&db.pool, new("bob", "", None)).await.unwrap();
+    let (id, mut data) = sessions.unseal(&client.cookie("s").unwrap()).unwrap();
+    owt_accounts::session::Signed::set_signature(
+        &mut data,
+        Some(owt_accounts::session::Signature {
+            account: bob.id,
+            epoch: bob.session_epoch,
+        }),
+    );
+    client.set_cookie("s", &sessions.seal(&id, &data));
+    let r = client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(r.location(), Some("/login?social=sign-in-first"));
+    assert_eq!(identities::list(&db.pool, bob.id).await.unwrap().len(), 0);
+    assert_eq!(identities::list(&db.pool, ada.id).await.unwrap().len(), 1);
+
+    // Cancelled at the provider: back to the connections page.
+    client.set_cookie(
+        "s",
+        &sessions.seal(&id, &{
+            let mut d = data.clone();
+            d.started = None;
+            owt_accounts::session::Signed::set_signature(
+                &mut d,
+                Some(owt_accounts::session::Signature {
+                    account: ada.id,
+                    epoch: ada.session_epoch,
+                }),
+            );
+            d
+        }),
+    );
+    client
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    let r = client
+        .get("/auth/google/callback?error=access_denied")
+        .await;
+    assert_eq!(r.location(), Some("/account/connections?social=cancelled"));
+
+    // Another account's identity: taken.
+    *sub.lock().unwrap() = "g-bob".into();
+    identities::link(
+        &db.pool,
+        bob.id,
+        &owt_auth::oauth::google(),
+        &identity("g-bob", None, false),
+    )
+    .await
+    .unwrap();
+    let r = round_trip(&client, &[("connect", "1")]).await;
+    assert_eq!(r.location(), Some("/account/connections?social=taken"));
+
+    // A session that began long ago must sign in again first.
+    let old = {
+        let mut d = owt_accounts::social::Data::default();
+        owt_accounts::session::Signed::set_signature(
+            &mut d,
+            Some(owt_accounts::session::Signature {
+                account: ada.id,
+                epoch: ada.session_epoch,
+            }),
+        );
+        d
+    };
+    let demanding = owt_accounts::social::SocialSignIn::new(
+        db.pool.clone(),
+        owt_auth::oauth::http_client().unwrap(),
+        owt_accounts::social::Providers::new("http://localhost:8000", "/auth/{provider}/callback")
+            .unwrap()
+            .with(owt_auth::oauth::google(), "cid", "secret")
+            .unwrap(),
+        identities::Welcome::default(),
+    )
+    .connect_within(Duration::ZERO);
+    let strict = owt_test::Client::new(social_app(&db, &sessions, &demanding));
+    strict.set_cookie("s", &sessions.seal(&owt_web::session::new_id(), &old));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let r = strict
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    assert_eq!(r.location(), Some("/login?social=sign-in-again"));
+    db.drop().await;
+}
+
+/// An identity linked to a deactivated account signs nobody in and creates nothing.
+#[tokio::test]
+async fn a_deactivated_accounts_identity_signs_nobody_in() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (_, client) = social_fixture(&db, sub, identities::Welcome { create: true }).await;
+    round_trip(&client, &[]).await;
+    let ada = store::by_username(&db.pool, "adalovelace")
+        .await
+        .unwrap()
+        .unwrap();
+    store::set_active(&db.pool, ada.id, false).await.unwrap();
+    client.clear_cookies();
+    let r = round_trip(&client, &[]).await;
+    assert_eq!(r.location(), Some("/login?social=unknown"));
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    db.drop().await;
+}
+
+/// A builder setting made after `routes()` reaches later routes, not earlier ones,
+/// and is never silently dropped.
+#[tokio::test]
+async fn the_builder_never_drops_a_setting() {
+    use owt_accounts::social::{self, Providers, SocialSignIn};
+    let db = db!();
+    let s = SocialSignIn::new(
+        db.pool.clone(),
+        owt_auth::oauth::http_client().unwrap(),
+        Providers::new("http://localhost:8000", social::DEFAULT_CALLBACK)
+            .unwrap()
+            .with(owt_auth::oauth::google(), "cid", "secret")
+            .unwrap(),
+        identities::Welcome::default(),
+    );
+    let _early = s.routes::<social::Data, ()>();
+    let s = s.sign_in_page("/signin");
+    let client = owt_test::Client::new(social_app(&db, &social_sessions(), &s));
+    let r = client.get("/auth/google/callback?state=x&code=y").await;
+    assert_eq!(r.location(), Some("/signin?social=expired"));
     db.drop().await;
 }

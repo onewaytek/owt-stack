@@ -674,15 +674,23 @@ pieces (its sign-in page and a settings page).
 - A person is the provider's key plus its subject, never an email (see "Accounts").
   A first sign-in creates an account when `Welcome { create: true }`; otherwise it
   is turned away with `?social=unknown`.
-- The start is a `POST` form, so the app's `CrossOrigin` layer covers it. The
-  pending sign-in (state, PKCE verifier, where to land) lives in the session and is
-  used up by the first callback, so a replayed or forged callback lands on
-  `?social=expired`.
+- The start and remove are `POST` forms: layer the app's `CrossOrigin` around them
+  (below). The pending sign-in (state, PKCE verifier, where to land) lives in the
+  session and is used up by the first callback, whatever it brings, so a replayed or
+  forged callback lands on `?social=expired` and so does the real one after it.
 - A callback for one provider cannot finish a sign-in begun with another. `next` is
-  followed only when it is a path on this site. Signing in cycles the session id.
-- Connecting a provider (`connect=1` on the start form) needs a signed-in session
-  and links to that account only. Remove never removes the last way in, and never
-  another account's connection (404).
+  followed only when it is a path on this site, and dropped when longer than
+  `social::MAX_NEXT` bytes (it rides in the session cookie, which a browser drops
+  past about 4 KB). Signing in cycles the session id.
+- Connecting a provider (`connect=1` on the start form) needs a session signed in
+  within the last 15 minutes (`SocialSignIn::connect_within`; older lands on
+  `?social=sign-in-again`, so the sign-in page must let a signed-in person sign in
+  again), and links only to the account that began it, even if someone else signs in
+  on the browser meanwhile. A stolen or borrowed session therefore cannot quietly add
+  a provider that outlives a password reset. Remove never removes the last way in,
+  and never another account's connection (404).
+- An identity linked to a deactivated account signs nobody in and creates nothing:
+  `?social=unknown`.
 - Every outcome redirects with `?social=<code>`, to the sign-in page or, for a
   connect or remove, the connections page. `social::outcome` turns the code into a
   message for `owt_web::ui::Alerts`.
@@ -695,20 +703,24 @@ sign-in.
 
 | Variable | Required | Value |
 |---|---|---|
-| `PUBLIC_BASE_URL` | when any provider is set | The origin people reach the site at, exactly: `https://myapp.example`. No path and no trailing slash (one is trimmed). `https` only, except `http://localhost:<port>` or `http://127.0.0.1:<port>` for development. Behind a CDN or the OpenShift router, this is the public host, not the pod's. |
+| `PUBLIC_BASE_URL` | when any provider is set | The origin people reach the site at, exactly: `https://myapp.example`. No path, query, fragment or credentials, and no trailing slash (one is trimmed). `https` only, except `http://localhost:<port>`, `http://127.0.0.1:<port>` or `http://[::1]:<port>` for development. Behind a CDN or the OpenShift router, this is the public host, not the pod's. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | both or neither | From the Google Cloud console (below). Neither: no Google button. |
 | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | both or neither | From the Discord developer portal. |
 | `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET` | both or neither | From the Twitch developer console. |
 
-With no provider configured, `Providers` is empty: the routes answer 404 and the
-buttons render nothing, so one build serves a deployment with and without sign-in by
+With no provider configured, `Providers` is empty: start and callback answer 404
+(remove still answers, as for an account with no connections) and the buttons render
+nothing, so one build serves a deployment with and without sign-in by
 provider. Blank values count as unset. Setting one variable of a pair is an error.
 
 An OpenID Connect issuer (Keycloak, an Entra tenant) is added in code, with its
 issuer URL and endpoints from its discovery document
 (`<issuer>/.well-known/openid-configuration`). Its identities are keyed by the
 issuer, so pointing `sso` at a different realm later starts a fresh set of
-identities rather than mixing two realms' users:
+identities rather than mixing two realms' users. The issuer and endpoints must be
+`https` (`oidc` refuses others), and every sign-in must bring an ID token from that
+issuer for this client. An app configuring providers without the environment uses
+`Providers::new(public_base_url, callback)` and `.with(…)` for each:
 
 ```rust,no_run
 # fn demo() -> anyhow::Result<()> {
@@ -720,7 +732,7 @@ let providers = Providers::from_env(DEFAULT_CALLBACK)?.with(
     oauth::oidc("sso", "Staff SSO", issuer,
         &format!("{issuer}/protocol/openid-connect/auth"),
         &format!("{issuer}/protocol/openid-connect/token"),
-        &format!("{issuer}/protocol/openid-connect/userinfo")),
+        &format!("{issuer}/protocol/openid-connect/userinfo"))?,
     owt_runtime::env::required("SSO_CLIENT_ID")?,
     owt_runtime::env::required("SSO_CLIENT_SECRET")?,
 )?;
@@ -730,7 +742,8 @@ let providers = Providers::from_env(DEFAULT_CALLBACK)?.with(
 **The callback path** is `/auth/{provider}/callback` (`social::DEFAULT_CALLBACK`).
 An app whose providers are already registered with another path passes that instead
 (`"/accounts/{provider}/login/callback/"`), so existing registrations keep working;
-it must start with `/` and contain `{provider}`. Start and remove are always
+it must start with `/` and name `{provider}` once, with no other capture, wildcard,
+query or fragment. Start and remove are always
 `/auth/{provider}/start` and `/auth/connections/{id}/remove`.
 
 #### 2. Registering at each provider
@@ -763,14 +776,17 @@ use owt_accounts::identities::Welcome;
 use owt_accounts::social::{self, Providers, SocialSignIn, DEFAULT_CALLBACK};
 use owt_accounts::Accounts;
 use owt_auth::oauth;
+use owt_web::csrf::CrossOrigin;
 use owt_web::headers::Csp;
 use owt_web::session::Sessions;
 
 let providers = Providers::from_env(DEFAULT_CALLBACK)?; // fails start-up on bad config
+// Configure fully before `routes()`: the routes keep the configuration they were made with.
 let social = SocialSignIn::new(pool.clone(), oauth::http_client()?, providers, Welcome { create: true })
     .sign_in_page("/login")                  // failures land here with ?social=
     .connections_page("/account/connections") // connects and removals land here
-    .after_sign_in("/");                     // when the form gave no `next` on this site
+    .after_sign_in("/")                      // when the form gave no `next` on this site
+    .connect_within(Duration::from_secs(15 * 60)); // how recent a sign-in a connect needs
 
 // The start form's redirect goes to the provider: allow its origin in form-action.
 let mut form_action = vec!["'self'".to_owned()];
@@ -780,12 +796,17 @@ let _csp = Csp::new().directive("form-action", &form_action.join(" "));
 // Session data that can hold a sign-in in progress: `social::Data`, or the app's
 // own type implementing `social::Social` (below). Lax cookies (the default) are
 // required: the provider's redirect back is a cross-site navigation, and a Strict
-// cookie would not come with it.
-let sessions: Sessions<social::Data> = Sessions::new(key, "s", Duration::from_secs(14 * 86_400), true);
+// cookie would not come with it. A `__Host-` name keeps a sibling subdomain from
+// planting a cookie of its own for these paths.
+let sessions: Sessions<social::Data> =
+    Sessions::new(key, "__Host-session", Duration::from_secs(14 * 86_400), true);
 let app: Router = Router::new()
     .merge(social.routes::<social::Data, ()>()) // merge: the paths are absolute
     .layer(from_fn_with_state(Accounts::new(pool, "/login"), Accounts::load::<social::Data>))
-    .layer(from_fn_with_state(sessions, Sessions::layer));
+    .layer(from_fn_with_state(sessions, Sessions::layer))
+    // Outermost: a cross-origin POST (a sibling subdomain is same-site, so Lax
+    // cookies come with it) is refused before it reaches start or remove.
+    .layer(from_fn_with_state(CrossOrigin::new(), CrossOrigin::layer));
 # let _ = app; Ok(()) }
 ```
 
@@ -858,8 +879,9 @@ let _connections = social.connections(me.id).await?; // each with Remove, then "
 | Every sign-in lands on `?social=expired` | The session cookie did not survive the trip: `PUBLIC_BASE_URL`'s host differs from the one the person started on (`www.` or not), the cookie is `Secure` over `http`, the session layer is not around the routes, or the cookie was made `SameSite=Strict`. |
 | Pressing the button does nothing; the console shows a `form-action` violation | The CSP's `form-action` lacks the provider's origin: add `form_action_sources()`. |
 | `?social=failed` | The code exchange or user-info request failed: a wrong secret, a Twitch client that is not Confidential, or the provider unreachable. The server log has a `warn` naming the provider. |
-| `?social=unknown` | `Welcome { create: false }` and no account is linked to that identity. The person signs in another way and connects the provider from settings. |
-| Start-up fails naming a variable | A pair half-set, `PUBLIC_BASE_URL` missing or not an `https` origin, or a callback path without `{provider}`. |
+| `?social=unknown` | `Welcome { create: false }` and no account is linked to that identity, or the linked account is deactivated. The person signs in another way and connects the provider from settings. |
+| Connect always lands on `?social=sign-in-again` | The session began longer ago than `connect_within`; the person signs in again first. If it repeats right after signing in, the sign-in page is not signing a signed-in person in again (it redirects them away instead). |
+| Start-up fails naming a variable | A pair half-set, `PUBLIC_BASE_URL` missing or not an `https` origin, a callback path without `{provider}` (or with another capture), or an OIDC issuer or endpoint that is not `https`. |
 
 ### Change requests
 

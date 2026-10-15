@@ -15,12 +15,17 @@
 //! [`owt_web::ui::Alerts`]. Nothing here renders a page of its own: the app's sign-in
 //! and settings pages embed [`Buttons`] and [`Connections`].
 //!
+//! A connect is bound to the account that began it and needs a recent sign-in
+//! ([`SocialSignIn::connect_within`]): a borrowed or stolen session cannot quietly
+//! add a provider that would let its holder back in after a password reset.
+//!
 //! **Configuration** ([`Providers::from_env`]): `PUBLIC_BASE_URL`, and for each
 //! provider `<PROVIDER>_CLIENT_ID` with `<PROVIDER>_CLIENT_SECRET`. The README's
 //! "Sign-in with a provider" section lists every requirement, at the providers too.
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use askama::Template;
 use askama::filters::HtmlSafe;
@@ -76,8 +81,10 @@ pub enum ConfigError {
         "{PUBLIC_BASE_URL} must be an https origin with no path (http is accepted for localhost): {0}"
     )]
     BaseUrl(String),
-    /// The callback path is not a path naming `{provider}`.
-    #[error("the callback path must start with / and contain {{provider}}: {0}")]
+    /// The callback path is not a path naming `{provider}` once and nothing else.
+    #[error(
+        "the callback path must start with / and name {{provider}} once, with no other {{…}}, *, ?, # or //: {0}"
+    )]
     Callback(String),
     /// Two providers share an id.
     #[error("two providers have the id {0}")]
@@ -166,7 +173,7 @@ impl Providers {
     }
 
     /// Add `provider` with this site's registration at it: an [`oauth::oidc`]
-    /// issuer, or a preset pointed elsewhere in a test. Its redirect URI is this
+    /// issuer (`oidc(…)?`), or a preset pointed elsewhere in a test. Its redirect URI is this
     /// set's [`redirect_uri`](Self::redirect_uri).
     ///
     /// # Errors
@@ -243,26 +250,43 @@ fn env_var(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// `https://host[:port]`, no trailing slash; `http` only for this machine.
+/// `https://host[:port]`, no trailing slash; `http` only for this machine
+/// (`localhost`, `127.0.0.1`, `[::1]`).
 fn origin(raw: &str) -> Result<String, ConfigError> {
     let bad = || ConfigError::BaseUrl(raw.to_owned());
     let url = url::Url::parse(raw.trim()).map_err(|_| bad())?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && local);
     let bare = matches!(url.path(), "" | "/") && url.query().is_none() && url.fragment().is_none();
-    if !scheme_ok || !bare || url.host_str().is_none() || !url.username().is_empty() {
+    if !scheme_ok
+        || !bare
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(bad());
     }
     Ok(url.origin().ascii_serialization())
 }
 
+/// A path with `{provider}` as its only capture: another capture, a wildcard or a
+/// query would route and then fail every callback.
 fn callback_path(raw: &str) -> Result<String, ConfigError> {
-    if raw.starts_with('/') && raw.contains("{provider}") && !raw.contains("//") {
+    let rest = raw.replacen("{provider}", "", 1);
+    let ok = raw.starts_with('/')
+        && raw.contains("{provider}")
+        && !rest.contains(['{', '}', '*', '?', '#'])
+        && !raw.contains("//");
+    if ok {
         Ok(raw.to_owned())
     } else {
         Err(ConfigError::Callback(raw.to_owned()))
     }
 }
+
+/// The longest `next` kept: the pending sign-in rides in the session cookie, and a
+/// browser drops a cookie over about 4 KB (which would lose the sign-in).
+pub const MAX_NEXT: usize = 1024;
 
 /// A sign-in on its way to a provider and back, kept in the session between the two.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -273,9 +297,10 @@ pub struct Started {
     /// Where to land afterwards; checked to be on this site when used.
     #[serde(rename = "n", default, skip_serializing_if = "String::is_empty")]
     pub next: String,
-    /// Adding the provider to the signed-in account, not signing in.
-    #[serde(rename = "c", default, skip_serializing_if = "std::ops::Not::not")]
-    pub connect: bool,
+    /// Adding the provider to this account (the one signed in when it began), not
+    /// signing in. The callback links only for that account.
+    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
+    pub connect: Option<i64>,
 }
 
 /// Session data that can hold a [`Started`] sign-in as well as the signature. An
@@ -343,7 +368,11 @@ pub fn outcome(code: Option<&str>) -> Option<Flash> {
         ),
         "unknown" => (
             Level::Error,
-            "No account here uses that sign-in. Sign in another way, then connect it from your settings.",
+            "That sign-in cannot be used here. If you have an account, sign in another way, then connect it from your settings.",
+        ),
+        "sign-in-again" => (
+            Level::Warning,
+            "For your security, sign in again, then connect the new sign-in.",
         ),
         "taken" => (
             Level::Error,
@@ -366,10 +395,12 @@ pub fn outcome(code: Option<&str>) -> Option<Flash> {
 
 /// Sign-in with providers, configured. Cheap to clone: keep one in the app's state
 /// for the pages that show [`Buttons`] and [`Connections`], and merge
-/// [`SocialSignIn::routes`] into the router.
+/// [`SocialSignIn::routes`] into the router. Configure it fully first: the routes
+/// keep the configuration they were made with.
 #[derive(Clone)]
 pub struct SocialSignIn(Arc<Inner>);
 
+#[derive(Clone)]
 struct Inner {
     pool: PgPool,
     http: reqwest::Client,
@@ -378,6 +409,7 @@ struct Inner {
     sign_in_page: String,
     connections_page: String,
     after_sign_in: String,
+    connect_within: Duration,
 }
 
 impl fmt::Debug for SocialSignIn {
@@ -408,14 +440,14 @@ impl SocialSignIn {
             sign_in_page: "/login".into(),
             connections_page: "/account/connections".into(),
             after_sign_in: "/".into(),
+            connect_within: Duration::from_secs(15 * 60),
         }))
     }
 
     fn edit(mut self, f: impl FnOnce(&mut Inner)) -> Self {
-        // Built once at start-up, before any clone exists.
-        if let Some(inner) = Arc::get_mut(&mut self.0) {
-            f(inner);
-        }
+        // A copy when a clone (a router's state, say) shares it: that one keeps
+        // what it was made with, and this one takes the change.
+        f(Arc::make_mut(&mut self.0));
         self
     }
 
@@ -438,6 +470,14 @@ impl SocialSignIn {
     pub fn after_sign_in(self, path: impl Into<String>) -> Self {
         let path = path.into();
         self.edit(|i| i.after_sign_in = path)
+    }
+
+    /// How recent a sign-in a connect needs (15 minutes unless set): older, and
+    /// the person is sent to the sign-in page (`?social=sign-in-again`) to sign in
+    /// again first, so the app's sign-in page must let a signed-in person do that.
+    #[must_use]
+    pub fn connect_within(self, window: Duration) -> Self {
+        self.edit(|i| i.connect_within = window)
     }
 
     /// The providers.
@@ -595,14 +635,25 @@ async fn start<T: Social + SessionData>(
     let Some(client) = this.0.providers.get(&provider) else {
         return Err(owt_web::Error::NotFound);
     };
-    let connect = !form.connect.is_empty();
-    if connect && me.is_none() {
-        return Ok(landing(&this.0.sign_in_page, "sign-in-first"));
-    }
+    let connect = if form.connect.is_empty() {
+        None
+    } else {
+        let Some(me) = me else {
+            return Ok(landing(&this.0.sign_in_page, "sign-in-first"));
+        };
+        if !signed_in_within(&session, this.0.connect_within) {
+            return Ok(landing(&this.0.sign_in_page, "sign-in-again"));
+        }
+        Some(me.id)
+    };
     let (url, pending) = client
         .begin()
         .map_err(|e| owt_web::Error::Internal(e.into()))?;
-    let next = redirect::local_or(Some(&form.next), "").to_owned();
+    let next = if form.next.len() > MAX_NEXT {
+        String::new()
+    } else {
+        redirect::local_or(Some(&form.next), "").to_owned()
+    };
     session.update(|d| {
         d.set_started(Some(Started {
             pending,
@@ -611,6 +662,16 @@ async fn start<T: Social + SessionData>(
         }));
     });
     Ok((CachePolicy::no_store(), Redirect::to(&url)).into_response())
+}
+
+/// The session began (signed in: signing in starts a new one) within `window`.
+fn signed_in_within<T: SessionData>(session: &Session<T>, window: Duration) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    session
+        .issued()
+        .is_some_and(|issued| now.saturating_sub(issued) <= window.as_secs())
 }
 
 #[derive(Deserialize)]
@@ -640,7 +701,7 @@ async fn callback<T: Social + SessionData>(
     let Some(started) = started else {
         return Ok(landing(&inner.sign_in_page, "expired"));
     };
-    let back = if started.connect {
+    let back = if started.connect.is_some() {
         inner.connections_page.as_str()
     } else {
         inner.sign_in_page.as_str()
@@ -664,8 +725,10 @@ async fn callback<T: Social + SessionData>(
             return Ok(landing(back, "failed"));
         }
     };
-    if started.connect {
-        let Some(me) = me else {
+    if let Some(began_as) = started.connect {
+        // Only for the account that began it: whoever is signed in now may be
+        // someone else on the same browser.
+        let Some(me) = me.filter(|me| me.id == began_as) else {
             return Ok(landing(&inner.sign_in_page, "sign-in-first"));
         };
         return match identities::link(&inner.pool, me.id, &client.provider, &identity).await {
@@ -683,7 +746,15 @@ async fn callback<T: Social + SessionData>(
         };
     }
     let arrival =
-        identities::arrive(&inner.pool, &client.provider, &identity, inner.welcome).await?;
+        match identities::arrive(&inner.pool, &client.provider, &identity, inner.welcome).await {
+            Ok(arrival) => arrival,
+            Err(e) if e.refused() == Some(&Refused::NoSubject) => {
+                return Ok(landing(&inner.sign_in_page, "failed"));
+            }
+            Err(e) => return Err(e.into()),
+        };
+    // Unknown: nothing linked and no self-signup, or linked to a deactivated
+    // account; one message for both.
     let Some(account) = arrival.account() else {
         return Ok(landing(&inner.sign_in_page, "unknown"));
     };
@@ -774,15 +845,25 @@ mod tests {
             "https://myapp.example",
             "https://myapp.example:8443/",
             "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://[::1]:8000",
         ] {
             assert!(origin(ok).is_ok(), "{ok}");
         }
+        assert_eq!(
+            origin("https://MyApp.example/").unwrap(),
+            "https://myapp.example"
+        );
         for bad in [
             "http://myapp.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
             "https://myapp.example/app",
             "https://myapp.example/?x=1",
+            "https://myapp.example/#f",
             "myapp.example",
             "https://user@myapp.example",
+            "https://:pw@myapp.example",
             "",
         ] {
             assert!(origin(bad).is_err(), "{bad}");
@@ -802,8 +883,21 @@ mod tests {
             p.redirect_uri("discord"),
             "https://myapp.example/accounts/discord/login/callback/"
         );
-        assert!(Providers::new("https://myapp.example", "/auth/callback").is_err());
-        assert!(Providers::new("https://myapp.example", "auth/{provider}").is_err());
+        for bad in [
+            "/auth/callback",
+            "auth/{provider}",
+            "/{lang}/auth/{provider}/callback",
+            "/auth/{provider}/{provider}",
+            "/auth/{provider}/{*rest}",
+            "/auth/{provider}/callback?x=1",
+            "/auth/{provider}#f",
+            "//evil.example/{provider}",
+        ] {
+            assert!(
+                Providers::new("https://myapp.example", bad).is_err(),
+                "{bad}"
+            );
+        }
         assert_eq!(
             p.with(oauth::discord(), "again", "s").unwrap_err(),
             ConfigError::Duplicate("discord".into())
@@ -819,6 +913,7 @@ mod tests {
             "unknown",
             "taken",
             "sign-in-first",
+            "sign-in-again",
             "connected",
             "removed",
             "last-way-in",
