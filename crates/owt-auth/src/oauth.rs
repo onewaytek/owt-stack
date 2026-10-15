@@ -13,8 +13,13 @@
 //!
 //! A [`Provider`] is data: endpoints, scope, and how to read its user-info response.
 //! [`google`], [`discord`] and [`twitch`] are presets; [`oidc`] covers any `OpenID`
-//! Connect provider (Keycloak, say) from its issuer's endpoints. Endpoints are plain
-//! fields, so a test can point a preset at a fake server.
+//! Connect provider (Keycloak, say) from its issuer and that issuer's endpoints.
+//! Endpoints are plain fields, so a test can point a preset at a fake server.
+//!
+//! A person is the pair ([`Provider::key`], [`Identity::uid`]), never their email: a
+//! provider lets people change the address, and an address can pass to someone else
+//! (a recycled workplace mailbox, a lapsed domain), so the same email is not the same
+//! person, at one provider or across two.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -26,8 +31,11 @@ use subtle::ConstantTimeEq;
 /// An OAuth 2 provider.
 #[derive(Clone, Debug)]
 pub struct Provider {
-    /// Stable id, in URLs and stored account links: `google`.
+    /// Stable id, in URLs and in the pending login: `google`.
     pub id: &'static str,
+    /// The `OpenID` Connect issuer whose subjects these are, for [`oidc`]; `None` for
+    /// a preset, whose subjects are scoped by the preset itself.
+    pub issuer: Option<String>,
     /// For buttons: `Google`.
     pub name: &'static str,
     /// Where the person is sent to consent.
@@ -46,14 +54,28 @@ pub struct Provider {
     pub identity: fn(Value) -> Option<Identity>,
 }
 
+impl Provider {
+    /// The namespace its subjects are unique in, as stored with an account's linked
+    /// identities: the issuer for [`oidc`], else the [`id`](Self::id). Re-pointing an
+    /// id at another issuer therefore cannot sign that issuer's `sub` into the
+    /// account of the old issuer's person with the same `sub`.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        self.issuer.as_deref().unwrap_or(self.id)
+    }
+}
+
 /// Who a provider vouches for.
 #[derive(Clone, Debug)]
 pub struct Identity {
-    /// The provider's id for the person: stable, never reassigned.
+    /// The provider's id for the person: stable, never reassigned. With
+    /// [`Provider::key`], the only thing that identifies them.
     pub uid: String,
-    /// Their email, if the provider shared one.
+    /// Their email, if the provider shared one. Contact data, not identity: it can
+    /// change, and the same address can belong to someone else later.
     pub email: Option<String>,
-    /// The provider checked the person controls that email.
+    /// The provider checked the person controls that email, now. Says nothing about
+    /// who held it before.
     pub email_verified: bool,
     /// What they call themselves there.
     pub display_name: Option<String>,
@@ -65,12 +87,18 @@ fn s(v: &Value, k: &str) -> Option<String> {
     v[k].as_str().map(str::to_owned)
 }
 
+/// A subject: present and not empty, or there is no identity.
+fn id(v: &Value, k: &str) -> Option<String> {
+    s(v, k).filter(|u| !u.is_empty())
+}
+
 /// Google, with PKCE.
 #[must_use]
 pub fn google() -> Provider {
     Provider {
         id: "google",
         name: "Google",
+        issuer: None,
         authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
         token_url: "https://oauth2.googleapis.com/token".into(),
         userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".into(),
@@ -87,6 +115,7 @@ pub fn discord() -> Provider {
     Provider {
         id: "discord",
         name: "Discord",
+        issuer: None,
         authorize_url: "https://discord.com/api/oauth2/authorize".into(),
         token_url: "https://discord.com/api/oauth2/token".into(),
         userinfo_url: "https://discord.com/api/users/@me".into(),
@@ -95,7 +124,7 @@ pub fn discord() -> Provider {
         client_id_header: false,
         identity: |info| {
             Some(Identity {
-                uid: s(&info, "id")?,
+                uid: id(&info, "id")?,
                 email: s(&info, "email"),
                 email_verified: info["verified"].as_bool().unwrap_or(false),
                 display_name: s(&info, "global_name").or_else(|| s(&info, "username")),
@@ -111,6 +140,7 @@ pub fn twitch() -> Provider {
     Provider {
         id: "twitch",
         name: "Twitch",
+        issuer: None,
         authorize_url: "https://id.twitch.tv/oauth2/authorize".into(),
         token_url: "https://id.twitch.tv/oauth2/token".into(),
         userinfo_url: "https://api.twitch.tv/helix/users".into(),
@@ -120,7 +150,7 @@ pub fn twitch() -> Provider {
         identity: |info| {
             let user = info["data"][0].clone();
             Some(Identity {
-                uid: s(&user, "id")?,
+                uid: id(&user, "id")?,
                 email: s(&user, "email"),
                 // Twitch only returns a verified email.
                 email_verified: user["email"].is_string(),
@@ -132,11 +162,13 @@ pub fn twitch() -> Provider {
 }
 
 /// Any `OpenID` Connect provider, from its issuer (`https://sso.example/realms/x`) and
-/// the endpoints its discovery document names.
+/// the endpoints its discovery document names. Linked identities are keyed by the
+/// issuer (see [`Provider::key`]), so `id` only names it in URLs.
 #[must_use]
 pub fn oidc(
     id: &'static str,
     name: &'static str,
+    issuer: &str,
     authorize: &str,
     token: &str,
     userinfo: &str,
@@ -144,6 +176,7 @@ pub fn oidc(
     Provider {
         id,
         name,
+        issuer: Some(issuer.into()),
         authorize_url: authorize.into(),
         token_url: token.into(),
         userinfo_url: userinfo.into(),
@@ -157,7 +190,7 @@ pub fn oidc(
 /// The standard claims of an OIDC user-info response.
 fn oidc_identity(info: Value) -> Option<Identity> {
     Some(Identity {
-        uid: s(&info, "sub")?,
+        uid: id(&info, "sub")?,
         email: s(&info, "email"),
         email_verified: info["email_verified"].as_bool().unwrap_or(false),
         display_name: s(&info, "name").or_else(|| s(&info, "preferred_username")),
@@ -427,6 +460,22 @@ mod tests {
             (who.uid.as_str(), who.email.as_deref(), who.email_verified),
             ("42", Some("a@b.c"), true)
         );
+    }
+
+    #[test]
+    fn identities_are_keyed_by_the_issuer_where_there_is_one() {
+        assert_eq!(google().key(), "google");
+        let sso = oidc(
+            "sso",
+            "SSO",
+            "https://sso.example/realms/x",
+            "https://sso.example/a",
+            "https://sso.example/t",
+            "https://sso.example/u",
+        );
+        assert_eq!(sso.key(), "https://sso.example/realms/x");
+        let (_, pending) = client(sso).begin().unwrap();
+        assert_eq!(pending.provider, "sso");
     }
 
     #[test]

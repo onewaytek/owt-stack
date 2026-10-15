@@ -1,10 +1,16 @@
 //! Provider identities linked to accounts: what an OAuth sign-in resolves to.
 //!
-//! [`owt_auth::oauth`] gets the [`Identity`](owt_auth::oauth::Identity) from the
-//! provider; [`arrive`] turns it into an account, by the app's [`Welcome`] policy.
-//! Linking a second provider to a signed-in account, listing them and unlinking are
-//! here too.
+//! [`owt_auth::oauth`] gets the [`Identity`] from the provider; [`arrive`] turns it
+//! into an account, by the app's [`Welcome`] policy. Linking a second provider to a
+//! signed-in account, listing them and unlinking are here too.
+//!
+//! An identity is found by its provider's [`key`](Provider::key) and subject alone.
+//! Its email never finds an account: the address can change at the provider and pass
+//! to someone else, so an unlinked identity whose verified email matches an account
+//! is still a stranger to it. The only way to add a provider to an existing account
+//! is [`link`], from a session already signed in to that account.
 
+use owt_auth::oauth::{Identity, Provider};
 use serde_json::Value;
 use sqlx::{PgExecutor, PgPool};
 
@@ -18,7 +24,8 @@ pub struct Linked {
     pub id: i64,
     /// The account it signs in.
     pub account_id: i64,
-    /// The provider, as the app names it (`google`, `discord`, an issuer's slug).
+    /// The provider's [`key`](Provider::key): `google`, `discord`, or an OIDC
+    /// issuer's URL.
     pub provider: String,
     /// The provider's stable id for the person.
     pub subject: String,
@@ -49,13 +56,13 @@ impl Linked {
 /// The identity `provider` knows as `subject`, if it is linked.
 pub async fn find(
     db: impl PgExecutor<'_>,
-    provider: &str,
+    provider: &Provider,
     subject: &str,
 ) -> sqlx::Result<Option<Linked>> {
     sqlx::query_as::<_, Linked>(
         "SELECT id, account_id, provider, subject, claims FROM account_identities WHERE provider = $1 AND subject = $2"
     )
-    .bind(provider)
+    .bind(provider.key())
     .bind(subject)
     .fetch_optional(db)
     .await
@@ -71,15 +78,19 @@ pub async fn list(db: impl PgExecutor<'_>, account_id: i64) -> sqlx::Result<Vec<
     .await
 }
 
-/// Link an identity to `account_id`. Already linked there: the claims are refreshed.
-/// Linked to another account: [`Refused::IdentityTaken`].
+/// Link `identity`, which `provider` just vouched for, to `account_id`. Call it only
+/// for the account the session is signed in to: this is how a person adds a provider.
+/// Already linked there: the claims are refreshed. Linked to another account:
+/// [`Refused::IdentityTaken`]. No subject: [`Refused::NoSubject`].
 pub async fn link(
     db: impl PgExecutor<'_>,
     account_id: i64,
-    provider: &str,
-    subject: &str,
-    claims: &Value,
+    provider: &Provider,
+    identity: &Identity,
 ) -> Result<Linked> {
+    if identity.uid.is_empty() {
+        return Err(Refused::NoSubject.into());
+    }
     let linked = sqlx::query_as::<_, Linked>(
         "INSERT INTO account_identities (account_id, provider, subject, claims)
          VALUES ($1, $2, $3, $4)
@@ -89,9 +100,9 @@ pub async fn link(
          RETURNING id, account_id, provider, subject, claims",
     )
     .bind(account_id)
-    .bind(provider)
-    .bind(subject)
-    .bind(claims)
+    .bind(provider.key())
+    .bind(&identity.uid)
+    .bind(&identity.extra)
     .fetch_optional(db)
     .await?;
     // No row back: the conflict's WHERE excluded it, so another account holds it.
@@ -126,10 +137,7 @@ pub async fn unlink(pool: &PgPool, account_id: i64, id: i64) -> Result<bool> {
 /// What an app lets a provider sign-in do when the identity is new.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Welcome {
-    /// An identity whose provider-verified email matches an active account's signs
-    /// into it (and is linked). Only safe when the provider verifies emails.
-    pub match_verified_email: bool,
-    /// An identity matching nothing creates an account. Off: the sign-in is refused
+    /// An identity linked to nothing creates an account. Off: the sign-in is refused
     /// as [`Arrival::Unknown`], for an app with no self-signup.
     pub create: bool,
 }
@@ -139,8 +147,6 @@ pub struct Welcome {
 pub enum Arrival {
     /// The identity was linked already.
     Known(Account),
-    /// Its verified email matched an account; the identity is now linked to it.
-    Matched(Account),
     /// An account was created for it, with a username made from the identity.
     Created(Account),
     /// Nothing matched and the policy creates nothing.
@@ -152,18 +158,19 @@ impl Arrival {
     #[must_use]
     pub fn account(&self) -> Option<&Account> {
         match self {
-            Self::Known(a) | Self::Matched(a) | Self::Created(a) => Some(a),
+            Self::Known(a) | Self::Created(a) => Some(a),
             Self::Unknown => None,
         }
     }
 }
 
-/// Resolve a provider's identity to an account, per `welcome`. Refreshes the
-/// identity's claims. A deactivated account resolves to [`Arrival::Unknown`].
+/// Resolve a provider's identity to an account, per `welcome`: by its subject, never
+/// its email. Refreshes the identity's claims. A deactivated account resolves to
+/// [`Arrival::Unknown`].
 pub async fn arrive(
     pool: &PgPool,
-    provider: &str,
-    identity: &owt_auth::oauth::Identity,
+    provider: &Provider,
+    identity: &Identity,
     welcome: Welcome,
 ) -> Result<Arrival> {
     if identity.uid.is_empty() {
@@ -173,35 +180,28 @@ pub async fn arrive(
         let Some(account) = store::by_id(pool, linked.account_id).await? else {
             return Ok(Arrival::Unknown);
         };
-        link(pool, account.id, provider, &identity.uid, &identity.extra).await?;
+        link(pool, account.id, provider, identity).await?;
         return Ok(Arrival::Known(account));
-    }
-    if welcome.match_verified_email
-        && identity.email_verified
-        && let Some(email) = &identity.email
-        && let Some(account) = store::by_email(pool, email).await?
-    {
-        link(pool, account.id, provider, &identity.uid, &identity.extra).await?;
-        return Ok(Arrival::Matched(account));
     }
     if !welcome.create {
         return Ok(Arrival::Unknown);
     }
     let email = identity.email.as_deref().unwrap_or("");
-    // Only a verified email is worth recording; another account may hold it anyway.
+    // Only a verified email is worth recording, as contact data; an account holding it
+    // already keeps it, and learns nothing of this sign-in.
     let email = if identity.email_verified && store::by_email(pool, email).await?.is_none() {
         email
     } else {
         ""
     };
     let account = create_for(pool, &username_base(identity), email).await?;
-    link(pool, account.id, provider, &identity.uid, &identity.extra).await?;
+    link(pool, account.id, provider, identity).await?;
     Ok(Arrival::Created(account))
 }
 
 /// A username from what the provider says: the display name, else the email's
 /// local part, else `user`; letters, digits, `_`, `.` and `-` only, 30 at most.
-fn username_base(identity: &owt_auth::oauth::Identity) -> String {
+fn username_base(identity: &Identity) -> String {
     let raw = identity
         .display_name
         .clone()
@@ -271,8 +271,8 @@ fn random_suffix() -> String {
 mod tests {
     use super::*;
 
-    fn identity(name: Option<&str>, email: Option<&str>) -> owt_auth::oauth::Identity {
-        owt_auth::oauth::Identity {
+    fn identity(name: Option<&str>, email: Option<&str>) -> Identity {
+        Identity {
             uid: "1".into(),
             email: email.map(str::to_owned),
             email_verified: true,

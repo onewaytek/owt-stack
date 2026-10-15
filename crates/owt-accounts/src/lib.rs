@@ -56,6 +56,9 @@ pub enum Refused {
     /// A provider identity is linked to another account.
     #[error("That account is already connected to a different user.")]
     IdentityTaken,
+    /// A provider identity with an empty subject: nobody in particular.
+    #[error("That sign-in did not say who you are. Try again.")]
+    NoSubject,
     /// Unlinking would leave the account with no way to sign in.
     #[error("Your account has no password, so its only connection cannot be removed.")]
     LastWayIn,

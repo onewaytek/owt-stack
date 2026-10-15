@@ -10,6 +10,7 @@ use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 use owt_accounts::session::{self, Data};
 use owt_accounts::{Accounts, Maybe, New, Signed, Staff, identities, links, store};
+use owt_auth::oauth;
 use owt_web::session::{Session, Sessions};
 use sqlx::PgPool;
 use sqlx::postgres::PgConnectOptions;
@@ -438,8 +439,8 @@ async fn signing_in_cycles_the_id_and_signing_out_empties_the_session() {
     db.drop().await;
 }
 
-fn identity(uid: &str, email: Option<&str>, verified: bool) -> owt_auth::oauth::Identity {
-    owt_auth::oauth::Identity {
+fn identity(uid: &str, email: Option<&str>, verified: bool) -> oauth::Identity {
+    oauth::Identity {
         uid: uid.into(),
         email: email.map(str::to_owned),
         email_verified: verified,
@@ -448,17 +449,25 @@ fn identity(uid: &str, email: Option<&str>, verified: bool) -> owt_auth::oauth::
     }
 }
 
+fn sso(issuer: &str) -> oauth::Provider {
+    oauth::oidc(
+        "sso",
+        "SSO",
+        issuer,
+        "https://sso.example/a",
+        "https://sso.example/t",
+        "https://sso.example/u",
+    )
+}
+
 #[tokio::test]
-async fn an_identity_arrives_by_link_then_by_verified_email_then_by_creation() {
+async fn an_identity_arrives_by_its_subject_or_creates_an_account() {
     let db = db!();
-    let open = identities::Welcome {
-        match_verified_email: true,
-        create: true,
-    };
+    let open = identities::Welcome { create: true };
     // Unknown, with nothing allowed.
     let arrival = identities::arrive(
         &db.pool,
-        "google",
+        &oauth::google(),
         &identity("g1", None, false),
         identities::Welcome::default(),
     )
@@ -469,7 +478,7 @@ async fn an_identity_arrives_by_link_then_by_verified_email_then_by_creation() {
     // Created, with a username from the name.
     let arrival = identities::arrive(
         &db.pool,
-        "google",
+        &oauth::google(),
         &identity("g1", Some("ada@example.com"), true),
         open,
     )
@@ -481,87 +490,195 @@ async fn an_identity_arrives_by_link_then_by_verified_email_then_by_creation() {
     assert_eq!(ada.username, "adalovelace");
     assert_eq!(ada.email, "ada@example.com");
 
-    // Known on the next arrival.
+    // Known on the next arrival, though the email changed at the provider.
     let again = identities::arrive(
         &db.pool,
-        "google",
-        &identity("g1", Some("ada@example.com"), true),
+        &oauth::google(),
+        &identity("g1", Some("ada@new.example"), true),
         open,
     )
     .await
     .unwrap();
     assert_eq!(again, identities::Arrival::Known(ada.clone()));
 
-    // Another provider, verified email matching: linked to the same account.
+    // An empty subject is nobody, whatever the email says.
     let arrival = identities::arrive(
         &db.pool,
-        "discord",
-        &identity("d1", Some("ADA@example.com"), true),
+        &oauth::google(),
+        &identity("", Some("ada@example.com"), true),
         open,
     )
     .await
     .unwrap();
-    assert_eq!(arrival, identities::Arrival::Matched(ada.clone()));
-    assert_eq!(identities::list(&db.pool, ada.id).await.unwrap().len(), 2);
-
-    // An unverified matching email creates a second account, without that email.
-    let arrival = identities::arrive(
+    assert_eq!(arrival, identities::Arrival::Unknown);
+    let err = identities::link(
         &db.pool,
-        "twitch",
-        &identity("t1", Some("ada@example.com"), false),
-        open,
+        ada.id,
+        &oauth::google(),
+        &identity("", None, true),
     )
     .await
-    .unwrap();
-    let identities::Arrival::Created(other) = arrival else {
-        panic!("{arrival:?}")
-    };
-    assert_eq!(other.username, "adalovelace2");
-    assert_eq!(other.email, "");
+    .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::NoSubject));
 
     // Linking an identity another account holds is refused.
-    let err = identities::link(&db.pool, other.id, "google", "g1", &serde_json::Value::Null)
-        .await
-        .unwrap_err();
-    assert_eq!(err.refused(), Some(&owt_accounts::Refused::IdentityTaken));
-
-    // Unlinking the only way in is refused; with a password it goes.
-    let only = identities::list(&db.pool, other.id).await.unwrap()[0].id;
-    let err = identities::unlink(&db.pool, other.id, only)
-        .await
-        .unwrap_err();
-    assert_eq!(err.refused(), Some(&owt_accounts::Refused::LastWayIn));
-    store::set_password(&db.pool, &other, "a passphrase of her own")
+    let other = store::create(&db.pool, new("other", "", None))
         .await
         .unwrap();
-    assert!(identities::unlink(&db.pool, other.id, only).await.unwrap());
-    assert!(!identities::unlink(&db.pool, other.id, only).await.unwrap());
+    let err = identities::link(
+        &db.pool,
+        other.id,
+        &oauth::google(),
+        &identity("g1", None, true),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::IdentityTaken));
+
+    // Linked from the signed-in account, a second provider signs in to it.
+    identities::link(
+        &db.pool,
+        ada.id,
+        &oauth::discord(),
+        &identity("d1", None, false),
+    )
+    .await
+    .unwrap();
+    let arrival = identities::arrive(
+        &db.pool,
+        &oauth::discord(),
+        &identity("d1", None, false),
+        open,
+    )
+    .await
+    .unwrap();
+    assert_eq!(arrival, identities::Arrival::Known(ada.clone()));
 
     // A deactivated account's identity signs nobody in.
     store::set_active(&db.pool, ada.id, false).await.unwrap();
-    let arrival = identities::arrive(&db.pool, "google", &identity("g1", None, false), open)
-        .await
-        .unwrap();
-    assert_eq!(arrival, identities::Arrival::Unknown);
-
-    // Its email is still taken (the unique index covers inactive rows) but no longer
-    // matched (by_email reads active ones): the same race as two first sign-ins with
-    // one address. The newcomer gets an account without the email, not a refusal.
     let arrival = identities::arrive(
         &db.pool,
-        "github",
-        &identity("h1", Some("ada@example.com"), true),
+        &oauth::google(),
+        &identity("g1", None, false),
         open,
     )
     .await
     .unwrap();
-    let identities::Arrival::Created(third) = arrival else {
-        panic!("{arrival:?}")
+    assert_eq!(arrival, identities::Arrival::Unknown);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn the_last_way_in_cannot_be_unlinked() {
+    let db = db!();
+    let open = identities::Welcome { create: true };
+    // Unlinking the only way in is refused; with a password it goes.
+    let lone = identities::arrive(
+        &db.pool,
+        &oauth::twitch(),
+        &identity("t1", None, false),
+        open,
+    )
+    .await
+    .unwrap();
+    let identities::Arrival::Created(lone) = lone else {
+        panic!("{lone:?}")
     };
+    let only = identities::list(&db.pool, lone.id).await.unwrap()[0].id;
+    let err = identities::unlink(&db.pool, lone.id, only)
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::LastWayIn));
+    store::set_password(&db.pool, &lone, "a passphrase of her own")
+        .await
+        .unwrap();
+    assert!(identities::unlink(&db.pool, lone.id, only).await.unwrap());
+    assert!(!identities::unlink(&db.pool, lone.id, only).await.unwrap());
+
+    db.drop().await;
+}
+
+/// The account-takeover shape: someone holds, at another provider, an address an
+/// account here was created with (it changed hands, or the provider vouches loosely).
+/// A verified match must not open the account, link to it, or reveal it.
+#[tokio::test]
+async fn a_verified_email_never_opens_someone_elses_account() {
+    let db = db!();
+    let open = identities::Welcome { create: true };
+    let ada = store::create(
+        &db.pool,
+        new("ada", "ada@example.com", Some("correct horse battery")),
+    )
+    .await
+    .unwrap();
+    for (provider, uid) in [
+        (oauth::google(), "g9"),
+        (oauth::discord(), "d9"),
+        (oauth::twitch(), "t9"),
+        (sso("https://sso.example/realms/x"), "s9"),
+    ] {
+        let arrival = identities::arrive(
+            &db.pool,
+            &provider,
+            &identity(uid, Some("ADA@example.com"), true),
+            open,
+        )
+        .await
+        .unwrap();
+        let identities::Arrival::Created(stranger) = arrival else {
+            panic!("{arrival:?}")
+        };
+        assert_ne!(stranger.id, ada.id);
+        // The address stays with its holder; the newcomer gets none.
+        assert_eq!(stranger.email, "");
+    }
     assert_eq!(
-        (third.username.as_str(), third.email.as_str()),
-        ("adalovelace3", "")
+        identities::list(&db.pool, ada.id).await.unwrap(),
+        Vec::new()
     );
+
+    // With self-signup off, the same arrival is simply unknown.
+    let arrival = identities::arrive(
+        &db.pool,
+        &oauth::google(),
+        &identity("g10", Some("ada@example.com"), true),
+        identities::Welcome::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(arrival, identities::Arrival::Unknown);
+    db.drop().await;
+}
+
+/// An OIDC provider's subjects belong to its issuer: an app that re-points its `sso`
+/// id at another realm does not sign that realm's `sub` into the old realm's person.
+#[tokio::test]
+async fn an_oidc_subject_belongs_to_its_issuer() {
+    let db = db!();
+    let open = identities::Welcome { create: true };
+    let first = identities::arrive(
+        &db.pool,
+        &sso("https://sso.example/realms/a"),
+        &identity("42", None, false),
+        open,
+    )
+    .await
+    .unwrap();
+    let second = identities::arrive(
+        &db.pool,
+        &sso("https://sso.example/realms/b"),
+        &identity("42", None, false),
+        open,
+    )
+    .await
+    .unwrap();
+    let (identities::Arrival::Created(a), identities::Arrival::Created(b)) = (&first, &second)
+    else {
+        panic!("{first:?} {second:?}")
+    };
+    assert_ne!(a.id, b.id);
+    let linked = identities::list(&db.pool, a.id).await.unwrap();
+    assert_eq!(linked[0].provider, "https://sso.example/realms/a");
     db.drop().await;
 }
 
