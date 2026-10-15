@@ -238,9 +238,12 @@ impl Jobs {
     /// The lock lives as long as its session. If that connection drops mid-run (an
     /// idle-session timeout, a failover, a network reset), Postgres releases the lock
     /// and another replica may take it at its next tick; so the connection is checked
-    /// every [`LOCK_CHECK`], and a run whose check fails is aborted (at its next
-    /// `.await`) and counted as failed, rather than left running beside the new
-    /// holder. A task must therefore tolerate being stopped part-way, as it would a
+    /// every [`LOCK_CHECK`] (the lock seen held, within the check's own deadline), and
+    /// a run whose check fails is aborted (at its next `.await`) and counted as
+    /// failed, rather than left running beside the new holder. The guarantee has a
+    /// window: up to two checks may pass between the lock's loss and the abort, and a
+    /// statement the run already sent may still commit. Make overlapping work
+    /// idempotent, or guard its writes (a fencing token), where that matters. A task must therefore tolerate being stopped part-way, as it would a
     /// crash. Session advisory locks need a direct connection: a transaction-mode
     /// pooler (`PgBouncer`) gives no such guarantee at all.
     pub fn singleton<F, Fut>(
@@ -263,14 +266,18 @@ impl Jobs {
                     Ok(Some(mut conn)) => {
                         let task = task.clone();
                         let outcome = this
-                            .run_until(name, move || task(), lock_lost(&mut conn, name))
+                            .run_until(name, move || task(), lock_lost(&mut conn, name, lock_id))
                             .await;
-                        let unlocked =
+                        // Bounded like the checks: a hung connection is closed, which
+                        // ends the session and its lock, rather than waited on.
+                        let unlocked = tokio::time::timeout(
+                            LOCK_CHECK,
                             sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
                                 .bind(lock_id)
-                                .fetch_one(&mut *conn)
-                                .await;
-                        if !matches!(unlocked, Ok(true)) {
+                                .fetch_one(&mut *conn),
+                        )
+                        .await;
+                        if !matches!(unlocked, Ok(Ok(true))) {
                             tracing::warn!(
                                 job = name,
                                 "advisory unlock failed; closing its connection"
@@ -367,15 +374,35 @@ impl Jobs {
 /// How often a singleton's run checks that its lock's connection is alive.
 pub const LOCK_CHECK: Duration = Duration::from_secs(2);
 
-/// Resolves when the lock's connection stops answering (and marks it to be closed):
-/// the session, and so the lock, is gone.
-async fn lock_lost(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>, name: &'static str) {
+/// Resolves (and marks the connection to be closed) when the lock is not seen held
+/// within a check: the session ended, or its connection hangs half-open (a lost
+/// node, a partition), which a check without a deadline would wait out for as long
+/// as TCP takes to give up while another replica takes the lock.
+async fn lock_lost(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    name: &'static str,
+    lock_id: i64,
+) {
     loop {
         tokio::time::sleep(LOCK_CHECK).await;
-        if let Err(e) = sqlx::query("SELECT 1").execute(&mut **conn).await {
-            tracing::warn!(job = name, error = %e, "the job's lock connection failed");
-            conn.close_on_drop();
-            return;
+        let held = tokio::time::timeout(
+            LOCK_CHECK,
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'
+                    AND pid = pg_backend_pid() AND granted
+                    AND ((classid::bigint << 32) | objid::bigint) = $1)",
+            )
+            .bind(lock_id)
+            .fetch_one(&mut **conn),
+        )
+        .await;
+        match held {
+            Ok(Ok(true)) => {}
+            outcome => {
+                tracing::warn!(job = name, ?outcome, "the job's lock is no longer held");
+                conn.close_on_drop();
+                return;
+            }
         }
     }
 }

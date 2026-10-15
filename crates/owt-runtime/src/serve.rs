@@ -2,10 +2,12 @@
 //!
 //! [`serve`] bounds what a client can hold without sending a request: the request
 //! head must arrive within [`ServeOptions::header_read_timeout`] (a slow-loris
-//! client trickling headers is cut off rather than holding a socket for ever), and
-//! a stop waits at most [`ServeOptions::drain`] for the connections still open
-//! (streams and slow uploads included) before closing them, so a rollout is never
-//! held to the pod's whole termination grace period. `owt_web::limits::Limits`
+//! client trickling headers is cut off rather than holding a socket for ever; hyper
+//! applies it to an idle kept-alive connection too), and a stop waits at most
+//! [`ServeOptions::drain`] for the requests still in flight (responses streaming,
+//! slow uploads) before closing their connections, so a rollout is never held to the
+//! pod's whole termination grace period. A connection already upgraded (a
+//! WebSocket) is the handler's own and is not closed by a stop. `owt_web::limits::Limits`
 //! bounds the time to a response; this bounds the time before a request.
 
 use std::net::SocketAddr;
@@ -56,7 +58,9 @@ pub fn raise_open_files_limit() {
 pub struct ServeOptions {
     /// How long a connection may take to send a request's head (the request line
     /// and headers), for its first request and each one after on a kept-alive
-    /// connection. Default 10 seconds.
+    /// connection, so also how long a kept-alive connection may sit idle. Default 30
+    /// seconds: keep it above the idle time of whatever proxy reuses connections to
+    /// the app, or a request it sends just as the app closes one fails (a 502).
     pub header_read_timeout: Duration,
     /// How long a stop waits for open connections to finish before closing them.
     /// Default 20 seconds, inside Kubernetes' default 30-second grace period.
@@ -66,7 +70,7 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
-            header_read_timeout: Duration::from_secs(10),
+            header_read_timeout: Duration::from_secs(30),
             drain: Duration::from_secs(20),
         }
     }
@@ -120,11 +124,21 @@ pub(crate) async fn run<F>(
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(pair) => pair,
+                // One connection's trouble (reset before it was accepted): the next.
+                Err(e) if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                ) => continue,
                 Err(e) => {
-                    // Out of file descriptors, say: back off rather than spin.
+                    // Out of file descriptors, say: back off rather than spin, and
+                    // still hear a stop.
                     tracing::warn!(error = %e, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(50)) => continue,
+                        () = &mut shutdown => break,
+                    }
                 }
             },
             () = &mut shutdown => break,

@@ -108,7 +108,8 @@ async fn main() -> anyhow::Result<()> {
     // Replicas starting together migrate once; the rest wait on the lock.
     owt_runtime::db::migrate_locked(&pool, &MIGRATOR, 8_531_207).await?;
     let bind = env::var("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8000".into());
-    // A request head must arrive within 10 s; a stop drains for up to 20 s
+    // A request head must arrive within 30 s (an idle kept-alive connection closes
+    // then too); a stop drains for up to 20 s
     // (`serve::serve_with` and `ServeOptions` to change either).
     serve::serve(&bind, router(pool), serve::shutdown_signal()).await
 }
@@ -508,7 +509,8 @@ work tracker.
   `CHANGE_REQUESTS_KEY` set, the routes answer 404 and the button renders nothing.
   One without the other fails at start.
 - **The key travels encrypted.** `CHANGE_REQUESTS_URL` must be `https`, except to
-  `localhost` or a cluster service (`http://tracker.tools.svc:8080/…`), and may not
+  `localhost` or a cluster service by its full name
+  (`http://tracker.tools.svc.cluster.local:8080/…`), and may not
   carry credentials, a query or a fragment.
 
 ```rust,no_run
@@ -1097,7 +1099,7 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - The bus's Redis is inside the trust boundary: a password or ACL user, a network
   only the app reaches, `rediss://` where the path leaves the node.
 - `Limits` bounds the time to a response; `serve::serve` bounds the time to a request
-  (its head within 10 s) and to a stop (20 s of draining), on the metrics listener
+  (its head within 30 s) and to a stop (20 s of draining), on the metrics listener
   too, which no router fronts. A handler that reads `Body` or `Request` itself is
   outside `DefaultBodyLimit`; it bounds what it reads.
 - The metrics middleware labels by matched route and by method, an invented method
@@ -1114,10 +1116,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - `Bus::redis` refuses a prefix with characters other than ASCII letters, digits,
   `_`, `.` and `-`, and a zero `beat_every`.
 - `CHANGE_REQUESTS_URL` must be `https` unless it names `localhost` or a cluster
-  service, and may not carry credentials, a query or a fragment.
-- `serve::serve` closes a connection whose request head takes over 10 seconds and
-  stops draining after 20; `serve_with` sets other bounds.
-- `jobs::singleton` aborts a run whose lock connection drops.
+  service (`….svc.cluster.local`), and may not carry credentials, a query or a fragment.
+- `serve::serve` closes a connection whose request head (or the next one on a
+  kept-alive connection) takes over 30 seconds, and stops draining after 20;
+  `serve_with` sets other bounds.
+- `jobs::singleton` aborts a run whose lock is no longer seen held.
 
 ## Upgrading from 0.1
 
