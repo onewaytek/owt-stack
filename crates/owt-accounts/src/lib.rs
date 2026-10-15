@@ -14,6 +14,9 @@
 //!   and the extractors ([`Signed`], [`Staff`], [`Maybe`]) a handler names.
 //! - [`identities`]: provider identities (OAuth) linked to accounts.
 //! - [`links`]: one-time sign-in links.
+//! - [`roles`]: user, staff, and the roles an app declares; the [`roles::Holds`]
+//!   extractor.
+//! - [`admin`]: the staff pages that find and change accounts.
 //!
 //! What stays in the app: its pages (the sign-in form is an app's template, with
 //! its look), its extra columns (`ALTER TABLE accounts ADD COLUMN …` in a
@@ -22,11 +25,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod identities;
 pub mod layer;
 pub mod links;
 pub mod migrations;
 pub mod password;
+pub mod roles;
 pub mod session;
 pub mod store;
 

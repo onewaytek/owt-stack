@@ -8,7 +8,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
-| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; one-time sign-in links |
+| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -414,9 +414,9 @@ its template), its extra columns (`ALTER TABLE accounts ADD COLUMN …` in a mig
 of its own) and the choice of flows (self-signup or not, which providers, whether
 links are minted).
 
-**Tables:** write `owt_accounts::migrations::ALL[0].sql` to
-`migrations/0001_owt_accounts.sql`, first, since the app's tables reference
-`accounts(id)`; a test calls `owt_accounts::migrations::assert_installed("migrations")`
+**Tables:** write each of `owt_accounts::migrations::ALL`, in order, to the app's
+`migrations/` (`0001_owt_accounts.sql`, `0002_owt_accounts_roles.sql`), first, since
+the app's tables reference `accounts(id)`; a test calls `owt_accounts::migrations::assert_installed("migrations")`
 so an edited or missing copy fails the build. sqlx keeps one ledger per database, which
 is why the library does not run a migrator of its own. A shipped migration never
 changes (sqlx would refuse the re-copied file at deploy, its checksum differing from
@@ -541,6 +541,88 @@ let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Ref
 A refusal (`owt_accounts::Refused`) carries the sentence the person reads; a handler
 matches `Error::Refused` to re-render the form with it, and the `From` into
 `owt_web::Error` answers 422 with the same text.
+
+#### Roles
+
+Three tiers, and the third is the app's:
+
+| Tier | Held by | Extractor |
+|---|---|---|
+| user | every active, signed-in account | `Signed` |
+| staff | `accounts.is_staff` (`store::set_staff`) | `Staff` |
+| a role the app declares | a row of `account_roles` (`roles::grant`), or staff too when the role is `held_by_staff()` | `roles::Holds<R>` |
+
+A role is a constant in the app's code; the database holds only who has it (with who
+granted it). `Account::roles` is read with the account on every request, so a revoked
+role is refused at the holder's next request, without signing them out.
+
+```rust,no_run
+# async fn demo(pool: sqlx::PgPool, ada: owt_accounts::Account, boss: owt_accounts::Account) -> anyhow::Result<()> {
+use owt_accounts::roles::{self, Holds, Named, Role};
+
+/// May run a live session. Staff may too, without a grant.
+pub struct Host;
+impl Named for Host {
+    const ROLE: Role = Role::new("host", "Host", "May run a live session.").held_by_staff();
+}
+
+async fn start_session(Holds(me, _): Holds<Host>) -> String { me.username } // others: 403
+
+roles::grant(&pool, ada.id, &Host::ROLE, Some(boss.id)).await?; // `false` when already held
+let _hosts = roles::holders(&pool, &Host::ROLE).await?; // active holders, staff included here
+let _may_host = ada.holds(&Host::ROLE); // from the loaded account, no query
+roles::revoke(&pool, ada.id, &Host::ROLE).await?;
+# Ok(()) }
+```
+
+A role name is lower-case letters, digits and `_`, a letter first, and not `user` or
+`staff`; `Role::new` checks it at compile time and the table's `CHECK` on writes.
+An app moving a boolean column onto a role (`can_host`, say) copies it in its own
+migration: `INSERT INTO account_roles (account_id, role) SELECT id, 'host' FROM
+accounts WHERE can_host`, then drops the column.
+
+#### The accounts admin
+
+`owt_accounts::admin` is the staff pages for accounts, mounted once: find (search by
+username or email; filter by staff, each role, or deactivated; paged), create
+(username, email, staff, roles; no password), and change (email, active, staff, each
+role; a generated password or a sign-in link, shown once; sign out everywhere; remove
+a sign-in connection). It refuses what would lock staff out (your own staff access,
+deactivating yourself) and unlinking an account's last way in. Every page is
+`no-store`, and each change is logged at `info` with who made it.
+
+The app gives it a layout and, optionally, its roles, a sign-in-link route and a link
+to its own page about each account (what the admin does not show: a nickname, what
+they own):
+
+```rust,no_run
+# fn demo(pool: sqlx::PgPool, accounts: owt_accounts::Accounts) {
+# use owt_accounts::roles::{Named, Role};
+# pub struct Host;
+# impl Named for Host { const ROLE: Role = Role::new("host", "Host", "May run a live session."); }
+use axum::response::{Html, IntoResponse};
+use owt_accounts::admin::{Admin, Page};
+
+// The app's shell around the admin's body: its own Askama layout, usually. The
+// request's extensions hold what the layout reads (session, nonce, account).
+let chrome = |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
+    Ok(Html(format!("<!doctype html><title>{}</title><main>{}</main>", page.title, page.body)).into_response())
+};
+let admin = Admin::new(pool, "/staff/accounts", chrome)
+    .roles(&[Host::ROLE])
+    .sign_in_links(std::time::Duration::from_secs(86_400), |token| {
+        format!("https://myapp.example/login/link/{token}") // the app's `links::redeem` route
+    })
+    .more("Profile", |a| format!("/staff/profiles/{}", a.id));
+let _app: axum::Router = axum::Router::new()
+    .nest("/staff/accounts", admin.routes()) // `Staff` only
+    .layer(axum::middleware::from_fn_with_state(accounts, owt_accounts::Accounts::load::<owt_accounts::session::Data>));
+# }
+```
+
+Its markup carries only `owt-*` classes from `tailwind/owt.css` (buttons, tables,
+badges, checkboxes), so it takes the app's tokens with no CSS of the app's. A test
+here fails if a template names a class the stylesheet lacks.
 
 ### Change requests
 

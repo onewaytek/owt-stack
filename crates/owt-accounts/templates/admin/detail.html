@@ -1,0 +1,50 @@
+<section class="owt-admin">
+<header class="owt-admin-head">
+<h1>{{ account.username }}</h1>
+<a href="{{ base }}">All accounts</a>
+</header>
+{% if let Some(n) = notice %}{% if n.level == "error" %}<div class="owt-alert owt-alert-error" role="alert">{{ n.text }}</div>
+{% else %}<div class="owt-alert owt-alert-success" role="status">{{ n.text }}</div>
+{% endif %}{% endif %}{% if let Some(s) = secret %}<div class="owt-secret" role="status">
+<p>{{ s.what }}</p>
+<p><code class="owt-secret-value">{{ s.value }}</code></p>
+<p class="owt-hint">Shown this once. Pass it on privately; nothing here can show it again.</p>
+</div>
+{% endif %}<dl class="owt-facts">
+<dt>Joined</dt><dd>{{ joined }}</dd>
+<dt>Last sign-in</dt><dd>{{ last_sign_in }}</dd>
+<dt>Status</dt><dd>{% if account.is_active %}Active{% else %}Deactivated{% endif %}</dd>
+</dl>
+{% if let Some((label, href)) = more %}<p><a href="{{ href }}">{{ label }}</a></p>
+{% endif %}<form class="owt-form" method="post" action="{{ base }}/{{ account.id }}">
+{{ email }}
+<fieldset class="owt-fieldset">
+<legend class="owt-label">Access</legend>
+<p class="owt-hint">Every active account is a user.</p>
+{% if myself %}<input type="hidden" name="active" value="on"><input type="hidden" name="staff" value="on">
+<label class="owt-check"><input type="checkbox" checked disabled><span><strong>Active</strong><span class="owt-hint owt-block">You cannot deactivate yourself.</span></span></label>
+<label class="owt-check"><input type="checkbox" checked disabled><span><strong>Staff</strong><span class="owt-hint owt-block">You cannot take away your own staff access.</span></span></label>
+{% else %}<label class="owt-check"><input type="checkbox" name="active"{% if account.is_active %} checked{% endif %}><span><strong>Active</strong><span class="owt-hint owt-block">Deactivating signs the account out everywhere and keeps its data.</span></span></label>
+<label class="owt-check"><input type="checkbox" name="staff"{% if account.is_staff %} checked{% endif %}><span><strong>Staff</strong><span class="owt-hint owt-block">May use the staff pages, this one included. Removing it signs the account out.</span></span></label>
+{% endif %}{% for r in roles %}<label class="owt-check"><input type="checkbox" name="role" value="{{ r.name }}"{% if r.checked %} checked{% endif %}><span><strong>{{ r.label }}</strong><span class="owt-hint owt-block">{{ r.description }}{% if r.staff %} Staff hold it anyway.{% endif %}</span></span></label>
+{% endfor %}</fieldset>
+<div class="owt-actions"><button class="owt-button" type="submit">Save</button></div>
+</form>
+<section class="owt-section">
+<h2>Ways in</h2>
+<p>{% if has_password %}Has a password.{% else %}No password.{% endif %}</p>
+<div class="owt-actions">
+<form method="post" action="{{ base }}/{{ account.id }}/password"><button class="owt-button owt-button-secondary" type="submit">Set a generated password</button></form>
+{% if !links_for.is_empty() %}<form method="post" action="{{ base }}/{{ account.id }}/link"><button class="owt-button owt-button-secondary" type="submit">Issue a sign-in link ({{ links_for }})</button></form>
+{% endif %}<form method="post" action="{{ base }}/{{ account.id }}/sign-out"><button class="owt-button owt-button-danger" type="submit">Sign out everywhere</button></form>
+</div>
+<h3>Sign-in connections</h3>
+{% if identities.is_empty() %}<p class="owt-hint">None. Only the account's owner can connect one, while signed in.</p>
+{% else %}<table class="owt-table">
+<thead><tr><th scope="col">Provider</th><th scope="col">Shown as</th><th scope="col"><span class="owt-sr">Actions</span></th></tr></thead>
+<tbody>
+{% for i in identities %}<tr><td>{{ i.provider }}</td><td>{{ i.label }}</td><td><form method="post" action="{{ base }}/{{ account.id }}/identities/{{ i.id }}/unlink"><button class="owt-button owt-button-quiet" type="submit">Remove</button></form></td></tr>
+{% endfor %}</tbody>
+</table>
+{% endif %}</section>
+</section>

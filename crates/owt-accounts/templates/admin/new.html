@@ -1,0 +1,19 @@
+<section class="owt-admin">
+<header class="owt-admin-head">
+<h1>New account</h1>
+<a href="{{ base }}">All accounts</a>
+</header>
+{% if let Some(e) = error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endif %}<form class="owt-form" method="post" action="{{ base }}">
+{{ username }}
+{{ email }}
+<fieldset class="owt-fieldset">
+<legend class="owt-label">Access</legend>
+<p class="owt-hint">Every account is a user. Add more only where it is needed.</p>
+<label class="owt-check"><input type="checkbox" name="staff"{% if staff %} checked{% endif %}><span><strong>Staff</strong><span class="owt-hint owt-block">May use the staff pages, this one included.</span></span></label>
+{% for r in roles %}<label class="owt-check"><input type="checkbox" name="role" value="{{ r.name }}"{% if r.checked %} checked{% endif %}><span><strong>{{ r.label }}</strong><span class="owt-hint owt-block">{{ r.description }}{% if r.staff %} Staff hold it anyway.{% endif %}</span></span></label>
+{% endfor %}</fieldset>
+<p class="owt-hint">The account starts with no password. Its page offers a way in afterwards.</p>
+<div class="owt-actions"><button class="owt-button" type="submit">Create account</button></div>
+</form>
+</section>
