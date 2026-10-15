@@ -42,7 +42,7 @@ pub const ALL: &[Migration] = &[
 #[cfg(test)]
 const SHIPPED_SHA256: &[&str] = &[
     "743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4",
-    "22a8b941423a1bffaa91a624834f0752d8437b2dfdd71b6dd96d46b62648dde9",
+    "0e6d42a67ddabfb50f56650fe85ff0bc810c4b3230a1115706db467ea27b2338",
 ];
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;

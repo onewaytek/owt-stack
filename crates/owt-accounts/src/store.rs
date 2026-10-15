@@ -254,8 +254,8 @@ pub async fn has_password(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<bool
         .map(|has| has.unwrap_or(false))
 }
 
-/// Replace `account`'s password and sign it out everywhere. `false` when the row is
-/// gone. Refuses a password that breaks a rule, the similarity rule included: the
+/// Replace `account`'s password, sign it out everywhere and void its unused sign-in
+/// links. `false` when the row is gone. Refuses a password that breaks a rule, the similarity rule included: the
 /// account is passed, not its id, so its username and email are there to check
 /// against.
 pub async fn set_password(
@@ -271,7 +271,11 @@ pub async fn set_password(
         .await
         .map_err(Error::Hash)?;
     let done = sqlx::query(
-        "UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1 WHERE id = $2",
+        "WITH voided AS (
+            UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
+            WHERE account_id = $2 AND used_at IS NULL)
+         UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1
+         WHERE id = $2",
     )
     .bind(&hash)
     .bind(account.id)
@@ -281,19 +285,28 @@ pub async fn set_password(
 }
 
 /// Sign the account out everywhere: every session it has, on any device, ends at
-/// its next request.
+/// its next request, and its unused sign-in links are void.
 pub async fn sign_out_everywhere(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<()> {
-    sqlx::query("UPDATE accounts SET session_epoch = session_epoch + 1 WHERE id = $1")
-        .bind(id)
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "WITH voided AS (
+            UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
+            WHERE account_id = $1 AND used_at IS NULL)
+         UPDATE accounts SET session_epoch = session_epoch + 1 WHERE id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
-/// Activate or deactivate. Deactivating also signs the account out everywhere.
+/// Activate or deactivate. Deactivating also signs the account out everywhere and
+/// voids its unused sign-in links, so reactivating it later revives none.
 pub async fn set_active(db: impl PgExecutor<'_>, id: i64, active: bool) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE accounts SET session_epoch = session_epoch + (is_active AND NOT $2)::int,
+        "WITH voided AS (
+            UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
+            WHERE account_id = $1 AND used_at IS NULL AND NOT $2)
+         UPDATE accounts SET session_epoch = session_epoch + (is_active AND NOT $2)::int,
                 is_active = $2
          WHERE id = $1",
     )

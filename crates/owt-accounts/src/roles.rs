@@ -35,11 +35,12 @@ use crate::store::{Account, COLUMNS};
 use crate::{Maybe, Signed};
 
 /// A role an app defines. Declare it as a constant: [`Role::new`] checks the name at
-/// compile time.
+/// compile time, and is the only way to make one outside this crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Role {
     /// What the database stores: lower-case ASCII letters, digits and `_`, a letter
-    /// first, at most 63 bytes, and neither `user` nor `staff` (the built-in tiers).
+    /// first, at most 63 bytes, and none of the [`RESERVED`] names.
     pub name: &'static str,
     /// What the admin pages call it: `Host`.
     pub label: &'static str,
@@ -60,7 +61,7 @@ impl Role {
     pub const fn new(name: &'static str, label: &'static str, description: &'static str) -> Self {
         assert!(
             valid_name(name),
-            "a role name is lower-case ASCII letters, digits and `_`, a letter first, at most 63 bytes, and not `user` or `staff`"
+            "a role name is lower-case ASCII letters, digits and `_`, a letter first, at most 63 bytes, and not `user`, `staff` or `inactive`"
         );
         Self {
             name,
@@ -93,14 +94,21 @@ const fn same(a: &[u8], b: &[u8]) -> bool {
     true
 }
 
-/// The rule the migration's `CHECK` also enforces, plus the reserved names.
+/// Names no role may take: the built-in tiers, and the admin list's other filter.
+pub const RESERVED: [&str; 3] = ["user", "staff", "inactive"];
+
+/// The rule the migration's `CHECK` also enforces.
 const fn valid_name(name: &str) -> bool {
     let b = name.as_bytes();
     if b.is_empty() || b.len() > 63 || !b[0].is_ascii_lowercase() {
         return false;
     }
-    if same(b, b"user") || same(b, b"staff") {
-        return false;
+    let mut r = 0;
+    while r < RESERVED.len() {
+        if same(b, RESERVED[r].as_bytes()) {
+            return false;
+        }
+        r += 1;
     }
     let mut i = 0;
     while i < b.len() {
@@ -184,9 +192,18 @@ pub async fn grant(
 /// Revoke `role` from `account_id`. `true` when it was held. Staff keep a role
 /// [`held_by_staff`](Role::held_by_staff) whatever is revoked.
 pub async fn revoke(db: impl PgExecutor<'_>, account_id: i64, role: &Role) -> sqlx::Result<bool> {
+    revoke_named(db, account_id, role.name).await
+}
+
+/// Revoke a role by its stored name: one the app no longer declares.
+pub(crate) async fn revoke_named(
+    db: impl PgExecutor<'_>,
+    account_id: i64,
+    name: &str,
+) -> sqlx::Result<bool> {
     let done = sqlx::query("DELETE FROM account_roles WHERE account_id = $1 AND role = $2")
         .bind(account_id)
-        .bind(role.name)
+        .bind(name)
         .execute(db)
         .await?;
     Ok(done.rows_affected() == 1)
@@ -225,6 +242,7 @@ mod tests {
             "has space",
             "user",
             "staff",
+            "inactive",
             "é",
             &"a".repeat(64),
         ] {

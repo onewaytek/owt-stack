@@ -117,6 +117,17 @@ pub async fn link(
 /// second would see the first's identity still there, and both would go.
 pub async fn unlink(pool: &PgPool, account_id: i64, id: i64) -> Result<bool> {
     let mut tx = pool.begin().await?;
+    let done = unlink_in(&mut tx, account_id, id).await?;
+    tx.commit().await?;
+    Ok(done)
+}
+
+/// [`unlink`], inside the caller's transaction (which it locks the account's row in).
+pub(crate) async fn unlink_in(
+    tx: &mut sqlx::PgConnection,
+    account_id: i64,
+    id: i64,
+) -> Result<bool> {
     let Some(has_password) = sqlx::query_scalar::<_, bool>(
         "SELECT password_hash <> '' FROM accounts WHERE id = $1 FOR UPDATE",
     )
@@ -146,7 +157,6 @@ pub async fn unlink(pool: &PgPool, account_id: i64, id: i64) -> Result<bool> {
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
     Ok(done.rows_affected() == 1)
 }
 

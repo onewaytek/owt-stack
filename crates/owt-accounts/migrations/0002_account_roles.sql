@@ -3,8 +3,10 @@
 -- Every account is a user; staff is accounts.is_staff; anything else is a row here.
 CREATE TABLE account_roles (
     account_id bigint NOT NULL REFERENCES accounts ON DELETE CASCADE,
-    -- The role's name, as the app's Role declares it: lower-case, a letter first.
-    role text NOT NULL CHECK (role ~ '^[a-z][a-z0-9_]{0,62}$'),
+    -- The role's name, as the app's Role declares it: lower-case, a letter first,
+    -- and not a built-in tier's (or the admin's other filter's) name.
+    role text NOT NULL CHECK (role ~ '^[a-z][a-z0-9_]{0,62}$'
+                              AND role NOT IN ('user', 'staff', 'inactive')),
     -- Who granted it, while that account exists.
     granted_by bigint REFERENCES accounts ON DELETE SET NULL,
     granted_at timestamptz NOT NULL DEFAULT now(),

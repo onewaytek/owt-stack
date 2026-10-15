@@ -10,16 +10,23 @@
 //!   issue a sign-in link ([`Admin::sign_in_links`]), sign out everywhere, unlink a
 //!   provider identity.
 //!
-//! What it refuses: taking away your own staff access or deactivating yourself (so
-//! the last member of staff cannot lock everyone out), unlinking an account's only
-//! way in, and every refusal the [`store`] makes (a taken email, say). A password or
-//! link is shown once, in the answer to the `POST` that made it; every page here is
-//! `no-store`. Each change is logged at `info` with who made it.
+//! What it refuses: taking away your own staff access or deactivating yourself, a
+//! change by someone who stopped being staff after their request began, unlinking an
+//! account's only way in, and every refusal the [`store`] makes (a taken email, say).
+//! Each change runs in a transaction that first locks the acting member of staff's
+//! row and the account's, in id order, and checks the actor is still active staff in
+//! their session's epoch: two staff removing each other's access at once queue, and
+//! the second is refused, so staff never reach zero this way.
+//!
+//! A password or link is shown once, in the answer to the `POST` that made it; every
+//! page here is `no-store`. Each change is logged at `info` with who made it and what
+//! it changed.
 //!
 //! The app supplies its layout through a [`Chrome`] function: the admin renders the
 //! page's body (only `owt-*` classes, from `tailwind/owt.css`) and the app wraps it,
-//! as it would any page. Only [`Staff`] reach the routes. Forms post to the same
-//! origin, so the app's `owt_web::csrf::CrossOrigin` layer covers them.
+//! as it would any page. Only [`Staff`] reach the routes, and the routes refuse a
+//! cross-origin `POST` themselves ([`CrossOrigin`]), whether or not the app layers it
+//! too: a sibling subdomain is same-site, so `SameSite=Lax` alone would let it post.
 
 use std::fmt;
 use std::sync::Arc;
@@ -34,11 +41,12 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use owt_web::cache::CachePolicy;
+use owt_web::csrf::CrossOrigin;
 use owt_web::pager::Pager;
 use owt_web::request::RequestInfo;
 use owt_web::ui::{Field, Pagination};
 use serde::Deserialize;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgExecutor, PgPool};
 
 use crate::roles::{self, Role};
 use crate::store::{self, Account, COLUMNS, New};
@@ -48,7 +56,8 @@ use crate::{Refused, Staff, identities, links};
 pub const PER_PAGE: usize = 50;
 
 /// The rendered body of an admin page, for the app's layout to embed as
-/// `{{ page.body }}`: HTML, so it is not escaped again.
+/// `{{ page.body }}`: HTML the admin escaped already, so an Askama layout does not
+/// escape it again.
 #[derive(Clone, Debug)]
 pub struct Body(String);
 
@@ -66,7 +75,8 @@ pub struct Page<'a> {
     pub request: &'a Parts,
     /// The member of staff looking at it.
     pub me: &'a Account,
-    /// The page's title: `Accounts`, `ada`.
+    /// The page's title, as plain text: `Accounts`, or an account's username, which
+    /// its owner chose. Escape it (an Askama layout does); never format it into HTML.
     pub title: &'a str,
     /// The page's content.
     pub body: Body,
@@ -94,7 +104,7 @@ where
 type LinkUrl = Box<dyn Fn(&str) -> String + Send + Sync>;
 type MoreHref = Box<dyn Fn(&Account) -> String + Send + Sync>;
 
-/// The admin, configured. Build it, then mount [`Admin::routes`] at `base`.
+/// The admin, configured. Build it, then merge [`Admin::routes`] into the app.
 pub struct Admin {
     pool: PgPool,
     base: String,
@@ -114,12 +124,21 @@ impl fmt::Debug for Admin {
 }
 
 impl Admin {
-    /// The admin over `pool`'s accounts, to be nested at `base` (`/staff/accounts`,
-    /// no trailing slash), drawn inside `chrome`.
+    /// The admin over `pool`'s accounts, at `base` (`/staff/accounts`), drawn inside
+    /// `chrome`.
+    ///
+    /// # Panics
+    ///
+    /// When `base` is not a path below the root (`/`, `staff`).
     pub fn new(pool: PgPool, base: impl Into<String>, chrome: impl Chrome) -> Self {
+        let base = base.into().trim_end_matches('/').to_owned();
+        assert!(
+            base.starts_with('/') && base.len() > 1,
+            "the admin's base is a path below the root, such as /staff/accounts"
+        );
         Self {
             pool,
-            base: base.into().trim_end_matches('/').to_owned(),
+            base,
             roles: Vec::new(),
             chrome: Box::new(chrome),
             links: None,
@@ -159,10 +178,12 @@ impl Admin {
         self
     }
 
-    /// The routes, to nest at the `base` given to [`Admin::new`], inside the
-    /// accounts layer ([`crate::Accounts::load`]).
+    /// The routes, at the `base` given to [`Admin::new`]: merge them into the app's
+    /// router, inside the accounts layer ([`crate::Accounts::load`]). They refuse a
+    /// cross-origin `POST` on their own.
     pub fn routes<S: Clone + Send + Sync + 'static>(self) -> Router<S> {
-        Router::new()
+        let base = self.base.clone();
+        let pages = Router::new()
             .route("/", get(list).post(create))
             .route("/new", get(new_form))
             .route("/{id}", get(detail).post(save))
@@ -171,6 +192,11 @@ impl Admin {
             .route("/{id}/sign-out", post(sign_out))
             .route("/{id}/identities/{identity}/unlink", post(unlink))
             .with_state(Arc::new(self))
+            .layer(axum::middleware::from_fn_with_state(
+                CrossOrigin::new(),
+                CrossOrigin::layer,
+            ));
+        Router::new().nest(&base, pages)
     }
 
     fn render(&self, request: &Parts, me: &Account, title: &str, body: &impl Template) -> Response {
@@ -243,7 +269,9 @@ impl Notice {
             "created" => Self::success("Account created. Give it a way in below."),
             "saved" => Self::success("Saved."),
             "signed-out" => Self::success("Signed out everywhere."),
-            "unlinked" => Self::success("Sign-in connection removed."),
+            "unlinked" => {
+                Self::success("Sign-in connection removed, and the account signed out everywhere.")
+            }
             "last-way-in" => Self::error(Refused::LastWayIn.to_string()),
             _ => return None,
         })
@@ -260,24 +288,33 @@ struct Secret {
 /// A role as a checkbox.
 #[derive(Clone, Debug)]
 struct RoleBox {
-    name: &'static str,
-    label: &'static str,
-    description: &'static str,
+    name: String,
+    label: String,
+    description: String,
     staff: bool,
     checked: bool,
 }
 
-fn boxes(roles: &[Role], held: &[String]) -> Vec<RoleBox> {
+/// The declared roles, ticked where `ticked` names them.
+fn boxes(roles: &[Role], ticked: &[String]) -> Vec<RoleBox> {
     roles
         .iter()
         .map(|r| RoleBox {
-            name: r.name,
-            label: r.label,
-            description: r.description,
+            name: r.name.to_owned(),
+            label: r.label.to_owned(),
+            description: r.description.to_owned(),
             staff: r.staff,
-            checked: held.iter().any(|h| h == r.name),
+            checked: ticked.iter().any(|h| h == r.name),
         })
         .collect()
+}
+
+/// The roles an account holds that the app does not declare (it dropped one, or
+/// another app shares the table): shown, ticked, so staff can revoke them. A name
+/// declared again later would otherwise grant whatever it means then.
+fn undeclared<'a>(roles: &'a [Role], held: &'a [String]) -> impl Iterator<Item = &'a String> {
+    held.iter()
+        .filter(|h| !roles.iter().any(|r| r.name == h.as_str()))
 }
 
 /// A word beside an account in the list.
@@ -443,6 +480,12 @@ fn badges(roles: &[Role], a: &Account) -> Vec<Badge> {
             quiet: false,
         });
     }
+    for name in undeclared(roles, &a.roles) {
+        out.push(Badge {
+            text: format!("{name} (undeclared)"),
+            quiet: true,
+        });
+    }
     if out.is_empty() {
         out.push(Badge {
             text: "User".into(),
@@ -509,6 +552,31 @@ async fn new_form(State(admin): Shared, Staff(me): Staff, Req(parts): Req) -> Re
     admin.render(&parts, &me, "New account", &new_page(&admin, &empty, None))
 }
 
+/// Lock the acting member of staff's row and `target`'s, in id order (two staff
+/// acting on each other queue rather than deadlock), and check the actor is still
+/// active staff in the epoch their session signed in under. 403 when not; 404 when
+/// `target` does not exist.
+async fn lock(conn: &mut PgConnection, me: &Account, target: i64) -> owt_web::Result<()> {
+    let rows: Vec<(i64, bool)> = sqlx::query_as(
+        "SELECT id, is_staff AND is_active AND session_epoch = $3 FROM accounts
+         WHERE id IN ($1, $2) ORDER BY id FOR UPDATE",
+    )
+    .bind(me.id)
+    .bind(target)
+    .bind(me.session_epoch)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !rows.iter().any(|&(id, staff)| id == me.id && staff) {
+        return Err(owt_web::Error::Forbidden(
+            "Only staff can open this page.".into(),
+        ));
+    }
+    if !rows.iter().any(|&(id, _)| id == target) {
+        return Err(owt_web::Error::NotFound);
+    }
+    Ok(())
+}
+
 async fn create(
     State(admin): Shared,
     Staff(me): Staff,
@@ -517,6 +585,7 @@ async fn create(
 ) -> owt_web::Result<Response> {
     let form = Posted(pairs);
     let mut tx = admin.pool.begin().await?;
+    lock(&mut tx, &me, me.id).await?;
     let made = store::create(
         &mut *tx,
         New {
@@ -569,6 +638,7 @@ struct DetailPage<'a> {
     secret: Option<Secret>,
     email: Field<'a>,
     roles: Vec<RoleBox>,
+    undeclared: Vec<String>,
     has_password: bool,
     joined: String,
     last_sign_in: String,
@@ -578,7 +648,7 @@ struct DetailPage<'a> {
 }
 
 /// The account, active or not, with its dates as text.
-async fn load(pool: &PgPool, id: i64) -> owt_web::Result<(Account, String, String)> {
+async fn load(db: impl PgExecutor<'_>, id: i64) -> owt_web::Result<(Account, String, String)> {
     let row = sqlx::query_as::<
         _,
         (
@@ -598,7 +668,7 @@ async fn load(pool: &PgPool, id: i64) -> owt_web::Result<(Account, String, Strin
              FROM accounts WHERE id = $1"
     )))
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(db)
     .await?
     .ok_or(owt_web::Error::NotFound)?;
     let (id, username, email, is_staff, is_active, session_epoch, roles, joined, last) = row;
@@ -662,6 +732,7 @@ async fn show(
             .error(error.as_deref())
             .hint("Contact only: it never decides who someone is."),
         roles: boxes(&admin.roles, &account.roles),
+        undeclared: undeclared(&admin.roles, &account.roles).cloned().collect(),
         has_password,
         joined,
         last_sign_in,
@@ -718,9 +789,8 @@ async fn save(
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> owt_web::Result<Response> {
     let form = Posted(pairs);
-    let (account, ..) = load(&admin.pool, id).await?;
     let (active, staff) = (form.ticked("active"), form.ticked("staff"));
-    if account.id == me.id && (!active || !staff) {
+    if id == me.id && (!active || !staff) {
         let mut response = show(
             &admin,
             &parts,
@@ -737,6 +807,9 @@ async fn save(
         return Ok(response);
     }
     let mut tx = admin.pool.begin().await?;
+    lock(&mut tx, &me, id).await?;
+    let (account, ..) = load(&mut *tx, id).await?;
+    let email_changed = store::normalize(form.value("email")) != account.email;
     if let Err(e) = store::set_email(&mut *tx, id, form.value("email")).await {
         let Some(refused) = e.refused() else {
             return Err(e.into());
@@ -758,28 +831,48 @@ async fn save(
     store::set_active(&mut *tx, id, active).await?;
     store::set_staff(&mut *tx, id, staff).await?;
     let wanted = form.roles();
+    let (mut granted, mut revoked) = (Vec::new(), Vec::new());
     for role in &admin.roles {
         if wanted.iter().any(|w| w == role.name) {
-            roles::grant(&mut *tx, id, role, Some(me.id)).await?;
-        } else {
-            roles::revoke(&mut *tx, id, role).await?;
+            if roles::grant(&mut *tx, id, role, Some(me.id)).await? {
+                granted.push(role.name);
+            }
+        } else if roles::revoke(&mut *tx, id, role).await? {
+            revoked.push(role.name);
+        }
+    }
+    // An undeclared role can only be kept or revoked: the form cannot grant one.
+    for name in undeclared(&admin.roles, &account.roles) {
+        if !wanted.contains(name) && roles::revoke_named(&mut *tx, id, name).await? {
+            revoked.push(name.as_str());
         }
     }
     tx.commit().await?;
-    tracing::info!(by = me.id, account = id, active, staff, roles = ?wanted, "admin saved an account");
+    tracing::info!(
+        by = me.id,
+        account = id,
+        email_changed,
+        active_was = account.is_active,
+        active,
+        staff_was = account.is_staff,
+        staff,
+        granted = ?granted,
+        revoked = ?revoked,
+        "admin saved an account"
+    );
     Ok(admin.redirect(id, "saved"))
 }
 
 /// Twenty letters and digits: passes every rule in [`crate::password`] unless it
 /// happens to contain the username, when another is drawn.
 fn generated_password(account: &Account) -> String {
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::rng();
     loop {
-        let mut bytes = [0u8; 20];
-        rand::fill(&mut bytes);
-        let password: String = bytes
-            .iter()
-            .map(|b| char::from(ALPHABET[usize::from(*b) % ALPHABET.len()]))
+        // Uniform over the alphabet (no modulo bias): 20 × log2(56) ≈ 116 bits.
+        let password: String = (0..20)
+            .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
             .collect();
         if crate::password::check(&password, &[&account.username, &account.email]).is_empty() {
             return password;
@@ -793,13 +886,16 @@ async fn reset_password(
     Req(parts): Req,
     Path(id): Path<i64>,
 ) -> owt_web::Result<Response> {
-    let (account, ..) = load(&admin.pool, id).await?;
+    let mut tx = admin.pool.begin().await?;
+    lock(&mut tx, &me, id).await?;
+    let (account, ..) = load(&mut *tx, id).await?;
     let password = generated_password(&account);
-    store::set_password(&admin.pool, &account, &password).await?;
+    store::set_password(&mut *tx, &account, &password).await?;
+    tx.commit().await?;
     tracing::info!(by = me.id, account = id, "admin set a generated password");
     let secret = Secret {
         what: format!(
-            "New password for {}. It has signed out every session.",
+            "New password for {}. It has signed out every session and voided its unused sign-in links.",
             account.username
         ),
         value: password,
@@ -816,9 +912,20 @@ async fn issue_link(
     let Some((ttl, url)) = &admin.links else {
         return Err(owt_web::Error::NotFound);
     };
-    let (account, ..) = load(&admin.pool, id).await?;
-    let reason = format!("issued in the admin by {}", me.username);
-    let minted = links::mint(&admin.pool, account.id, *ttl, &reason).await?;
+    let mut tx = admin.pool.begin().await?;
+    lock(&mut tx, &me, id).await?;
+    let (account, ..) = load(&mut *tx, id).await?;
+    if !account.is_active {
+        drop(tx);
+        let notice =
+            Notice::error("A deactivated account cannot use a sign-in link. Activate it first.");
+        let mut response = show(&admin, &parts, &me, id, Some(notice), None, None).await?;
+        *response.status_mut() = StatusCode::CONFLICT;
+        return Ok(response);
+    }
+    let reason = format!("issued in the admin by {} (id {})", me.username, me.id);
+    let minted = links::mint(&mut *tx, account.id, *ttl, &reason).await?;
+    tx.commit().await?;
     tracing::info!(by = me.id, account = id, "admin issued a sign-in link");
     let secret = Secret {
         what: format!(
@@ -836,8 +943,10 @@ async fn sign_out(
     Staff(me): Staff,
     Path(id): Path<i64>,
 ) -> owt_web::Result<Response> {
-    load(&admin.pool, id).await?;
-    store::sign_out_everywhere(&admin.pool, id).await?;
+    let mut tx = admin.pool.begin().await?;
+    lock(&mut tx, &me, id).await?;
+    store::sign_out_everywhere(&mut *tx, id).await?;
+    tx.commit().await?;
     tracing::info!(
         by = me.id,
         account = id,
@@ -851,8 +960,13 @@ async fn unlink(
     Staff(me): Staff,
     Path((id, identity)): Path<(i64, i64)>,
 ) -> owt_web::Result<Response> {
-    match identities::unlink(&admin.pool, id, identity).await {
-        Ok(_) => {
+    let mut tx = admin.pool.begin().await?;
+    lock(&mut tx, &me, id).await?;
+    match identities::unlink_in(&mut tx, id, identity).await {
+        // Removed: whoever signed in through it is signed out with everyone else.
+        Ok(true) => {
+            store::sign_out_everywhere(&mut *tx, id).await?;
+            tx.commit().await?;
             tracing::info!(
                 by = me.id,
                 account = id,
@@ -861,6 +975,7 @@ async fn unlink(
             );
             Ok(admin.redirect(id, "unlinked"))
         }
+        Ok(false) => Err(owt_web::Error::NotFound),
         Err(e) if e.refused() == Some(&Refused::LastWayIn) => Ok(admin.redirect(id, "last-way-in")),
         Err(e) => Err(e.into()),
     }

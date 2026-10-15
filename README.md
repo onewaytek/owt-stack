@@ -572,11 +572,18 @@ roles::grant(&pool, ada.id, &Host::ROLE, Some(boss.id)).await?; // `false` when 
 let _hosts = roles::holders(&pool, &Host::ROLE).await?; // active holders, staff included here
 let _may_host = ada.holds(&Host::ROLE); // from the loaded account, no query
 roles::revoke(&pool, ada.id, &Host::ROLE).await?;
+// Page chrome, from a request's extensions: show the link only to hosts.
+# let req: axum::extract::Request = axum::extract::Request::default();
+let _show_host_link = roles::signed_in_holds(req.extensions(), &Host::ROLE);
 # Ok(()) }
 ```
 
-A role name is lower-case letters, digits and `_`, a letter first, and not `user` or
-`staff`; `Role::new` checks it at compile time and the table's `CHECK` on writes.
+A role name is lower-case letters, digits and `_`, a letter first, and none of
+`roles::RESERVED` (`user`, `staff`, `inactive`); `Role::new` checks it at compile time
+(and is the only way to make a `Role`), and the table's `CHECK` on writes. A role the
+app stops declaring keeps its rows, and `Account::holds` matches by name: the admin
+shows such a role on the account's page so staff can revoke it, and a name declared
+again later grants whatever it means then to whoever still holds it.
 An app moving a boolean column onto a role (`can_host`, say) copies it in its own
 migration: `INSERT INTO account_roles (account_id, role) SELECT id, 'host' FROM
 accounts WHERE can_host`, then drops the column.
@@ -587,9 +594,21 @@ accounts WHERE can_host`, then drops the column.
 username or email; filter by staff, each role, or deactivated; paged), create
 (username, email, staff, roles; no password), and change (email, active, staff, each
 role; a generated password or a sign-in link, shown once; sign out everywhere; remove
-a sign-in connection). It refuses what would lock staff out (your own staff access,
-deactivating yourself) and unlinking an account's last way in. Every page is
-`no-store`, and each change is logged at `info` with who made it.
+a sign-in connection). Lists show `admin::PER_PAGE` accounts a page.
+
+- **Who:** only `Staff`, and each change re-checks inside its transaction that its
+  author is still active staff (locking both rows, so two staff removing each other at
+  once cannot leave none). It refuses your own staff access, deactivating yourself and
+  unlinking an account's last way in.
+- **From where:** the routes refuse a cross-origin `POST` themselves, with
+  `owt_web::csrf::CrossOrigin`, whatever the app layers: `SameSite=Lax` alone lets a
+  sibling subdomain post.
+- **What a revocation takes:** a generated password, deactivation and "sign out
+  everywhere" end every session and void the account's unused sign-in links (in the
+  same statement); removing a sign-in connection signs the account out everywhere too.
+  A link is not issued to a deactivated account.
+- **What is kept:** every page is `no-store`; a password or link is shown once; each
+  change is logged at `info` with who made it and what changed.
 
 The app gives it a layout and, optionally, its roles, a sign-in-link route and a link
 to its own page about each account (what the admin does not show: a nickname, what
@@ -600,13 +619,20 @@ they own):
 # use owt_accounts::roles::{Named, Role};
 # pub struct Host;
 # impl Named for Host { const ROLE: Role = Role::new("host", "Host", "May run a live session."); }
+use askama::Template;
 use axum::response::{Html, IntoResponse};
-use owt_accounts::admin::{Admin, Page};
+use owt_accounts::admin::{Admin, Body, Page};
 
-// The app's shell around the admin's body: its own Askama layout, usually. The
-// request's extensions hold what the layout reads (session, nonce, account).
+// The app's shell around the admin's body: its own Askama layout, which escapes the
+// title (an account's username, which its owner chose) and embeds the body, already
+// escaped by the admin, as it is. Never `format!` the title into HTML. The request's
+// extensions hold what the layout reads (session, nonce, account).
+#[derive(Template)]
+#[template(source = "<!doctype html><title>{{ title }}</title><main>{{ body }}</main>", ext = "html")]
+struct Shell<'a> { title: &'a str, body: Body }
 let chrome = |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
-    Ok(Html(format!("<!doctype html><title>{}</title><main>{}</main>", page.title, page.body)).into_response())
+    let html = Shell { title: page.title, body: page.body }.render().map_err(|e| owt_web::Error::Internal(e.into()))?;
+    Ok(Html(html).into_response())
 };
 let admin = Admin::new(pool, "/staff/accounts", chrome)
     .roles(&[Host::ROLE])
@@ -615,7 +641,7 @@ let admin = Admin::new(pool, "/staff/accounts", chrome)
     })
     .more("Profile", |a| format!("/staff/profiles/{}", a.id));
 let _app: axum::Router = axum::Router::new()
-    .nest("/staff/accounts", admin.routes()) // `Staff` only
+    .merge(admin.routes()) // at /staff/accounts; `Staff` only, same-origin posts only
     .layer(axum::middleware::from_fn_with_state(accounts, owt_accounts::Accounts::load::<owt_accounts::session::Data>));
 # }
 ```

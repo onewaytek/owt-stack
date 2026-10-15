@@ -27,6 +27,7 @@
 {% else %}<label class="owt-check"><input type="checkbox" name="active"{% if account.is_active %} checked{% endif %}><span><strong>Active</strong><span class="owt-hint owt-block">Deactivating signs the account out everywhere and keeps its data.</span></span></label>
 <label class="owt-check"><input type="checkbox" name="staff"{% if account.is_staff %} checked{% endif %}><span><strong>Staff</strong><span class="owt-hint owt-block">May use the staff pages, this one included. Removing it signs the account out.</span></span></label>
 {% endif %}{% for r in roles %}<label class="owt-check"><input type="checkbox" name="role" value="{{ r.name }}"{% if r.checked %} checked{% endif %}><span><strong>{{ r.label }}</strong><span class="owt-hint owt-block">{{ r.description }}{% if r.staff %} Staff hold it anyway.{% endif %}</span></span></label>
+{% endfor %}{% for name in undeclared %}<label class="owt-check"><input type="checkbox" name="role" value="{{ name }}" checked><span><strong>{{ name }}</strong><span class="owt-hint owt-block">Held, but this app does not declare it. Untick to revoke it; it cannot be granted here.</span></span></label>
 {% endfor %}</fieldset>
 <div class="owt-actions"><button class="owt-button" type="submit">Save</button></div>
 </form>

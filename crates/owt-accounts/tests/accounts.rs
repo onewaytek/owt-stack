@@ -1012,11 +1012,21 @@ async fn roles_are_granted_held_and_revoked_at_the_next_request() {
     async fn host(Holds(me, _): Holds<Host>) -> String {
         format!("hosting: {}", me.username)
     }
+    /// What page chrome asks: may the viewer host?
+    async fn may_host(req: axum::extract::Request) -> String {
+        roles::signed_in_holds(req.extensions(), &Host::ROLE).to_string()
+    }
     let db = db!();
     let sessions = sessions();
-    let client =
-        owt_test::Client::new(app(&db, &sessions, Router::new().route("/host", get(host))));
+    let client = owt_test::Client::new(app(
+        &db,
+        &sessions,
+        Router::new()
+            .route("/host", get(host))
+            .route("/may-host", get(may_host)),
+    ));
     assert_eq!(client.get("/host").await.status, 303);
+    assert_eq!(client.get("/may-host").await.text(), "false");
 
     let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
     let boss = store::create(&db.pool, new("boss", "", None))
@@ -1039,6 +1049,7 @@ async fn roles_are_granted_held_and_revoked_at_the_next_request() {
             .unwrap()
     );
     assert_eq!(client.get("/host").await.text(), "hosting: ada");
+    assert_eq!(client.get("/may-host").await.text(), "true");
     let ada_now = store::by_id(&db.pool, ada.id).await.unwrap().unwrap();
     assert_eq!(ada_now.roles, vec!["host".to_owned()]);
     assert!(ada_now.holds(&Host::ROLE) && !ada_now.holds(&EDITOR));
@@ -1065,29 +1076,39 @@ async fn roles_are_granted_held_and_revoked_at_the_next_request() {
     db.drop().await;
 }
 
-/// The test app with the admin nested at `/staff/accounts`, drawn in a bare shell.
-fn admin_app(db: &Db, sessions: &Sessions<Data>) -> Router {
+/// Text made safe for HTML, as an app's layout must make the page's title.
+fn escaped(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The admin at `/staff/accounts`, drawn in a bare shell.
+fn admin(db: &Db) -> owt_accounts::admin::Admin {
     use owt_accounts::admin::{Admin, Page};
     use owt_accounts::roles::Named;
     let chrome = |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
         use axum::response::IntoResponse;
         Ok(axum::response::Html(format!(
             "<title>{}</title><p>me: {}</p>{}",
-            page.title, page.me.username, page.body
+            escaped(page.title),
+            escaped(&page.me.username),
+            page.body
         ))
         .into_response())
     };
-    let admin = Admin::new(db.pool.clone(), "/staff/accounts", chrome)
-        .roles(&[Host::ROLE, EDITOR])
+    Admin::new(db.pool.clone(), "/staff/accounts", chrome).roles(&[Host::ROLE, EDITOR])
+}
+
+/// The test app with the whole admin.
+fn admin_app(db: &Db, sessions: &Sessions<Data>) -> Router {
+    let admin = admin(db)
         .sign_in_links(Duration::from_secs(86_400), |token| {
             format!("https://app.example/login/link/{token}")
         })
         .more("Profile", |a| format!("/staff/profiles/{}", a.id));
-    app(
-        db,
-        sessions,
-        Router::new().nest("/staff/accounts", admin.routes()),
-    )
+    app(db, sessions, admin.routes())
 }
 
 /// The value of the one-time secret on an admin page.
@@ -1360,10 +1381,24 @@ async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
         .await
         .unwrap();
     assert!(client.get(&at).await.text().contains(">google</td>"));
+    let epoch = store::by_id(&db.pool, ada.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .session_epoch;
     let r = client
         .post_form(&format!("{at}/identities/{}/unlink", linked.id), &[])
         .await;
     assert_eq!(r.location(), Some(format!("{at}?notice=unlinked").as_str()));
+    // Whoever signed in through it is signed out.
+    assert!(
+        store::by_id(&db.pool, ada.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .session_epoch
+            > epoch
+    );
     let lone = identities::arrive(
         &db.pool,
         &oauth::discord(),
@@ -1387,5 +1422,324 @@ async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
     assert_eq!(identities::list(&db.pool, lone.id).await.unwrap().len(), 1);
 
     assert_eq!(client.get("/staff/accounts/999999").await.status, 404);
+    db.drop().await;
+}
+
+/// Only staff, from this origin, reach the admin's actions: a signed-in user gets a
+/// 403 from every one, and so does staff's own browser posting from another site
+/// (a sibling subdomain is same-site, so `SameSite=Lax` would have sent the cookie).
+#[tokio::test]
+async fn the_admin_refuses_everyone_but_staff_and_every_other_origin() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(admin_app(&db, &sessions));
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    let linked = identities::link(
+        &db.pool,
+        ada.id,
+        &owt_auth::oauth::google(),
+        &identity("g1", None, false),
+    )
+    .await
+    .unwrap();
+    let at = format!("/staff/accounts/{}", ada.id);
+    let actions = [
+        "/staff/accounts".to_owned(),
+        at.clone(),
+        format!("{at}/password"),
+        format!("{at}/link"),
+        format!("{at}/sign-out"),
+        format!("{at}/identities/{}/unlink", linked.id),
+    ];
+    let fields = [
+        ("username", "x"),
+        ("email", ""),
+        ("active", "on"),
+        ("staff", "on"),
+    ];
+
+    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    for path in &actions {
+        let r = client.post_form(path, &fields).await;
+        assert_eq!(r.status, 403, "{path}: {}", r.text());
+    }
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    for path in &actions {
+        for site in ["cross-site", "same-site"] {
+            let r = client
+                .send(
+                    axum::http::Request::post(path)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .header("sec-fetch-site", site)
+                        .body(axum::body::Body::from("email=&active=on&staff=on"))
+                        .unwrap(),
+                )
+                .await;
+            assert_eq!(r.status, 403, "{site} {path}");
+        }
+    }
+    // Nothing changed.
+    let ada_now = store::by_id(&db.pool, ada.id).await.unwrap().unwrap();
+    assert!(!ada_now.is_staff && ada_now.session_epoch == ada.session_epoch);
+    assert!(
+        store::authenticate(&db.pool, "ada", "correct horse battery")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(identities::list(&db.pool, ada.id).await.unwrap().len(), 1);
+    assert!(store::by_username(&db.pool, "x").await.unwrap().is_none());
+    db.drop().await;
+}
+
+/// Two staff taking each other's staff access away at the same moment: the changes
+/// queue on the rows, the second finds its author no longer staff, and staff never
+/// reach zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staff_removing_each_other_at_once_leave_one() {
+    let db = db!();
+    let sessions = sessions();
+    let router = admin_app(&db, &sessions);
+    let a = store::create(&db.pool, new("ann", "", None)).await.unwrap();
+    let b = store::create(&db.pool, new("bea", "", None)).await.unwrap();
+    for round in 0..10 {
+        for id in [a.id, b.id] {
+            store::set_staff(&db.pool, id, true).await.unwrap();
+        }
+        let ann = store::by_id(&db.pool, a.id).await.unwrap().unwrap();
+        let bea = store::by_id(&db.pool, b.id).await.unwrap().unwrap();
+        let (as_ann, as_bea) = (
+            owt_test::Client::new(router.clone()),
+            owt_test::Client::new(router.clone()),
+        );
+        as_ann.set_cookie("s", &cookie_for(&sessions, &ann));
+        as_bea.set_cookie("s", &cookie_for(&sessions, &bea));
+        let demote = |client: owt_test::Client, target: i64| async move {
+            client
+                .post_form(
+                    &format!("/staff/accounts/{target}"),
+                    &[("email", ""), ("active", "on")],
+                )
+                .await
+                .status
+        };
+        let (one, two) = tokio::join!(
+            tokio::spawn(demote(as_ann, bea.id)),
+            tokio::spawn(demote(as_bea, ann.id)),
+        );
+        let staff: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts WHERE is_staff")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            staff,
+            1,
+            "round {round}: {:?} {:?}",
+            one.unwrap(),
+            two.unwrap()
+        );
+    }
+    db.drop().await;
+}
+
+/// A role the app stopped declaring stays visible, revocable and never grantable.
+#[tokio::test]
+async fn an_undeclared_role_is_shown_and_can_only_be_revoked() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(admin_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let cy = store::create(&db.pool, new("cy", "", None)).await.unwrap();
+    sqlx::query("INSERT INTO account_roles (account_id, role) VALUES ($1, 'retired')")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        client
+            .get("/staff/accounts")
+            .await
+            .text()
+            .contains("retired (undeclared)")
+    );
+    let at = format!("/staff/accounts/{}", ada.id);
+    let page = client.get(&at).await.text();
+    assert!(
+        page.contains(r#"name="role" value="retired" checked"#),
+        "{page}"
+    );
+    // Kept while ticked; another account cannot be given it.
+    client
+        .post_form(&at, &[("email", ""), ("active", "on"), ("role", "retired")])
+        .await;
+    client
+        .post_form(
+            &format!("/staff/accounts/{}", cy.id),
+            &[("email", ""), ("active", "on"), ("role", "retired")],
+        )
+        .await;
+    let held = |id| {
+        let pool = db.pool.clone();
+        async move { store::by_id(&pool, id).await.unwrap().unwrap().roles }
+    };
+    assert_eq!(held(ada.id).await, ["retired"]);
+    assert_eq!(held(cy.id).await, Vec::<String>::new());
+    // Unticked: revoked.
+    client
+        .post_form(&at, &[("email", ""), ("active", "on")])
+        .await;
+    assert_eq!(held(ada.id).await, Vec::<String>::new());
+    db.drop().await;
+}
+
+/// Revoking a way in voids the sign-in links still out; a deactivated account gets
+/// none; an unknown or another account's connection is a 404; without links
+/// configured the action is a 404.
+#[tokio::test]
+async fn the_admin_leaves_no_way_back_in_behind() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(admin_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let at = format!("/staff/accounts/{}", ada.id);
+    let mint = || {
+        let pool = db.pool.clone();
+        async move {
+            links::mint(&pool, ada.id, Duration::from_secs(600), "test")
+                .await
+                .unwrap()
+                .token
+        }
+    };
+    let spent = |token: String| {
+        let pool = db.pool.clone();
+        async move { links::redeem(&pool, &token, "test").await.is_err() }
+    };
+    for action in ["password", "sign-out"] {
+        let token = mint().await;
+        client.post_form(&format!("{at}/{action}"), &[]).await;
+        assert!(spent(token).await, "{action} left a link alive");
+    }
+    let token = mint().await;
+    client.post_form(&at, &[("email", "")]).await; // deactivated
+    store::set_active(&db.pool, ada.id, true).await.unwrap();
+    assert!(spent(token).await, "deactivating left a link alive");
+
+    store::set_active(&db.pool, ada.id, false).await.unwrap();
+    let r = client.post_form(&format!("{at}/link"), &[]).await;
+    assert_eq!(r.status, 409);
+    assert!(!r.text().contains("owt-secret-value"));
+
+    let cy = store::create(&db.pool, new("cy", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let cys = identities::link(
+        &db.pool,
+        cy.id,
+        &owt_auth::oauth::google(),
+        &identity("g-cy", None, false),
+    )
+    .await
+    .unwrap();
+    for path in [
+        format!("{at}/identities/{}/unlink", cys.id),
+        format!("{at}/identities/999999/unlink"),
+    ] {
+        assert_eq!(client.post_form(&path, &[]).await.status, 404, "{path}");
+    }
+    assert_eq!(identities::list(&db.pool, cy.id).await.unwrap().len(), 1);
+
+    let bare = owt_test::Client::new(app(&db, &sessions, admin(&db).routes()));
+    bare.set_cookie("s", &cookie_for(&sessions, &boss));
+    assert_eq!(bare.post_form(&format!("{at}/link"), &[]).await.status, 404);
+    db.drop().await;
+}
+
+/// A username is the page's title: the app's layout escapes it, and the admin's
+/// own body escapes everything it shows.
+#[tokio::test]
+async fn a_username_is_text_on_every_admin_page() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(admin_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let evil = store::create(&db.pool, new("</title><svg/onload=alert(1)>", "", None))
+        .await
+        .unwrap();
+    for path in [
+        "/staff/accounts".to_owned(),
+        format!("/staff/accounts/{}", evil.id),
+    ] {
+        let html = client.get(&path).await.text();
+        assert!(!html.contains("<svg"), "{path}: {html}");
+    }
+    db.drop().await;
+}
+
+/// The list pages past fifty accounts and keeps its search and filter on each page.
+#[tokio::test]
+async fn the_list_pages_and_keeps_its_filter() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(admin_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    sqlx::query(
+        "WITH made AS (
+            INSERT INTO accounts (username, email, password_hash)
+            SELECT 'ed' || lpad(n::text, 3, '0'), '', '' FROM generate_series(1, 55) n
+            RETURNING id)
+         INSERT INTO account_roles (account_id, role) SELECT id, 'editor' FROM made",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let first = client.get("/staff/accounts?q=ed&role=editor").await.text();
+    assert!(
+        first.contains("55 accounts")
+            && first.contains(">ed050</a>")
+            && !first.contains(">ed051</a>"),
+        "{first}"
+    );
+    assert!(
+        first.contains("?q=ed&#38;role=editor&#38;page=2"),
+        "{first}"
+    );
+    let second = client
+        .get("/staff/accounts?q=ed&role=editor&page=2")
+        .await
+        .text();
+    assert!(
+        second.contains(">ed055</a>") && !second.contains(">ed001</a>"),
+        "{second}"
+    );
     db.drop().await;
 }
