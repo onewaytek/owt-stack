@@ -413,6 +413,19 @@ impl Client {
         if pending.provider != self.provider.id {
             return Err(Error::Provider);
         }
+        // An OIDC provider's ID token is trusted for having come straight from its
+        // token endpoint over verified TLS: hold a provider built or changed by hand
+        // to what `oidc` checks.
+        if let Some(issuer) = &self.provider.issuer {
+            if issuer.is_empty() || issuer.ends_with('/') || !issuer.contains("://") {
+                return Err(Error::Config(format!(
+                    "the issuer {issuer:?} is not oidc()'s"
+                )));
+            }
+            checked_url("issuer", issuer)?;
+            checked_url("token", &self.provider.token_url)?;
+            checked_url("userinfo", &self.provider.userinfo_url)?;
+        }
         if !pending.matches(state) {
             return Err(Error::State);
         }
@@ -698,6 +711,32 @@ mod tests {
             part(&serde_json::json!({"alg": "RS256"})),
             part(claims)
         )
+    }
+
+    /// A provider built by hand with an issuer `oidc` would refuse is refused at
+    /// the exchange, before any request.
+    #[tokio::test]
+    async fn a_hand_built_oidc_provider_is_held_to_oidcs_rules() {
+        let http = http_client().unwrap();
+        for (issuer, token) in [
+            ("google", "https://sso.example/t"),
+            ("https://sso.example/x/", "https://sso.example/t"),
+            ("https://sso.example/x", "http://sso.example/t"),
+        ] {
+            let c = client(Provider {
+                issuer: Some(issuer.into()),
+                token_url: token.into(),
+                ..google()
+            });
+            let (_, pending) = c.begin().unwrap();
+            assert!(
+                matches!(
+                    c.complete(&http, &pending, &pending.state, "abc").await,
+                    Err(Error::Config(_))
+                ),
+                "{issuer} {token}"
+            );
+        }
     }
 
     /// An OIDC provider is held to its issuer: an ID token from another issuer, for

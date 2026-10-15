@@ -2545,3 +2545,64 @@ async fn legacy_account(pool: &PgPool, username: &str) -> store::Account {
     .unwrap();
     store::by_id(pool, id).await.unwrap().unwrap()
 }
+
+/// The account's own change, still checking the current password when staff reset
+/// it, is refused: the reset stands.
+#[tokio::test]
+async fn a_reset_by_staff_beats_a_change_in_flight() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let (pool, a) = (db.pool.clone(), ada.clone());
+    let changing = async move {
+        store::change_password(&pool, &a, "correct horse battery", "the attackers choice").await
+    };
+    let changing = tokio::spawn(changing);
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(
+        store::set_password(&db.pool, &ada, "staff reset passphrase")
+            .await
+            .unwrap()
+    );
+    let err = changing.await.unwrap().unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::CurrentPassword));
+    for (password, opens) in [
+        ("staff reset passphrase", true),
+        ("the attackers choice", false),
+    ] {
+        assert_eq!(
+            store::authenticate(&db.pool, "ada", password)
+                .await
+                .unwrap()
+                .is_some(),
+            opens,
+            "{password}"
+        );
+    }
+    // A damaged Argon2 hash opens nothing, so it is no password.
+    sqlx::query("UPDATE accounts SET password_hash = '$argon2id$garbage' WHERE id = $1")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(!store::has_password(&db.pool, ada.id).await.unwrap());
+    db.drop().await;
+}
+
+/// However many people share a non-Latin name, a first sign-in gets an account.
+#[tokio::test]
+async fn a_common_name_in_any_script_always_gets_an_account() {
+    let db = db!();
+    let open = identities::Welcome { create: true };
+    for n in 0..23 {
+        let mut who = identity(&format!("ivan-{n}"), None, false);
+        who.display_name = Some("Иван".into());
+        let arrival = identities::arrive(&db.pool, &oauth::google(), &who, open)
+            .await
+            .unwrap();
+        let name = &arrival.account().unwrap().username;
+        assert!(name.starts_with("иван"), "{name}");
+    }
+    db.drop().await;
+}

@@ -68,9 +68,19 @@ pub fn normalize(name: &str) -> String {
 pub(crate) fn valid_username(username: &str) -> bool {
     use unicode_normalization::char::is_combining_mark;
     use unicode_security::{GeneralSecurityProfile, MixedScript};
+    // After NFKC, a mark still standing beside a letter of a script that has its
+    // accented letters precomposed (Latin, Greek, Cyrillic) is a trick: a stacked
+    // or overlaid accent. So are the spacing modifier letters (`ʼ` passing for `'`).
+    let trick = |c: char| {
+        matches!(c,
+            '\u{02B0}'..='\u{02FF}' | '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}' | '\u{20D0}'..='\u{20FF}' | '\u{FE20}'..='\u{FE2F}')
+    };
     let allowed = |c: char| {
         matches!(c, '-' | '.' | '_')
-            || (c.identifier_allowed() && (c.is_alphanumeric() || is_combining_mark(c)))
+            || (c.identifier_allowed()
+                && !trick(c)
+                && (c.is_alphanumeric() || is_combining_mark(c)))
     };
     username.chars().next().is_some_and(char::is_alphanumeric)
         && username.chars().count() <= MAX_USERNAME_CHARS
@@ -293,7 +303,7 @@ pub async fn has_password(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<bool
 
 /// SQL true when the row's password can open it: an Argon2 PHC string, as
 /// [`owt_auth::password::usable`] says (a legacy hash opens nothing).
-pub(crate) const USABLE_PASSWORD: &str = "password_hash LIKE '$argon2%'";
+pub(crate) const USABLE_PASSWORD: &str = "password_hash LIKE '$argon2%$v=%$m=%,t=%,p=%$%$%'";
 
 /// The signed-in person's own change: `current` must open `account` first, so a
 /// session someone else is holding cannot also take the password (and sign its owner
@@ -313,7 +323,13 @@ pub async fn change_password(
     if !owt_auth::password::verify_or_decoy(current, stored.as_deref()).await {
         return Err(Refused::CurrentPassword.into());
     }
-    set_password(pool, account, new).await
+    // Only over the hash just checked: a reset by staff while this ran (answering a
+    // compromise, say) stands, and this change is refused rather than undoing it.
+    if replace_password(pool, account, new, stored.as_deref()).await? {
+        Ok(true)
+    } else {
+        Err(Refused::CurrentPassword.into())
+    }
 }
 
 /// Replace `account`'s password, sign it out everywhere and void its unused sign-in
@@ -326,6 +342,16 @@ pub async fn set_password(
     account: &Account,
     password: &str,
 ) -> Result<bool> {
+    replace_password(db, account, password, None).await
+}
+
+/// [`set_password`], only while the stored hash is still `expected` (when given).
+async fn replace_password(
+    db: impl PgExecutor<'_>,
+    account: &Account,
+    password: &str,
+    expected: Option<&str>,
+) -> Result<bool> {
     let problems = password::check(password, &[&account.username, &account.email]);
     if !problems.is_empty() {
         return Err(Refused::Password(problems).into());
@@ -334,14 +360,18 @@ pub async fn set_password(
         .await
         .map_err(Error::Hash)?;
     let done = sqlx::query(
-        "WITH voided AS (
+        "WITH target AS (
+            SELECT id FROM accounts
+            WHERE id = $2 AND ($3::text IS NULL OR password_hash = $3) FOR UPDATE),
+         voided AS (
             UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
-            WHERE account_id = $2 AND used_at IS NULL)
+            WHERE account_id IN (SELECT id FROM target) AND used_at IS NULL)
          UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1
-         WHERE id = $2",
+         WHERE id IN (SELECT id FROM target)",
     )
     .bind(&hash)
     .bind(account.id)
+    .bind(expected)
     .execute(db)
     .await?;
     Ok(done.rows_affected() == 1)
@@ -474,6 +504,10 @@ mod tests {
             "_admin",
             "admin'",
             "ad:min",
+            "admin\u{2bc}",
+            "a\u{301}\u{301}min",
+            "r\u{335}oot",
+            "admi\u{331}n",
         ] {
             assert!(!ok(fake), "{fake:?} passed for a name");
         }

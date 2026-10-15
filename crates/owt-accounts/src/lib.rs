@@ -47,7 +47,9 @@ pub use store::{Account, New, normalize};
 pub enum Refused {
     /// The username is empty, too long, or has an `@`, whitespace or control
     /// characters.
-    #[error("Enter a username: up to 150 characters, with no spaces and no “@”.")]
+    #[error(
+        "Enter a username: up to 150 letters and digits of one alphabet (plus - . _), starting with a letter or digit, with no spaces and no “@”."
+    )]
     Username,
     /// The email is not one address.
     #[error("Enter a valid email address.")]

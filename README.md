@@ -1662,8 +1662,12 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ### Accounts
 
-- New usernames follow the identifier rules above; existing ones keep working.
-  Logins are NFKC-normalized, which changes nothing for ASCII names.
+- New usernames follow the identifier rules above. Logins are NFKC-normalized,
+  which changes nothing for ASCII names; an existing username that NFKC changes
+  (fullwidth letters, a decomposed accent) no longer signs in by username until it is
+  renamed. Before deploying, list them:
+  `SELECT id, username FROM accounts WHERE username <> normalize(lower(username), NFKC)`
+  and rename each (or have its owner sign in by email).
 - `links::MAX_TTL` is 30 days (it was a century); longer `ttl`s are capped.
 - `store::authenticate` fails a sign-in whose password changed while it was checked.
 - `store::has_password` (and the last-way-in rule) counts only an Argon2 hash: an

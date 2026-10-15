@@ -39,9 +39,10 @@ impl Linked {
     /// else the subject.
     #[must_use]
     pub fn label(&self) -> &str {
+        // Some providers send the flag as a string ("false").
         let unverified = [&self.claims["email_verified"], &self.claims["verified"]]
             .iter()
-            .any(|v| v.as_bool() == Some(false));
+            .any(|v| v.as_bool() == Some(false) || v.as_str() == Some("false"));
         [
             if unverified { "" } else { "email" },
             "name",
@@ -423,18 +424,23 @@ async fn create_for(
             Err(crate::Error::Refused(Refused::EmailTaken(_))) if !email.is_empty() => {
                 email = "";
             }
+            // A name the rules refuse after all: a plain one, once.
+            Err(crate::Error::Refused(Refused::Username)) if !username.starts_with("user-") => {
+                username = format!("user-{}", random_suffix());
+            }
             Err(e) => return Err(e),
         }
         attempt.rollback().await?;
     }
 }
 
+/// Eight digits: digits belong to every script, so `иван-` and `李小龙-` stay
+/// one-script names with it.
 fn random_suffix() -> String {
     use rand::RngExt;
-    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = rand::rng();
     (0..8)
-        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
+        .map(|_| char::from(b'0' + rng.random_range(0..10u8)))
         .collect()
 }
 

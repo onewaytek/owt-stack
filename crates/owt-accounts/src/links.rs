@@ -67,6 +67,10 @@ pub async fn mint(
 /// signs in. [`Refused::Link`] when the token is unknown, used, expired, or its
 /// account is deactivated. The handler then calls [`crate::session::sign_in`].
 pub async fn redeem(pool: &sqlx::PgPool, token: &str, from: &str) -> Result<Account> {
+    // One transaction, the account read under a share lock: a revocation (which
+    // voids this link and bumps the epoch in one statement) is either before it,
+    // and the link is spent, or after it, and the session this signs in is revoked.
+    let mut tx = pool.begin().await?;
     let account_id = sqlx::query_scalar::<_, i64>(
         "UPDATE sign_in_links SET used_at = now(), used_from = $2
          WHERE token_sha256 = $1 AND used_at IS NULL AND expires_at > now()
@@ -74,14 +78,20 @@ pub async fn redeem(pool: &sqlx::PgPool, token: &str, from: &str) -> Result<Acco
     )
     .bind(digest(token))
     .bind(from)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(account_id) = account_id else {
         return Err(Refused::Link.into());
     };
-    store::by_id(pool, account_id)
-        .await?
-        .ok_or_else(|| Refused::Link.into())
+    let account = sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
+        "SELECT {} FROM accounts WHERE id = $1 AND is_active FOR SHARE",
+        store::COLUMNS
+    )))
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    account.ok_or_else(|| Refused::Link.into())
 }
 
 /// Void every unused link of an account (its password was reset another way, say).

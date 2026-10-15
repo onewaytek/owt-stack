@@ -53,6 +53,11 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5);
 /// How long a fetched key set is trusted before the next token refetches it.
 pub const KEYS_MAX_AGE: Duration = Duration::from_secs(3600);
 
+/// How long keys held through failed refetches keep verifying: past this, a provider
+/// (or a network path) that keeps the refetch failing does not keep a withdrawn key
+/// alive, and tokens are refused until a fetch succeeds.
+pub const KEYS_STALE_LIMIT: Duration = Duration::from_secs(24 * 3600);
+
 /// How long a fetch of the provider's keys (or its discovery document) may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -94,6 +99,7 @@ struct Config {
     min_refresh: Duration,
     retry_after_failure: Duration,
     keys_max_age: Duration,
+    keys_stale_limit: Duration,
     http: reqwest::Client,
 }
 
@@ -135,6 +141,7 @@ impl Verifier {
             min_refresh: Duration::from_secs(60),
             retry_after_failure: RETRY_AFTER_FAILURE,
             keys_max_age: KEYS_MAX_AGE,
+            keys_stale_limit: KEYS_STALE_LIMIT,
             http,
         })
     }
@@ -287,6 +294,16 @@ impl Verifier {
                 }
             }
         }
+        let expired = self
+            .0
+            .keys
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= self.0.config.keys_stale_limit);
+        if expired {
+            return Err(Error::UnknownKey);
+        }
         // Whether this caller fetched or waited for one that did.
         self.cached(kid, alg)
             .await
@@ -402,6 +419,18 @@ mod tests {
         *down.0.keys.write().await = v.0.keys.read().await.clone();
         tokio::time::sleep(Duration::from_millis(150)).await;
         down.verify::<Claims>(&t).await.unwrap();
+        // But not for ever: past the stale limit, nothing held verifies.
+        let limited = {
+            let mut c = down.0.config.clone();
+            c.keys_stale_limit = Duration::from_millis(400);
+            Verifier::with(c)
+        };
+        *limited.0.keys.write().await = down.0.keys.read().await.clone();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(matches!(
+            limited.verify::<Claims>(&t).await,
+            Err(Error::UnknownKey)
+        ));
     }
 
     /// A key published for encryption verifies no signature.
