@@ -465,7 +465,9 @@ let _sso = oauth::oidc("sso", "SSO", "https://sso.example/realms/x",
     "https://sso.example/realms/x/protocol/openid-connect/token",
     "https://sso.example/realms/x/protocol/openid-connect/userinfo")?;
 
-// Machine clients with an IdP's token: signature, algorithm, issuer, audience,
+// Machine clients with an IdP's token: the keys are refetched once they are an hour
+// old (`jwt::KEYS_MAX_AGE`), so a key the IdP withdrew stops verifying within the
+// hour; keys published for encryption verify nothing. Signature, algorithm, issuer, audience,
 // expiry and not-before.
 let verifier = jwt::Verifier::discover(http, "https://sso.example/realms/x", "myapp").await?;
 let claims: jwt::Claims = verifier.verify("eyJ...").await?;
@@ -546,7 +548,30 @@ trailing `/`); `oidc` refuses another spelling, since it would match no token's
 **Logins:** a username is one token without `@`; an email always has one. So a login
 is never both, and nobody can register a username equal to someone else's email to
 shadow their sign-in. The table's `CHECK` enforces it on writes made around the
-library.
+library. An email is a sign-in name too (with the password), not only contact data.
+
+**Usernames cannot pass for one another.** Logins are stored NFKC-normalized and
+lower-cased (`ＡＤＭＩＮ` is `admin`; a composed and a decomposed `é` are one name). A new
+username is letters, digits and combining marks that Unicode's identifier profile
+allows (UTS #39), or `-`, `.` and `_`, starting with a letter or digit, in one
+script: no zero-width or filler characters, no bidirectional controls, no Cyrillic
+`а` inside a Latin `admin`. Rows from before keep their names. A whole-script
+lookalike (`аԁmіn`, all Cyrillic) is still possible: an app that shows usernames
+where impersonation matters shows something else beside them too.
+
+**Revocation, and what it does not reach:**
+
+- `session::sign_out` replaces this browser's cookie; a copy of it taken earlier
+  still opens until it expires. Only `sign_out_everywhere` (the epoch) revokes.
+- A password change, deactivation or a demotion ends every session at its next
+  request, but a stream opened before (SSE, a WebSocket) was checked at its start:
+  an app that streams to signed-in people re-checks `store::by_id_in_epoch` on
+  each event, or closes streams on a schedule.
+- `store::authenticate` stands only if the hash it checked is still the account's,
+  so a sign-in with the old password that finishes after a change fails.
+- The sign-in throttle counts each login string: an account's username and its
+  email are two budgets. An app that wants one per account also charges the
+  throttle with the account's id once the login resolves.
 
 ```rust,no_run
 # async fn demo(
@@ -592,7 +617,10 @@ session::sign_out_everywhere(&pool, &session).await?; // every session: the epoc
 let ada = store::create(&pool, New {
     username: "Ada", email: "ada@example.com", password: Some("correct horse battery"), is_staff: false,
 }).await?;
-store::set_password(&pool, &ada, "a different passphrase").await?; // same rules; signs out everywhere
+store::set_password(&pool, &ada, "a different passphrase").await?; // staff or a link's reset: signs out everywhere
+// The account's own change asks for the current password (Refused::CurrentPassword),
+// so whoever holds a session cannot also take the password; throttle it like a sign-in.
+store::change_password(&pool, &ada, "a different passphrase", "yet another passphrase").await?;
 store::set_staff(&pool, ada.id, true).await?; // revoking signs out; granting does not
 
 // A provider's identity (from `oauth::Client::complete`) becomes an account per policy:
@@ -607,7 +635,10 @@ if let Some(account) = identities::arrive(&pool, &google, &who, welcome).await?.
 identities::link(&pool, ada.id, &owt_auth::oauth::discord(), &discord_who).await?;
 
 // A one-time sign-in link, minted by an operator; only its SHA-256 is stored. The
-// lifetime is capped at `links::MAX_TTL`.
+// lifetime is capped at `links::MAX_TTL` (30 days), and `Minted`'s Debug leaves the
+// token out. It travels in the URL, so it reaches access logs and link scanners that
+// open it: the app's route shows a page with a button that POSTs it, and redeems on
+// that POST, not on the GET.
 let minted = links::mint(&pool, ada.id, std::time::Duration::from_secs(900), "new account").await?;
 let _url = format!("https://app.example/login/link/{}", minted.token);
 let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Refused::Link when spent
@@ -1628,6 +1659,16 @@ The router example under "Wiring an app" composes the layers; beyond it:
   random bytes (fewer than 8 distinct byte values); a test fixture of `[7u8; 64]`
   needs real bytes.
 - `RequestInfo::at` always yields a path starting with `/`.
+
+### Accounts
+
+- New usernames follow the identifier rules above; existing ones keep working.
+  Logins are NFKC-normalized, which changes nothing for ASCII names.
+- `links::MAX_TTL` is 30 days (it was a century); longer `ttl`s are capped.
+- `store::authenticate` fails a sign-in whose password changed while it was checked.
+- `store::has_password` (and the last-way-in rule) counts only an Argon2 hash: an
+  account holding only a legacy hash has no password, since it opens nothing.
+- `Refused` has a `CurrentPassword` variant.
 
 ## Upgrading from 0.1
 

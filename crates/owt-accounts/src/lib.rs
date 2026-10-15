@@ -67,6 +67,9 @@ pub enum Refused {
     /// A provider identity with an empty subject: nobody in particular.
     #[error("That sign-in did not say who you are. Try again.")]
     NoSubject,
+    /// The current password, asked for before a change, is not the account's.
+    #[error("That is not your current password.")]
+    CurrentPassword,
     /// Unlinking would leave the account with no way to sign in.
     #[error("Your account has no password, so its only connection cannot be removed.")]
     LastWayIn,

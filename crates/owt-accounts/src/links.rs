@@ -15,20 +15,28 @@ use sqlx::PgExecutor;
 use crate::store::{self, Account};
 use crate::{Refused, Result};
 
-/// A link just minted. The token is shown once and never stored.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A link just minted. The token is shown once and never stored, and its `Debug`
+/// leaves it out, so a `?minted` in a log line does not publish a way in.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Minted {
     /// What goes in the URL: 43 characters of base64url.
     pub token: String,
+}
+
+impl std::fmt::Debug for Minted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Minted").finish_non_exhaustive()
+    }
 }
 
 fn digest(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-/// The longest a link lives: a century. A `ttl` beyond it is capped here rather
-/// than taken to Postgres, where `now() + interval` overflows the timestamp range.
-pub const MAX_TTL: Duration = Duration::from_secs(100 * 366 * 24 * 60 * 60);
+/// The longest a link lives: 30 days. A link is a bearer credential that may sit in
+/// a mailbox, a chat log or a proxy's access log (it travels in the URL), so a
+/// longer `ttl` is capped here.
+pub const MAX_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Mint a link for `account_id`, good for `ttl` (at most [`MAX_TTL`]), with `reason`
 /// for the audit trail.

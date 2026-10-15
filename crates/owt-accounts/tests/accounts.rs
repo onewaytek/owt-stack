@@ -1168,9 +1168,7 @@ async fn the_admin_is_for_staff_and_finds_accounts_by_name_email_and_role() {
         .await
         .unwrap();
     store::set_staff(&db.pool, boss.id, true).await.unwrap();
-    let cy = store::create(&db.pool, new("cy_50%", "", None))
-        .await
-        .unwrap();
+    let cy = legacy_account(&db.pool, "cy_50%").await;
     roles::grant(&db.pool, cy.id, &EDITOR, None).await.unwrap();
     client.set_cookie("s", &cookie_for(&sessions, &ada));
     assert_eq!(client.get("/staff/accounts").await.status, 403);
@@ -1721,9 +1719,13 @@ async fn a_username_is_text_on_every_admin_page() {
     store::set_staff(&db.pool, boss.id, true).await.unwrap();
     let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
     client.set_cookie("s", &cookie_for(&sessions, &boss));
-    let evil = store::create(&db.pool, new("</title><svg/onload=alert(1)>", "", None))
-        .await
-        .unwrap();
+    // Today's rules refuse it; an older row may have it.
+    assert!(
+        store::create(&db.pool, new("</title><svg/onload=alert(1)>", "", None))
+            .await
+            .is_err()
+    );
+    let evil = legacy_account(&db.pool, "</title><svg/onload=alert(1)>").await;
     for path in [
         "/staff/accounts".to_owned(),
         format!("/staff/accounts/{}", evil.id),
@@ -2444,4 +2446,102 @@ async fn the_builder_never_drops_a_setting() {
     let r = client.get("/auth/google/callback?state=x&code=y").await;
     assert_eq!(r.location(), Some("/signin?social=expired"));
     db.drop().await;
+}
+
+/// A sign-in with the old password, still checking it when the password changes
+/// (the owner's reset, staff answering a compromise), does not stand: it would
+/// otherwise get the new session epoch and outlive the change.
+#[tokio::test]
+async fn a_sign_in_in_flight_does_not_outlive_a_password_change() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let replacement = owt_auth::password::hash("a different passphrase")
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let signing_in =
+        tokio::spawn(
+            async move { store::authenticate(&pool, "ada", "correct horse battery").await },
+        );
+    // The check is under way (Argon2 takes far longer than this); change the
+    // password and sign out everywhere in one statement, as set_password does.
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    sqlx::query(
+        "UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1 WHERE id = $2",
+    )
+    .bind(&replacement)
+    .bind(ada.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(signing_in.await.unwrap().unwrap(), None);
+    let now = store::by_id(&db.pool, ada.id).await.unwrap().unwrap();
+    assert!(
+        store::authenticate(&db.pool, "ada", "a different passphrase")
+            .await
+            .unwrap()
+            .is_some_and(|a| a.session_epoch == now.session_epoch)
+    );
+    db.drop().await;
+}
+
+/// The account's own change needs its current password; a legacy hash is no
+/// password at all (it opens nothing, so it is not a way in).
+#[tokio::test]
+async fn changing_a_password_needs_the_current_one() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let err = store::change_password(&db.pool, &ada, "wrong guess", "a different passphrase")
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::CurrentPassword));
+    assert!(
+        store::change_password(
+            &db.pool,
+            &ada,
+            "correct horse battery",
+            "a different passphrase"
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        store::authenticate(&db.pool, "ada", "a different passphrase")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    sqlx::query("UPDATE accounts SET password_hash = 'pbkdf2_sha256$600000$s$h' WHERE id = $1")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(!store::has_password(&db.pool, ada.id).await.unwrap());
+    db.drop().await;
+}
+
+/// The token never reaches a log through `Debug`.
+#[test]
+fn a_minted_link_keeps_its_token_out_of_debug() {
+    let minted = links::Minted {
+        token: "secret-token-value".into(),
+    };
+    assert!(!format!("{minted:?}").contains("secret"));
+}
+
+/// An account whose username predates today's username rules (an import, an older
+/// release): inserted around the library, as such rows were.
+async fn legacy_account(pool: &PgPool, username: &str) -> store::Account {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (username, email, password_hash) VALUES ($1, '', '') RETURNING id",
+    )
+    .bind(username)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    store::by_id(pool, id).await.unwrap().unwrap()
 }

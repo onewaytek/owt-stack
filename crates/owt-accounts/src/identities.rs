@@ -34,12 +34,16 @@ pub struct Linked {
 }
 
 impl Linked {
-    /// Something to show for it: the email, name or handle the claims carry, else
-    /// the subject.
+    /// Something to show for it: the email (unless the provider says it is
+    /// unverified, when anyone could have typed it), name or handle the claims carry,
+    /// else the subject.
     #[must_use]
     pub fn label(&self) -> &str {
+        let unverified = [&self.claims["email_verified"], &self.claims["verified"]]
+            .iter()
+            .any(|v| v.as_bool() == Some(false));
         [
-            "email",
+            if unverified { "" } else { "email" },
             "name",
             "display_name",
             "preferred_username",
@@ -128,9 +132,10 @@ pub(crate) async fn unlink_in(
     account_id: i64,
     id: i64,
 ) -> Result<bool> {
-    let Some(has_password) = sqlx::query_scalar::<_, bool>(
-        "SELECT password_hash <> '' FROM accounts WHERE id = $1 FOR UPDATE",
-    )
+    let Some(has_password) = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+        "SELECT {} FROM accounts WHERE id = $1 FOR UPDATE",
+        store::USABLE_PASSWORD
+    )))
     .bind(account_id)
     .fetch_optional(&mut *tx)
     .await?
@@ -361,17 +366,23 @@ fn username_base(identity: &Identity) -> String {
                 .map(|e| e.split('@').next().unwrap_or("").to_owned())
         })
         .unwrap_or_default();
-    let cleaned: String = raw
+    let keep = |c: &char| c.is_alphanumeric() || "_.-".contains(*c);
+    let cleaned = store::normalize(&raw.chars().filter(keep).collect::<String>());
+    let cleaned: String = cleaned
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
         .chars()
-        .filter(|c| c.is_alphanumeric() || "_.-".contains(*c))
         .take(30)
-        .collect::<String>()
-        .to_lowercase();
-    if cleaned.is_empty() {
-        "user".to_owned()
-    } else {
-        cleaned
-    }
+        .collect();
+    // A name the username rules refuse (two scripts, a symbol that mimics a
+    // letter): its ASCII letters and digits, else `user`.
+    let ascii: String = cleaned
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    [cleaned, ascii]
+        .into_iter()
+        .find(|name| store::valid_username(name))
+        .unwrap_or_else(|| "user".to_owned())
 }
 
 /// Create an account named `base`, or `base2`, `base3`… if taken, then `base` with
@@ -452,6 +463,14 @@ mod tests {
             "ada.lx"
         );
         assert_eq!(username_base(&identity(Some("!!!"), None)), "user");
+        // Two scripts: the Latin part. Only a lookalike: the default.
+        assert_eq!(username_base(&identity(Some("Ivan Иванов"), None)), "ivan");
+        assert_eq!(username_base(&identity(Some("иван"), None)), "иван");
+        assert_eq!(username_base(&identity(Some("_.admin"), None)), "admin");
+        assert_eq!(
+            username_base(&identity(Some("\u{430}\u{434}"), None)),
+            "\u{430}\u{434}"
+        );
         assert_eq!(username_base(&identity(None, None)), "user");
         assert_eq!(
             username_base(&identity(Some(&"é".repeat(40)), None))
@@ -474,6 +493,12 @@ mod tests {
         linked.claims = serde_json::json!({"login": "ada"});
         assert_eq!(linked.label(), "ada");
         linked.claims = serde_json::json!({"email": ""});
+        assert_eq!(linked.label(), "108");
+        // An address the provider did not verify is not shown as theirs.
+        linked.claims =
+            serde_json::json!({"email": "ceo@example.com", "email_verified": false, "name": "Eve"});
+        assert_eq!(linked.label(), "Eve");
+        linked.claims = serde_json::json!({"email": "ceo@example.com", "verified": false});
         assert_eq!(linked.label(), "108");
     }
 }

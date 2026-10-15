@@ -46,22 +46,36 @@ pub const COLUMNS: &str = "id, username, email, is_staff, is_active, session_epo
 /// The most characters a username has.
 pub const MAX_USERNAME_CHARS: usize = 150;
 
-/// How usernames and emails are stored and looked up: trimmed and lower-cased.
+/// How usernames and emails are stored and looked up: trimmed, NFKC-normalized and
+/// lower-cased, so the fullwidth `ａｄｍｉｎ`, a composed and a decomposed `é`, and
+/// `Admin` are each one name.
 #[must_use]
 pub fn normalize(name: &str) -> String {
-    name.trim().to_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+    let compatible: String = name.trim().nfkc().collect();
+    compatible.to_lowercase().nfkc().collect()
 }
 
-/// One token, no `@`. A login is a username or an email, so the two must not
-/// overlap: a username shaped like an address could be registered as a squatter's
-/// and shadow the real owner's email at sign-in. Every email has an `@` and no
-/// username does, so no login is ever both.
-fn valid_username(username: &str) -> bool {
-    !username.is_empty()
+/// A name people read as one thing, and as no one else's. A login is a username or
+/// an email, so the two must not overlap: no username has an `@` (every email does),
+/// so a username shaped like an address cannot shadow its owner's email at sign-in.
+/// And a username must not pass for another in the admin list or an app's pages, so
+/// every character is a letter, digit or combining mark that Unicode's identifier
+/// profile allows (UTS #39: no invisible joiners or fillers, no bidirectional
+/// controls, no symbols that mimic letters), or `-`, `.` or `_`; it starts with a
+/// letter or digit; and its letters are of one script (no Cyrillic `а` inside a Latin
+/// `admin`).
+pub(crate) fn valid_username(username: &str) -> bool {
+    use unicode_normalization::char::is_combining_mark;
+    use unicode_security::{GeneralSecurityProfile, MixedScript};
+    let allowed = |c: char| {
+        matches!(c, '-' | '.' | '_')
+            || (c.identifier_allowed() && (c.is_alphanumeric() || is_combining_mark(c)))
+    };
+    username.chars().next().is_some_and(char::is_alphanumeric)
         && username.chars().count() <= MAX_USERNAME_CHARS
-        && !username
-            .chars()
-            .any(|c| c == '@' || c.is_whitespace() || c.is_control())
+        && username.chars().all(allowed)
+        && username.is_single_script()
 }
 
 /// One address: something before one `@`, something after, no whitespace. The
@@ -153,12 +167,19 @@ pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
 ///
 /// Charge [`owt_auth::throttle::Throttle::sign_in`] first and do not call this when
 /// it refuses: that is what bounds guessing.
+///
+/// The check takes a while (Argon2, perhaps after waiting for a permit), and the
+/// password may change meanwhile, by its owner or by staff answering a compromise.
+/// So the sign-in stands only if the hash it checked is still the account's: a
+/// sign-in with the old password that finishes after the change fails, rather than
+/// taking the new session epoch (and, with a rehash, writing the old password back).
 pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<Option<Account>> {
     let login = normalize(login);
     // At most one row: no username has an `@`, every email does, and each is unique.
+    // `lower(email)` (the stored form already) is what the unique index covers.
     let row = sqlx::query_as::<_, (i64, String)>(
         "SELECT id, password_hash FROM accounts
-         WHERE is_active AND (username = $1 OR (email <> '' AND email = $1))",
+         WHERE is_active AND (username = $1 OR (email <> '' AND lower(email) = $1))",
     )
     .bind(&login)
     .fetch_optional(pool)
@@ -173,19 +194,28 @@ pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<
     let Some((id, hash)) = row else {
         return Ok(None);
     };
-    if owt_auth::password::needs_rehash(&hash)
-        && let Ok(hash) = owt_auth::password::hash(password).await
+    let mut current = hash;
+    if owt_auth::password::needs_rehash(&current)
+        && let Ok(rehashed) = owt_auth::password::hash(password).await
     {
-        sqlx::query("UPDATE accounts SET password_hash = $1 WHERE id = $2")
-            .bind(&hash)
-            .bind(id)
-            .execute(pool)
-            .await?;
+        let done = sqlx::query(
+            "UPDATE accounts SET password_hash = $1 WHERE id = $2 AND password_hash = $3",
+        )
+        .bind(&rehashed)
+        .bind(id)
+        .bind(&current)
+        .execute(pool)
+        .await?;
+        if done.rows_affected() == 1 {
+            current = rehashed;
+        }
     }
     Ok(sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "UPDATE accounts SET last_sign_in = now() WHERE id = $1 AND is_active RETURNING {COLUMNS}"
+        "UPDATE accounts SET last_sign_in = now()
+         WHERE id = $1 AND is_active AND password_hash = $2 RETURNING {COLUMNS}"
     )))
     .bind(id)
+    .bind(&current)
     .fetch_optional(pool)
     .await?)
 }
@@ -233,7 +263,7 @@ pub async fn by_email(db: impl PgExecutor<'_>, email: &str) -> sqlx::Result<Opti
         return Ok(None);
     }
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM accounts WHERE email = $1 AND is_active"
+        "SELECT {COLUMNS} FROM accounts WHERE lower(email) = $1 AND is_active"
     )))
     .bind(email)
     .fetch_optional(db)
@@ -249,17 +279,46 @@ pub async fn list(db: impl PgExecutor<'_>) -> sqlx::Result<Vec<Account>> {
     .await
 }
 
-/// Whether the account has a password (else only an identity or a link opens it).
+/// Whether the account has a password that can open it (else only an identity or
+/// a link does): an Argon2 hash, not an empty or legacy one.
 pub async fn has_password(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<bool> {
-    sqlx::query_scalar::<_, bool>("SELECT password_hash <> '' FROM accounts WHERE id = $1")
-        .bind(id)
-        .fetch_optional(db)
-        .await
-        .map(|has| has.unwrap_or(false))
+    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+        "SELECT {USABLE_PASSWORD} FROM accounts WHERE id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map(|has| has.unwrap_or(false))
+}
+
+/// SQL true when the row's password can open it: an Argon2 PHC string, as
+/// [`owt_auth::password::usable`] says (a legacy hash opens nothing).
+pub(crate) const USABLE_PASSWORD: &str = "password_hash LIKE '$argon2%'";
+
+/// The signed-in person's own change: `current` must open `account` first, so a
+/// session someone else is holding cannot also take the password (and sign its owner
+/// out). [`Refused::CurrentPassword`] when it does not. Charge the sign-in throttle
+/// for the account first, as for a sign-in: this is a password check too.
+pub async fn change_password(
+    pool: &PgPool,
+    account: &Account,
+    current: &str,
+    new: &str,
+) -> Result<bool> {
+    let stored =
+        sqlx::query_scalar::<_, String>("SELECT password_hash FROM accounts WHERE id = $1")
+            .bind(account.id)
+            .fetch_optional(pool)
+            .await?;
+    if !owt_auth::password::verify_or_decoy(current, stored.as_deref()).await {
+        return Err(Refused::CurrentPassword.into());
+    }
+    set_password(pool, account, new).await
 }
 
 /// Replace `account`'s password, sign it out everywhere and void its unused sign-in
-/// links. `false` when the row is gone. Refuses a password that breaks a rule, the similarity rule included: the
+/// links. `false` when the row is gone. For staff, or a reset by link; the account's
+/// own change is [`change_password`]. Refuses a password that breaks a rule, the similarity rule included: the
 /// account is passed, not its id, so its username and email are there to check
 /// against.
 pub async fn set_password(
@@ -376,6 +435,48 @@ mod tests {
         assert!(!valid_username("tab\there"));
         assert!(!valid_username(&"a".repeat(MAX_USERNAME_CHARS + 1)));
         assert!(valid_username(&"a".repeat(MAX_USERNAME_CHARS)));
+    }
+
+    /// Every name the sweep registered as a distinct `admin`, and the scripts real
+    /// people write their names in.
+    #[test]
+    fn a_username_cannot_pass_for_another() {
+        let ok = |raw: &str| valid_username(&normalize(raw));
+        for real in [
+            "ada_lovelace",
+            "josé",
+            "jose\u{301}",
+            "μαρία",
+            "иван",
+            "नमस्ते",
+            "李小龙",
+            "user-2.0",
+            "ＡＤＭＩＮ",
+        ] {
+            assert!(ok(real), "{real:?} is a real name");
+        }
+        // Composed and decomposed, fullwidth and plain: one name each.
+        assert_eq!(normalize("jose\u{301}"), normalize("jos\u{e9}"));
+        assert_eq!(normalize("ＡＤＭＩＮ"), "admin");
+        for fake in [
+            "admin\u{200b}",
+            "ad\u{200d}min",
+            "\u{feff}admin",
+            "ad\u{ad}min",
+            "admin\u{2060}",
+            "admin\u{3164}",
+            "admin\u{2800}",
+            "admin\u{e0041}",
+            "\u{202e}nimda",
+            "\u{430}dmin",
+            "ceo\u{ff20}corp.com",
+            "\u{301}admin",
+            "_admin",
+            "admin'",
+            "ad:min",
+        ] {
+            assert!(!ok(fake), "{fake:?} passed for a name");
+        }
     }
 
     #[test]
