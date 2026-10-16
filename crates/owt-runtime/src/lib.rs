@@ -22,3 +22,35 @@ pub mod logging;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod serve;
+
+/// A Redis key prefix that names one deployment and nothing nested under it: ASCII
+/// letters, digits, `_`, `.` and `-`, the rule `owt_bus::Bus::redis` applies too. A
+/// `:` would let `myapp:c` hold a cache key that is also a lease under `myapp`, and
+/// a space or glob character reads differently in a pattern than in a key.
+#[cfg(feature = "redis")]
+pub(crate) fn checked_prefix(prefix: &str) -> anyhow::Result<()> {
+    let literal = !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    anyhow::ensure!(
+        literal,
+        "a Redis prefix is ASCII letters, digits, `_`, `.` and `-`: {prefix:?}"
+    );
+    Ok(())
+}
+
+#[cfg(all(test, feature = "redis"))]
+mod tests {
+    use super::checked_prefix;
+
+    #[test]
+    fn a_prefix_names_one_deployment() {
+        for ok in ["myapp", "my-app_2.staging"] {
+            assert!(checked_prefix(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "*", "my?app", "[ab]", "myapp:c", "my app", "é"] {
+            assert!(checked_prefix(bad).is_err(), "{bad}");
+        }
+    }
+}

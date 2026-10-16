@@ -367,6 +367,8 @@ impl<T: Topic, M: Message> Bus<T, M> {
 }
 
 /// A prefix the channel glob matches only literally, with nothing nested under it.
+/// The same rule as `owt-runtime`'s cache and leases, which share their own copy:
+/// this crate does not depend on that one.
 fn checked_prefix(prefix: &str) -> anyhow::Result<()> {
     let literal = !prefix.is_empty()
         && prefix

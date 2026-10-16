@@ -454,6 +454,9 @@ let cache = match owt_runtime::env::var("REDIS_URL") {
   a format version: `Expiry::Lru`) or expires when the value stops being true
   (`Expiry::At`); `Expiry::For` is for values that may merely be a little stale. A
   Redis that is absent, slow (over 100 ms) or failing is a miss.
+- **One prefix per deployment:** `Cache::connect`, `Leases::new` and `Bus::redis` take
+  the same one and refuse any but ASCII letters, digits, `_`, `.` and `-`. A `:` in
+  it could make one prefix's cache key another's lease.
 
 ### Authentication
 
@@ -1371,7 +1374,7 @@ survives a failed or panicking run, and graceful shutdown:
 use std::time::Duration;
 use owt_runtime::jobs::{CancellationToken, Every, JobMetrics, Jobs, lease::Leases};
 
-# async fn demo(pool: sqlx::PgPool, redis: redis::aio::ConnectionManager) {
+# async fn demo(pool: sqlx::PgPool, redis: redis::aio::ConnectionManager) -> anyhow::Result<()> {
 let shutdown = CancellationToken::new();
 let jobs = Jobs::new(shutdown.clone()).metrics(JobMetrics::prefixed("myapp"));
 
@@ -1386,7 +1389,7 @@ jobs.every_replica("weekly_pass", Every::new(Duration::from_secs(60)), move || {
 jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_001, || async { Ok(()) });
 
 // One replica owns the clock; the TTL outlasts the period so ownership sticks.
-let leases = Leases::new(redis, Leases::new_holder_id(), "myapp");
+let leases = Leases::new(redis, Leases::new_holder_id(), "myapp")?;
 jobs.leased("clock", Every::new(Duration::from_secs(1)), leases, "clock", Duration::from_secs(5), |held| async move {
     tokio::select! {
         () = held.lost() => {}  // another replica took over mid-run: stop owner-only work
@@ -1399,7 +1402,7 @@ jobs.leased("clock", Every::new(Duration::from_secs(1)), leases, "clock", Durati
 owt_runtime::serve::shutdown_signal().await;
 shutdown.cancel();
 jobs.stopped().await;
-# }
+# Ok(()) }
 ```
 
 Name each advisory lock id once, in one place in the app: two jobs sharing an id
@@ -1413,6 +1416,8 @@ ends. A lease is a Redis key: a Redis that evicts under memory pressure (as a ca
 does) can drop it, and until the holder's next renewal fails (a third of the TTL) two
 replicas may run the job. Work that must never run twice gets a `noeviction` Redis,
 and checks `held.is_lost()` before each owner-only step.
+
+`Leases::new` refuses the prefixes the cache refuses (see "Caching").
 
 A run's panic, in the future or in the closure that builds it, is one failed tick;
 the loop goes on.
@@ -1929,6 +1934,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ## Upgrading from 0.5
 
+- `Cache::connect` and `Leases::new` refuse a prefix with characters other than ASCII
+  letters, digits, `_`, `.` and `-`, as `Bus::redis` already did, and `Leases::new`
+  returns a `Result`: add `?`. An app whose prefix has a `:` or a space renames it:
+  its cache starts cold, and while old and new replicas overlap in the rollout each
+  side holds its own leases, so a leased job may run twice until the rollout ends.
 - Install `owt_accounts::migrations::ALL[3]` (`owt_accounts_policies`) as the app's
   next unused migration version (see "Tables" under "Accounts"), whether or not the
   app uses site policies: `assert_installed` expects every entry. Its tables stay
