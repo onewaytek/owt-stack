@@ -303,7 +303,7 @@ fn app(db: &Db, sessions: &Sessions<Data>, extra: Router) -> Router {
 fn sessions() -> Sessions<Data> {
     let key = owt_web::session::key_from_base64(&base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
-        [7u8; 64],
+        (0..64u8).collect::<Vec<_>>(),
     ))
     .unwrap();
     Sessions::new(key, "s", Duration::from_secs(3600), false)

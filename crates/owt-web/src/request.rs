@@ -36,15 +36,21 @@ impl RequestInfo {
     /// The request at `uri` (a path with an optional query), as no client sent it:
     /// error pages, tests, and pages rendered outside a request.
     ///
-    /// Leading slashes collapse to one. `GET //elsewhere.example/` is a path to the
-    /// server and another host to a browser, so a link built from it (the 404 page's
-    /// "sign in and come back") would leave the site.
+    /// Leading slashes and backslashes collapse to one slash, and a `uri` that does
+    /// not start with one gains it. `GET //elsewhere.example/`
+    /// (or `/\elsewhere.example/`, which a browser reads the same way) is a path to
+    /// the server and another host to a browser, so a link built from it (the 404
+    /// page's "sign in and come back") would leave the site.
     #[must_use]
     pub fn at(uri: &str) -> Self {
-        let uri = match uri.strip_prefix("//") {
-            Some(rest) => &format!("/{}", rest.trim_start_matches('/')),
-            None => uri,
-        };
+        // Control characters and spaces too: a browser drops a tab or newline from
+        // a URL, so `/\t/elsewhere.example` is `//elsewhere.example` to it.
+        let rest = uri.trim_start_matches(|c: char| {
+            c == '/' || c == '\\' || c.is_control() || c.is_whitespace()
+        });
+        // Always rooted: `at("https://elsewhere.example/x")` is the path
+        // `/https://elsewhere.example/x` here, never a link off the site.
+        let uri = &format!("/{rest}");
         let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
         Self {
             path: path.to_owned(),
@@ -168,6 +174,32 @@ mod tests {
     use axum::http::Request;
 
     use super::*;
+
+    /// No link built from the path leaves the site, whatever it starts with.
+    #[test]
+    fn leading_slashes_and_backslashes_collapse() {
+        for (raw, path) in [
+            ("//evil.example/x?page=2", "/evil.example/x"),
+            ("/\\evil.example/x?page=2", "/evil.example/x"),
+            ("\\\\evil.example/x", "/evil.example/x"),
+            ("/\\/evil.example/x", "/evil.example/x"),
+            ("/\t/evil.example/x", "/evil.example/x"),
+            ("/\n\r/ evil.example/x", "/evil.example/x"),
+            ("/games/", "/games/"),
+            ("https://evil.example/x", "/https://evil.example/x"),
+            ("evil.example/x", "/evil.example/x"),
+            ("?page=2", "/"),
+            ("", "/"),
+        ] {
+            let r = RequestInfo::at(raw);
+            assert_eq!(r.path, path, "{raw}");
+            let link = r.url_with("page", Some("3"));
+            assert!(
+                link.starts_with('/') && !link[1..].starts_with(['/', '\\']),
+                "{raw} -> {link}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn reads_path_query_and_htmx_headers() {
