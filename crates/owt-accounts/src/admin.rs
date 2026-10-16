@@ -784,18 +784,15 @@ async fn detail(
 }
 
 /// No admin page is shown inside another's frame, whatever the app's own CSP (one in
-/// report-only mode enforces no `frame-ancestors`): framed by a hostile sibling
-/// subdomain, which `SameSite=Lax` and [`CrossOrigin`] treat as the site itself, a
-/// click would act with staff's authority.
+/// report-only mode enforces no `frame-ancestors`, and browsers then obey
+/// `X-Frame-Options`): framed by a hostile sibling subdomain, which `SameSite=Lax`
+/// and [`CrossOrigin`] treat as the site itself, a click would act with staff's
+/// authority. No `Content-Security-Policy` of its own: the app's `Csp` layer adds its
+/// policy only to a response that has none, so one here would replace it.
 async fn never_framed(mut response: Response) -> Response {
-    let h = response.headers_mut();
-    h.insert(
+    response.headers_mut().insert(
         axum::http::header::X_FRAME_OPTIONS,
         axum::http::HeaderValue::from_static("DENY"),
-    );
-    h.append(
-        axum::http::header::CONTENT_SECURITY_POLICY,
-        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
     );
     response
 }

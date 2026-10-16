@@ -1111,6 +1111,36 @@ fn admin_app(db: &Db, sessions: &Sessions<Data>) -> Router {
     app(db, sessions, admin.routes())
 }
 
+/// Under the app's enforcing CSP, an admin page keeps the app's whole policy (the
+/// admin adds no policy of its own, which would make the layer skip the app's) and is
+/// never framed.
+#[tokio::test]
+async fn an_admin_page_keeps_the_apps_csp() {
+    use owt_web::headers::Csp;
+    let db = db!();
+    let sessions = sessions();
+    let app = admin_app(&db, &sessions).layer(from_fn_with_state(Csp::new(), Csp::layer));
+    let client = owt_test::Client::new(app);
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let r = client.get("/staff/accounts").await;
+    assert_eq!(r.status, 200);
+    let policy = r
+        .header("content-security-policy")
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        policy.contains("script-src") && policy.contains("frame-ancestors 'none'"),
+        "{policy}"
+    );
+    assert_eq!(r.header("x-frame-options"), Some("DENY"));
+    db.drop().await;
+}
+
 /// The value of the one-time secret on an admin page.
 fn secret(html: &str) -> String {
     html.split("owt-secret-value\">")
