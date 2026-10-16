@@ -738,6 +738,33 @@ every name made after.
 - The sign-in throttle counts each login string: an account's username and its
   email are two budgets. An app that wants one per account also charges the
   throttle with the account's id once the login resolves.
+- Everything that revokes an account's sessions moves `accounts.session_epoch`
+  (`sign_out_everywhere`, `set_password` and `change_password`, deactivating,
+  revoking staff), and nothing else does. An app that keeps something per account
+  that must go with the sessions (a provider's tokens, sealed) puts a trigger on
+  that column in a migration of its own, so it goes in the same transaction
+  whichever path revoked, the staff pages and a console included. The `WHEN` clause
+  matters: `set_active` and `set_staff` write the column even when it does not
+  change.
+
+```sql
+-- migrations/0009_provider_tokens.sql (the app's next unused version)
+CREATE TABLE provider_tokens (
+    account_id bigint PRIMARY KEY REFERENCES accounts (id) ON DELETE CASCADE,
+    sealed text NOT NULL
+);
+
+CREATE FUNCTION forget_provider_tokens() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM provider_tokens WHERE account_id = NEW.id;
+    RETURN NULL;
+END $$;
+
+CREATE TRIGGER forget_provider_tokens
+    AFTER UPDATE OF session_epoch ON accounts
+    FOR EACH ROW WHEN (NEW.session_epoch <> OLD.session_epoch)
+    EXECUTE FUNCTION forget_provider_tokens();
+```
 
 ```rust,no_run
 # async fn demo(
@@ -805,6 +832,15 @@ let google = owt_auth::oauth::google();
 if let Some(account) = identities::arrive(&pool, &google, &who, welcome).await?.account() {
     session::sign_in(&session, account);
 }
+// Or in the app's transaction, so what it keeps beside the account (the provider's
+// tokens, sealed) commits with the arrival or not at all.
+let mut tx = pool.begin().await?;
+let arrival = identities::arrive_in(&mut tx, &google, &who, welcome).await?;
+if let Some(account) = arrival.account() {
+    sqlx::query("INSERT INTO provider_tokens (account_id, sealed) VALUES ($1, $2)")
+        .bind(account.id).bind("…").execute(&mut *tx).await?;
+}
+tx.commit().await?;
 // Adding a provider: only from a session signed in to the account (`Signed(me)`).
 identities::link(&pool, ada.id, &owt_auth::oauth::discord(), &discord_who).await?;
 
@@ -1048,10 +1084,12 @@ session type that can hold a sign-in in progress, and two pages that embed the
 pieces (its sign-in page and a settings page).
 
 It keeps who signed in and nothing the provider granted. An app that calls the
-provider's APIs as the person writes its own callback over
-`oauth::Client::complete_with_tokens` (see "Authentication"), then hands the
-identity to `identities::arrive` or `link` as `social` does. Like `social`'s, such a
-callback takes the pending sign-in out of the session first and answers every
+provider's APIs as the person gets the tokens from its hooks (`on_arrival` and
+`on_connect`, under "3. Wiring the app") and stores them itself. An app that needs
+other routes writes its own callback over `oauth::Client::complete_with_tokens` (see
+"Authentication"), then hands the identity to `identities::arrive` (or `arrive_in`,
+to keep the tokens in the same transaction) or `link` as `social` does. Like
+`social`'s, such a callback takes the pending sign-in out of the session first and answers every
 failure after that, the database's included, with a redirect, never a 5xx: a 5xx
 seals no session change, so the pending sign-in would outlive the callback that was
 meant to use it up.
@@ -1284,17 +1322,29 @@ let _missing: Vec<_> = CODES.iter().filter(|c| mensaje(c).is_none()).collect();
 
 **The app's own code at each arrival:** `on_arrival` runs after the account is found
 or created and before the session is signed in, with the account, whether this
-sign-in created it, and the provider's id. It is for what every new account gets (a
-profile, a default setting) and the app's own sign-in bookkeeping. An error is
+sign-in created it, the provider's id, and the tokens the provider granted
+(`Arrived::tokens`, an `oauth::Tokens`). It is for what every new account gets (a
+profile, a default setting), the app's own sign-in bookkeeping, and keeping the
+tokens of an app that calls the provider's APIs as the person. An error is
 logged and signs nobody in: the person lands on the sign-in page with the `failed`
 outcome. An account it created stays, and arrives with `created` false next time, so
 set-up that must happen should also be done where it is found missing later.
 Connecting a provider signs nobody in and does not call it. A second `on_arrival`
 replaces the first. To unit-test a hook, build its argument with `Arrived::new`
-(account, created, provider).
+(account, created, provider), and `.with_tokens(oauth::Tokens::bearer("…"))`.
+
+`on_connect` is the same for connecting a provider to the signed-in account, after
+the identity is linked, with the account, the provider's id and the tokens
+(`Connected`; `Connected::new(account, provider)` in a test): a person who signed
+up with a password hands the app a provider's tokens here. An error is logged and
+lands on the connections page with `failed`; the identity stays linked, and the
+next sign-in with it brings fresh tokens to `on_arrival`.
 
 ```rust,no_run
-# fn demo(social: owt_accounts::social::SocialSignIn, pool: sqlx::PgPool) {
+# fn demo(
+#     social: owt_accounts::social::SocialSignIn, pool: sqlx::PgPool,
+#     seal: fn(&owt_auth::oauth::Tokens) -> String,
+# ) {
 let social = social.on_arrival(move |arrived| {
     let pool = pool.clone();
     async move {
@@ -1304,6 +1354,14 @@ let social = social.on_arrival(move |arrived| {
                 .execute(&pool)
                 .await?;
         }
+        // Sealed by the app (with the expiry as an instant: the lifetime is relative),
+        // never in the clear. Each sign-in replaces what the last one granted.
+        sqlx::query("INSERT INTO provider_tokens (account_id, sealed) VALUES ($1, $2)
+                     ON CONFLICT (account_id) DO UPDATE SET sealed = EXCLUDED.sealed")
+            .bind(arrived.account.id)
+            .bind(seal(&arrived.tokens))
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 });

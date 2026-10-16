@@ -313,10 +313,24 @@ pub async fn arrive(
     identity: &Identity,
     welcome: Welcome,
 ) -> Result<Arrival> {
+    arrive_in(&mut *pool.acquire().await?, provider, identity, welcome).await
+}
+
+/// [`arrive`] on `conn`: inside the caller's transaction, say, so that what the app
+/// does with the account (keeping the provider's tokens) commits with the arrival or
+/// not at all. In a transaction it works in a savepoint, so an error or refusal
+/// undoes only its own writes, and the lock on the identity is held until the
+/// caller's transaction ends.
+pub async fn arrive_in(
+    conn: &mut sqlx::PgConnection,
+    provider: &Provider,
+    identity: &Identity,
+    welcome: Welcome,
+) -> Result<Arrival> {
     if identity.uid.is_empty() {
         return Err(Refused::NoSubject.into());
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = sqlx::Connection::begin(conn).await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
         .bind(ARRIVAL_LOCK)
         .bind(format!("{}\n{}", provider.key(), identity.uid))
