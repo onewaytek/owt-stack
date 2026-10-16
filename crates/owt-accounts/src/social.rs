@@ -24,6 +24,8 @@
 //! "Sign-in with a provider" section lists every requirement, at the providers too.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +46,7 @@ use sqlx::PgPool;
 
 use crate::identities::{self, Arrival, Welcome};
 use crate::session::Signed as SignedData;
-use crate::{Maybe, Refused, Signed, session};
+use crate::{Account, Maybe, Refused, Signed, session};
 
 /// The variable naming this site's public origin (`https://myapp.example`): the
 /// redirect URI each provider is told is built from it.
@@ -434,6 +436,37 @@ pub fn outcome(code: Option<&str>) -> Option<Flash> {
     Some(Flash(level, text.to_owned()))
 }
 
+/// A sign-in with a provider about to sign `account` in, for
+/// [`SocialSignIn::on_arrival`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Arrived {
+    /// The account it signs in.
+    pub account: Account,
+    /// The account was created by this sign-in (a first sign-in, with
+    /// `Welcome { create: true }`).
+    pub created: bool,
+    /// The provider's id (`google`).
+    pub provider: String,
+}
+
+impl Arrived {
+    /// An arrival built by hand, for an app's tests of its own hook: the callback
+    /// builds the real ones.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(account: Account, created: bool, provider: impl Into<String>) -> Self {
+        Self {
+            account,
+            created,
+            provider: provider.into(),
+        }
+    }
+}
+
+type OnArrival =
+    Arc<dyn Fn(Arrived) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
+
 /// Sign-in with providers, configured. Cheap to clone: keep one in the app's state
 /// for the pages that show [`Buttons`] and [`Connections`], and merge
 /// [`SocialSignIn::routes`] into the router. Configure it fully first: the routes
@@ -451,6 +484,7 @@ struct Inner {
     connections_page: String,
     after_sign_in: String,
     connect_within: Duration,
+    on_arrival: Option<OnArrival>,
 }
 
 impl fmt::Debug for SocialSignIn {
@@ -482,6 +516,7 @@ impl SocialSignIn {
             connections_page: "/account/connections".into(),
             after_sign_in: "/".into(),
             connect_within: Duration::from_secs(15 * 60),
+            on_arrival: None,
         }))
     }
 
@@ -519,6 +554,25 @@ impl SocialSignIn {
     #[must_use]
     pub fn connect_within(self, window: Duration) -> Self {
         self.edit(|i| i.connect_within = window)
+    }
+
+    /// Run the app's own code for each sign-in with a provider, after the account is
+    /// found or created and before the session is signed in: what every new account
+    /// gets (a profile), or a stamp of its own. An error is logged and signs nobody
+    /// in: the person lands on the sign-in page with the `failed` outcome, and the
+    /// pending sign-in stays used up. An account it created stays, and its next
+    /// sign-in arrives with `created` false, so set-up that must happen should also be
+    /// done where it is missing later (on first use), not only here. Connecting a
+    /// provider to a signed-in account signs nobody in and does not call it. Calling
+    /// this again replaces the earlier hook.
+    #[must_use]
+    pub fn on_arrival<F, Fut>(self, f: F) -> Self
+    where
+        F: Fn(Arrived) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let f: OnArrival = Arc::new(move |arrived| Box::pin(f(arrived)));
+        self.edit(|i| i.on_arrival = Some(f))
     }
 
     /// The providers.
@@ -825,6 +879,29 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
+impl Inner {
+    /// Whether the app's [`SocialSignIn::on_arrival`] hook, if any, let `account`
+    /// in; its error is logged.
+    async fn heard(&self, account: &Account, created: bool, provider: &str) -> bool {
+        let Some(on_arrival) = &self.on_arrival else {
+            return true;
+        };
+        let arrived = Arrived::new(account.clone(), created, provider);
+        match on_arrival(arrived).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(
+                    account = account.id,
+                    provider = %provider,
+                    error = %e,
+                    "the app's on_arrival failed"
+                );
+                false
+            }
+        }
+    }
+}
+
 async fn callback<T: Social + SessionData>(
     State(this): State<SocialSignIn>,
     session: Session<T>,
@@ -920,11 +997,17 @@ async fn callback<T: Social + SessionData>(
     let Some(account) = arrival.account() else {
         return Ok(landing(&inner.sign_in_page, "unknown"));
     };
+    let created = matches!(arrival, Arrival::Created(_));
+    // A redirect, not a 500: a 5xx seals no session change, and the pending sign-in
+    // taken above must stay used up.
+    if !inner.heard(account, created, &provider).await {
+        return Ok(landing(&inner.sign_in_page, "failed"));
+    }
     session::sign_in(&session, account);
     tracing::info!(
         account = account.id,
         provider = %provider,
-        created = matches!(arrival, Arrival::Created(_)),
+        created,
         "signed in with a provider"
     );
     let to = redirect::local_or(Some(&started.next), &inner.after_sign_in).to_owned();
