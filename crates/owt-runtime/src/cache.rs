@@ -101,9 +101,14 @@ impl Cache {
     /// call returns within the response budget as a miss. The background attempts
     /// stop when the last clone of the cache is dropped.
     ///
+    /// # Errors
+    /// A `prefix` that is not ASCII letters, digits, `_`, `.` and `-` (a `:` in it
+    /// could make a cache key another prefix's lease), or a bad `url`.
+    ///
     /// # Panics
     /// Outside a Tokio runtime.
     pub fn connect(url: &str, prefix: &str, options: Options) -> anyhow::Result<Self> {
+        crate::checked_prefix(prefix)?;
         let client = redis::Client::open(url)?;
         let cell = Arc::new(OnceCell::new());
         let slot = Arc::downgrade(&cell);
@@ -296,6 +301,7 @@ mod tests {
         assert_eq!(c.get("k").await, None);
         c.set_detached(vec![("k".into(), b"v".to_vec())], Expiry::Lru);
         assert!(Cache::connect("not a url", "t", Options::default()).is_err());
+        assert!(Cache::connect("redis://127.0.0.1:9/0", "t:lease", Options::default()).is_err());
     }
 
     /// Needs `REDIS_URL`; skipped without it (or with it blank).

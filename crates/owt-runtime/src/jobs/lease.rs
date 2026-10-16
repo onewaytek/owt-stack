@@ -66,15 +66,23 @@ impl Leases {
     /// Leases held as `holder` (unique per replica: [`Leases::new_holder_id`]), under
     /// keys `<prefix>:lease:<name>`. The prefix keeps deployments that share a Redis
     /// apart.
-    #[must_use]
-    pub fn new(redis: ConnectionManager, holder: impl Into<String>, prefix: &str) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// A `prefix` that is not ASCII letters, digits, `_`, `.` and `-` (a `:` in it
+    /// could make a lease another prefix's cache key or once-marker).
+    pub fn new(
+        redis: ConnectionManager,
+        holder: impl Into<String>,
+        prefix: &str,
+    ) -> anyhow::Result<Self> {
+        crate::checked_prefix(prefix)?;
+        Ok(Self {
             redis,
             holder: Arc::from(holder.into()),
             prefix: Arc::from(prefix),
             renew: Arc::new(redis::Script::new(RENEW_IF_HELD)),
             release: Arc::new(redis::Script::new(RELEASE_IF_HELD)),
-        }
+        })
     }
 
     /// `"<hostname>:<8 hex>"`: the pod's name (Kubernetes sets `HOSTNAME`) and a

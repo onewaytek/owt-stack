@@ -153,6 +153,7 @@ async fn only_an_admin_may_send() {
     assert!(seen.lock().unwrap().is_empty());
 }
 
+#[cfg(feature = "accounts")]
 #[tokio::test]
 async fn staff_is_walled_like_any_staff_page() {
     // Without the accounts layer nobody is signed in, so `Staff` sends the

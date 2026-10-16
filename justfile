@@ -11,7 +11,7 @@ default:
 # when REDIS_URL is set.
 #
 # Everything that must pass before a commit.
-check: fmt lint test audit
+check: fmt lint features test audit
 
 # Formatting, checked rather than applied.
 fmt:
@@ -20,6 +20,10 @@ fmt:
 # Clippy over every crate and feature, warnings fatal.
 lint:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+# The builds `lint` cannot see: a crate without its default features.
+features:
+    cargo clippy -p owt-change --all-targets --no-default-features --locked -- -D warnings
 
 # The tests, README doctests included; arguments pass through.
 test *args:

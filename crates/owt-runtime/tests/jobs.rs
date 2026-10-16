@@ -300,8 +300,8 @@ mod leases {
         let Some(conn) = redis().await else { return };
         let p = prefix();
         let (a, b) = (
-            Leases::new(conn.clone(), "a", &p),
-            Leases::new(conn.clone(), "b", &p),
+            Leases::new(conn.clone(), "a", &p).unwrap(),
+            Leases::new(conn.clone(), "b", &p).unwrap(),
         );
         let ttl = Duration::from_millis(300);
         assert!(a.acquire("clock", ttl).await);
@@ -345,7 +345,7 @@ mod leases {
             jobs.leased(
                 "clock",
                 every,
-                Leases::new(conn.clone(), who, &p),
+                Leases::new(conn.clone(), who, &p).unwrap(),
                 "clock",
                 ttl,
                 move |_held| {
@@ -389,14 +389,14 @@ mod leases {
     async fn a_ttl_longer_than_the_period_keeps_the_lease_between_ticks() {
         let Some(conn) = redis().await else { return };
         let p = prefix();
-        let thief = Leases::new(conn.clone(), "thief", &p);
+        let thief = Leases::new(conn.clone(), "thief", &p).unwrap();
         let jobs = Jobs::new(CancellationToken::new());
         let runs = Arc::new(AtomicUsize::new(0));
         let r = runs.clone();
         jobs.leased(
             "tick",
             Every::new(Duration::from_millis(400)).jitter(Duration::ZERO),
-            Leases::new(conn.clone(), "owner", &p),
+            Leases::new(conn.clone(), "owner", &p).unwrap(),
             "tick",
             Duration::from_millis(500),
             move |_held| {
@@ -430,7 +430,7 @@ mod leases {
         let Some(conn) = redis().await else { return };
         let p = prefix();
         let ttl = Duration::from_millis(600);
-        let thief = Leases::new(conn.clone(), "thief", &p);
+        let thief = Leases::new(conn.clone(), "thief", &p).unwrap();
         let jobs = Jobs::new(CancellationToken::new());
         let lost = Arc::new(AtomicUsize::new(0));
         let l = lost.clone();
@@ -438,7 +438,7 @@ mod leases {
         jobs.leased(
             "long",
             Every::new(Duration::from_secs(60)).jitter(Duration::ZERO),
-            Leases::new(conn.clone(), "owner", &p),
+            Leases::new(conn.clone(), "owner", &p).unwrap(),
             "long",
             ttl,
             move |held| {

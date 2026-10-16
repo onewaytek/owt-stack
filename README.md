@@ -58,6 +58,7 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
 
 `owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export,
 `redis` for leases and leased jobs.
+`owt-change`'s: `accounts` (default) for `owt_accounts::Staff` as its admin.
 
 A shared crate is only shared while the majors agree: an app that names `axum`, `sqlx`,
 `askama` or `redis` directly must use the major in this workspace's `Cargo.toml`.
@@ -186,15 +187,14 @@ pub struct SessionData {
     pub user_id: Option<i64>,
     /// The account's epoch at sign-in; bumping the account's signs it out everywhere.
     #[serde(default)]
-    pub epoch: i64,
+    pub epoch: i32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<owt_web::flash::Flash>,
 }
 
-/// One indexed read: `SELECT epoch FROM account WHERE id = $1`. `None`: no such
-/// account any more.
-async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<Option<i64>> {
-    sqlx::query_scalar("SELECT epoch FROM account WHERE id = $1")
+/// One indexed read of `owt-accounts`' table. `None`: no such account any more.
+async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<Option<i32>> {
+    sqlx::query_scalar("SELECT session_epoch FROM accounts WHERE id = $1")
         .bind(user_id)
         .fetch_optional(pool)
         .await
@@ -454,6 +454,9 @@ let cache = match owt_runtime::env::var("REDIS_URL") {
   a format version: `Expiry::Lru`) or expires when the value stops being true
   (`Expiry::At`); `Expiry::For` is for values that may merely be a little stale. A
   Redis that is absent, slow (over 100 ms) or failing is a miss.
+- **One prefix per deployment:** `Cache::connect`, `Leases::new` and `Bus::redis` take
+  the same one and refuse any but ASCII letters, digits, `_`, `.` and `-`. A `:` in
+  it could make one prefix's cache key another's lease.
 
 ### Authentication
 
@@ -1296,8 +1299,9 @@ let _ = Shell { change_button: changes.button("/staff", viewer_is_staff) };
 # let _ = app; Ok(()) }
 ```
 
-An app without `owt-accounts` implements `owt_change::Admin` on its own extractor and
-names it in `routes::<MyAdmin, _>()`.
+An app without `owt-accounts` implements `owt_change::Admin` on its own extractor,
+names it in `routes::<MyAdmin, _>()`, and can leave out the `Staff` implementation
+and the dependency it brings: `owt-change = { …, default-features = false }`.
 
 **The button** is `change.js`, served by the routes, immutable under its `?v=` hash. It
 runs under the default Content-Security-Policy: no inline script, no style
@@ -1403,7 +1407,7 @@ survives a failed or panicking run, and graceful shutdown:
 use std::time::Duration;
 use owt_runtime::jobs::{CancellationToken, Every, JobMetrics, Jobs, lease::Leases};
 
-# async fn demo(pool: sqlx::PgPool, redis: redis::aio::ConnectionManager) {
+# async fn demo(pool: sqlx::PgPool, redis: redis::aio::ConnectionManager) -> anyhow::Result<()> {
 let shutdown = CancellationToken::new();
 let jobs = Jobs::new(shutdown.clone()).metrics(JobMetrics::prefixed("myapp"));
 
@@ -1418,7 +1422,7 @@ jobs.every_replica("weekly_pass", Every::new(Duration::from_secs(60)), move || {
 jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_001, || async { Ok(()) });
 
 // One replica owns the clock; the TTL outlasts the period so ownership sticks.
-let leases = Leases::new(redis, Leases::new_holder_id(), "myapp");
+let leases = Leases::new(redis, Leases::new_holder_id(), "myapp")?;
 jobs.leased("clock", Every::new(Duration::from_secs(1)), leases, "clock", Duration::from_secs(5), |held| async move {
     tokio::select! {
         () = held.lost() => {}  // another replica took over mid-run: stop owner-only work
@@ -1431,7 +1435,7 @@ jobs.leased("clock", Every::new(Duration::from_secs(1)), leases, "clock", Durati
 owt_runtime::serve::shutdown_signal().await;
 shutdown.cancel();
 jobs.stopped().await;
-# }
+# Ok(()) }
 ```
 
 Name each advisory lock id once, in one place in the app: two jobs sharing an id
@@ -1445,6 +1449,8 @@ ends. A lease is a Redis key: a Redis that evicts under memory pressure (as a ca
 does) can drop it, and until the holder's next renewal fails (a third of the TTL) two
 replicas may run the job. Work that must never run twice gets a `noeviction` Redis,
 and checks `held.is_lost()` before each owner-only step.
+
+`Leases::new` refuses the prefixes the cache refuses (see "Caching").
 
 A run's panic, in the future or in the closure that builds it, is one failed tick;
 the loop goes on.
@@ -1961,6 +1967,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ## Upgrading from 0.5
 
+- `Cache::connect` and `Leases::new` refuse a prefix with characters other than ASCII
+  letters, digits, `_`, `.` and `-`, as `Bus::redis` already did, and `Leases::new`
+  returns a `Result`: add `?`. An app whose prefix has a `:` or a space renames it:
+  its cache starts cold, and while old and new replicas overlap in the rollout each
+  side holds its own leases, so a leased job may run twice until the rollout ends.
 - Install `owt_accounts::migrations::ALL[3]` (`owt_accounts_policies`) as the app's
   next unused migration version (see "Tables" under "Accounts"), whether or not the
   app uses site policies: `assert_installed` expects every entry. Its tables stay
@@ -2130,8 +2141,9 @@ and two of them reach further than their names:
 
 ## Working on owt-stack
 
-`just check` is the gate (fmt, clippy over every crate and feature, the tests with the
-README doctests, `cargo audit`), and CI runs the same command. The Redis tests run when
+`just check` is the gate (fmt, clippy over every crate and feature and over
+`owt-change` without its defaults, the tests with the README doctests, `cargo audit`),
+and CI runs the same command. The Redis tests run when
 `REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
 `DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL
 whose certificate the system trusts (`SSL_CERT_FILE=ca.crt` for a test CA; the test's
