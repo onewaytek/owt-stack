@@ -40,10 +40,16 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0";
 
-/// A TTL in milliseconds as Redis takes it: at least one, and at most what its
-/// signed 64-bit `PX` accepts (a larger one is refused, and the lease never taken).
+/// The longest TTL given to Redis: about 285 years. Redis adds the current time to a
+/// `PX` and refuses one whose sum overflows (`i64::MAX` is "invalid expire time", and
+/// the lease would never be taken), so the ceiling leaves it ample room.
+const MAX_TTL_MS: i64 = 1 << 53;
+
+/// A TTL in milliseconds as Redis takes it: at least one, at most [`MAX_TTL_MS`].
 fn millis(d: Duration) -> i64 {
-    i64::try_from(d.as_millis()).unwrap_or(i64::MAX).max(1)
+    i64::try_from(d.as_millis())
+        .unwrap_or(MAX_TTL_MS)
+        .clamp(1, MAX_TTL_MS)
 }
 
 /// This replica's view of the lease table. Cheap to clone.
@@ -274,5 +280,19 @@ async fn renew_while_running(
             lost.cancel();
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::*;
+
+    /// Redis takes every TTL given: none is zero, none overflows its expiry.
+    #[test]
+    fn a_ttl_is_one_millisecond_to_the_ceiling() {
+        assert_eq!(millis(Duration::ZERO), 1);
+        assert_eq!(millis(Duration::from_millis(1500)), 1500);
+        assert_eq!(millis(Duration::MAX), MAX_TTL_MS);
+        assert_eq!(millis(Duration::from_secs(u64::MAX / 1000)), MAX_TTL_MS);
     }
 }

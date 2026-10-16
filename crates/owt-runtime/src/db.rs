@@ -70,7 +70,8 @@ impl PoolConfig {
 #[must_use]
 pub fn unverified_tls(opts: &PgConnectOptions) -> bool {
     use sqlx::postgres::PgSslMode;
-    let local = matches!(opts.get_host(), "localhost" | "127.0.0.1" | "::1")
+    // sqlx keeps an IPv6 host in brackets, as it was written in the URL.
+    let local = matches!(opts.get_host(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
         || opts.get_host().starts_with('/');
     !local && !matches!(opts.get_ssl_mode(), PgSslMode::VerifyFull)
 }
@@ -124,6 +125,7 @@ mod tests {
             "postgres://u:p@db.example/app?sslmode=verify-full"
         ));
         assert!(!unverified("postgres://u:p@localhost/app"));
+        assert!(!unverified("postgres://u:p@[::1]/app"), "IPv6 loopback");
         assert!(!unverified("postgres://u:p@127.0.0.1:5432/app"));
     }
 }

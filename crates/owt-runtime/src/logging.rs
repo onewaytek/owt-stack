@@ -59,17 +59,32 @@ pub fn init(opts: &Options) -> Guard {
         use opentelemetry::trace::TracerProvider as _;
         let provider = opts.otel_endpoint.as_ref().and_then(|endpoint| {
             use opentelemetry_otlp::WithTonicConfig as _;
+            use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
             // An https collector is verified against the system's roots (where a
             // cluster's service CA is installed) and the public web's; without roots
-            // the exporter's default TLS would trust nothing.
-            let tls = opentelemetry_otlp::tonic_types::transport::ClientTlsConfig::new()
-                .with_enabled_roots();
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_tls_config(tls)
-                .build()
-                .map_err(|e| eprintln!("OTLP exporter for {endpoint} failed: {e}"))
-                .ok()?;
+            // the exporter's default TLS would trust nothing. Only an https one: TLS
+            // configured for `http://` or `unix://` fails the exporter outright. An
+            // image with no system bundle (scratch, distroless) falls back to the
+            // public web's roots alone.
+            let build = |tls: Option<ClientTlsConfig>| {
+                let builder = opentelemetry_otlp::SpanExporter::builder().with_tonic();
+                match tls {
+                    Some(tls) => builder.with_tls_config(tls).build(),
+                    None => builder.build(),
+                }
+            };
+            let exporter = if endpoint.to_ascii_lowercase().starts_with("https://") {
+                build(Some(ClientTlsConfig::new().with_enabled_roots())).or_else(|e| {
+                    eprintln!(
+                        "OTLP exporter for {endpoint}: {e}; trusting the public web's roots only"
+                    );
+                    build(Some(ClientTlsConfig::new().with_webpki_roots()))
+                })
+            } else {
+                build(None)
+            }
+            .map_err(|e| eprintln!("OTLP exporter for {endpoint} failed: {e}"))
+            .ok()?;
             Some(
                 opentelemetry_sdk::trace::SdkTracerProvider::builder()
                     .with_batch_exporter(exporter)

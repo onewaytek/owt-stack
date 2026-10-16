@@ -55,6 +55,7 @@ pub fn raise_open_files_limit() {
 
 /// How [`serve_with`] bounds a connection.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct ServeOptions {
     /// How long a connection may take to send a request's head (the request line
     /// and headers), for its first request and each one after on a kept-alive
@@ -65,6 +66,16 @@ pub struct ServeOptions {
     /// How long a stop waits for open connections to finish before closing them.
     /// Default 20 seconds, inside Kubernetes' default 30-second grace period.
     pub drain: Duration,
+    /// The most connections open at once; past it, new ones wait in the kernel's
+    /// accept queue until one closes. Default 4096: a client that opens connections
+    /// and never finishes with them cannot take every socket and file descriptor.
+    pub max_connections: usize,
+    /// How long a connection may stay open, whatever it is doing; `None` (the default)
+    /// for none. The head timeout bounds a client that sends nothing, not one that
+    /// uploads a byte a minute or never reads its response; `Limits` bounds those for
+    /// the app's routes. A listener with no `Limits` in front (metrics) sets this.
+    /// It ends upgraded connections (`WebSocket`s) too.
+    pub max_connection_age: Option<Duration>,
 }
 
 impl Default for ServeOptions {
@@ -72,6 +83,8 @@ impl Default for ServeOptions {
         Self {
             header_read_timeout: Duration::from_secs(30),
             drain: Duration::from_secs(20),
+            max_connections: 4096,
+            max_connection_age: None,
         }
     }
 }
@@ -120,7 +133,16 @@ pub(crate) async fn run<F>(
     let stopping = CancellationToken::new();
     let mut connections = tokio::task::JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(options.max_connections.max(1)));
     loop {
+        // A slot first: at the cap, accept nothing until a connection ends.
+        let slot = tokio::select! {
+            slot = slots.clone().acquire_owned() => match slot {
+                Ok(slot) => slot,
+                Err(_) => break,
+            },
+            () = &mut shutdown => break,
+        };
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(pair) => pair,
@@ -154,14 +176,26 @@ pub(crate) async fn run<F>(
             .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
             .with_upgrades();
         let stopping = stopping.clone();
+        let age = options.max_connection_age;
         connections.spawn(async move {
+            let _slot = slot;
             let mut connection = std::pin::pin!(connection);
+            let too_old = async {
+                match age {
+                    Some(age) => tokio::time::sleep(age).await,
+                    None => std::future::pending().await,
+                }
+            };
             let ended = tokio::select! {
                 ended = connection.as_mut() => ended,
                 () = stopping.cancelled() => {
                     // Finish the request in flight, then close.
                     connection.as_mut().graceful_shutdown();
                     connection.await
+                }
+                () = too_old => {
+                    tracing::debug!(%peer, "closing a connection at its age limit");
+                    return;
                 }
             };
             if let Err(e) = ended {
@@ -197,6 +231,8 @@ mod tests {
     use super::*;
 
     const QUICK: ServeOptions = ServeOptions {
+        max_connections: 4096,
+        max_connection_age: None,
         header_read_timeout: Duration::from_millis(300),
         drain: Duration::from_millis(300),
     };
@@ -204,6 +240,16 @@ mod tests {
     /// `run` on an ephemeral port with `/who` (the peer's address) and `/slow` (an
     /// hour), stopped by the sender.
     async fn started() -> (
+        SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        started_with(QUICK).await
+    }
+
+    async fn started_with(
+        options: ServeOptions,
+    ) -> (
         SocketAddr,
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<()>,
@@ -231,7 +277,7 @@ mod tests {
             async move {
                 let _ = stopped.await;
             },
-            QUICK,
+            options,
         ));
         (addr, stop, task)
     }
@@ -244,6 +290,52 @@ mod tests {
             .ok()?
             .ok()?;
         Some(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// A connection past its age limit is closed, whatever it is waiting on.
+    #[tokio::test]
+    async fn a_connection_ends_at_its_age_limit() {
+        let options = ServeOptions {
+            max_connection_age: Some(Duration::from_millis(300)),
+            ..QUICK
+        };
+        let (addr, _stop, _task) = started_with(options).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /slow HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let begun = Instant::now();
+        assert!(read_all(&mut s, Duration::from_secs(5)).await.is_some());
+        assert!(begun.elapsed() < Duration::from_secs(3));
+    }
+
+    /// At the connection cap, the next connection is served only once one ends.
+    #[tokio::test]
+    async fn connections_past_the_cap_wait_their_turn() {
+        let options = ServeOptions {
+            max_connections: 1,
+            max_connection_age: Some(Duration::from_millis(500)),
+            ..QUICK
+        };
+        let (addr, _stop, _task) = started_with(options).await;
+        let mut held = TcpStream::connect(addr).await.unwrap();
+        held.write_all(b"GET /slow HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let begun = Instant::now();
+        let mut next = TcpStream::connect(addr).await.unwrap();
+        next.write_all(b"GET /who HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let answer = read_all(&mut next, Duration::from_secs(5)).await.unwrap();
+        assert!(answer.ends_with("127.0.0.1"), "{answer}");
+        assert!(
+            begun.elapsed() >= Duration::from_millis(300),
+            "served before a slot was free: {:?}",
+            begun.elapsed()
+        );
+        drop(held);
     }
 
     #[tokio::test]

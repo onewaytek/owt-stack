@@ -109,14 +109,32 @@ async fn main() -> anyhow::Result<()> {
     owt_runtime::db::migrate_locked(&pool, &MIGRATOR, 8_531_207).await?;
     let bind = env::var("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8000".into());
     // A request head must arrive within 30 s (an idle kept-alive connection closes
-    // then too); a stop drains for up to 20 s
-    // (`serve::serve_with` and `ServeOptions` to change either).
+    // then too), at most 4096 connections are open at once, and a stop drains for up
+    // to 20 s (`serve::serve_with` and `ServeOptions` to change them).
     serve::serve(&bind, router(pool), serve::shutdown_signal()).await
 }
 ```
 
+`ServeOptions` is built from its default and changed field by field:
+
+```rust,no_run
+# async fn run(app: axum::Router) -> anyhow::Result<()> {
+use owt_runtime::serve::{self, ServeOptions};
+let mut options = ServeOptions::default();
+options.max_connections = 1024;
+// For a listener nothing like `Limits` fronts: no connection outlives a minute.
+options.max_connection_age = Some(std::time::Duration::from_secs(60));
+serve::serve_with("0.0.0.0:8000", app, serve::shutdown_signal(), options).await
+# }
+```
+
+The server speaks HTTP/1.1 only (the router in front speaks HTTP/2 to browsers);
+`axum::serve` also answered HTTP/2 without TLS (h2c) when axum's `http2` feature was
+on.
+
 `PoolConfig::connect` warns at start when the database is not on this machine and
-its TLS is not verified: give the pod `PGSSLMODE=verify-full` and `PGSSLROOTCERT`
+its TLS is not verified (`db::unverified_tls(&options)` asks the same of any
+`PgConnectOptions`): give the pod `PGSSLMODE=verify-full` and `PGSSLROOTCERT`
 (the OpenShift template does), since sqlx's default (`prefer`) neither requires TLS
 nor checks the server.
 
@@ -509,9 +527,10 @@ work tracker.
   `CHANGE_REQUESTS_KEY` set, the routes answer 404 and the button renders nothing.
   One without the other fails at start.
 - **The key travels encrypted.** `CHANGE_REQUESTS_URL` must be `https`, except to
-  `localhost` or a cluster service by its full name
-  (`http://tracker.tools.svc.cluster.local:8080/…`), and may not
-  carry credentials, a query or a fragment.
+  `localhost` or a cluster service by its absolute name, final dot included
+  (`http://tracker.tools.svc.cluster.local.:8080/…`), and may not carry credentials,
+  a query or a fragment. Without the dot, a pod's resolver (`ndots:5`) tries the
+  name under each search domain first, and one of those could answer for it.
 
 ```rust,no_run
 # fn demo(http: reqwest::Client) -> Result<(), owt_change::ConfigError> {
@@ -633,7 +652,8 @@ survives a failed or panicking run, and graceful shutdown:
   is checked every `jobs::LOCK_CHECK`: a run whose connection drops (a failover, an
   idle timeout) is aborted at its next `.await`, as a crash would stop it, before
   another replica's run can overlap it. It needs a direct connection, not a
-  transaction-mode pooler.
+  transaction-mode pooler, behind which every run longer than a check is aborted;
+  a check that itself takes longer than `LOCK_CHECK` aborts the run too.
 - `leased` (feature `redis`): one replica, the same one while it lives, by a Redis
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
@@ -1099,8 +1119,10 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - The bus's Redis is inside the trust boundary: a password or ACL user, a network
   only the app reaches, `rediss://` where the path leaves the node.
 - `Limits` bounds the time to a response; `serve::serve` bounds the time to a request
-  (its head within 30 s) and to a stop (20 s of draining), on the metrics listener
-  too, which no router fronts. A handler that reads `Body` or `Request` itself is
+  head (30 s), the connections open at once (4096) and a stop (20 s of draining). It
+  does not bound a client that uploads slowly or never reads its response: `Limits`
+  does, for the app's routes. The metrics listener, which nothing fronts, also caps
+  each connection's life at 15 s and holds 64 at most. A handler that reads `Body` or `Request` itself is
   outside `DefaultBodyLimit`; it bounds what it reads.
 - The metrics middleware labels by matched route and by method, an invented method
   counting as `other`, so no client can grow the label set (each new set is a
@@ -1116,11 +1138,17 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - `Bus::redis` refuses a prefix with characters other than ASCII letters, digits,
   `_`, `.` and `-`, and a zero `beat_every`.
 - `CHANGE_REQUESTS_URL` must be `https` unless it names `localhost` or a cluster
-  service (`….svc.cluster.local`), and may not carry credentials, a query or a fragment.
+  service by its absolute name (`….svc.cluster.local.`, with the final dot), and may
+  not carry credentials, a query or a fragment.
 - `serve::serve` closes a connection whose request head (or the next one on a
-  kept-alive connection) takes over 30 seconds, and stops draining after 20;
-  `serve_with` sets other bounds.
-- `jobs::singleton` aborts a run whose lock is no longer seen held.
+  kept-alive connection) takes over 30 seconds, holds 4096 connections at most, and
+  stops draining after 20 seconds, which also ends an SSE stream or WebSocket still
+  open then; `serve_with` sets other bounds (`ServeOptions` is `non_exhaustive`:
+  start from `default()`). It serves HTTP/1.1 only: no h2c.
+- `jobs::singleton` aborts a run whose lock is no longer seen held. Behind a
+  transaction-mode pooler (PgBouncer) the check lands on another server connection,
+  so every run longer than `jobs::LOCK_CHECK` is aborted: give singletons a direct
+  connection.
 
 ## Upgrading from 0.1
 

@@ -6,9 +6,9 @@
 //!
 //! Two things it does not bound. A response *body* may stream for as long as it
 //! likes: the timeout ends when the handler returns, so SSE streams and `WebSocket`
-//! upgrades are unaffected. And the time a client takes to *send* its request is the
-//! proxy's to bound: `axum::serve` sets no header-read timeout, so serve behind one
-//! that does (the `OpenShift` router gives a request ten seconds to arrive).
+//! upgrades are unaffected. And the time a client takes to *send* its request head is
+//! the server's to bound: `owt_runtime::serve` closes a connection whose head takes
+//! over 30 seconds (`axum::serve` sets no such timeout).
 
 use std::time::Duration;
 

@@ -91,7 +91,7 @@ pub enum ConfigError {
     /// The endpoint is not an `https` URL (`http` only to this machine or a cluster
     /// service), or it carries credentials, a query or a fragment.
     #[error(
-        "{URL_VAR} must be an https URL (http only for localhost or a cluster .svc.cluster.local name), without credentials, query or fragment"
+        "{URL_VAR} must be an https URL (http only for localhost or a cluster service's absolute name, ending .svc.cluster.local. with the dot), without credentials, query or fragment"
     )]
     Url,
 }
@@ -128,13 +128,16 @@ impl Config {
 }
 
 /// An endpoint the key may be sent to: `https`, or `http` where the traffic stays on
-/// this machine or inside the cluster (a `.svc.cluster.local` service name); never with
-/// credentials, a query or a fragment, which `Debug` would print.
+/// this machine or inside the cluster (a service's absolute name, ending in
+/// `.svc.cluster.local.`); never with credentials, a query or a fragment, which
+/// `Debug` would print.
 fn endpoint_ok(url: &url::Url) -> bool {
     let internal = match url.host() {
-        // `url` lower-cases a domain when it parses it. Only the full cluster name: a bare `x.svc` goes through the pod's DNS
-        // search path first, where another domain could answer for it.
-        Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".svc.cluster.local"),
+        // `url` lower-cases a domain when it parses it. Only the absolute name, with its
+        // final dot: a pod resolves with `ndots:5`, so even `x.ns.svc.cluster.local`
+        // (four dots) is tried under every search domain first, the node's own among
+        // them, where a wildcard record could answer for it and take the key in clear.
+        Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".svc.cluster.local."),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => return false,
@@ -469,7 +472,7 @@ mod tests {
             "https://tracker.example/api/change-requests",
             "http://localhost:8080/x",
             "http://127.0.0.1/x",
-            "http://tracker.tools.svc.cluster.local:8080/x",
+            "http://tracker.tools.svc.cluster.local.:8080/x",
         ] {
             assert!(with(ok).is_ok(), "{ok}");
         }
@@ -478,6 +481,8 @@ mod tests {
             "http://localhost.evil.example/x",
             "http://svc.evil.example/x",
             "http://tracker.tools.svc:8080/x",
+            "http://tracker.tools.svc.cluster.local:8080/x",
+            "http://svc.cluster.local.evil.example/x",
             "https://user:pw@tracker.example/x",
             "https://tracker.example/x?token=t",
             "https://tracker.example/x#f",

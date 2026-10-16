@@ -208,15 +208,14 @@ where
         }),
     );
     tracing::info!(addr = %listener.local_addr()?, "metrics listening");
-    // With the same header timeout as the app's listener: this port is not behind
-    // the router that would otherwise bound a slow client.
-    crate::serve::run(
-        listener,
-        app,
-        std::future::pending(),
-        crate::serve::ServeOptions::default(),
-    )
-    .await;
+    // This port has no router or `Limits` in front to bound a slow client, so each
+    // connection gets a lifetime (a scrape takes well under one), and few at once.
+    let options = crate::serve::ServeOptions {
+        max_connection_age: Some(std::time::Duration::from_secs(15)),
+        max_connections: 64,
+        ..crate::serve::ServeOptions::default()
+    };
+    crate::serve::run(listener, app, std::future::pending(), options).await;
     Ok(())
 }
 

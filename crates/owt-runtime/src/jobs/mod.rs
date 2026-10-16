@@ -390,6 +390,7 @@ async fn lock_lost(
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'
                     AND pid = pg_backend_pid() AND granted
+                    AND objsubid = 1
                     AND ((classid::bigint << 32) | objid::bigint) = $1)",
             )
             .bind(lock_id)
