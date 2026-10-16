@@ -43,6 +43,19 @@ pub enum Refusal {
     OriginMismatch,
 }
 
+/// An entry [`CrossOrigin::try_trust`] refused, as given less surrounding whitespace.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("not an http(s) origin to trust: {0:?}")]
+pub struct BadOrigin(String);
+
+impl BadOrigin {
+    /// The refused entry.
+    #[must_use]
+    pub fn entry(&self) -> &str {
+        &self.0
+    }
+}
+
 impl Refusal {
     fn reason(self) -> &'static str {
         match self {
@@ -65,29 +78,44 @@ impl CrossOrigin {
     ///
     /// # Panics
     ///
+    /// On an entry [`try_trust`](Self::try_trust) refuses. Origins read from the
+    /// environment go through `try_trust` instead, so a bad one fails start-up with
+    /// an error naming it rather than a panic.
+    #[must_use]
+    pub fn trust<I, S>(self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.try_trust(origins).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`trust`](Self::trust), with an error instead of a panic. Nothing is added
+    /// unless every entry is good.
+    ///
+    /// # Errors
+    ///
     /// On an entry that is not an `http(s)` origin: `null` (which any sandboxed
-    /// frame or `data:` page sends, from any site), a wildcard, a bare host, or a URL
+    /// frame or `data:` page sends, from any site), a wildcard, a bare host, a scheme
+    /// with no host (`https://`, from `https://$HOST` with `HOST` blank), or a URL
     /// with a path, query, fragment or credentials. Each would trust far more than
     /// meant, or silently nothing.
-    #[must_use]
-    pub fn trust<I, S>(mut self, origins: I) -> Self
+    pub fn try_trust<I, S>(mut self, origins: I) -> Result<Self, BadOrigin>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         let mut all: Vec<String> = self.trusted.to_vec();
-        all.extend(
-            origins
-                .into_iter()
-                .map(|o| o.as_ref().trim().trim_end_matches('/').to_owned())
-                .filter(|o| !o.is_empty())
-                .map(|o| match origin_of(&o) {
-                    Some(origin) => origin,
-                    None => panic!("not an http(s) origin to trust: {o:?}"),
-                }),
-        );
+        for entry in origins {
+            let entry = entry.as_ref().trim();
+            let bare = entry.trim_end_matches('/');
+            if bare.is_empty() {
+                continue;
+            }
+            all.push(origin_of(bare).ok_or_else(|| BadOrigin(entry.to_owned()))?);
+        }
         self.trusted = all.into();
-        self
+        Ok(self)
     }
 
     /// Don't check requests to one of `prefixes` or below it (webhooks signed another
@@ -329,6 +357,8 @@ mod tests {
         ] {
             let refused = std::panic::catch_unwind(|| CrossOrigin::new().trust([bad]));
             assert!(refused.is_err(), "{bad}");
+            let err = CrossOrigin::new().try_trust([bad]).unwrap_err();
+            assert_eq!(err.entry(), bad);
         }
         let c = CrossOrigin::new().trust(["https://Partner.test:8443/"]);
         let h = headers(&[
@@ -338,6 +368,32 @@ mod tests {
         assert_eq!(c.same_origin(&h), Ok(()));
         let h = headers(&[("sec-fetch-site", "cross-site"), ("origin", "null")]);
         assert_eq!(c.same_origin(&h), Err(Refusal::CrossSite));
+    }
+
+    #[test]
+    fn try_trust_names_the_bad_entry() {
+        // `https://$HOST` with `HOST` blank: a scheme with no host.
+        let err = CrossOrigin::new()
+            .try_trust(["https://partner.test", " https:// ", "http://x.test"])
+            .unwrap_err();
+        assert_eq!(err.entry(), "https://");
+        assert_eq!(
+            err.to_string(),
+            r#"not an http(s) origin to trust: "https://""#
+        );
+        // `trust` panics with the same message.
+        let panic =
+            std::panic::catch_unwind(|| CrossOrigin::new().trust(["https://"])).unwrap_err();
+        assert_eq!(panic.downcast_ref::<String>(), Some(&err.to_string()));
+        // Blank entries are still skipped, beside good ones.
+        let c = CrossOrigin::new()
+            .try_trust(["", " ", "/", "https://Partner.test/"])
+            .unwrap();
+        let h = headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://partner.test"),
+        ]);
+        assert_eq!(c.same_origin(&h), Ok(()));
     }
 
     #[test]
