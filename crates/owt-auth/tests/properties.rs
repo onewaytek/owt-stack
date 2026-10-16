@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+#[cfg(feature = "jwt")]
+use owt_auth::jwt;
 use owt_auth::oauth::{self, Pending};
+use owt_auth::password;
 use owt_auth::throttle::{Budgets, Throttle};
-use owt_auth::{jwt, password};
 use proptest::prelude::*;
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -184,6 +186,7 @@ proptest! {
     }
 
     /// Nothing that is not a token verifies, or panics, whatever shape it has.
+    #[cfg(feature = "jwt")]
     #[test]
     fn garbage_is_never_a_token(token in prop_oneof![
         any::<String>(),

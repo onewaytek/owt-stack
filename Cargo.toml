@@ -66,7 +66,8 @@ url = "2.5"
 
 owt-web = { path = "crates/owt-web" }
 owt-runtime = { path = "crates/owt-runtime" }
-owt-auth = { path = "crates/owt-auth" }
+# Without `jwt`: a member that verifies bearer tokens names the feature.
+owt-auth = { path = "crates/owt-auth", default-features = false }
 owt-accounts = { path = "crates/owt-accounts" }
 owt-bus = { path = "crates/owt-bus" }
 owt-test = { path = "crates/owt-test" }

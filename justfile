@@ -21,9 +21,11 @@ fmt:
 lint:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-# The builds `lint` cannot see: a crate without its default features.
+# The builds `lint` cannot see: a crate without its default features (owt-auth without
+# `jwt` is how owt-accounts builds it).
 features:
     cargo clippy -p owt-change --all-targets --no-default-features --locked -- -D warnings
+    cargo clippy -p owt-auth --all-targets --no-default-features --locked -- -D warnings
 
 # The tests, README doctests included; arguments pass through.
 test *args:
