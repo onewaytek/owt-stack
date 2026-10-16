@@ -27,7 +27,9 @@ Outside the crates:
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
-| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
+| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger and the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
+| `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone |
+| `templates/openshift/cronjob.yaml` | a scheduled task in the app's image, with the app's database, TLS, environment and NetworkPolicies |
 | `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters, and rehearses a Postgres major upgrade |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
 | `tailwind/owt.css` | font stacks, htmx state variants (`htmx-request:opacity-50`), and the `owt-*` classes the shared components and the change-request button use |
@@ -1273,14 +1275,15 @@ let social = social.on_arrival(move |arrived| {
 
 #### 4. Deploying
 
-- **OpenShift:** keep the credentials in a Secret and add it to the Deployment's
-  environment, with `PUBLIC_BASE_URL` beside it:
+- **OpenShift:** keep the credentials in the app's environment Secret, `myapp-env`
+  ("The app's environment" under "Commands, CI, releases and deployment"), with
+  `PUBLIC_BASE_URL` beside them, and restart to read them (`oc set data` changes a
+  Secret that exists; `oc create secret generic myapp-env` makes it):
 
   ```sh
-  oc create secret generic myapp-oauth \
-    --from-literal=GOOGLE_CLIENT_ID=... --from-literal=GOOGLE_CLIENT_SECRET=...
-  oc set env deployment/myapp --from=secret/myapp-oauth
-  oc set env deployment/myapp PUBLIC_BASE_URL=https://myapp.example
+  oc set data secret/myapp-env \
+    GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... PUBLIC_BASE_URL=https://myapp.example
+  oc rollout restart deployment/myapp
   ```
 
 - **Development:** the app's `.env` (which `just` loads) holds
@@ -1891,8 +1894,58 @@ oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
 ```
 
 The ImageStream polls ghcr for the channel's tag (`rc` or `latest`), and the
-Deployment's trigger rolls out each new digest. App-specific environment is a patch
-on the Deployment.
+Deployment's trigger rolls out each new digest.
+
+**The app's environment** (`SESSION_SECRET`, a provider's credentials, its own
+tuning) lives in a Secret named `myapp-env`, which the Deployment reads whole. It is
+optional: until it exists, the app starts without it. A variable the template sets
+(`DATABASE_URL`, `PGSSLMODE`, `BIND_ADDR`, `RUST_LOG`, …) wins over the Secret's. A
+Secret's change reaches pods only when they start, so restart after one:
+
+```sh
+oc create secret generic myapp-env \
+  --from-literal=SESSION_SECRET="$(openssl rand 64 | base64 -w0)"
+oc set data secret/myapp-env PUBLIC_BASE_URL=https://myapp.example   # later changes
+oc rollout restart deployment/myapp
+```
+
+**Redis** is a template of its own, for an app that uses the cache, the bus across
+replicas or leases. It runs as compose does: nothing on disk, `MAXMEMORY` (128mb)
+with `MAXMEMORY_POLICY` (`allkeys-lru`), one pod replaced rather than surged so the
+replicas never split across two. A password protects it, and a NetworkPolicy admits
+the app's pods alone. The password is a Secret made once by hand, since a generated
+one would change on every apply. The Deployment reads `REDIS_URL` from that Secret
+when it exists, so the app picks Redis up at its next restart:
+
+```sh
+pw=$(openssl rand -hex 24)
+oc create secret generic myapp-redis --from-literal=password="$pw" \
+  --from-literal=url="redis://:$pw@myapp-redis:6379"
+oc process -f templates/openshift/redis.yaml -p NAME=myapp -p NAMESPACE=myapp | oc apply -f -
+oc rollout restart deployment/myapp
+```
+
+An app whose leased work must never run twice gives it `-p MAXMEMORY_POLICY=noeviction`
+("Background jobs"): a full Redis then refuses writes instead of dropping a lease.
+
+**Scheduled tasks** run the app's image with other arguments, one `cronjob.yaml` per
+task. The image's entrypoint is the binary, so `ARGS` picks the subcommand:
+
+```sh
+oc process -f templates/openshift/cronjob.yaml -p NAME=myapp -p NAMESPACE=myapp \
+  -p JOB=digest -p SCHEDULE="0 6 * * *" -p ARGS='["send-digest"]' | oc apply -f -
+```
+
+It follows the app's channel through the same image trigger, and has the Deployment's
+database access: `DATABASE_URL` from `myapp-db-app`, `PGSSLMODE=verify-full` with
+`PGSSLROOTCERT` at the mounted `myapp-db-ca`, `POD_NAMESPACE`, `REDIS_URL` and
+`myapp-env`. It takes the same `DB_SUFFIX` as `app.yaml` (default `db`), which names the
+database cluster and those Secrets. Its pods are labelled `app: myapp-<JOB>`, never `app: myapp`, which the
+app's Service sends traffic to. The database's and Redis's NetworkPolicies admit the
+app's pods only, so the template brings two more admitting that label (policies add
+up). A worker that runs all the time is the same pod spec in a Deployment, with
+`app.yaml`'s strategy and image trigger (`fieldPath` naming its container), and the
+same label and policies.
 
 **An app whose database already exists passes the major it runs**, on every apply:
 `-p POSTGRES_MAJOR=16` if
@@ -1998,7 +2051,8 @@ and the template's `DB_SUFFIX` then moves the app onto it (`DATABASE_URL`'s Secr
 CA, the backups and the NetworkPolicy follow the name):
 
 1. Stop the app, since writes after the dump would be lost:
-   `oc scale deployment/myapp --replicas=0`.
+   `oc scale deployment/myapp --replicas=0`, and suspend its CronJobs
+   (`oc patch cronjob/myapp-digest -p '{"spec": {"suspend": true}}'`).
 2. Let the new cluster's pods reach the old database, which admits only the app:
 
    ```yaml
@@ -2040,8 +2094,9 @@ CA, the backups and the NetworkPolicy follow the name):
 
 4. When `oc wait cluster.postgresql.cnpg.io/myapp-db18 --for=condition=Ready` returns,
    apply the template with `-p POSTGRES_MAJOR=18 -p DB_SUFFIX=db18`, as every apply
-   will from now on (and `monitoring.yaml` with the same `DB_SUFFIX`). The Deployment
-   is back at `REPLICAS`, reading the new cluster's Secret.
+   will from now on (and `monitoring.yaml` and each `cronjob.yaml` with the same
+   `DB_SUFFIX`). The Deployment is back at `REPLICAS`, reading the new cluster's
+   Secret; resume any CronJob suspended in step 1 (`suspend: false`).
 5. To switch back, apply with the old major and no `DB_SUFFIX`. Once the app is
    settled, delete the old `myapp-db` Cluster, its `myapp-db-nightly` ScheduledBackup
    and the `myapp-db` and `myapp-db-import` NetworkPolicies. The pruning follows the
@@ -2159,6 +2214,12 @@ The router example under "Wiring an app" composes the layers; beyond it:
   upgrades an older cluster in place (or is refused before CNPG 1.26). Moving to a
   new major is its own step: "Upgrading Postgres" under "Commands, CI, releases and
   deployment". The new `DB_SUFFIX` parameter leaves the default render as it was.
+- The OpenShift template's Deployment reads `myapp-env` whole and `REDIS_URL` from
+  `myapp-redis`'s `url`, each only if it exists, so the next apply rolls the pods once
+  and changes nothing else. An app whose environment was patched onto the Deployment
+  (`oc set env`) moves it into `myapp-env`, and its hand-made Redis and CronJobs onto
+  `redis.yaml` and `cronjob.yaml` ("Commands, CI, releases and deployment"). Check
+  first that no Secret of either name already holds something else.
 
 ### Authentication
 
