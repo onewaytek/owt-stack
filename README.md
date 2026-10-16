@@ -1674,10 +1674,13 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ### Accounts
 
-Copy `0003_owt_accounts_constraints.sql` (`ALL[2]`) into the app's migrations after
-`0002`, and call `owt_accounts::migrations::complete(&pool)` after the migrations run.
-`0003` moves existing rows to the form the library now stores, then adds the
-constraints:
+Copy `0002_owt_accounts_roles.sql` (`ALL[1]`) and `0003_owt_accounts_constraints.sql`
+(`ALL[2]`) into the app's migrations after `0001`, and call
+`owt_accounts::migrations::complete(&pool)` after the migrations run. An app with an
+OIDC provider rewrites its identities' provider key first (see "Upgrading from 0.4
+with an OIDC provider" above); `Welcome::match_verified_email` and
+`Arrival::Matched` are gone. `0003` moves existing rows to the form the library now
+stores, then adds the constraints:
 
 - **Usernames are NFKC-normalized** (a fullwidth `ａｄｍｉｎ` becomes `admin`), since
   sign-in input is. One that would become another account's name keeps its id as a
