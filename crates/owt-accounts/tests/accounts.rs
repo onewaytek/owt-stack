@@ -28,6 +28,16 @@ struct Db {
 
 impl Db {
     async fn fresh() -> Option<Self> {
+        let db = Self::empty().await?;
+        MIGRATOR.run(&db.pool).await.unwrap();
+        // As an app does before serving.
+        let done = owt_accounts::migrations::complete(&db.pool).await.unwrap();
+        assert!(done.validated, "{done:?}");
+        Some(db)
+    }
+
+    /// A schema of its own with nothing installed.
+    async fn empty() -> Option<Self> {
         let url = owt_runtime::env::var("DATABASE_URL")?;
         let schema = format!(
             "owt_accounts_{}_{}",
@@ -45,10 +55,6 @@ impl Db {
             .connect_with(opts.options([("search_path", schema.as_str())]))
             .await
             .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
-        // As an app does before serving.
-        let done = owt_accounts::migrations::complete(&pool).await.unwrap();
-        assert!(done.validated, "{done:?}");
         Some(Self {
             pool,
             schema,
@@ -3063,4 +3069,121 @@ async fn schema_after(
             .unwrap();
     };
     Some((pool, drop_schema))
+}
+
+#[tokio::test]
+async fn nothing_conflicts_where_the_migrations_are_installed() {
+    let db = db!();
+    let found = owt_accounts::migrations::conflicts(&db.pool).await.unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn every_name_the_migrations_take_is_checked() {
+    // Every relation and function the migrations create, read back from an installed
+    // schema, then held by something of an app's in an empty one: conflicts names
+    // each, so its list cannot fall behind a new migration.
+    let installed = db!();
+    let relations: Vec<String> = sqlx::query_scalar(
+        "SELECT relname::text FROM pg_class
+         WHERE relnamespace = current_schema()::regnamespace
+           AND relname NOT IN ('_sqlx_migrations', '_sqlx_migrations_pkey')
+         ORDER BY 1",
+    )
+    .fetch_all(&installed.pool)
+    .await
+    .unwrap();
+    let functions: Vec<String> = sqlx::query_scalar(
+        "SELECT proname::text FROM pg_proc
+         WHERE pronamespace = current_schema()::regnamespace ORDER BY 1",
+    )
+    .fetch_all(&installed.pool)
+    .await
+    .unwrap();
+    installed.drop().await;
+
+    let Some(db) = Db::empty().await else { return };
+    for name in &relations {
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE \"{name}\" ()")))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    for name in &functions {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE FUNCTION \"{name}\"() RETURNS int LANGUAGE sql AS 'SELECT 1'"
+        )))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let found = owt_accounts::migrations::conflicts(&db.pool).await.unwrap();
+    let held = |by: &str| {
+        let mut named: Vec<String> = found
+            .iter()
+            .filter(|c| c.held_by == by)
+            .map(|c| c.name.to_owned())
+            .collect();
+        named.sort();
+        named
+    };
+    assert_eq!(held("table"), relations);
+    assert_eq!(held("function"), functions);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn an_apps_own_accounts_table_is_named_until_renamed() {
+    let Some(db) = Db::empty().await else { return };
+    // An app's `accounts`, unrelated to sign-in, with a key of its own: renaming the
+    // table alone leaves its key's index and sequence under their old names.
+    sqlx::raw_sql(
+        "CREATE TABLE accounts (id serial PRIMARY KEY, username text UNIQUE, goods int);
+         CREATE TYPE account_roles AS ENUM ('buyer', 'seller');",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let found = owt_accounts::migrations::conflicts(&db.pool).await.unwrap();
+    let named: Vec<(&str, &str, &str)> = found
+        .iter()
+        .map(|c| (c.migration, c.name, c.held_by))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("owt_accounts", "accounts", "table"),
+            ("owt_accounts", "accounts_pkey", "index"),
+            ("owt_accounts", "accounts_id_seq", "sequence"),
+            ("owt_accounts", "accounts_username_key", "index"),
+            ("owt_accounts_roles", "account_roles", "type"),
+        ]
+    );
+    assert_eq!(found[0].schema, db.schema);
+    let said = found[0].to_string();
+    assert!(
+        said.contains("accounts is already a table") && said.contains("before owt-accounts"),
+        "{said}"
+    );
+    assert!(MIGRATOR.run(&db.pool).await.is_err());
+
+    // The rename an app writes before owt-accounts' files: the table and what was
+    // named after it.
+    sqlx::raw_sql(
+        "ALTER TABLE accounts RENAME TO holdings;
+         ALTER INDEX accounts_pkey RENAME TO holdings_pkey;
+         ALTER SEQUENCE accounts_id_seq RENAME TO holdings_id_seq;
+         ALTER INDEX accounts_username_key RENAME TO holdings_username_key;
+         ALTER TYPE account_roles RENAME TO trade_roles;",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let found = owt_accounts::migrations::conflicts(&db.pool).await.unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    MIGRATOR.run(&db.pool).await.unwrap();
+    let found = owt_accounts::migrations::conflicts(&db.pool).await.unwrap();
+    assert!(found.is_empty(), "{found:?}");
+    db.drop().await;
 }

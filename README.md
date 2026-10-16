@@ -656,6 +656,41 @@ for r in &done.renamed {
 # Ok(()) }
 ```
 
+**Names the migrations take**, in the schema they run in (the first on the
+`search_path`, usually `public`):
+
+| Migration | Tables | Indexes and sequences | Functions |
+|---|---|---|---|
+| `owt_accounts` | `accounts`, `account_identities`, `sign_in_links` | `accounts_pkey`, `accounts_id_seq`, `accounts_username_key`, `accounts_email_key`, `account_identities_pkey`, `account_identities_id_seq`, `account_identities_provider_subject_key`, `account_identities_account`, `sign_in_links_pkey`, `sign_in_links_account` | |
+| `owt_accounts_roles` | `account_roles` | `account_roles_pkey`, `account_roles_role` | |
+| `owt_accounts_constraints` | | `accounts_username_skeleton_key` | |
+| `owt_accounts_policies` | `policy_versions`, `policy_acceptances`, `policy_acceptance_events` | `policy_versions_pkey`, `policy_versions_id_seq`, `policy_versions_kind_version_key`, `policy_acceptances_pkey`, `policy_acceptances_version`, `policy_acceptance_events_pkey`, `policy_acceptance_events_id_seq`, `policy_acceptance_events_account` | `policy_versions_immutable()`, `policy_versions_keep_current()` |
+
+Each table is also a type of its name, and its triggers and constraints are its own.
+An app that already has any of these names (a table, view, index, sequence, type or
+function) renames its own first, in a migration of its own placed before
+owt-accounts' files. A taken table or index name fails the migration at `CREATE`; a
+taken key index or sequence name is worse: Postgres gives the library's a suffix
+silently, and the library no longer recognizes a taken username. Renaming a table
+keeps the names of its indexes and sequences, so rename those
+too (`ALTER INDEX accounts_pkey RENAME TO holdings_pkey`, and so on). When the
+migrations fail, `owt_accounts::migrations::conflicts(&pool)` names each name
+something else holds, skipping migrations sqlx's ledger records as applied; a test
+can call it against a copy of the app's schema before adopting the crate:
+
+```rust,no_run
+# async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
+if let Err(e) = owt_runtime::db::migrate_locked(&pool, migrator, 8_531_207).await {
+    for clash in owt_accounts::migrations::conflicts(&pool).await? {
+        // "public.accounts is already a table, and owt-accounts' `owt_accounts`
+        // migration creates accounts: rename the app's ..."
+        eprintln!("{clash}");
+    }
+    return Err(e);
+}
+# Ok(()) }
+```
+
 **Provider identities are found by subject, never by email.** `identities::arrive`
 looks up the provider's key and the identity's subject, and nothing else. An address
 changes at the provider and can pass to someone else (a recycled workplace mailbox, a
@@ -2240,7 +2275,9 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - Install `owt_accounts::migrations::ALL[3]` (`owt_accounts_policies`) as the app's
   next unused migration version (see "Tables" under "Accounts"), whether or not the
   app uses site policies: `assert_installed` expects every entry. Its tables stay
-  empty until the app wires `policies::Policies` ("Site policies").
+  empty until the app wires `policies::Policies` ("Site policies"). It takes the
+  `policy_*` names listed under "Names the migrations take": an app with a table,
+  index or function of one of them renames its own first.
 - **Re-applying the OpenShift template:** pass `-p POSTGRES_MAJOR=<the major the
   cluster runs>`, and keep compose and CI's `postgres-major` on it. The default, 18,
   upgrades an older cluster in place (or is refused before CNPG 1.26). Moving to a

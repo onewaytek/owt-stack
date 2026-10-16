@@ -17,6 +17,10 @@
 //! What SQL cannot do exactly (normalizing old rows as sign-in does, a username's
 //! lookalike key) [`complete`] does: await it after the migrations run and before
 //! serving, at every start (it does next to nothing once done).
+//!
+//! The migrations create their tables under fixed names (`accounts`, `account_roles`,
+//! `policy_versions`, ...) in the schema they run in. An app that already holds one
+//! renames its own first; [`conflicts`] names each that is held.
 
 use std::path::Path;
 
@@ -424,6 +428,203 @@ pub fn assert_installed(dir: impl AsRef<Path>) {
             ),
         }
     }
+}
+
+/// The names each of [`ALL`] gives a relation (table, index, sequence) in the schema
+/// it runs in, by migration. Those Postgres picks itself (a key's index, an identity's
+/// sequence) are here too: when one is held, Postgres picks another silently, and the
+/// library matches a unique violation on `accounts_username_key`.
+const RELATIONS: &[(&str, &[&str])] = &[
+    (
+        "owt_accounts",
+        &[
+            "accounts",
+            "accounts_pkey",
+            "accounts_id_seq",
+            "accounts_username_key",
+            "accounts_email_key",
+            "account_identities",
+            "account_identities_pkey",
+            "account_identities_id_seq",
+            "account_identities_provider_subject_key",
+            "account_identities_account",
+            "sign_in_links",
+            "sign_in_links_pkey",
+            "sign_in_links_account",
+        ],
+    ),
+    (
+        "owt_accounts_roles",
+        &["account_roles", "account_roles_pkey", "account_roles_role"],
+    ),
+    (
+        "owt_accounts_constraints",
+        &["accounts_username_skeleton_key"],
+    ),
+    (
+        "owt_accounts_policies",
+        &[
+            "policy_versions",
+            "policy_versions_pkey",
+            "policy_versions_id_seq",
+            "policy_versions_kind_version_key",
+            "policy_acceptances",
+            "policy_acceptances_pkey",
+            "policy_acceptances_version",
+            "policy_acceptance_events",
+            "policy_acceptance_events_pkey",
+            "policy_acceptance_events_id_seq",
+            "policy_acceptance_events_account",
+        ],
+    ),
+];
+
+/// The functions (of no arguments) each of [`ALL`] creates, by migration.
+const FUNCTIONS: &[(&str, &[&str])] = &[(
+    "owt_accounts_policies",
+    &["policy_versions_immutable", "policy_versions_keep_current"],
+)];
+
+/// A name one of [`ALL`] takes that something of the app's already holds, from
+/// [`conflicts`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Conflict {
+    /// The migration that takes the name ([`Migration::name`]).
+    pub migration: &'static str,
+    /// The name.
+    pub name: &'static str,
+    /// The schema it is held in: the one the migrations create their objects in.
+    pub schema: String,
+    /// What holds it now: `table`, `index`, `sequence`, `view`, `materialized view`,
+    /// `foreign table`, `type` or `function`.
+    pub held_by: &'static str,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{schema}.{name} is already a {held_by}, and owt-accounts' `{migration}` migration \
+             creates {name}: rename the app's in a migration placed before owt-accounts' files",
+            schema = self.schema,
+            name = self.name,
+            held_by = self.held_by,
+            migration = self.migration,
+        )
+    }
+}
+
+/// The names [`ALL`] would take that the database already gives something else, in
+/// the schema the migrations run in (`current_schema()`, the first on the
+/// `search_path`). Empty when there is nothing in the way.
+///
+/// A migration sqlx's ledger (`_sqlx_migrations`, found on the `search_path` as sqlx
+/// finds it) records as applied, by its checksum, is installed, and what it created
+/// is the library's own; the names of every other migration are checked against the
+/// tables, indexes, sequences, views, types and functions there. A held table or
+/// index name fails that migration at `CREATE`; a held name Postgres would have
+/// picked itself (a key's index, an identity's sequence) is taken silently with a
+/// suffix instead, so the library no longer recognizes the key. Call it when the
+/// migrations fail, to say why, or from a test against a copy of the app's schema
+/// before adopting the crate.
+///
+/// # Errors
+///
+/// The database.
+///
+/// ```no_run
+/// # async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
+/// if let Err(e) = owt_runtime::db::migrate_locked(&pool, migrator, 8_531_207).await {
+///     for clash in owt_accounts::migrations::conflicts(&pool).await? {
+///         tracing::error!(%clash, "a name owt-accounts needs is taken");
+///     }
+///     return Err(e);
+/// }
+/// # Ok(()) }
+/// ```
+pub async fn conflicts(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Conflict>> {
+    use sha2::{Digest, Sha384};
+
+    let ledger: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(pool)
+        .await?;
+    let applied: Vec<Vec<u8>> = if ledger {
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE success")
+            .fetch_all(pool)
+            .await?
+    } else {
+        Vec::new()
+    };
+    // sqlx's checksum is the SHA-384 of the file, which assert_installed holds to
+    // ALL's text byte for byte.
+    let pending = |name: &str| {
+        ALL.iter()
+            .any(|m| m.name == name && !applied.iter().any(|c| c[..] == Sha384::digest(m.sql)[..]))
+    };
+    let names =
+        |of: &[(&'static str, &'static [&'static str])]| -> Vec<(&'static str, &'static str)> {
+            of.iter()
+                .filter(|(migration, _)| pending(migration))
+                .flat_map(|(migration, names)| names.iter().map(move |n| (*migration, *n)))
+                .collect()
+        };
+    let relations = names(RELATIONS);
+    let functions = names(FUNCTIONS);
+    if relations.is_empty() && functions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // What holds each name in the current schema: a relation (by its kind; a
+    // composite type is one too), another type (`T`), or a function of no arguments
+    // (`F`).
+    let held: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT current_schema()::text, relname::text, relkind::text FROM pg_class
+         WHERE relnamespace = current_schema()::regnamespace AND relname = ANY($1)
+         UNION ALL
+         SELECT current_schema()::text, typname::text, 'T' FROM pg_type
+         WHERE typnamespace = current_schema()::regnamespace AND typrelid = 0
+           AND typname = ANY($1)
+         UNION ALL
+         SELECT current_schema()::text, proname::text, 'F' FROM pg_proc
+         WHERE pronamespace = current_schema()::regnamespace AND pronargs = 0
+           AND proname = ANY($2)",
+    )
+    .bind(relations.iter().map(|(_, n)| *n).collect::<Vec<_>>())
+    .bind(functions.iter().map(|(_, n)| *n).collect::<Vec<_>>())
+    .fetch_all(pool)
+    .await?;
+
+    let mut found = Vec::new();
+    for (schema, name, kind) in held {
+        let Some(&(migration, name)) = relations.iter().chain(&functions).find(|(_, n)| *n == name)
+        else {
+            continue;
+        };
+        found.push(Conflict {
+            migration,
+            name,
+            schema,
+            held_by: match kind.as_str() {
+                "r" | "p" => "table",
+                "i" | "I" => "index",
+                "S" => "sequence",
+                "v" => "view",
+                "m" => "materialized view",
+                "f" => "foreign table",
+                "F" => "function",
+                _ => "type",
+            },
+        });
+    }
+    // In the order the migrations take the names.
+    found.sort_by_key(|c| {
+        relations
+            .iter()
+            .chain(&functions)
+            .position(|(_, n)| *n == c.name)
+    });
+    Ok(found)
 }
 
 #[cfg(test)]
