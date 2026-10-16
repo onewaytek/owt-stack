@@ -221,7 +221,7 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 }
 
 /// `host[:port]` as a `Host` header carries it (default ports omitted).
-fn authority(u: &url::Url) -> String {
+pub(crate) fn authority(u: &url::Url) -> String {
     let host = u.host_str().unwrap_or_default();
     match u.port() {
         Some(p) => format!("{host}:{p}"),

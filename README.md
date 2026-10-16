@@ -724,6 +724,11 @@ let accounts = Accounts::new(pool.clone(), "/login");
 // `/es/login`) installs the layer on each nested router with its own path.
 async fn home(Maybe(me): Maybe) -> String { me.map_or("hello".into(), |a| a.username) }
 async fn settings(Signed(me): Signed) -> String { me.username } // anonymous: 303 /login?next=…
+// An htmx request (not a boosted one) meets the wall as a 204 with `HX-Redirect` instead:
+// htmx would follow a 303 and swap the sign-in page into its target. Its `?next=` is the
+// page the visitor was on (`HX-Current-URL`, when it is this site's: the same host as the
+// request), not the fragment. A fragment polling a page still open after a sign-out
+// takes the whole page to sign-in, and back to that page after.
 async fn admin(Staff(me): Staff) -> String { me.username } // signed in, not staff: 403
 // Database down: `Maybe` reads as anonymous, `Signed` and `Staff` answer 503 (the
 // sign-in page could not help), and the cookie keeps its signature for when it is back.
