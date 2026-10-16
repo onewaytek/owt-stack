@@ -511,8 +511,12 @@ let _sso = oauth::oidc("sso", "SSO", "https://sso.example/realms/x",
 // Or from its discovery document, which must be the issuer's own; `end_session`
 // is its RP-Initiated Logout endpoint, if it has one.
 let found = oauth::discover(&http, "sso", "SSO", "https://sso.example/realms/x").await?;
+// A provider asks for its preset's scopes; set others with a literal or a `String`
+// from configuration (`offline_access` for a refresh token, at some issuers).
+let mut provider = found.provider;
+provider.scope = "openid profile email offline_access".into();
 let sso = oauth::Client {
-    provider: found.provider,
+    provider,
     client_id: "myapp".into(),
     client_secret: "secret".into(),
     redirect_uri: "https://app.example/auth/callback".into(),
@@ -1933,6 +1937,13 @@ The router example under "Wiring an app" composes the layers; beyond it:
   next unused migration version (see "Tables" under "Accounts"), whether or not the
   app uses site policies: `assert_installed` expects every entry. Its tables stay
   empty until the app wires `policies::Policies` ("Site policies").
+
+### Authentication
+
+- `oauth::Provider`'s `scope` is a `Cow<'static, str>`: a literal becomes
+  `scope: "openid email".into()`, and a scope from configuration is a `String`
+  (`scope: configured.into()`), no longer leaked to get a `&'static str`.
+- `oauth::Error` is `#[non_exhaustive]`: a `match` on it adds a `_` arm.
 
 ## Upgrading from 0.4
 

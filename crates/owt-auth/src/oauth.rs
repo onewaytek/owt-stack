@@ -27,6 +27,8 @@
 //! (a recycled workplace mailbox, a lapsed domain), so the same email is not the same
 //! person, at one provider or across two.
 
+use std::borrow::Cow;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -50,8 +52,9 @@ pub struct Provider {
     pub token_url: String,
     /// Who the token belongs to.
     pub userinfo_url: String,
-    /// Space-separated scopes.
-    pub scope: &'static str,
+    /// Space-separated scopes: a literal for a fixed set (`"openid email".into()`),
+    /// or a `String` from configuration.
+    pub scope: Cow<'static, str>,
     /// Send a PKCE challenge (S256).
     pub pkce: bool,
     /// Send `Client-Id: <client id>` with the user-info request (Twitch's Helix API).
@@ -108,7 +111,7 @@ pub fn google() -> Provider {
         authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
         token_url: "https://oauth2.googleapis.com/token".into(),
         userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".into(),
-        scope: "profile email",
+        scope: "profile email".into(),
         pkce: true,
         client_id_header: false,
         identity: oidc_identity,
@@ -125,7 +128,7 @@ pub fn discord() -> Provider {
         authorize_url: "https://discord.com/api/oauth2/authorize".into(),
         token_url: "https://discord.com/api/oauth2/token".into(),
         userinfo_url: "https://discord.com/api/users/@me".into(),
-        scope: "identify email",
+        scope: "identify email".into(),
         pkce: true,
         client_id_header: false,
         identity: |info| {
@@ -150,7 +153,7 @@ pub fn twitch() -> Provider {
         authorize_url: "https://id.twitch.tv/oauth2/authorize".into(),
         token_url: "https://id.twitch.tv/oauth2/token".into(),
         userinfo_url: "https://api.twitch.tv/helix/users".into(),
-        scope: "user:read:email",
+        scope: "user:read:email".into(),
         pkce: false,
         client_id_header: true,
         identity: |info| {
@@ -212,7 +215,7 @@ pub fn oidc(
         authorize_url: authorize.into(),
         token_url: token.into(),
         userinfo_url: userinfo.into(),
-        scope: "openid profile email",
+        scope: "openid profile email".into(),
         pkce: true,
         client_id_header: false,
         identity: oidc_identity,
@@ -493,8 +496,10 @@ pub fn http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Why a sign-in failed.
+/// Why a sign-in failed. New variants may come in a minor release, so a `match` on it
+/// ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The callback's `state` is not the pending login's: not this browser's sign-in.
     #[error("the callback's state does not match the sign-in that was begun")]
@@ -566,7 +571,7 @@ impl Client {
             .append_pair("client_id", &self.client_id)
             .append_pair("redirect_uri", &self.redirect_uri)
             .append_pair("response_type", "code")
-            .append_pair("scope", self.provider.scope)
+            .append_pair("scope", &self.provider.scope)
             .append_pair("state", &state);
         let verifier = self.provider.pkce.then(|| crate::random_token(64));
         if let Some(v) = &verifier {
