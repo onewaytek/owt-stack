@@ -917,16 +917,22 @@ jobs:
 - **An app whose code reads its version** writes it into its files with the release:
   `with: {version-command: 'uv version "$VERSION" && uv lock', version-files:
   "pyproject.toml uv.lock", changelog: true, uv: true}`. The files are committed back
-  as `chore(release): vX.Y.Z [skip ci]`. The command runs in bash, without the
-  release's token.
+  as `chore(release): vX.Y.Z [skip ci]`. The command runs in bash on main only,
+  with `GITHUB_TOKEN` unset; it is a child of the process that holds the token,
+  though, and could read it from there, so only reviewed code and dependencies the
+  app trusts (a `uv lock` builds sdists) belong in it.
 - **rc is unreviewed code,** so on rc the release removes everything in the checkout
   that could configure semantic-release (`.releaserc*`, `release.config.*`, `.config/`,
   `package.yaml`, `node_modules`; a `release` or `cosmiconfig` key in package.json
   fails the run), runs no `version-command` and commits nothing back, installs its
   tooling away from the checkout's `.npmrc`, and fails unless the version is a
   prerelease; `image.yml` builds a stable image only
-  from a tag on `main`. Add a tag ruleset on `v*` in the repository settings so tags
-  are created by the release job alone.
+  from a tag on `main`, naming every ref in full (so neither a branch named like a
+  release nor a tag named `origin/main` stands in). Add a tag ruleset on `v*` in the
+  repository settings so tags are created by the release job alone, and a branch
+  ruleset refusing new `v*` branches. A credential that can change
+  `.github/workflows` can bypass all of this (a branch's push runs its own workflow
+  files): keep that permission to people, never to automation.
 - **Images** are tagged `X.Y.Z`, plus `X.Y` and `latest` (and `X` from 1.0) for a
   stable release, or `rc` for a prerelease. Rebuild an existing tag by calling
   `image.yml` from a `workflow_dispatch` with `floating-tags: false`.

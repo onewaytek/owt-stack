@@ -237,9 +237,12 @@ jobs:
           # the scale set can write /cache. An archive comes from the shared copy
           # only into this job's own cache, and only if its SHA-256, taken of that
           # private copy (after the copy, so no other job can swap it between check
-          # and use), is the lockfile's. Anything else (another lockfile's crates,
-          # `cargo install`'s) is downloaded and verified by cargo. The slot's release
-          # adds this job's archives back for the next.
+          # and use), is the lockfile's. Another lockfile's crates are downloaded and
+          # checked against this lockfile's checksums by cargo. The shared index is
+          # trusted only where the lockfile pins a checksum: nothing here runs `cargo
+          # install`, which would take a crate's version, checksum and download URL
+          # from that index (the gate's tools come prebuilt, below). The slot's
+          # release adds this job's archives back for the next.
           mkdir -p "$home/registry/cache" "$home/git" /cache/cargo/registry/index \
             /cache/cargo/registry/cache /cache/cargo/git/db
           for f in registry/index git/db .package-cache .package-cache-mutate; do
@@ -298,13 +301,24 @@ jobs:
         run: eval "$CHECK"
       - run: cargo fmt --check
         if: ${{ inputs.check-command == '' }}
+      # Prebuilt and checksummed, as the gate's tools are: `cargo install` would build
+      # whatever the shared index says, which any job on the scale set can write.
+      - name: Install cargo-audit
+        if: ${{ inputs.check-command == '' && inputs.audit }}
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: cargo-audit@0.22.2
       - name: cargo audit
         if: ${{ inputs.check-command == '' && inputs.audit }}
-        run: cargo install cargo-audit --locked && cargo audit --deny warnings
+        run: cargo audit --deny warnings
+      - name: Install sqlx-cli
+        if: ${{ inputs.check-command == '' && inputs.sqlx-check && inputs.database != '' }}
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: sqlx-cli@0.9.0
       - name: sqlx metadata is current
         if: ${{ inputs.check-command == '' && inputs.sqlx-check && inputs.database != '' }}
         run: |
-          cargo install sqlx-cli --locked --no-default-features --features postgres,rustls
           cargo sqlx migrate run
           SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets
       - run: cargo clippy --all-targets --locked -- -D warnings
