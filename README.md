@@ -458,8 +458,8 @@ let who = google.complete(&http, &pending, state, code).await?;
 println!("{} <{:?}>", who.uid, who.email);
 // Any OIDC issuer: its subjects are keyed by the issuer, not the `sso` id. The
 // issuer and endpoints must be https (http only on localhost); `complete` refuses an
-// ID token whose `iss`, `aud` or `sub` is not this issuer, this client and the
-// user-info subject.
+// ID token whose `iss`, `aud`, `azp` or `sub` is not this issuer, this client and
+// the user-info subject, or whose `exp` has passed.
 let _sso = oauth::oidc("sso", "SSO", "https://sso.example/realms/x",
     "https://sso.example/realms/x/protocol/openid-connect/auth",
     "https://sso.example/realms/x/protocol/openid-connect/token",
@@ -483,9 +483,11 @@ if let Some(refresh) = &tokens.refresh {
     match sso.refresh(&http, refresh, &who.uid).await {
         // No refresh token in the answer: the one held stays good.
         Ok(fresh) => { let _ = fresh.refresh.as_ref().unwrap_or(refresh); }
-        // The grant is gone (expired, revoked): forget it and sign in again.
+        // The grant is gone (`invalid_grant`: expired, revoked): forget it and sign
+        // in again.
         Err(e) if e.is_rejected() => {}
-        // The provider is unavailable: keep the grant, try again later.
+        // The provider is unavailable, or the app's client is misconfigured
+        // (`invalid_client`, a moved endpoint): keep the grant, try again later.
         Err(e) => return Err(e.into()),
     }
 }
@@ -1668,8 +1670,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   with a provider"); it uses `oauth::http_client()`, and `Client::complete` checks the
   state and the provider itself. An app that needs the person's tokens uses
   `Client::complete_with_tokens`, `refresh` and `client_credentials`, never its own
-  exchange, which would skip the ID-token checks. Key people by (`Provider::key()`, `Identity::uid`),
-  never by `Identity::email`, in the app's own tables too.
+  exchange, which would skip the ID-token checks. Key people by (`Provider::key()`,
+  `Identity::uid`), never by `Identity::email`, in the app's own tables too.
 - The bus's Redis is inside the trust boundary: a password or ACL user, a network
   only the app reaches, `rediss://` where the path leaves the node.
 - `Limits` bounds the time to a response; `serve::serve` bounds the time to a request
