@@ -4,8 +4,8 @@
 <a class="owt-button" href="{{ base }}/new">New account</a>
 </header>
 <form class="owt-toolbar" method="get" action="{{ base }}" role="search">
-<label class="owt-sr" for="owt-admin-q">Username or email</label>
-<input class="owt-input" id="owt-admin-q" name="q" type="search" value="{{ q }}" placeholder="Username or email">
+<label class="owt-sr" for="owt-admin-q">{{ placeholder }}</label>
+<input class="owt-input" id="owt-admin-q" name="q" type="search" value="{{ q }}" placeholder="{{ placeholder }}">
 <label class="owt-sr" for="owt-admin-role">Show</label>
 <select class="owt-input" id="owt-admin-role" name="role">
 <option value="">Everyone</option>
@@ -13,7 +13,8 @@
 {% endfor %}</select>
 <button class="owt-button owt-button-secondary" type="submit">Search</button>
 </form>
-<p class="owt-hint">{{ total }} {% if total == 1 %}account{% else %}accounts{% endif %}</p>
+{% if let Some(n) = notice %}<div class="owt-alert owt-alert-error" role="alert">{{ n.text }}</div>
+{% endif %}<p class="owt-hint">{{ total }} {% if total == 1 %}account{% else %}accounts{% endif %}</p>
 {% if rows.is_empty() %}<p>No accounts match.</p>
 {% else %}<table class="owt-table">
 <thead><tr><th scope="col">Account</th><th scope="col">Access</th><th scope="col">Last sign-in</th></tr></thead>

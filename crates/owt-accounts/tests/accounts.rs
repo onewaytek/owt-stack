@@ -1222,6 +1222,95 @@ async fn the_admin_is_for_staff_and_finds_accounts_by_name_email_and_role() {
     db.drop().await;
 }
 
+/// The app's own search adds its matches to the username and email ones, once each,
+/// under the same filters; a failure leaves the built-in matches and says so.
+#[tokio::test]
+async fn the_admin_also_finds_accounts_by_the_apps_own_columns() {
+    let db = db!();
+    let sessions = sessions();
+    let ada = store::create(&db.pool, new("ada", "ada@example.com", None))
+        .await
+        .unwrap();
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    let cy = store::create(&db.pool, new("cy", "", None)).await.unwrap();
+    sqlx::query("CREATE TABLE profiles (account_id bigint NOT NULL, nickname text NOT NULL)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // Ada's nickname also matches her username; one row has no account.
+    sqlx::query("INSERT INTO profiles VALUES ($1, 'Wizard'), ($2, 'ada fan'), (999999, 'wizard')")
+        .bind(cy.id)
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let admin = admin(&db).search("nickname", move |term| {
+        let pool = pool.clone();
+        async move {
+            anyhow::ensure!(term != "boss", "the profiles are down");
+            Ok(sqlx::query_scalar(
+                "SELECT account_id FROM profiles WHERE strpos(lower(nickname), lower($1)) > 0",
+            )
+            .bind(term)
+            .fetch_all(&pool)
+            .await?)
+        }
+    });
+    let client = owt_test::Client::new(app(&db, &sessions, admin.routes()));
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+
+    let list = |q: &str| {
+        let client = &client;
+        let q = q.to_owned();
+        async move {
+            let r = client.get(&format!("/staff/accounts?{q}")).await;
+            assert_eq!(r.status, 200);
+            r.text()
+        }
+    };
+    let found = |html: &str| {
+        ["ada", "boss", "cy"]
+            .into_iter()
+            .filter(|u| html.contains(&format!(">{u}</a>")))
+            .collect::<Vec<_>>()
+    };
+    let html = list("q=").await;
+    assert!(
+        html.contains(r#"placeholder="Username, email or nickname""#),
+        "{html}"
+    );
+    assert_eq!(found(&html), ["ada", "boss", "cy"]);
+    let html = list("q=wiz").await;
+    assert_eq!(found(&html), ["cy"], "{html}");
+    assert!(
+        html.contains("1 account<"),
+        "the id with no account: {html}"
+    );
+    // Found by username and by nickname, listed once.
+    let html = list("q=ada").await;
+    assert_eq!(found(&html), ["ada"]);
+    assert!(html.contains("1 account<"), "{html}");
+    let html = list("q=a").await;
+    assert_eq!(found(&html), ["ada", "cy"], "{html}");
+    // The filters hold for the app's matches too.
+    assert_eq!(found(&list("q=wiz&role=staff").await), Vec::<&str>::new());
+
+    let html = list("q=boss").await;
+    assert_eq!(found(&html), ["boss"]);
+    assert!(
+        html.contains(
+            "Searching by nickname failed, so these are username and email matches only."
+        ),
+        "{html}"
+    );
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn the_admin_creates_and_changes_accounts_and_never_locks_out_its_user() {
     let db = db!();
