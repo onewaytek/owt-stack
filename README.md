@@ -1664,8 +1664,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - `serve::serve` closes a connection whose request head (or the next one on a
   kept-alive connection) takes over 30 seconds, holds 4096 connections at most, and
   stops draining after 20 seconds, which also ends an SSE stream still
-  open then; `serve_with` sets other bounds (`ServeOptions` is `non_exhaustive`:
-  start from `default()`). It serves HTTP/1.1 only: no h2c. A WebSocket leaves the
+  open then; the new `serve_with` sets other bounds (build its `ServeOptions` from
+  `default()`). It serves HTTP/1.1 only: no h2c. A WebSocket leaves the
   server at its upgrade and is bounded by none of these: its handler limits how many
   it holds and for how long.
 - `jobs::singleton` aborts a run whose lock is no longer seen held. Behind a
