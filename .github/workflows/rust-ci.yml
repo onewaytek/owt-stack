@@ -241,7 +241,8 @@ jobs:
           # checked against this lockfile's checksums by cargo. The shared index is
           # trusted only where the lockfile pins a checksum: nothing here runs `cargo
           # install`, which would take a crate's version, checksum and download URL
-          # from that index (the gate's tools come prebuilt, below). The slot's
+          # from that index (the gate's tools come prebuilt or, sqlx-cli, are built
+          # under a cargo home of the job's own, below). The slot's
           # release adds this job's archives back for the next.
           mkdir -p "$home/registry/cache" "$home/git" /cache/cargo/registry/index \
             /cache/cargo/registry/cache /cache/cargo/git/db
@@ -285,9 +286,26 @@ jobs:
         if: ${{ inputs.check-command != '' }}
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         # Pinned, so the gate doesn't change under an app between its own commits.
-        # sqlx-cli's major must match the apps' sqlx (0.9); move these together.
+        # Prebuilt and checksummed by the action's manifests; `fallback: none`, so a
+        # tool without one fails here instead of being compiled from the shared index.
         with:
-          tool: just@1.58.0,cargo-audit@0.22.2,sqlx-cli@0.9.0
+          tool: just@1.58.0,cargo-audit@0.22.2
+          fallback: none
+      # sqlx publishes no binaries, so sqlx-cli is built: under a cargo home and a
+      # target of this job's own, from crates.io afresh, never through the shared
+      # index (whose entries name a crate's checksum and download URL). Its major
+      # must match the apps' sqlx (0.9); move these together.
+      - name: Install sqlx-cli
+        if: ${{ inputs.check-command != '' || (inputs.sqlx-check && inputs.database != '') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/cargo-tools"
+          CARGO_HOME="$tools/home" CARGO_TARGET_DIR="$tools/target" \
+            cargo install sqlx-cli@0.9.0 --locked --no-default-features \
+            --features postgres,rustls --root "$tools"
+          rm -rf "${tools:?}/target"
+          echo "$tools/bin" >> "$GITHUB_PATH"
       - name: Migrate
         if: ${{ inputs.check-command != '' && inputs.database != '' }}
         # A library's tests can want a database without having migrations of their own.
@@ -308,14 +326,10 @@ jobs:
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-audit@0.22.2
+          fallback: none
       - name: cargo audit
         if: ${{ inputs.check-command == '' && inputs.audit }}
         run: cargo audit --deny warnings
-      - name: Install sqlx-cli
-        if: ${{ inputs.check-command == '' && inputs.sqlx-check && inputs.database != '' }}
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
-        with:
-          tool: sqlx-cli@0.9.0
       - name: sqlx metadata is current
         if: ${{ inputs.check-command == '' && inputs.sqlx-check && inputs.database != '' }}
         run: |
