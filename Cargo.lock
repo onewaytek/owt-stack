@@ -2213,6 +2213,7 @@ name = "owt-accounts"
 version = "0.4.4"
 dependencies = [
  "anyhow",
+ "askama",
  "axum",
  "base64 0.23.1",
  "owt-auth",

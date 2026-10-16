@@ -21,7 +21,27 @@ pub struct Account {
     pub is_active: bool,
     /// Compared with the session's on every request.
     pub session_epoch: i32,
+    /// The names of the app's roles it holds (see [`crate::roles`]), sorted; read on
+    /// every request with the rest, so a revoked role is gone at the next one.
+    /// A query of the app's own that does not select it (one written before roles,
+    /// say) reads none: it fails closed. Select [`COLUMNS`] to read them.
+    #[sqlx(default)]
+    pub roles: Vec<String>,
 }
+
+impl Account {
+    /// Whether it holds `role`: granted, or staff when the role is
+    /// [`held_by_staff`](crate::roles::Role::held_by_staff).
+    #[must_use]
+    pub fn holds(&self, role: &crate::roles::Role) -> bool {
+        (role.staff && self.is_staff) || self.roles.iter().any(|r| r == role.name)
+    }
+}
+
+/// The columns an [`Account`] is read from, for a query on `accounts` (unaliased):
+/// `format!("SELECT {COLUMNS} FROM accounts WHERE …")` with `query_as::<_, Account>`.
+pub const COLUMNS: &str = "id, username, email, is_staff, is_active, session_epoch, \
+     ARRAY(SELECT r.role FROM account_roles r WHERE r.account_id = accounts.id ORDER BY r.role) AS roles";
 
 /// The most characters a username has.
 pub const MAX_USERNAME_CHARS: usize = 150;
@@ -108,10 +128,10 @@ pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
                 .map_err(Error::Hash)?
         }
     };
-    sqlx::query_as::<_, Account>(
+    sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
         "INSERT INTO accounts (username, email, password_hash, is_staff)
-         VALUES ($1, $2, $3, $4) RETURNING id, username, email, is_staff, is_active, session_epoch",
-    )
+         VALUES ($1, $2, $3, $4) RETURNING {COLUMNS}"
+    )))
     .bind(&username)
     .bind(&email)
     .bind(&hash)
@@ -162,21 +182,19 @@ pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<
             .execute(pool)
             .await?;
     }
-    Ok(
-        sqlx::query_as::<_, Account>(
-            "UPDATE accounts SET last_sign_in = now() WHERE id = $1 AND is_active RETURNING id, username, email, is_staff, is_active, session_epoch"
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?,
-    )
+    Ok(sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
+        "UPDATE accounts SET last_sign_in = now() WHERE id = $1 AND is_active RETURNING {COLUMNS}"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// The active account with this id.
 pub async fn by_id(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<Option<Account>> {
-    sqlx::query_as::<_, Account>(
-        "SELECT id, username, email, is_staff, is_active, session_epoch FROM accounts WHERE id = $1 AND is_active"
-    )
+    sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM accounts WHERE id = $1 AND is_active"
+    )))
     .bind(id)
     .fetch_optional(db)
     .await
@@ -189,9 +207,9 @@ pub async fn by_id_in_epoch(
     id: i64,
     epoch: i32,
 ) -> sqlx::Result<Option<Account>> {
-    sqlx::query_as::<_, Account>(
-        "SELECT id, username, email, is_staff, is_active, session_epoch FROM accounts WHERE id = $1 AND is_active AND session_epoch = $2"
-    )
+    sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM accounts WHERE id = $1 AND is_active AND session_epoch = $2"
+    )))
     .bind(id)
     .bind(epoch)
     .fetch_optional(db)
@@ -200,9 +218,9 @@ pub async fn by_id_in_epoch(
 
 /// The account (active or not) with this username.
 pub async fn by_username(db: impl PgExecutor<'_>, username: &str) -> sqlx::Result<Option<Account>> {
-    sqlx::query_as::<_, Account>(
-        "SELECT id, username, email, is_staff, is_active, session_epoch FROM accounts WHERE username = $1"
-    )
+    sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM accounts WHERE username = $1"
+    )))
     .bind(normalize(username))
     .fetch_optional(db)
     .await
@@ -214,9 +232,9 @@ pub async fn by_email(db: impl PgExecutor<'_>, email: &str) -> sqlx::Result<Opti
     if email.is_empty() {
         return Ok(None);
     }
-    sqlx::query_as::<_, Account>(
-        "SELECT id, username, email, is_staff, is_active, session_epoch FROM accounts WHERE email = $1 AND is_active"
-    )
+    sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM accounts WHERE email = $1 AND is_active"
+    )))
     .bind(email)
     .fetch_optional(db)
     .await
@@ -224,9 +242,11 @@ pub async fn by_email(db: impl PgExecutor<'_>, email: &str) -> sqlx::Result<Opti
 
 /// Every account, by username.
 pub async fn list(db: impl PgExecutor<'_>) -> sqlx::Result<Vec<Account>> {
-    sqlx::query_as::<_, Account>("SELECT id, username, email, is_staff, is_active, session_epoch FROM accounts ORDER BY username")
-        .fetch_all(db)
-        .await
+    sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM accounts ORDER BY username"
+    )))
+    .fetch_all(db)
+    .await
 }
 
 /// Whether the account has a password (else only an identity or a link opens it).
@@ -238,8 +258,8 @@ pub async fn has_password(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<bool
         .map(|has| has.unwrap_or(false))
 }
 
-/// Replace `account`'s password and sign it out everywhere. `false` when the row is
-/// gone. Refuses a password that breaks a rule, the similarity rule included: the
+/// Replace `account`'s password, sign it out everywhere and void its unused sign-in
+/// links. `false` when the row is gone. Refuses a password that breaks a rule, the similarity rule included: the
 /// account is passed, not its id, so its username and email are there to check
 /// against.
 pub async fn set_password(
@@ -255,7 +275,11 @@ pub async fn set_password(
         .await
         .map_err(Error::Hash)?;
     let done = sqlx::query(
-        "UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1 WHERE id = $2",
+        "WITH voided AS (
+            UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
+            WHERE account_id = $2 AND used_at IS NULL)
+         UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1
+         WHERE id = $2",
     )
     .bind(&hash)
     .bind(account.id)
@@ -265,19 +289,28 @@ pub async fn set_password(
 }
 
 /// Sign the account out everywhere: every session it has, on any device, ends at
-/// its next request.
+/// its next request, and its unused sign-in links are void.
 pub async fn sign_out_everywhere(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<()> {
-    sqlx::query("UPDATE accounts SET session_epoch = session_epoch + 1 WHERE id = $1")
-        .bind(id)
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "WITH voided AS (
+            UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
+            WHERE account_id = $1 AND used_at IS NULL)
+         UPDATE accounts SET session_epoch = session_epoch + 1 WHERE id = $1",
+    )
+    .bind(id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
-/// Activate or deactivate. Deactivating also signs the account out everywhere.
+/// Activate or deactivate. Deactivating also signs the account out everywhere and
+/// voids its unused sign-in links, so reactivating it later revives none.
 pub async fn set_active(db: impl PgExecutor<'_>, id: i64, active: bool) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE accounts SET session_epoch = session_epoch + (is_active AND NOT $2)::int,
+        "WITH voided AS (
+            UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
+            WHERE account_id = $1 AND used_at IS NULL AND NOT $2)
+         UPDATE accounts SET session_epoch = session_epoch + (is_active AND NOT $2)::int,
                 is_active = $2
          WHERE id = $1",
     )

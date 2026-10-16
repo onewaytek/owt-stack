@@ -25,17 +25,25 @@ pub struct Migration {
 
 /// Every migration, in order. Append; never edit a shipped entry (see the module
 /// docs).
-pub const ALL: &[Migration] = &[Migration {
-    name: "owt_accounts",
-    sql: include_str!("../migrations/0001_accounts.sql"),
-}];
+pub const ALL: &[Migration] = &[
+    Migration {
+        name: "owt_accounts",
+        sql: include_str!("../migrations/0001_accounts.sql"),
+    },
+    Migration {
+        name: "owt_accounts_roles",
+        sql: include_str!("../migrations/0002_account_roles.sql"),
+    },
+];
 
 /// The SHA-256 of each of [`ALL`], in order, as released. A changed digest means a
 /// shipped migration was edited, which breaks every app's next deploy: revert it and
 /// write the change as a new file, pinned here as a new entry.
 #[cfg(test)]
-const SHIPPED_SHA256: &[&str] =
-    &["743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4"];
+const SHIPPED_SHA256: &[&str] = &[
+    "743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4",
+    "0e6d42a67ddabfb50f56650fe85ff0bc810c4b3230a1115706db467ea27b2338",
+];
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;
 /// panics naming the first that is not. Call it from a test.
@@ -126,6 +134,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("0001_owt_accounts.sql");
         std::fs::write(&file, ALL[0].sql).unwrap();
+        let roles = dir.join("0002_owt_accounts_roles.sql");
+        std::fs::write(&roles, ALL[1].sql).unwrap();
         assert_installed(&dir);
         std::fs::write(&file, format!("{}\n-- edited", ALL[0].sql)).unwrap();
         let err = std::panic::catch_unwind(|| assert_installed(&dir)).unwrap_err();
@@ -138,6 +148,7 @@ mod tests {
         let err = std::panic::catch_unwind(|| assert_installed(&dir)).unwrap_err();
         let text = err.downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(text.contains("is not in"), "{text}");
+        std::fs::remove_file(&roles).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
 }
