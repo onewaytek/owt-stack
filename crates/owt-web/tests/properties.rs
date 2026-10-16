@@ -70,6 +70,29 @@ proptest! {
         prop_assert!(to == "/home" || redirect::local(to) == Some(to));
     }
 
+    /// The page `HX-Current-URL` names is only ever a path `local` accepts, taken
+    /// from a URL of the host the request was addressed to.
+    #[test]
+    fn an_htmx_page_is_a_local_path_of_this_host(
+        tail in hostile(),
+        prefix in prop::sample::select(vec![
+            "https://app.example", "http://app.example", "https://evil.example",
+            "https://app.example.evil.example", "https://app.example@evil.example",
+            "", "//app.example", "javascript:",
+        ]),
+    ) {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("app.example"));
+        let Ok(current) = HeaderValue::from_str(&format!("{prefix}{tail}")) else {
+            return Ok(());
+        };
+        headers.insert("hx-current-url", current.clone());
+        let Some(page) = redirect::htmx_current_page(&headers) else { return Ok(()) };
+        prop_assert_eq!(redirect::local(&page), Some(page.as_str()));
+        let url = url::Url::parse(current.to_str().unwrap()).unwrap();
+        prop_assert_eq!(url.host_str(), Some("app.example"), "{:?}", current);
+    }
+
     /// The client cannot move its own address by what it writes to the left of the
     /// entries the trusted proxies append.
     #[test]
