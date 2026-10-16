@@ -62,13 +62,25 @@ pub struct ServeOptions {
     /// connection, so also how long a kept-alive connection may sit idle. Default 30
     /// seconds: keep it above the idle time of whatever proxy reuses connections to
     /// the app, or a request it sends just as the app closes one fails (a 502).
+    /// The `OpenShift` router's is 300 seconds by default (`HAProxy`'s
+    /// `timeout http-keep-alive`); it reads request heads itself, so a longer wait
+    /// here costs an idle socket, not slow-client protection.
     pub header_read_timeout: Duration,
     /// How long a stop waits for open connections to finish before closing them.
-    /// Default 20 seconds, inside Kubernetes' default 30-second grace period.
+    /// Default 20 seconds, inside Kubernetes' default 30-second grace period. An
+    /// idle kept-alive connection closes at once; a response still being sent gets
+    /// until the deadline. A Server-Sent Events stream is a response that does not
+    /// end, so every one still open is cut then, and its client must reconnect
+    /// (`EventSource` does on its own).
     pub drain: Duration,
     /// The most connections open at once; past it, new ones wait in the kernel's
     /// accept queue until one closes. Default 4096: a client that opens connections
     /// and never finishes with them cannot take every socket and file descriptor.
+    /// Every connection counts from its accept to its close: one sitting idle between
+    /// kept-alive requests, and one holding a Server-Sent Events stream (an ordinary
+    /// HTTP/1.1 response), for as long as the stream is open. A `WebSocket` leaves the
+    /// count at its upgrade. An app holding many streams raises this with
+    /// [`serve_with`] (and the open-files limit: [`raise_open_files_limit`]).
     pub max_connections: usize,
     /// How long a connection may stay open, whatever it is doing; `None` (the default)
     /// for none. The head timeout bounds a client that sends nothing, not one that

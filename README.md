@@ -109,14 +109,19 @@ async fn main() -> anyhow::Result<()> {
     // Replicas starting together migrate once; the rest wait on the lock.
     owt_runtime::db::migrate_locked(&pool, &MIGRATOR, 8_531_207).await?;
     let bind = env::var("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8000".into());
-    // A request head must arrive within 30 s (an idle kept-alive connection closes
-    // then too), at most 4096 connections are open at once, and a stop drains for up
-    // to 20 s (`serve::serve_with` and `ServeOptions` to change them).
-    serve::serve(&bind, router(pool), serve::shutdown_signal()).await
+    // Behind the OpenShift router: an idle kept-alive connection is closed after
+    // `header_read_timeout` (30 s by default), and the router may reuse one for up to
+    // 300 s, so keep the app's wait above the router's (see "Bounds" below).
+    let mut options = serve::ServeOptions::default();
+    options.header_read_timeout = std::time::Duration::from_secs(310);
+    serve::serve_with(&bind, router(pool), serve::shutdown_signal(), options).await
 }
 ```
 
-`ServeOptions` is built from its default and changed field by field:
+`serve::serve` is the same with `ServeOptions::default()`: a request head must arrive
+within 30 s (an idle kept-alive connection closes then too), at most 4096 connections
+are open at once, and a stop drains for up to 20 s. `ServeOptions` is built from its
+default and changed field by field:
 
 ```rust,no_run
 # async fn run(app: axum::Router) -> anyhow::Result<()> {
@@ -132,6 +137,31 @@ serve::serve_with("0.0.0.0:8000", app, serve::shutdown_signal(), options).await
 The server speaks HTTP/1.1 only (the router in front speaks HTTP/2 to browsers);
 `axum::serve` also answered HTTP/2 without TLS (h2c) when axum's `http2` feature was
 on.
+
+**Bounds.** What each bound counts:
+
+- **Keep-alive.** `header_read_timeout` is the wait for each request head, the first
+  on a connection and every one after, so it is also how long a kept-alive
+  connection may sit idle before the app closes it. A proxy that keeps idle
+  connections to the app for reuse longer than that sends, now and then, a request
+  on a connection the app has just closed, and answers it with a 502. The OpenShift
+  router's HAProxy waits up to 300 s by default (`timeout http-keep-alive`), so an
+  app behind it sets the timeout above that, as the example above does. The router
+  reads request heads itself, so the longer wait costs an idle socket, not
+  protection from slow clients.
+- **Connections.** `max_connections` counts every connection from its accept to its
+  close: one idle between kept-alive requests, and one holding a Server-Sent Events
+  stream, which is an ordinary HTTP/1.1 response that does not end. A WebSocket
+  leaves the count at its upgrade. At the cap, new connections (readiness probes
+  among them) wait in the kernel's accept queue, so an app with many SSE clients
+  can reach it long before it runs out of CPU: raise it with `serve_with`, and the
+  open-files limit with `serve::raise_open_files_limit()`.
+- **Drain.** A stop closes idle connections at once and gives a response in flight
+  until `drain` (20 s). An SSE stream never finishes, so every one still open is cut
+  at the deadline, on each rollout: its client must reconnect (to another pod) and
+  catch up. `EventSource` reconnects on its own; a page that keeps state from the
+  stream asks for it again on `open`. A stop does not close a WebSocket: its
+  handler ends it, or the process exiting does.
 
 `PoolConfig::connect` warns at start when the database is not on this machine and
 its TLS is not verified (`db::unverified_tls(&options)` asks the same of any
@@ -1776,6 +1806,15 @@ The ImageStream polls ghcr for the channel's tag (`rc` or `latest`), and the
 Deployment's trigger rolls out each new digest. App-specific environment is a patch
 on the Deployment.
 
+The Route sends traffic through the router (HAProxy), which keeps idle connections to
+the pod for reuse longer than the app's default 30-second keep-alive (its
+`timeout http-keep-alive` is 300 s). Serve with a `header_read_timeout` above that, as
+"Wiring an app" does, or requests on a connection the app has just closed fail with
+an occasional 502. Each rollout also cuts the app's SSE streams after the 20-second
+drain; their clients reconnect to the new pods ("Bounds" under "Wiring an app").
+The router also cuts a response that sends nothing for 30 s (its `timeout server`),
+so a quiet SSE stream sends `sse::HEARTBEAT` more often than that.
+
 **Backups come with it.** The database takes a volume snapshot nightly
 (`BACKUP_SCHEDULE`, CNPG's six-field cron, seconds first) and once at first apply.
 They are offline by default (`BACKUP_ONLINE=false`): Postgres stops for the seconds an
@@ -1910,7 +1949,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   open then; the new `serve_with` sets other bounds (build its `ServeOptions` from
   `default()`). It serves HTTP/1.1 only: no h2c. A WebSocket leaves the
   server at its upgrade and is bounded by none of these: its handler limits how many
-  it holds and for how long.
+  it holds and for how long. Behind the OpenShift router, and with SSE, see
+  "Serving" below.
 - `jobs::singleton` aborts a run whose lock is no longer seen held. Behind a
   transaction-mode pooler (PgBouncer) the check lands on another server connection,
   so every run longer than `jobs::LOCK_CHECK` is aborted: give singletons a direct
@@ -2008,6 +2048,24 @@ Also:
 - `Refused` has `CurrentPassword` and `UsernameLookalike` variants.
 - `Linked::label` shows an email only when the provider verified it.
 - The social routes refuse cross-origin `POST`s themselves.
+
+### Serving
+
+`serve::serve`'s bounds (above, and "Bounds" under "Wiring an app") are new in 0.5,
+and two of them reach further than their names:
+
+- **An app behind the OpenShift router serves with a longer
+  `header_read_timeout`.** It is also how long an idle kept-alive connection stays
+  open (30 s), and the router reuses idle connections to the pod for longer (its
+  `timeout http-keep-alive` is 300 s), so a request it sends on a connection the app
+  has just closed fails with a 502, now and then. Move `main` to `serve_with` with
+  the timeout above the router's, as "Wiring an app" shows.
+- **SSE streams count.** A Server-Sent Events stream is an ordinary HTTP/1.1
+  response, so each open one holds one of the 4096 connections (`max_connections`)
+  for as long as it lasts, and a stop cuts every stream still open at the 20-second
+  drain. A WebSocket leaves the count at its upgrade and is not drained. An app with
+  many SSE clients raises `max_connections` with `serve_with`, and its pages
+  reconnect after a rollout and fetch what they missed.
 
 ## Upgrading from 0.1
 
