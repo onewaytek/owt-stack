@@ -53,21 +53,40 @@ pub struct HttpTimer(pub &'static str);
 
 /// Middleware body, for `from_fn_with_state(HttpTimer("app_http_request_seconds"),
 /// metrics::http)`: time every request, labelled by `route` (the pattern, not the
-/// path), `method` and `status`. Unmatched requests are `route="unmatched"`, so a scan
-/// of random paths cannot grow the label set. Layer it on the routed router, so the
-/// matched path is known.
+/// path), `method` and `status`. Unmatched requests are `route="unmatched"` and a
+/// method outside the standard nine is `method="other"`, so neither a scan of random
+/// paths nor requests with invented methods (hyper accepts any token, and proxies
+/// pass them on) can grow the label set, each new set being a histogram kept for the
+/// life of the process. Layer it on the routed router, so the matched path is known.
 pub async fn http(State(timer): State<HttpTimer>, req: Request, next: Next) -> Response {
     let route = req
         .extensions()
         .get::<MatchedPath>()
         .map_or_else(|| "unmatched".to_owned(), |p| p.as_str().to_owned());
-    let method = req.method().as_str().to_owned();
+    let method = method_label(req.method());
     let started = Instant::now();
     let response = next.run(req).await;
     let status = response.status().as_u16().to_string();
     histogram!(timer.0, "route" => route, "method" => method, "status" => status)
         .record(started.elapsed().as_secs_f64());
     response
+}
+
+/// A standard method's name, else `other`: the label's values are a fixed set.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::OPTIONS => "OPTIONS",
+        Method::CONNECT => "CONNECT",
+        Method::TRACE => "TRACE",
+        _ => "other",
+    }
 }
 
 /// Gauges for the async runtime, named `<prefix>_runtime_*`.
@@ -189,6 +208,37 @@ where
         }),
     );
     tracing::info!(addr = %listener.local_addr()?, "metrics listening");
-    axum::serve(listener, app).await?;
+    // This port has no router or `Limits` in front to bound a slow client, so each
+    // connection gets a lifetime (a scrape takes well under one), and few at once.
+    // A scraper sends its request at once: a short head timeout frees a slot an idle
+    // socket holds well inside a scrape's timeout (Prometheus waits 10 s).
+    let options = crate::serve::ServeOptions {
+        header_read_timeout: std::time::Duration::from_secs(3),
+        max_connection_age: Some(std::time::Duration::from_secs(15)),
+        max_connections: 64,
+        ..crate::serve::ServeOptions::default()
+    };
+    crate::serve::run(listener, app, std::future::pending(), options).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Invented methods share one label value: a client cannot mint label sets.
+    #[test]
+    fn a_method_label_is_one_of_ten() {
+        use axum::http::Method;
+        let mut seen = std::collections::BTreeSet::new();
+        for m in [
+            "GET", "POST", "DELETE", "TRACE", "AAAA1", "AAAA2", "get", "PROPFIND",
+        ] {
+            seen.insert(method_label(&Method::from_bytes(m.as_bytes()).unwrap()));
+        }
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            ["DELETE", "GET", "POST", "TRACE", "other"]
+        );
+    }
 }

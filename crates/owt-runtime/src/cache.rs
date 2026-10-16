@@ -93,7 +93,10 @@ impl Cache {
     }
 
     /// Start connecting to `url` in the background and return at once. Every key is
-    /// stored under `<prefix>:`, so several apps (or test runs) can share a Redis.
+    /// stored under `<prefix>:c:`, so several apps (or test runs) can share a Redis,
+    /// and no cache key, whatever an app builds it from, can name one of the app's
+    /// leases (`<prefix>:lease:…`) or once-markers (`<prefix>:once:…`) under the same
+    /// prefix.
     /// Once established, the connection reconnects on its own; until it has, every
     /// call returns within the response budget as a miss. The background attempts
     /// stop when the last clone of the cache is dropped.
@@ -140,7 +143,7 @@ impl Cache {
         });
         Ok(Self {
             conn: Some(cell),
-            prefix: Arc::from(format!("{prefix}:")),
+            prefix: Self::namespace(prefix),
             budget: options.response_timeout,
         })
     }
@@ -157,6 +160,11 @@ impl Cache {
 
     fn key(&self, k: &str) -> String {
         format!("{}{k}", self.prefix)
+    }
+
+    /// Where a cache's keys live under `prefix`: a namespace of their own.
+    fn namespace(prefix: &str) -> Arc<str> {
+        Arc::from(format!("{prefix}:c:"))
     }
 
     /// Many keys in one round trip. Misses and errors are both `None`.
@@ -255,6 +263,17 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No cache key reaches the lease or once-marker keys under the same prefix.
+    #[test]
+    fn cache_keys_have_a_namespace_of_their_own() {
+        let c = Cache {
+            prefix: Cache::namespace("myapp"),
+            ..Cache::default()
+        };
+        assert_eq!(c.key("lease:clock"), "myapp:c:lease:clock");
+        assert!(!c.key("once:x").starts_with("myapp:once:"));
+    }
 
     #[tokio::test]
     async fn a_disabled_cache_misses_and_drops_writes() {

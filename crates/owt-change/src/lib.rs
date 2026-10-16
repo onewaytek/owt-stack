@@ -88,8 +88,11 @@ pub enum ConfigError {
     /// One of the two variables is set without the other.
     #[error("set both {URL_VAR} and {KEY_VAR}, or neither")]
     Half,
-    /// The endpoint is not an `http(s)` URL.
-    #[error("{URL_VAR} is not an http(s) URL")]
+    /// The endpoint is not an `https` URL (`http` only to this machine or a cluster
+    /// service), or it carries credentials, a query or a fragment.
+    #[error(
+        "{URL_VAR} must be an https URL (http only for localhost or a cluster service's absolute name, ending .svc.cluster.local. with the dot), without credentials, query or fragment"
+    )]
     Url,
 }
 
@@ -111,7 +114,7 @@ impl Config {
             (None, None) => Ok(None),
             (Some(url), Some(key)) => {
                 let endpoint = url::Url::parse(url.trim()).map_err(|_| ConfigError::Url)?;
-                if !matches!(endpoint.scheme(), "http" | "https") {
+                if !endpoint_ok(&endpoint) {
                     return Err(ConfigError::Url);
                 }
                 Ok(Some(Self {
@@ -122,6 +125,29 @@ impl Config {
             _ => Err(ConfigError::Half),
         }
     }
+}
+
+/// An endpoint the key may be sent to: `https`, or `http` where the traffic stays on
+/// this machine or inside the cluster (a service's absolute name, ending in
+/// `.svc.cluster.local.`); never with credentials, a query or a fragment, which
+/// `Debug` would print.
+fn endpoint_ok(url: &url::Url) -> bool {
+    let internal = match url.host() {
+        // `url` lower-cases a domain when it parses it. Only the absolute name, with its
+        // final dot: a pod resolves with `ndots:5`, so even `x.ns.svc.cluster.local`
+        // (four dots) is tried under every search domain first, the node's own among
+        // them, where a wildcard record could answer for it and take the key in clear.
+        Some(url::Host::Domain(d)) => d == "localhost" || d.ends_with(".svc.cluster.local."),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => return false,
+    };
+    let scheme = url.scheme() == "https" || (url.scheme() == "http" && internal);
+    scheme
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 /// Who asked, by the site's own sign-in.
@@ -436,6 +462,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(config.key, "k");
+    }
+
+    /// The key goes only where it cannot be read on the way.
+    #[test]
+    fn the_endpoint_is_https_or_internal() {
+        let with = |u: &str| Config::from_values(Some(u.into()), Some("k".into()));
+        for ok in [
+            "https://tracker.example/api/change-requests",
+            "http://localhost:8080/x",
+            "http://127.0.0.1/x",
+            "http://tracker.tools.svc.cluster.local.:8080/x",
+        ] {
+            assert!(with(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://tracker.example/x",
+            "http://localhost.evil.example/x",
+            "http://svc.evil.example/x",
+            "http://tracker.tools.svc:8080/x",
+            "http://tracker.tools.svc.cluster.local:8080/x",
+            "http://svc.cluster.local.evil.example/x",
+            "https://user:pw@tracker.example/x",
+            "https://tracker.example/x?token=t",
+            "https://tracker.example/x#f",
+            "ftp://tracker.example/x",
+        ] {
+            assert!(matches!(with(bad), Err(ConfigError::Url)), "{bad}");
+        }
     }
 
     #[test]
