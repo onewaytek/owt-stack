@@ -39,7 +39,9 @@ on:
         type: boolean
         default: false
       sqlx-check:
-        description: Check that .sqlx/ matches the queries (cargo sqlx prepare --check).
+        description: >-
+          Check that .sqlx/ matches the queries (cargo sqlx prepare --check), after
+          applying migrations/; each half is skipped when its directory is absent.
         type: boolean
         default: true
       audit:
@@ -57,7 +59,7 @@ on:
       container:
         description: The job container (a Rust toolchain image).
         type: string
-        default: rust:1-trixie
+        default: mirror.gcr.io/library/rust:1-trixie
       extra-env:
         description: >-
           KEY=VALUE lines added to the environment of every later step: test-only
@@ -69,9 +71,10 @@ on:
         description: >-
           The app's own gate (e.g. `just check`), run instead of the built-in fmt,
           audit, sqlx, clippy and test steps, so CI runs exactly what a developer
-          runs. just, sqlx-cli and cargo-audit are installed for it, and the database
-          is migrated first. With it set, `audit`, `sqlx-check` and `test-args` are
-          ignored: the app's gate decides those.
+          runs. just and cargo-audit are installed for it (sqlx-cli too, for an app
+          with a .sqlx/ or migrations/), and the database is migrated first. With it
+          set, `audit`, `sqlx-check` and `test-args` are ignored: the app's gate
+          decides those.
         type: string
         default: ""
       node-version-file:
@@ -93,6 +96,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   SQLX_OFFLINE: "true"
+  # sqlx-cli for the gate and the sqlx check (see "Does the app need sqlx-cli").
+  SQLX_CLI_VERSION: "0.9.0"
 
 jobs:
   rust:
@@ -108,9 +113,10 @@ jobs:
     # Docker network, so the services are at their names, not localhost. SERVICES_HOST
     # picks between the two; it, DATABASE_URL and REDIS_URL are in every step's
     # environment.
+    #
+    # Docker Hub's official images, the job container's too, through Google's mirror:
+    # the runners share an address, and Docker Hub's anonymous pull limit failed CI at it.
     container: ${{ inputs.container }}
-    # Docker Hub's official images through Google's mirror: the runners share an
-    # address, and Docker Hub's anonymous pull limit failed CI at it.
     services:
       postgres:
         image: ${{ inputs.database != '' && format('mirror.gcr.io/library/postgres:{0}-alpine', inputs.postgres-major) || '' }}
@@ -289,14 +295,48 @@ jobs:
         # Prebuilt and checksummed by the action's manifests; `fallback: none`, so a
         # tool without one fails here instead of being compiled from the shared index.
         with:
+          # templates/justfile's `setup` pins the same cargo-audit (and sqlx-cli).
           tool: just@1.58.0,cargo-audit@0.22.2
           fallback: none
       # sqlx publishes no binaries, so sqlx-cli is built: under a cargo home and a
       # target of this job's own, from crates.io afresh, never through the shared
-      # index (whose entries name a crate's checksum and download URL). Its major
-      # must match the apps' sqlx (0.9); move these together.
-      - name: Install sqlx-cli
+      # index (whose entries name a crate's checksum and download URL). The binary
+      # is kept in the GitHub cache (scoped to the repository and branch, like
+      # rust-cache's), keyed by its version and features and by the image it was
+      # built in, so it is built once per image rather than every run. It is
+      # installed only for an app with a .sqlx/ to check or migrations to apply.
+      # Its major must match the apps' sqlx (0.9); move these together, and with
+      # templates/justfile's `setup`.
+      - name: Does the app need sqlx-cli
+        id: sqlx-cli
         if: ${{ inputs.check-command != '' || (inputs.sqlx-check && inputs.database != '') }}
+        env:
+          DATABASE: ${{ inputs.database }}
+          CONTAINER: ${{ inputs.container }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d .sqlx ] || { [ -n "$DATABASE" ] && [ -d migrations ]; }; then
+            image=$( { echo "$CONTAINER"; cat /etc/os-release 2>/dev/null || true; } | sha256sum | cut -c1-12)
+            {
+              echo "needed=true"
+              echo "dir=$RUNNER_TEMP/sqlx-cli"
+              echo "key=sqlx-cli-$SQLX_CLI_VERSION-postgres-rustls-$RUNNER_OS-$RUNNER_ARCH-$image"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "no .sqlx/ to check and no migrations/ to apply: sqlx-cli is not installed"
+          fi
+      - name: Restore sqlx-cli
+        id: sqlx-cli-cache
+        if: ${{ steps.sqlx-cli.outputs.needed == 'true' }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.sqlx-cli.outputs.dir }}
+          key: ${{ steps.sqlx-cli.outputs.key }}
+      - name: Build sqlx-cli
+        if: ${{ steps.sqlx-cli.outputs.needed == 'true' && steps.sqlx-cli-cache.outputs.cache-hit != 'true' }}
+        env:
+          DIR: ${{ steps.sqlx-cli.outputs.dir }}
         shell: bash
         run: |
           set -euo pipefail
@@ -305,10 +345,24 @@ jobs:
           # sqlx-cli needs) and its .cargo/ have no say in the tool's build.
           mkdir -p "$tools" && cd "$tools"
           CARGO_HOME="$tools/home" CARGO_TARGET_DIR="$tools/target" \
-            cargo install sqlx-cli@0.9.0 --locked --no-default-features \
-            --features postgres,rustls --root "$tools"
-          rm -rf "${tools:?}/target"
-          echo "$tools/bin" >> "$GITHUB_PATH"
+            cargo install "sqlx-cli@$SQLX_CLI_VERSION" --locked --no-default-features \
+            --features postgres,rustls --root "$DIR"
+          cd / && rm -rf "${tools:?}"
+      # Saved straight away, so a gate that fails later doesn't throw the build away.
+      - name: Save sqlx-cli
+        if: ${{ steps.sqlx-cli.outputs.needed == 'true' && steps.sqlx-cli-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.sqlx-cli.outputs.dir }}
+          key: ${{ steps.sqlx-cli.outputs.key }}
+      - name: Put sqlx-cli on the PATH
+        if: ${{ steps.sqlx-cli.outputs.needed == 'true' }}
+        env:
+          DIR: ${{ steps.sqlx-cli.outputs.dir }}
+        shell: bash
+        run: |
+          "$DIR/bin/sqlx" --version
+          echo "$DIR/bin" >> "$GITHUB_PATH"
       - name: Migrate
         if: ${{ inputs.check-command != '' && inputs.database != '' }}
         # A library's tests can want a database without having migrations of their own.
@@ -334,10 +388,11 @@ jobs:
         if: ${{ inputs.check-command == '' && inputs.audit }}
         run: cargo audit --deny warnings
       - name: sqlx metadata is current
-        if: ${{ inputs.check-command == '' && inputs.sqlx-check && inputs.database != '' }}
+        if: ${{ inputs.check-command == '' && steps.sqlx-cli.outputs.needed == 'true' }}
+        shell: bash
         run: |
-          cargo sqlx migrate run
-          SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets
+          if [ -d migrations ]; then cargo sqlx migrate run; fi
+          if [ -d .sqlx ]; then SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
       - run: cargo clippy --all-targets --locked -- -D warnings
         if: ${{ inputs.check-command == '' }}
       - name: cargo test

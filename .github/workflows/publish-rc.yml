@@ -5,7 +5,10 @@ name: Publish rc
 # once the app's checks pass on that commit, this moves rc to it and starts its
 # prerelease. rc only fast-forwards: if it moved while the candidate was checked,
 # the candidate was checked against something rc no longer is, and this fails
-# rather than publish it. Promote again.
+# rather than publish it. Merging the PR onto the new rc here would publish a merge
+# nobody checked, so the retry is a fresh promotion: requeue-rc.yml re-runs the PR's
+# workflow when it finds a run that failed at the "Move rc to the candidate" step
+# (keep that name: it tells a lost race from a failed check).
 
 on:
   workflow_call:
@@ -52,7 +55,7 @@ jobs:
           git fetch --no-tags origin "+refs/heads/rc:refs/remotes/origin/rc" 2>/dev/null || true
           now=$(git rev-parse -q --verify refs/remotes/origin/rc || true)
           if [ "$now" != "$BASE" ]; then
-            echo "::error::rc moved while the candidate was checked (from ${BASE:-nothing} to ${now}); promote again"
+            echo "::error::rc moved while the candidate was checked (from ${BASE:-nothing} to ${now}); promote again (requeue-rc.yml does)"
             exit 1
           fi
           git cat-file -e "${SHA}^{commit}"

@@ -36,7 +36,10 @@ name: Promote to rc
 # conflict). With `candidate: true` the merge goes to `rc-candidate` instead, nothing
 # is released, and the outputs name it; the app runs its checks on that commit
 # (rust-ci.yml's `ref`) and publish-rc.yml then moves rc to it. The calling workflow
-# holds a concurrency group, so one candidate is checked at a time:
+# holds a concurrency group, so one candidate is checked at a time. GitHub keeps only
+# one run waiting on a group (a third cancels the waiting one), and publish-rc.yml
+# refuses a candidate when rc moved under it; requeue-rc.yml re-runs the promotions
+# those lose, and runs as a last job here and on a schedule:
 #
 #   concurrency: {group: promote-rc, cancel-in-progress: false}
 #   jobs:
