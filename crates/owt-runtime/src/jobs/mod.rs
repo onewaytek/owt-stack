@@ -14,6 +14,9 @@
 //! * **Jitter.** The first run waits a random part of the jitter, and each later run
 //!   waits the period plus a random part of it, so replicas started together do not
 //!   hit the database in lockstep.
+//! * **Boundaries.** An [`Every::aligned`] job runs at fixed times by the wall clock
+//!   instead ("at 03:00 UTC", "every Monday"): each run waits for the next boundary,
+//!   then a random part of the jitter, so replicas do not stampede it.
 //! * **Isolation.** Each run is its own task. An error or a panic in one run is logged
 //!   and counted (`failed`), and the loop goes on: one bad week must not stop the
 //!   clock for good.
@@ -30,18 +33,29 @@ pub mod lease;
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::RngExt;
 use tokio::task::JoinHandle;
 pub use tokio_util::sync::CancellationToken;
 
-/// How often a job runs.
+/// How often a job runs: once per period from when its loop starts ([`Every::new`]),
+/// or at fixed boundaries by the wall clock ([`Every::aligned`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Every {
     period: Duration,
     jitter: Duration,
+    /// Aligned: the boundaries are the UNIX epoch's multiples of the period, plus this.
+    offset: Option<Duration>,
 }
+
+/// The most an aligned schedule's default jitter is.
+const ALIGNED_JITTER: Duration = Duration::from_secs(10);
+
+/// The longest an aligned wait sleeps before it reads the wall clock again: tokio's
+/// clock is monotonic, so a wall clock stepped forward (a host resumed from suspend,
+/// a corrected clock) would otherwise be noticed only at the end of a long sleep.
+const ALIGNED_NAP: Duration = Duration::from_secs(60);
 
 impl Every {
     /// Once per `period`, with a tenth of it as jitter. A zero period is raised to
@@ -52,6 +66,41 @@ impl Every {
         Self {
             period,
             jitter: period / 10,
+            offset: None,
+        }
+    }
+
+    /// At each boundary: every instant, by the wall clock in UTC, that is a whole
+    /// number of periods after the UNIX epoch, plus `offset`; then a random part of
+    /// the jitter, a tenth of the period up to 10 seconds by default. The first run
+    /// waits for the first boundary after the loop starts, too.
+    ///
+    /// `aligned(Duration::from_secs(3600), Duration::ZERO)` runs at the top of each
+    /// hour; `aligned(DAY, 3 * HOUR)` at 03:00 UTC. The epoch (1970-01-01) was a
+    /// Thursday, so a weekly boundary on another day is that many days on:
+    /// `aligned(7 * DAY, 4 * DAY)` is each Monday at 00:00 UTC, and
+    /// `aligned(7 * DAY, 4 * DAY + 3 * HOUR)` each Monday at 03:00. Boundaries are in
+    /// UTC: a local time that follows daylight saving time is not a fixed period.
+    ///
+    /// A run that lasts past one or more boundaries is followed by the next boundary
+    /// after it ends: the missed ones are skipped, not caught up. The wall clock is
+    /// read at least every minute while waiting, so a run waits for its boundary by
+    /// the wall clock even when it is stepped. A replica runs each boundary once; a
+    /// wall clock stepped back past a boundary already run runs it again, and
+    /// replicas each wake at the same boundary (a [`Jobs::singleton`] keeps them from
+    /// overlapping, not from running one after another), so the task does the
+    /// boundary's work once by the app's own record of it, keyed by
+    /// [`Every::latest_boundary`].
+    ///
+    /// An `offset` of a period or more is taken modulo the period. A zero period is
+    /// raised to a millisecond, as in [`Every::new`].
+    #[must_use]
+    pub fn aligned(period: Duration, offset: Duration) -> Self {
+        let period = period.max(Duration::from_millis(1));
+        Self {
+            period,
+            jitter: (period / 10).min(ALIGNED_JITTER),
+            offset: Some(from_nanos(offset.as_nanos() % period.as_nanos())),
         }
     }
 
@@ -68,12 +117,69 @@ impl Every {
         self.period
     }
 
+    /// The offset of an aligned schedule's boundaries (less than the period); `None`
+    /// for one from [`Every::new`].
+    #[must_use]
+    pub fn offset(&self) -> Option<Duration> {
+        self.offset
+    }
+
+    /// The latest boundary at or before `now`: the one a run that starts at `now`
+    /// was woken for, as the key of its work (the week it closes, say). `None` for a
+    /// schedule from [`Every::new`], or before the first boundary after the epoch.
+    #[must_use]
+    pub fn latest_boundary(&self, now: SystemTime) -> Option<SystemTime> {
+        let offset = self.offset?.as_nanos();
+        let since = now.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+        let period = self.period.as_nanos();
+        let after = since.checked_sub(offset)?;
+        Some(UNIX_EPOCH + from_nanos(offset + after / period * period))
+    }
+
+    /// The first boundary strictly after `now`. `None` for a schedule from
+    /// [`Every::new`].
+    fn next_boundary(&self, now: SystemTime) -> Option<SystemTime> {
+        let offset = self.offset?.as_nanos();
+        let since = now
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let period = self.period.as_nanos();
+        let next = match since.checked_sub(offset) {
+            Some(after) => offset + (after / period + 1) * period,
+            None => offset,
+        };
+        // Past what the platform's clock holds (a period of `Duration::MAX`): tens of
+        // thousands of years on, which is never.
+        Some(
+            UNIX_EPOCH
+                .checked_add(from_nanos(next))
+                .unwrap_or(UNIX_EPOCH + Duration::from_secs(1 << 40)),
+        )
+    }
+
     fn spread(&self) -> Duration {
         if self.jitter.is_zero() {
             return Duration::ZERO;
         }
         self.jitter.mul_f64(rand::rng().random_range(0.0..1.0))
     }
+}
+
+/// A count of nanoseconds as a [`Duration`] (saturating, past any real time).
+fn from_nanos(nanos: u128) -> Duration {
+    const NANOS: u128 = 1_000_000_000;
+    let secs = u64::try_from(nanos / NANOS).unwrap_or(u64::MAX);
+    Duration::new(secs, u32::try_from(nanos % NANOS).unwrap_or_default())
+}
+
+/// The wall clock, read by aligned waits; a test's clock under tokio's paused time.
+fn wall_now() -> SystemTime {
+    #[cfg(test)]
+    if let Some(now) = tests::virtual_now() {
+        return now;
+    }
+    SystemTime::now()
 }
 
 /// What one tick of a job did.
@@ -357,13 +463,29 @@ impl Jobs {
     }
 
     /// Sleep until the next tick: a random part of the jitter first (`first`), else the
-    /// period plus one. False once shutdown is requested.
+    /// period plus one; for an aligned schedule, the next boundary and then a random
+    /// part of the jitter. False once shutdown is requested.
     async fn wait(&self, every: Every, first: bool) -> bool {
+        if let Some(boundary) = every.next_boundary(wall_now()) {
+            // Slept in naps by tokio's monotonic clock, each checked against the wall
+            // clock, so the run never starts before its boundary by the wall clock.
+            while let Ok(left) = boundary.duration_since(wall_now()) {
+                if left.is_zero() || !self.sleep(left.min(ALIGNED_NAP)).await {
+                    break;
+                }
+            }
+            return self.sleep(every.spread()).await;
+        }
         let delay = if first {
             every.spread()
         } else {
             every.period.saturating_add(every.spread())
         };
+        self.sleep(delay).await
+    }
+
+    /// Sleep for `delay`. False once shutdown is requested.
+    async fn sleep(&self, delay: Duration) -> bool {
         tokio::select! {
             () = self.shutdown.cancelled() => false,
             () = tokio::time::sleep(delay) => !self.shutdown.is_cancelled(),
@@ -419,4 +541,272 @@ async fn try_lock(
         .fetch_one(&mut *conn)
         .await?;
     Ok(got.then_some(conn))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    use super::*;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+    const DAY: Duration = Duration::from_secs(86_400);
+
+    thread_local! {
+        /// The wall clock a test set: this time at this paused-clock instant.
+        static CLOCK: Cell<Option<(SystemTime, tokio::time::Instant)>> = const { Cell::new(None) };
+    }
+
+    /// The test's wall clock, moving with tokio's paused one. The tests run on a
+    /// current-thread runtime, so the jobs' tasks read the same thread's clock.
+    pub(super) fn virtual_now() -> Option<SystemTime> {
+        let (wall, at) = CLOCK.with(Cell::get)?;
+        Some(wall + at.elapsed())
+    }
+
+    /// Set the wall clock to `since` the epoch, from now on the paused clock.
+    fn set_clock(since: Duration) {
+        let wall = UNIX_EPOCH + since;
+        CLOCK.with(|c| c.set(Some((wall, tokio::time::Instant::now()))));
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn since(t: SystemTime) -> Duration {
+        t.duration_since(UNIX_EPOCH).unwrap()
+    }
+
+    /// 2026-10-12 11:00:00 UTC, a Monday.
+    const ELEVEN: u64 = 1_791_802_800;
+
+    /// The `n`th hour from 11:00, since the epoch.
+    fn hour(n: u32) -> Duration {
+        Duration::from_secs(ELEVEN) + HOUR * n
+    }
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn the_next_boundary_is_strictly_after_now() {
+        let hourly = Every::aligned(HOUR, Duration::ZERO);
+        assert_eq!(hourly.next_boundary(at(ELEVEN - 1)), Some(at(ELEVEN)));
+        assert_eq!(hourly.next_boundary(at(ELEVEN)), Some(at(ELEVEN + 3600)));
+        assert_eq!(
+            hourly.next_boundary(at(ELEVEN + 1)),
+            Some(at(ELEVEN + 3600))
+        );
+        assert_eq!(hourly.latest_boundary(at(ELEVEN)), Some(at(ELEVEN)));
+        assert_eq!(hourly.latest_boundary(at(ELEVEN + 3599)), Some(at(ELEVEN)));
+        assert_eq!(Every::new(HOUR).next_boundary(at(ELEVEN)), None);
+        assert_eq!(Every::new(HOUR).latest_boundary(at(ELEVEN)), None);
+
+        // Before the first boundary after the epoch.
+        let late = Every::aligned(DAY, 3 * HOUR);
+        assert_eq!(late.next_boundary(UNIX_EPOCH), Some(at(3 * 3600)));
+        assert_eq!(late.latest_boundary(at(3 * 3600 - 1)), None);
+        // 03:00 UTC.
+        assert_eq!(
+            late.next_boundary(at(ELEVEN)),
+            Some(at(ELEVEN - 11 * 3600 + DAY.as_secs() + 3 * 3600))
+        );
+    }
+
+    #[test]
+    fn a_boundary_past_any_clock_is_far_off_not_a_panic() {
+        let never = Every::aligned(Duration::MAX, Duration::ZERO);
+        let next = never.next_boundary(at(ELEVEN)).unwrap();
+        assert!(next > at(ELEVEN) + 1000 * 365 * DAY);
+    }
+
+    #[test]
+    fn an_offset_of_a_period_or_more_is_reduced() {
+        let a = Every::aligned(HOUR, Duration::from_secs(90 * 60));
+        assert_eq!(a.offset(), Some(Duration::from_secs(30 * 60)));
+        assert_eq!(a.next_boundary(at(ELEVEN)), Some(at(ELEVEN + 1800)));
+        assert_eq!(Every::aligned(HOUR, HOUR).offset(), Some(Duration::ZERO));
+        assert_eq!(Every::new(HOUR).offset(), None);
+        let zero = Every::aligned(Duration::ZERO, Duration::from_secs(1));
+        assert_eq!(zero.period(), Duration::from_millis(1));
+        assert_eq!(zero.offset(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn monday_is_four_days_after_the_epoch() {
+        let mondays = Every::aligned(7 * DAY, 4 * DAY);
+        // Wednesday 2026-10-14 12:00 UTC to Monday 2026-10-19 00:00 UTC.
+        assert_eq!(
+            mondays.next_boundary(at(1_791_979_200)),
+            Some(at(1_792_368_000))
+        );
+        assert_eq!(
+            mondays.latest_boundary(at(1_791_979_200)),
+            Some(at(1_792_368_000 - 7 * 86_400))
+        );
+        // From the boundary itself, the next Monday.
+        assert_eq!(
+            mondays.next_boundary(at(1_792_368_000)),
+            Some(at(1_792_368_000 + 7 * 86_400))
+        );
+    }
+
+    #[test]
+    fn the_default_jitter_is_small_for_an_aligned_schedule() {
+        assert_eq!(
+            Every::aligned(7 * DAY, Duration::ZERO).jitter,
+            ALIGNED_JITTER
+        );
+        assert_eq!(
+            Every::aligned(Duration::from_secs(10), Duration::ZERO).jitter,
+            Duration::from_secs(1)
+        );
+    }
+
+    /// Run the paused clock forward until `done` holds (or a day of virtual time).
+    async fn until(done: impl Fn() -> bool) {
+        for _ in 0..1440 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+        panic!("condition never held");
+    }
+
+    /// The wall times at which each run started.
+    type Starts = Arc<Mutex<Vec<Duration>>>;
+
+    /// A task that records when each run starts, and those times.
+    fn recorder() -> (
+        Starts,
+        impl Fn() -> std::future::Ready<anyhow::Result<()>> + Send + Sync + 'static,
+    ) {
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let s = starts.clone();
+        let task = move || {
+            s.lock().unwrap().push(since(wall_now()));
+            std::future::ready(Ok(()))
+        };
+        (starts, task)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_aligned_job_runs_at_each_boundary_and_not_before() {
+        set_clock(hour(0).saturating_sub(500 * MS));
+        let jobs = Jobs::new(CancellationToken::new());
+        let (starts, task) = recorder();
+        jobs.every_replica(
+            "hourly",
+            Every::aligned(HOUR, Duration::ZERO).jitter(Duration::ZERO),
+            task,
+        );
+        until(|| starts.lock().unwrap().len() >= 3).await;
+        jobs.shutdown().cancel();
+        jobs.stopped().await;
+        let starts = starts.lock().unwrap();
+        for (n, &t) in (0..).zip(starts.iter().take(3)) {
+            let boundary = hour(n);
+            assert!(
+                (boundary..boundary + 10 * MS).contains(&t),
+                "run {n} at {t:?}, boundary {boundary:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn jitter_comes_after_the_boundary() {
+        set_clock(hour(0).saturating_sub(10_000 * MS));
+        let jobs = Jobs::new(CancellationToken::new());
+        let (starts, task) = recorder();
+        jobs.every_replica(
+            "hourly",
+            Every::aligned(HOUR, Duration::ZERO).jitter(Duration::from_secs(30)),
+            task,
+        );
+        until(|| starts.lock().unwrap().len() >= 4).await;
+        jobs.shutdown().cancel();
+        jobs.stopped().await;
+        for (n, &t) in (0..).zip(starts.lock().unwrap().iter().take(4)) {
+            let boundary = hour(n);
+            assert!(
+                (boundary..boundary + 30_000 * MS).contains(&t),
+                "run {n} at {t:?}, boundary {boundary:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_past_boundaries_skips_them() {
+        set_clock(hour(0).saturating_sub(1000 * MS));
+        let jobs = Jobs::new(CancellationToken::new());
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let s = starts.clone();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let r = runs.clone();
+        jobs.every_replica(
+            "slow",
+            Every::aligned(HOUR, Duration::ZERO).jitter(Duration::ZERO),
+            move || {
+                s.lock().unwrap().push(since(wall_now()));
+                let first = r.fetch_add(1, SeqCst) == 0;
+                async move {
+                    if first {
+                        // Past 12:00 and 13:00, to 13:30.
+                        tokio::time::sleep(Duration::from_secs(150 * 60)).await;
+                    }
+                    Ok(())
+                }
+            },
+        );
+        until(|| runs.load(SeqCst) >= 3).await;
+        jobs.shutdown().cancel();
+        jobs.stopped().await;
+        let starts: Vec<u64> = starts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Duration::as_secs)
+            .collect();
+        assert_eq!(
+            &starts[..3],
+            [hour(0), hour(3), hour(4)].map(|h| h.as_secs())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_wall_clock_is_waited_for_even_when_tokios_runs_ahead() {
+        // The wall clock stepped back by an hour just before 11:00: the run waits for
+        // 11:00 by the wall clock, though tokio's clock passed the hour it slept for.
+        set_clock(hour(0).saturating_sub(1000 * MS));
+        let jobs = Jobs::new(CancellationToken::new());
+        let (starts, task) = recorder();
+        jobs.every_replica(
+            "hourly",
+            Every::aligned(HOUR, Duration::ZERO).jitter(Duration::ZERO),
+            task,
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        set_clock(hour(0).saturating_sub(HOUR + 500 * MS));
+        until(|| !starts.lock().unwrap().is_empty()).await;
+        jobs.shutdown().cancel();
+        jobs.stopped().await;
+        let first = starts.lock().unwrap()[0];
+        assert!(first >= hour(0), "ran at {first:?}, before its boundary");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_ends_a_long_aligned_wait() {
+        set_clock(hour(0));
+        let jobs = Jobs::new(CancellationToken::new());
+        let (starts, task) = recorder();
+        jobs.every_replica("weekly", Every::aligned(7 * DAY, 4 * DAY), task);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let asked = tokio::time::Instant::now();
+        jobs.shutdown().cancel();
+        jobs.stopped().await;
+        assert!(asked.elapsed() < Duration::from_secs(1));
+        assert!(starts.lock().unwrap().is_empty());
+    }
 }

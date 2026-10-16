@@ -528,3 +528,48 @@ async fn a_singleton_run_stops_when_its_lock_is_lost() {
     shutdown.cancel();
     jobs.stopped().await;
 }
+
+/// An aligned singleton: two replicas wake at each boundary of the wall clock, one
+/// runs at a time, and the runs land on successive boundaries.
+#[tokio::test]
+async fn an_aligned_singleton_runs_at_boundaries_one_replica_at_a_time() {
+    let Some(pool) = pool().await else { return };
+    let id = lock_id();
+    let every = Every::aligned(Duration::from_millis(300), Duration::from_millis(100))
+        .jitter(Duration::ZERO);
+    let active = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let boundaries = Arc::new(Mutex::new(Vec::new()));
+    let shutdown = CancellationToken::new();
+    let replicas: Vec<Jobs> = (0..2).map(|_| Jobs::new(shutdown.clone())).collect();
+    for jobs in &replicas {
+        let (a, m, b) = (active.clone(), most.clone(), boundaries.clone());
+        jobs.singleton("aligned", every, pool.clone(), id, move || {
+            let (a, m, b) = (a.clone(), m.clone(), b.clone());
+            async move {
+                let now = a.fetch_add(1, SeqCst) + 1;
+                m.fetch_max(now, SeqCst);
+                b.lock()
+                    .unwrap()
+                    .push(every.latest_boundary(std::time::SystemTime::now()));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                a.fetch_sub(1, SeqCst);
+                Ok(())
+            }
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    shutdown.cancel();
+    for jobs in &replicas {
+        jobs.stopped().await;
+    }
+    assert_eq!(most.load(SeqCst), 1, "two replicas ran it at once");
+    let mut seen: Vec<_> = boundaries
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|b| b.unwrap())
+        .collect();
+    seen.dedup();
+    assert!(seen.len() >= 3, "ran at {} boundaries", seen.len());
+}

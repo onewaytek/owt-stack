@@ -1388,8 +1388,9 @@ deployments' channels.
 ### Background jobs
 
 Every replica runs the same binary, so a periodic task runs everywhere unless it
-says otherwise. `owt_runtime::jobs` gives three modes, all with jitter, a loop that
-survives a failed or panicking run, and graceful shutdown:
+says otherwise. `owt_runtime::jobs` gives three modes, all with jitter, a period or
+fixed times ("At fixed times", below), a loop that survives a failed or panicking
+run, and graceful shutdown:
 
 - `every_replica`: idempotent work; the task takes its rows with `SKIP LOCKED`.
 - `singleton`: at most one replica at a time, by a Postgres advisory lock that is
@@ -1454,6 +1455,52 @@ and checks `held.is_lost()` before each owner-only step.
 
 A run's panic, in the future or in the closure that builds it, is one failed tick;
 the loop goes on.
+
+**At fixed times.** `Every::new(period)` counts the period from when the loop starts.
+`Every::aligned(period, offset)` runs at boundaries by the wall clock instead: each
+instant a whole number of periods after the UNIX epoch, plus `offset`, in UTC. Jitter
+comes after the boundary (a tenth of the period, at most 10 seconds, by default), and
+it works with all three modes. The epoch was a Thursday, so a weekly boundary on
+Monday is `aligned(7 * DAY, 4 * DAY)` (Monday 00:00 UTC), and Monday 03:00 is
+`4 * DAY + 3 * HOUR`. An offset of a period or more is taken modulo the period. A run
+that lasts past boundaries is followed by the next boundary after it ends; the missed
+ones are skipped, not run in a burst. Every replica wakes at each boundary, and a
+`singleton` keeps them from overlapping, not from running one after another, so the
+task records the boundary it did (`Every::latest_boundary`) and does nothing for one
+already done:
+
+```rust,no_run
+use std::time::{Duration, SystemTime};
+use owt_runtime::jobs::{CancellationToken, Every, Jobs};
+
+# async fn demo(pool: sqlx::PgPool) {
+const HOUR: Duration = Duration::from_secs(3600);
+const DAY: Duration = Duration::from_secs(24 * 3600);
+let jobs = Jobs::new(CancellationToken::new());
+
+// Each Monday at 03:00 UTC, once, whichever replica gets there first.
+let weekly = Every::aligned(7 * DAY, 4 * DAY + 3 * HOUR);
+let p = pool.clone();
+jobs.singleton("close_week", weekly, pool.clone(), 7_210_002, move || {
+    let p = p.clone();
+    async move {
+        let Some(week) = weekly.latest_boundary(SystemTime::now()) else { return Ok(()) };
+        let week = week.duration_since(SystemTime::UNIX_EPOCH)?.as_secs() as i64;
+        let mut tx = p.begin().await?;
+        let fresh = sqlx::query("INSERT INTO closed_weeks (starts) VALUES (to_timestamp($1)) ON CONFLICT DO NOTHING")
+            .bind(week)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected() == 1;
+        if fresh {
+            // ... close the week, in `tx`.
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+});
+# }
+```
 
 ### Front-end assets
 
