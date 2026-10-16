@@ -7,6 +7,12 @@
 //!    both: it refuses a state that is not the pending login's, or a pending login
 //!    begun with another provider, before it trades the code for a token and the token
 //!    for the [`Identity`] the provider vouches for.
+//!    [`Client::complete_with_tokens`] does the same and also hands back the
+//!    [`Tokens`], for an app that calls the provider's APIs as the person.
+//! 3. [`Client::refresh`] trades a refresh token for fresh [`Tokens`];
+//!    [`Client::client_credentials`] gets the app a token of its own.
+//!
+//! [`discover`] builds an [`oidc`] provider from its issuer's discovery document.
 //!
 //! Make the HTTP client with [`http_client`]: it gives up on a provider that stalls
 //! and follows no redirects, so the client secret goes only where it was addressed.
@@ -223,6 +229,75 @@ pub fn oidc(
     })
 }
 
+/// An [`oidc`] provider read from its issuer's discovery document, and where it
+/// signs people out.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Discovered {
+    /// The provider, held to the same rules as one [`oidc`] builds.
+    pub provider: Provider,
+    /// `end_session_endpoint` (RP-Initiated Logout), if the issuer has one.
+    pub end_session: Option<String>,
+}
+
+/// Build an [`oidc`] provider from `<issuer>/.well-known/openid-configuration`.
+///
+/// `http` is [`http_client`]: the document is fetched without following a redirect,
+/// as the endpoints it names will be. The document must be the issuer's own
+/// (`OpenID` Connect Discovery §4.3; a trailing `/` aside, as [`oidc`] drops it), and
+/// name authorization, token and user-info endpoints.
+///
+/// # Errors
+///
+/// [`Error::Http`] if the document cannot be fetched or read, [`Error::Redirected`]
+/// if it is somewhere else, and [`Error::Config`] if it names another issuer, lacks
+/// an endpoint, or names one [`oidc`] refuses (`end_session_endpoint` included).
+pub async fn discover(
+    http: &reqwest::Client,
+    id: &'static str,
+    name: &'static str,
+    issuer: &str,
+) -> Result<Discovered, Error> {
+    let issuer = issuer.trim_end_matches('/');
+    checked_url("issuer", issuer)?;
+    let url = format!("{issuer}/.well-known/openid-configuration");
+    let res = http
+        .get(&url)
+        .header("accept", "application/json")
+        .send()
+        .await?;
+    let doc: Value = not_redirected(res, &url)?
+        .error_for_status()?
+        .json()
+        .await?;
+    if doc["issuer"].as_str().map(|i| i.trim_end_matches('/')) != Some(issuer) {
+        return Err(Error::Config(format!(
+            "the discovery document at {url:?} is not {issuer:?}'s"
+        )));
+    }
+    let endpoint = |k: &str| {
+        doc[k]
+            .as_str()
+            .ok_or_else(|| Error::Config(format!("the discovery document has no {k}")))
+    };
+    let provider = oidc(
+        id,
+        name,
+        issuer,
+        endpoint("authorization_endpoint")?,
+        endpoint("token_endpoint")?,
+        endpoint("userinfo_endpoint")?,
+    )?;
+    let end_session = match doc["end_session_endpoint"].as_str() {
+        Some(u) => Some(checked_url("end_session", u)?.into()),
+        None => None,
+    };
+    Ok(Discovered {
+        provider,
+        end_session,
+    })
+}
+
 /// An absolute `https` URL (or `http` on the loopback host) with no credentials and
 /// no fragment.
 fn checked_url(what: &str, raw: &str) -> Result<url::Url, Error> {
@@ -278,6 +353,93 @@ impl Pending {
     #[must_use]
     pub fn matches(&self, state: &str) -> bool {
         bool::from(self.state.as_bytes().ct_eq(state.as_bytes()))
+    }
+}
+
+/// What a token endpoint granted. Its `Debug` leaves out every token.
+///
+/// Lifetimes are as the endpoint sent them, relative to when it answered: turn them
+/// into instants as soon as the call returns.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct Tokens {
+    /// The bearer token for the provider's APIs.
+    pub access: String,
+    /// `expires_in`, if the response gave it (see [`Tokens::access_lifetime`]).
+    pub expires_in: Option<std::time::Duration>,
+    /// A refresh token, if one was issued. A refresh may answer without one, which
+    /// means the one already held stays good (RFC 6749 §6).
+    pub refresh: Option<String>,
+    /// `refresh_expires_in` (Keycloak's), if the response gave one other than `0`;
+    /// `None` is "no schedule given", not "never".
+    pub refresh_expires_in: Option<std::time::Duration>,
+    /// The scopes granted, if the response says (RFC 6749 §5.1).
+    pub scope: Option<String>,
+    /// The ID token as sent, already held to the issuer, client and subject for an
+    /// [`oidc`] provider: for `id_token_hint` at sign-out.
+    pub id_token: Option<String>,
+}
+
+impl Tokens {
+    /// The lifetime assumed when a response gives no `expires_in`: short, so the
+    /// worst case is a refresh sooner than needed.
+    pub const ASSUMED_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// An access token alone, the other fields to be set as needed: for a test, or
+    /// a token that came from elsewhere.
+    #[must_use]
+    pub fn bearer(access: impl Into<String>) -> Self {
+        Self {
+            access: access.into(),
+            expires_in: None,
+            refresh: None,
+            refresh_expires_in: None,
+            scope: None,
+            id_token: None,
+        }
+    }
+
+    /// How long the access token lasts: `expires_in`, or [`Self::ASSUMED_LIFETIME`].
+    #[must_use]
+    pub fn access_lifetime(&self) -> std::time::Duration {
+        self.expires_in.unwrap_or(Self::ASSUMED_LIFETIME)
+    }
+
+    /// Read a token response.
+    fn read(v: &Value) -> Result<Self, Error> {
+        // A lifetime as RFC 6749 writes it (a number of seconds), or as some
+        // endpoints do (a numeric string); a negative one has already run out.
+        let secs = |k: &str| -> Option<std::time::Duration> {
+            let n = match &v[k] {
+                Value::Number(n) => n.as_i64(),
+                Value::String(s) => s.trim().parse::<i64>().ok(),
+                _ => None,
+            }?;
+            Some(std::time::Duration::from_secs(n.max(0).cast_unsigned()))
+        };
+        let access = v["access_token"]
+            .as_str()
+            .filter(|a| !a.is_empty())
+            .ok_or(Error::NoToken)?;
+        Ok(Self {
+            access: access.to_owned(),
+            expires_in: secs("expires_in"),
+            refresh: s(v, "refresh_token").filter(|r| !r.is_empty()),
+            refresh_expires_in: secs("refresh_expires_in").filter(|d| !d.is_zero()),
+            scope: s(v, "scope"),
+            id_token: s(v, "id_token"),
+        })
+    }
+}
+
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tokens")
+            .field("expires_in", &self.expires_in)
+            .field("refresh", &self.refresh.is_some())
+            .field("refresh_expires_in", &self.refresh_expires_in)
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
     }
 }
 
@@ -367,6 +529,25 @@ fn not_redirected(res: reqwest::Response, asked: &str) -> Result<reqwest::Respon
     Ok(res)
 }
 
+impl Error {
+    /// The provider answered and said no: a 4xx other than 408 or 429 (an expired,
+    /// revoked or unknown grant answers `400 invalid_grant`), or a token response
+    /// with no access token. For a refresh, that means the person signs in again; an
+    /// outage, a timeout or a throttle is not this, and the grant may still be good.
+    #[must_use]
+    pub fn is_rejected(&self) -> bool {
+        match self {
+            Self::NoToken => true,
+            Self::Http(e) => e.status().is_some_and(|s| {
+                s.is_client_error()
+                    && s != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && s != reqwest::StatusCode::TOO_MANY_REQUESTS
+            }),
+            _ => false,
+        }
+    }
+}
+
 impl Client {
     /// The URL to send the person to, and the login to remember until they return.
     pub fn begin(&self) -> Result<(String, Pending), Error> {
@@ -410,22 +591,25 @@ impl Client {
         state: &str,
         code: &str,
     ) -> Result<Identity, Error> {
+        self.complete_with_tokens(http, pending, state, code)
+            .await
+            .map(|(who, _)| who)
+    }
+
+    /// [`complete`](Self::complete), also handing back what the token endpoint
+    /// granted: for an app that calls the provider's APIs as the person. Every check
+    /// `complete` makes is made first; the tokens are only ever a signed-in person's.
+    pub async fn complete_with_tokens(
+        &self,
+        http: &reqwest::Client,
+        pending: &Pending,
+        state: &str,
+        code: &str,
+    ) -> Result<(Identity, Tokens), Error> {
         if pending.provider != self.provider.id {
             return Err(Error::Provider);
         }
-        // An OIDC provider's ID token is trusted for having come straight from its
-        // token endpoint over verified TLS: hold a provider built or changed by hand
-        // to what `oidc` checks.
-        if let Some(issuer) = &self.provider.issuer {
-            if issuer.is_empty() || issuer.ends_with('/') || !issuer.contains("://") {
-                return Err(Error::Config(format!(
-                    "the issuer {issuer:?} is not oidc()'s"
-                )));
-            }
-            checked_url("issuer", issuer)?;
-            checked_url("token", &self.provider.token_url)?;
-            checked_url("userinfo", &self.provider.userinfo_url)?;
-        }
+        self.checked_provider()?;
         if !pending.matches(state) {
             return Err(Error::State);
         }
@@ -433,28 +617,26 @@ impl Client {
             ("grant_type", "authorization_code"),
             ("code", code),
             ("redirect_uri", &self.redirect_uri),
-            ("client_id", &self.client_id),
-            ("client_secret", &self.client_secret),
         ];
         if let Some(v) = &pending.verifier {
             form.push(("code_verifier", v));
         }
-        let res = http
-            .post(&self.provider.token_url)
-            .header("accept", "application/json")
-            .form(&form)
-            .send()
-            .await?;
-        let token: Value = not_redirected(res, &self.provider.token_url)?
-            .error_for_status()?
-            .json()
-            .await?;
-        let access = token["access_token"].as_str().ok_or(Error::NoToken)?;
+        let tokens = self.token_request(http, &form).await?;
         let id_token = match &self.provider.issuer {
-            Some(issuer) => Some(self.id_token_claims(issuer, &token)?),
+            Some(issuer) => Some(
+                self.id_token_claims(
+                    issuer,
+                    tokens
+                        .id_token
+                        .as_deref()
+                        .ok_or(Error::IdToken("the token response has none"))?,
+                )?,
+            ),
             None => None,
         };
-        let mut req = http.get(&self.provider.userinfo_url).bearer_auth(access);
+        let mut req = http
+            .get(&self.provider.userinfo_url)
+            .bearer_auth(&tokens.access);
         if self.provider.client_id_header {
             req = req.header("Client-Id", &self.client_id);
         }
@@ -470,17 +652,105 @@ impl Client {
         {
             return Err(Error::IdToken("its sub is not the user-info response's"));
         }
-        Ok(identity)
+        Ok((identity, tokens))
+    }
+
+    /// Trade a refresh token for fresh [`Tokens`], for the person whose
+    /// [`Identity::uid`] is `subject`.
+    ///
+    /// An [`oidc`] provider need not send an ID token with a refresh; one it sends is
+    /// held to the issuer and this client like a sign-in's, and must be about
+    /// `subject` (OIDC Core 12.2). The answer may carry no refresh token: keep the
+    /// one held. [`Error::is_rejected`] says whether the grant is gone, so the person
+    /// signs in again, or the provider is just unavailable.
+    pub async fn refresh(
+        &self,
+        http: &reqwest::Client,
+        refresh_token: &str,
+        subject: &str,
+    ) -> Result<Tokens, Error> {
+        self.checked_provider()?;
+        let tokens = self
+            .token_request(
+                http,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token),
+                ],
+            )
+            .await?;
+        if let (Some(issuer), Some(raw)) = (&self.provider.issuer, tokens.id_token.as_deref()) {
+            let claims = self.id_token_claims(issuer, raw)?;
+            if claims["sub"].as_str() != Some(subject) {
+                return Err(Error::IdToken("its sub is not the signed-in person's"));
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// A token for the app itself (the `client_credentials` grant), with `scope`, or
+    /// the client's default scopes for `None`. There is no person, so no identity,
+    /// and an ID token in the answer is ignored.
+    pub async fn client_credentials(
+        &self,
+        http: &reqwest::Client,
+        scope: Option<&str>,
+    ) -> Result<Tokens, Error> {
+        self.checked_provider()?;
+        let mut form = vec![("grant_type", "client_credentials")];
+        if let Some(scope) = scope {
+            form.push(("scope", scope));
+        }
+        let mut tokens = self.token_request(http, &form).await?;
+        tokens.id_token = None;
+        Ok(tokens)
+    }
+
+    /// An OIDC provider's ID token is trusted for having come straight from its
+    /// token endpoint over verified TLS: hold a provider built or changed by hand to
+    /// what [`oidc`] checks, before anything is sent.
+    fn checked_provider(&self) -> Result<(), Error> {
+        if let Some(issuer) = &self.provider.issuer {
+            if issuer.is_empty() || issuer.ends_with('/') || !issuer.contains("://") {
+                return Err(Error::Config(format!(
+                    "the issuer {issuer:?} is not oidc()'s"
+                )));
+            }
+            checked_url("issuer", issuer)?;
+            checked_url("token", &self.provider.token_url)?;
+            checked_url("userinfo", &self.provider.userinfo_url)?;
+        }
+        Ok(())
+    }
+
+    /// POST `form` and this client's credentials to the token endpoint, and read
+    /// the answer.
+    async fn token_request(
+        &self,
+        http: &reqwest::Client,
+        form: &[(&str, &str)],
+    ) -> Result<Tokens, Error> {
+        let mut form = form.to_vec();
+        form.push(("client_id", &self.client_id));
+        form.push(("client_secret", &self.client_secret));
+        let res = http
+            .post(&self.provider.token_url)
+            .header("accept", "application/json")
+            .form(&form)
+            .send()
+            .await?;
+        let token: Value = not_redirected(res, &self.provider.token_url)?
+            .error_for_status()?
+            .json()
+            .await?;
+        Tokens::read(&token)
     }
 
     /// The claims of the token response's ID token, once its `iss` is `issuer`, its
     /// `aud` names this client, and it has not expired. The token came straight from
     /// the token endpoint over TLS (no redirects followed), which OIDC Core 3.1.3.7
     /// accepts in place of checking its signature.
-    fn id_token_claims(&self, issuer: &str, token: &Value) -> Result<Value, Error> {
-        let raw = token["id_token"]
-            .as_str()
-            .ok_or(Error::IdToken("the token response has none"))?;
+    fn id_token_claims(&self, issuer: &str, raw: &str) -> Result<Value, Error> {
         let mut parts = raw.split('.');
         let (Some(_), Some(payload), Some(_), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -786,7 +1056,9 @@ mod tests {
             let (c, http) = (c.clone(), http.clone());
             async move {
                 let (_, pending) = c.begin().unwrap();
-                c.complete(&http, &pending, &pending.state, "abc").await
+                c.complete_with_tokens(&http, &pending, &pending.state, "abc")
+                    .await
+                    .map(|(who, _)| who)
             }
         };
         assert_eq!(attempt(Some(jwt(&good))).await.unwrap().uid, "42");
@@ -903,5 +1175,356 @@ mod tests {
             .await;
         assert!(matches!(outcome, Err(Error::Http(e)) if e.is_timeout()));
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    async fn serve(fake: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, fake).await });
+        base
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    const ISSUER: &str = "https://sso.example/realms/x";
+
+    fn sso(base: &str) -> Client {
+        client(
+            oidc(
+                "sso",
+                "SSO",
+                ISSUER,
+                "https://sso.example/a",
+                &format!("{base}/token"),
+                &format!("{base}/userinfo"),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn id_token(sub: &str) -> Value {
+        serde_json::json!({"iss": ISSUER, "aud": "cid", "sub": sub, "exp": now() + 300})
+    }
+
+    #[tokio::test]
+    async fn complete_with_tokens_hands_back_the_token_set() {
+        let token = jwt(&id_token("42"));
+        let served = token.clone();
+        let base = serve(
+            axum::Router::new()
+                .route(
+                    "/token",
+                    post(move || {
+                        let t = served.clone();
+                        async move {
+                            Json(serde_json::json!({
+                                "access_token": "at", "expires_in": 900, "refresh_token": "rt",
+                                "refresh_expires_in": 0, "scope": "openid api", "id_token": t,
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/userinfo",
+                    get(|| async { Json(serde_json::json!({"sub": "42"})) }),
+                ),
+        )
+        .await;
+        let c = sso(&base);
+        let http = http_client().unwrap();
+        let (_, pending) = c.begin().unwrap();
+        let (who, tokens) = c
+            .complete_with_tokens(&http, &pending, &pending.state, "abc")
+            .await
+            .unwrap();
+        assert_eq!(who.uid, "42");
+        assert_eq!(tokens.access, "at");
+        assert_eq!(tokens.expires_in, Some(std::time::Duration::from_secs(900)));
+        assert_eq!(tokens.refresh.as_deref(), Some("rt"));
+        assert_eq!(tokens.refresh_expires_in, None);
+        assert_eq!(tokens.scope.as_deref(), Some("openid api"));
+        assert_eq!(tokens.id_token.as_deref(), Some(token.as_str()));
+        let (_, pending) = c.begin().unwrap();
+        let alone = c.complete(&http, &pending, &pending.state, "abc").await;
+        assert_eq!(alone.unwrap().uid, "42");
+    }
+
+    #[test]
+    fn lifetimes_are_read_as_providers_write_them() {
+        use std::time::Duration;
+        let read = |v: Value| Tokens::read(&v);
+        let t = read(serde_json::json!({"access_token": "a", "expires_in": 900})).unwrap();
+        assert_eq!(t.access_lifetime(), Duration::from_secs(900));
+        let t = read(serde_json::json!({"access_token": "a", "expires_in": "900"})).unwrap();
+        assert_eq!(t.expires_in, Some(Duration::from_secs(900)));
+        let t = read(serde_json::json!({"access_token": "a", "expires_in": -5})).unwrap();
+        assert_eq!(t.expires_in, Some(Duration::ZERO));
+        let t = read(serde_json::json!({"access_token": "a"})).unwrap();
+        assert_eq!(
+            (t.expires_in, t.access_lifetime()),
+            (None, Tokens::ASSUMED_LIFETIME)
+        );
+        assert_eq!(t.refresh, None);
+        let t = read(serde_json::json!({
+            "access_token": "a", "refresh_token": "r", "refresh_expires_in": 1800,
+        }))
+        .unwrap();
+        assert_eq!(t.refresh_expires_in, Some(Duration::from_secs(1800)));
+        let t = read(serde_json::json!({"access_token": "a", "refresh_expires_in": 0})).unwrap();
+        assert_eq!(t.refresh_expires_in, None);
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"access_token": ""}),
+            serde_json::json!({"access_token": 7}),
+        ] {
+            assert!(matches!(read(bad), Err(Error::NoToken)));
+        }
+    }
+
+    /// The refresh grant: what it sends, and an ID token in the answer held to the
+    /// issuer, this client, and the person it was asked for.
+    #[tokio::test]
+    async fn refresh_trades_the_refresh_token_for_the_same_person() {
+        use std::sync::{Arc, Mutex};
+        let answer: Arc<Mutex<Value>> = Arc::default();
+        let served = answer.clone();
+        let base = serve(axum::Router::new().route(
+            "/token",
+            post(move |body: String| {
+                let a = served.lock().unwrap().clone();
+                async move {
+                    assert!(
+                        body.contains("grant_type=refresh_token")
+                            && body.contains("refresh_token=rt")
+                            && body.contains("client_id=cid")
+                            && body.contains("client_secret=s"),
+                        "{body}"
+                    );
+                    Json(a)
+                }
+            }),
+        ))
+        .await;
+        let c = sso(&base);
+        let http = http_client().unwrap();
+        let refresh = |v: Value| {
+            *answer.lock().unwrap() = v;
+            let (c, http) = (c.clone(), http.clone());
+            async move { c.refresh(&http, "rt", "42").await }
+        };
+        let t = refresh(serde_json::json!({"access_token": "at2"}))
+            .await
+            .unwrap();
+        assert_eq!((t.access.as_str(), t.refresh), ("at2", None));
+        let t = refresh(serde_json::json!({
+            "access_token": "at3", "refresh_token": "rt2", "id_token": jwt(&id_token("42")),
+        }))
+        .await
+        .unwrap();
+        assert_eq!(t.refresh.as_deref(), Some("rt2"));
+        let mut expired = id_token("42");
+        expired["exp"] = (now() - 3600).into();
+        let mut elsewhere = id_token("42");
+        elsewhere["iss"] = "https://evil.example".into();
+        let mut other_client = id_token("42");
+        other_client["aud"] = "other".into();
+        for bad in [id_token("43"), expired, elsewhere, other_client] {
+            let outcome = refresh(serde_json::json!({"access_token": "a", "id_token": jwt(&bad)}));
+            assert!(matches!(outcome.await, Err(Error::IdToken(_))), "{bad}");
+        }
+        // A preset has no issuer to hold an ID token to, and ignores one.
+        let preset = client(Provider {
+            token_url: format!("{base}/token"),
+            ..google()
+        });
+        *answer.lock().unwrap() =
+            serde_json::json!({"access_token": "a", "id_token": jwt(&id_token("43"))});
+        assert!(preset.refresh(&http, "rt", "42").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn client_credentials_sends_its_scope_and_wants_no_person() {
+        let base = serve(axum::Router::new().route(
+            "/token",
+            post(|body: String| async move {
+                assert!(body.contains("grant_type=client_credentials"), "{body}");
+                let scope = body.contains("scope=");
+                Json(serde_json::json!({
+                    "access_token": if scope { "scoped" } else { "default" },
+                    "id_token": "not-even-a-jwt",
+                }))
+            }),
+        ))
+        .await;
+        let c = sso(&base);
+        let http = http_client().unwrap();
+        let t = c.client_credentials(&http, Some("api")).await.unwrap();
+        assert_eq!((t.access.as_str(), t.id_token), ("scoped", None));
+        let t = c.client_credentials(&http, None).await.unwrap();
+        assert_eq!(t.access, "default");
+    }
+
+    /// The other grants are held to what a sign-in is: no redirect, and no provider
+    /// built by hand that `oidc` would refuse.
+    #[tokio::test]
+    async fn the_other_grants_follow_no_redirect_and_need_a_sound_provider() {
+        let base = serve(axum::Router::new().route(
+            "/token",
+            post(|| async { axum::response::Redirect::temporary("/elsewhere") }),
+        ))
+        .await;
+        let c = sso(&base);
+        let http = http_client().unwrap();
+        assert!(matches!(
+            c.refresh(&http, "rt", "42").await,
+            Err(Error::Redirected)
+        ));
+        assert!(matches!(
+            c.client_credentials(&http, None).await,
+            Err(Error::Redirected)
+        ));
+        let hand_built = client(Provider {
+            issuer: Some("https://sso.example/x".into()),
+            token_url: "http://sso.example/t".into(),
+            ..google()
+        });
+        assert!(matches!(
+            hand_built.refresh(&http, "rt", "42").await,
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            hand_built.client_credentials(&http, None).await,
+            Err(Error::Config(_))
+        ));
+    }
+
+    /// A refused grant is told apart from a provider that is merely unavailable, so
+    /// an app drops a refresh token only when it is really gone.
+    #[tokio::test]
+    async fn a_refused_grant_is_rejected_and_an_outage_is_not() {
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        let base = serve(axum::Router::new().route(
+            "/{status}/token",
+            post(|Path(status): Path<u16>| async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    Json(serde_json::json!({"error": "invalid_grant"})),
+                )
+            }),
+        ))
+        .await;
+        let http = http_client().unwrap();
+        for (status, rejected) in [
+            (400, true),
+            (401, true),
+            (403, true),
+            (408, false),
+            (429, false),
+            (500, false),
+            (503, false),
+        ] {
+            let c = client(Provider {
+                token_url: format!("{base}/{status}/token"),
+                ..google()
+            });
+            let e = c.refresh(&http, "rt", "42").await.unwrap_err();
+            assert_eq!(e.is_rejected(), rejected, "{status}: {e}");
+        }
+        assert!(Error::NoToken.is_rejected());
+        assert!(!Error::Redirected.is_rejected());
+    }
+
+    #[test]
+    fn tokens_debug_output_keeps_every_token() {
+        let mut t = Tokens::bearer("access-secret");
+        t.refresh = Some("refresh-secret".into());
+        t.id_token = Some("id-secret".into());
+        let shown = format!("{t:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("refresh: true"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn discover_reads_the_issuers_own_document() {
+        use std::sync::{Arc, Mutex};
+        let doc: Arc<Mutex<Value>> = Arc::default();
+        let served = doc.clone();
+        let base = serve(
+            axum::Router::new()
+                .route(
+                    "/realms/x/.well-known/openid-configuration",
+                    get(move || {
+                        let d = served.lock().unwrap().clone();
+                        async move { Json(d) }
+                    }),
+                )
+                .route(
+                    "/moved/.well-known/openid-configuration",
+                    get(|| async {
+                        axum::response::Redirect::temporary(
+                            "/realms/x/.well-known/openid-configuration",
+                        )
+                    }),
+                ),
+        )
+        .await;
+        let issuer = format!("{base}/realms/x");
+        let good = serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/auth"),
+            "token_endpoint": format!("{issuer}/token"),
+            "userinfo_endpoint": format!("{issuer}/userinfo"),
+            "end_session_endpoint": format!("{issuer}/logout"),
+        });
+        let http = http_client().unwrap();
+        let find = |d: Value, at: String| {
+            *doc.lock().unwrap() = d;
+            let http = http.clone();
+            async move { discover(&http, "sso", "SSO", &at).await }
+        };
+        let found = find(good.clone(), format!("{issuer}/")).await.unwrap();
+        assert_eq!(found.provider.key(), issuer);
+        assert_eq!(found.provider.token_url, format!("{issuer}/token"));
+        assert_eq!(found.end_session, Some(format!("{issuer}/logout")));
+        let mut none = good.clone();
+        none.as_object_mut().unwrap().remove("end_session_endpoint");
+        assert_eq!(find(none, issuer.clone()).await.unwrap().end_session, None);
+        let mut slash = good.clone();
+        slash["issuer"] = format!("{issuer}/").into();
+        assert!(find(slash, issuer.clone()).await.is_ok());
+        for (field, value) in [
+            ("issuer", serde_json::json!("https://evil.example/realms/x")),
+            ("issuer", Value::Null),
+            ("token_endpoint", Value::Null),
+            (
+                "token_endpoint",
+                serde_json::json!("http://sso.example/token"),
+            ),
+            (
+                "end_session_endpoint",
+                serde_json::json!("http://sso.example/out"),
+            ),
+        ] {
+            let mut bad = good.clone();
+            bad[field] = value.clone();
+            assert!(
+                matches!(find(bad, issuer.clone()).await, Err(Error::Config(_))),
+                "{field} = {value}"
+            );
+        }
+        assert!(matches!(
+            find(good.clone(), format!("{base}/moved")).await,
+            Err(Error::Redirected)
+        ));
+        assert!(matches!(
+            find(good, "http://sso.example/realms/x".into()).await,
+            Err(Error::Config(_))
+        ));
     }
 }

@@ -149,6 +149,10 @@ proptest! {
         let elsewhere = Pending { provider: "discord".into(), ..pending.clone() };
         let outcome = runtime().block_on(client.complete(&http, &elsewhere, &pending.state, &code));
         prop_assert!(matches!(outcome, Err(oauth::Error::Provider)));
+        let outcome = runtime().block_on(client.complete_with_tokens(&http, &pending, &state, &code));
+        prop_assert!(matches!(outcome, Err(oauth::Error::State)));
+        let outcome = runtime().block_on(client.complete_with_tokens(&http, &elsewhere, &pending.state, &code));
+        prop_assert!(matches!(outcome, Err(oauth::Error::Provider)));
     }
 
     /// Every sign-in begun carries a fresh state and, with PKCE, a challenge that is
