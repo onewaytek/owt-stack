@@ -59,7 +59,7 @@ pub const PER_PAGE: usize = 50;
 /// `{{ page.body }}`: HTML the admin escaped already, so an Askama layout does not
 /// escape it again.
 #[derive(Clone, Debug)]
-pub struct Body(String);
+pub struct Body(pub(crate) String);
 
 impl fmt::Display for Body {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -789,7 +789,7 @@ async fn detail(
 /// and [`CrossOrigin`] treat as the site itself, a click would act with staff's
 /// authority. No `Content-Security-Policy` of its own: the app's `Csp` layer adds its
 /// policy only to a response that has none, so one here would replace it.
-async fn never_framed(mut response: Response) -> Response {
+pub(crate) async fn never_framed(mut response: Response) -> Response {
     response.headers_mut().insert(
         axum::http::header::X_FRAME_OPTIONS,
         axum::http::HeaderValue::from_static("DENY"),
@@ -1046,6 +1046,10 @@ mod tests {
             include_str!("../templates/admin/list.html"),
             include_str!("../templates/admin/new.html"),
             include_str!("../templates/admin/detail.html"),
+            include_str!("../templates/policies/document.html"),
+            include_str!("../templates/policies/agree.html"),
+            include_str!("../templates/policies/admin_list.html"),
+            include_str!("../templates/policies/admin_form.html"),
         ];
         for t in templates {
             for attr in t.split("class=\"").skip(1) {

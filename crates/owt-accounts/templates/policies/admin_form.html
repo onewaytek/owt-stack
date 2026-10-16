@@ -1,0 +1,43 @@
+<section class="owt-admin">
+<header class="owt-admin-head">
+<h1>{{ label }}: {% if let Some(n) = doc.version %}version {{ n }}{% else %}draft{% endif %}</h1>
+<a href="{{ base }}">All policies</a>
+</header>
+{% if let Some(n) = notice %}{% if n.error %}<div class="owt-alert owt-alert-error" role="alert">{{ n.text }}</div>
+{% else %}<div class="owt-alert owt-alert-success" role="status">{{ n.text }}</div>
+{% endif %}{% endif %}{% for e in errors %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endfor %}{% if let Some(n) = doc.version %}<dl class="owt-facts">
+<dt>Published (UTC)</dt><dd>{% if let Some(at) = doc.published_at %}{{ at }}{% endif %}</dd>
+<dt>Last updated</dt><dd>{{ doc.effective_date }}</dd>
+<dt>What changed</dt><dd>{% if doc.summary.is_empty() %}<span class="owt-hint">nothing said</span>{% else %}{{ doc.summary }}{% endif %}</dd>
+<dt>Held by</dt><dd>{{ holders }} {% if holders == 1 %}account{% else %}accounts{% endif %}</dd>
+<dt>SHA-256</dt><dd><code class="owt-secret-value">{% if let Some(h) = doc.content_sha256 %}{{ h }}{% endif %}</code></dd>
+<dt>Public page</dt><dd><a href="/{{ doc.kind }}/v/{{ n }}">/{{ doc.kind }}/v/{{ n }}</a></dd>
+</dl>
+<p class="owt-hint">A published version cannot be changed. Start a new draft from the list instead.</p>
+{% else %}<form class="owt-form" method="post" action="{{ base }}/{{ doc.id }}">
+{{ title }}
+{{ effective_date }}
+<div class="owt-field">
+<label class="owt-label" for="summary">What changed</label>
+<textarea class="owt-input" id="summary" name="summary" rows="2" aria-describedby="summary-hint">{{ doc.summary }}</textarea>
+<p class="owt-hint" id="summary-hint">Shown to people asked to agree again. Needed to publish, unless this is the first version.</p>
+</div>
+<div class="owt-field">
+<label class="owt-label" for="body_markdown">Text</label>
+<textarea class="owt-input owt-code" id="body_markdown" name="body_markdown" rows="24" aria-describedby="body_markdown-hint">{{ doc.body_markdown }}</textarea>
+<p class="owt-hint" id="body_markdown-hint">Markdown. HTML in it is shown as text.</p>
+</div>
+<div class="owt-actions"><button class="owt-button" type="submit">Save draft</button></div>
+</form>
+<div class="owt-actions">
+<form method="post" action="{{ base }}/{{ doc.id }}/publish"><button class="owt-button owt-button-secondary" type="submit">Publish the saved draft</button></form>
+<form method="post" action="{{ base }}/{{ doc.id }}/delete"><button class="owt-button owt-button-danger" type="submit">Delete draft</button></form>
+</div>
+<p class="owt-hint">Publishing numbers the saved text, fixes it for good, and asks everyone signed in to agree to it.</p>
+{% endif %}<section class="owt-section">
+<h2>{% if doc.version.is_some() %}Text{% else %}Preview of the saved draft{% endif %}</h2>
+<div class="owt-prose">
+{{ preview }}</div>
+</section>
+</section>

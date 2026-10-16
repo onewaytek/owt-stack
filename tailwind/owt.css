@@ -267,4 +267,40 @@
   .owt-admin-head {
     @apply flex flex-wrap items-baseline justify-between gap-2;
   }
+  .owt-code {
+    @apply font-mono;
+  }
+  /* A site policy's page (owt_accounts::policies), and the text a page renders from
+     Markdown: headings, lists, links and tables with no class of their own. */
+  .owt-document {
+    @apply flex max-w-3xl flex-col gap-4 text-owt-ink;
+  }
+  .owt-document h1 {
+    @apply text-2xl font-semibold;
+  }
+  .owt-prose {
+    @apply flex flex-col gap-3 leading-relaxed;
+  }
+  .owt-prose h2 {
+    @apply mt-4 text-xl font-semibold;
+  }
+  .owt-prose h3 {
+    @apply mt-2 font-semibold;
+  }
+  .owt-prose ul {
+    @apply list-disc pl-6;
+  }
+  .owt-prose ol {
+    @apply list-decimal pl-6;
+  }
+  .owt-prose a {
+    @apply text-owt-accent underline;
+  }
+  .owt-prose table {
+    @apply w-full border-collapse text-left text-sm;
+  }
+  .owt-prose th,
+  .owt-prose td {
+    @apply border-b border-owt-line py-2 pr-3 align-top;
+  }
 }

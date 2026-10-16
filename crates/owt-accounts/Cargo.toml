@@ -1,6 +1,6 @@
 [package]
 name = "owt-accounts"
-description = "Accounts and sign-in flows the onewaytek apps share: the accounts table and its migration, credentials with a decoy check and rehash, sessions revoked by epoch, the signed-in extractors, linked provider identities, one-time sign-in links, roles, the staff accounts admin, and sign-in with a provider."
+description = "Accounts and sign-in flows the onewaytek apps share: the accounts table and its migration, credentials with a decoy check and rehash, sessions revoked by epoch, the signed-in extractors, linked provider identities, one-time sign-in links, roles, the staff accounts admin, sign-in with a provider, and which version of each site policy an account accepted."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,7 @@ axum = { workspace = true, features = ["tokio", "http1", "form", "query", "origi
 base64.workspace = true
 owt-auth.workspace = true
 owt-web.workspace = true
+pulldown-cmark.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

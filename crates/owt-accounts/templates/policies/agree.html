@@ -1,0 +1,19 @@
+<section class="owt-document">
+<header>
+<h1>{% if self.first_time() %}Before you continue{% else %}We have updated our policies{% endif %}</h1>
+<p>Please read {% if docs.len() == 1 %}this{% else %}these{% endif %} and agree to continue.</p>
+</header>
+{% if let Some(e) = error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endif %}{% for d in docs %}{% let v = d.version %}<section class="owt-section">
+<h2><a href="/{{ v.kind }}" target="_blank" rel="noopener">{{ v.title }}</a></h2>
+<p class="owt-hint">Version {{ v.number() }}, last updated {{ v.effective_date }}</p>
+{% if let Some(previous) = d.previous %}<p>You last agreed to <a href="/{{ v.kind }}/v/{{ previous }}" target="_blank" rel="noopener">version {{ previous }}</a>.</p>
+{% if !v.summary.is_empty() %}<p><strong>What changed:</strong> {{ v.summary }}</p>
+{% endif %}{% endif %}</section>
+{% endfor %}<form class="owt-form" method="post" action="{{ action }}">
+<input type="hidden" name="next" value="{{ next }}">
+{% for d in docs %}<input type="hidden" name="version" value="{{ d.version.id }}">
+{% endfor %}<label class="owt-check"><input type="checkbox" name="agree" value="yes" required><span>{{ agreement }}</span></label>
+<div class="owt-actions"><button class="owt-button" type="submit">Agree and continue</button></div>
+</form>
+</section>

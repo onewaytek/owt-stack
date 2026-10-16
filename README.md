@@ -485,7 +485,8 @@ links are minted).
 
 **Tables:** write each of `owt_accounts::migrations::ALL`, in order, to the app's
 `migrations/`. A new app writes them first (`0001_owt_accounts.sql`,
-`0002_owt_accounts_roles.sql`, `0003_owt_accounts_constraints.sql`), since its
+`0002_owt_accounts_roles.sql`, `0003_owt_accounts_constraints.sql`,
+`0004_owt_accounts_policies.sql`), since its
 tables reference `accounts(id)`. An app that has migrations of its own gives a newly
 released entry its next unused version (`0007_owt_accounts_roles.sql` after its
 `0006_…`), never a number already applied: sqlx refuses a file whose version it ran
@@ -780,6 +781,93 @@ let _app: axum::Router = axum::Router::new()
 Its markup carries only `owt-*` classes from `tailwind/owt.css` (buttons, tables,
 badges, checkboxes), so it takes the app's tokens with no CSS of the app's. A test
 here fails if a template names a class the stylesheet lacks.
+
+#### Site policies
+
+`owt_accounts::policies` tracks which version of each of the app's policies (its
+terms, its privacy notice) each account has agreed to. It asks again when one
+changes. The app declares the documents and writes their text, and supplies its
+layout as for the admin. The tables come from `0004_owt_accounts_policies.sql`
+(above), and they start empty.
+
+- **Versions:** staff write a draft, preview it and publish it. Publishing numbers
+  it (1, 2, 3… per document), fixes its text for good (a trigger refuses any change)
+  and records the SHA-256 of that text. A document with no published version is
+  not asked for.
+- **The gate:** a signed-in account that has not accepted the current version of
+  each document is sent to the page that asks (`/agree?next=…`) before any other
+  page. This includes an account just made through a provider, and someone already
+  signed in when a new version is published. Only full page loads are sent (a `GET`
+  that is not htmx's and accepts HTML), so a socket, a stream or a fragment is never
+  interrupted. If the database can't say, the request goes through. The gate reads
+  the account loaded for the request and caches nothing in the session, so a second
+  person signing in on the same browser is asked for themselves.
+- **The page that asks** shows only what is outstanding. For a document agreed to
+  before, it shows the version agreed to and what changed (the draft's summary,
+  required to publish any version after the first). It records exactly the versions
+  it showed: if one is published while the person reads, they are asked again.
+- **What is kept:** each account's latest acceptance per document, and an
+  append-only record of every acceptance (version, hash, time, address, browser).
+  An older version stays on record (at `/{slug}/v/{n}`) while it is somebody's
+  latest acceptance. `policies::prune` removes the rest; run it on a schedule, or
+  from the staff pages.
+- **Where:** each document at `/{slug}`, the page that asks at `/agree`
+  (`agree_at`), and the staff pages wherever `admin` puts them. They carry only
+  `owt-*` classes and refuse a cross-origin `POST` themselves.
+
+```rust,no_run
+# fn demo(pool: sqlx::PgPool, accounts: owt_accounts::Accounts) {
+use askama::Template;
+use axum::middleware::from_fn_with_state;
+use axum::response::{Html, IntoResponse};
+use owt_accounts::policies::{self, Document, Page, Policies};
+
+#[derive(Template)]
+#[template(source = "<!doctype html><title>{{ title }}</title><main>{{ body }}</main>", ext = "html")]
+struct Shell<'a> { title: &'a str, body: owt_accounts::admin::Body }
+let chrome = |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
+    let html = Shell { title: page.title, body: page.body }.render().map_err(|e| owt_web::Error::Internal(e.into()))?;
+    Ok(Html(html).into_response())
+};
+// `TERMS` is at /terms and `PRIVACY` at /privacy; an app may declare others.
+let cookies = Document::new("cookies", "Cookie Policy");
+let policies = Policies::new(pool, chrome, &[policies::TERMS, policies::PRIVACY, cookies])
+    .admin("/staff/policies") // staff only
+    .agreement("I have read and agree to these, and I am at least 13 years old.")
+    .exempt(&["/static/", "/ws/"]) // never sent to the page that asks
+    .client_ip(owt_web::client_ip::Source::ForwardedFor { proxies: 1 }); // the address recorded
+let _app: axum::Router = axum::Router::new()
+    .merge(policies.routes())
+    // Inside the accounts layer, which loads the account the gate reads.
+    .layer(from_fn_with_state(policies, Policies::gate))
+    .layer(from_fn_with_state(accounts, owt_accounts::Accounts::load::<owt_accounts::session::Data>));
+# }
+```
+
+The first versions can be published from the staff pages, or in code (a one-off
+command, a seed) with the same functions the staff pages use. `accept` records an
+acceptance outside the page that asks, for a seeded account for example:
+
+```rust,no_run
+# async fn demo(pool: sqlx::PgPool, seeded: &[i64]) -> anyhow::Result<()> {
+use owt_accounts::policies::{self, Draft};
+let draft = policies::draft(&pool, "terms", Draft {
+    title: "Terms of Service",
+    effective_date: "2026-10-16",
+    summary: "",
+    body_markdown: "## Using the site\n\n…",
+}, None).await?;
+let v1 = policies::publish(&pool, draft.id).await?.expect("a draft with text");
+for &id in seeded {
+    policies::accept(&pool, id, &[v1.id], None, Some("seed")).await?;
+}
+let removed = policies::prune(&pool).await?; // nightly: versions nobody holds
+# let _ = removed; Ok(()) }
+```
+
+Each replica keeps the current versions for 30 seconds (`refresh`). A version
+published from the staff pages is asked for at once on that replica, and on others
+within that time.
 
 ### Sign-in with a provider
 
@@ -1651,6 +1739,13 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - Start `Csp` in report-only mode and read the browser console before enforcing.
   htmx needs `htmx.config.includeIndicatorStyles = false` (or its
   `inlineStyleNonce`) and no `hx-on:*` attributes, which a nonce cannot cover.
+
+## Upgrading from 0.5
+
+- Install `owt_accounts::migrations::ALL[3]` (`owt_accounts_policies`) as the app's
+  next unused migration version (see "Tables" under "Accounts"), whether or not the
+  app uses site policies: `assert_installed` expects every entry. Its tables stay
+  empty until the app wires `policies::Policies` ("Site policies").
 
 ## Upgrading from 0.4
 
