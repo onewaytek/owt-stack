@@ -10,6 +10,10 @@
 //!
 //! Text in them is escaped as in any template; a password field never echoes its
 //! value.
+//!
+//! The few words a component writes itself are English unless the app passes its
+//! own ([`PagerWords`]); everything else they show (labels, messages, an error
+//! page's heading) is the app's text already.
 
 use askama::Template;
 use askama::filters::HtmlSafe;
@@ -221,9 +225,9 @@ pub struct Item {
 /// carry, would link to the bare fragment.
 #[derive(Template, Clone, Debug)]
 #[template(
-    source = r#"{% if pager.is_paginated() %}<nav class="owt-pager" aria-label="Pages">
-{% for item in self.items() %}{% match item.kind %}{% when Kind::Previous %}<a href="{{ item.href }}" rel="prev"><span aria-hidden="true">‹</span><span class="owt-sr">Previous page</span></a>
-{% when Kind::Next %}<a href="{{ item.href }}" rel="next"><span class="owt-sr">Next page</span><span aria-hidden="true">›</span></a>
+    source = r#"{% if pager.is_paginated() %}<nav class="owt-pager" aria-label="{{ words.nav }}">
+{% for item in self.items() %}{% match item.kind %}{% when Kind::Previous %}<a href="{{ item.href }}" rel="prev"><span aria-hidden="true">‹</span><span class="owt-sr">{{ words.previous }}</span></a>
+{% when Kind::Next %}<a href="{{ item.href }}" rel="next"><span class="owt-sr">{{ words.next }}</span><span aria-hidden="true">›</span></a>
 {% when Kind::Current %}<span class="owt-pager-current" aria-current="page">{{ item.label }}</span>
 {% when Kind::Gap %}<span class="owt-pager-gap" aria-hidden="true">…</span>
 {% when Kind::Page %}<a href="{{ item.href }}">{{ item.label }}</a>
@@ -238,18 +242,55 @@ pub struct Pagination<'a> {
     pub request: &'a RequestInfo,
     /// The query parameter that names the page; `page` for most lists.
     pub param: &'a str,
+    /// What the links are called, for assistive technology.
+    pub words: PagerWords<'a>,
 }
 impl HtmlSafe for Pagination<'_> {}
 
+/// The words [`Pagination`] writes, read by assistive technology: the row's name and
+/// the previous and next links'. English unless the app passes its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagerWords<'a> {
+    /// The `nav`'s accessible name.
+    pub nav: &'a str,
+    /// The link to the page before.
+    pub previous: &'a str,
+    /// The link to the page after.
+    pub next: &'a str,
+}
+
+impl PagerWords<'static> {
+    /// `Pages`, `Previous page`, `Next page`.
+    pub const ENGLISH: Self = Self {
+        nav: "Pages",
+        previous: "Previous page",
+        next: "Next page",
+    };
+}
+
+impl Default for PagerWords<'_> {
+    fn default() -> Self {
+        PagerWords::ENGLISH
+    }
+}
+
 impl<'a> Pagination<'a> {
-    /// Links for `pager` on `request`, with `?page=`.
+    /// Links for `pager` on `request`, with `?page=`, in English.
     #[must_use]
     pub fn new(pager: Pager, request: &'a RequestInfo) -> Self {
         Self {
             pager,
             request,
             param: "page",
+            words: PagerWords::ENGLISH,
         }
+    }
+
+    /// In the page's language.
+    #[must_use]
+    pub fn words(mut self, words: PagerWords<'a>) -> Self {
+        self.words = words;
+        self
     }
 
     /// The link to page `n`. Page 1 drops the parameter, so the first page has one
@@ -320,7 +361,8 @@ impl<'a> Pagination<'a> {
 }
 
 /// The body of an error page, for the app's shell to wrap: the status, a heading, a
-/// sentence, and a way back.
+/// sentence, and a way back. [`ErrorBody::for_status`] has English words; a page in
+/// another language sets the fields itself.
 #[derive(Template, Clone, Debug)]
 #[template(
     source = r#"<section class="owt-errorpage">
@@ -577,6 +619,29 @@ mod tests {
             .unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn pagination_speaks_the_pages_language() {
+        let request = RequestInfo::at("/items?page=2");
+        let html = Pagination::new(
+            Pager {
+                number: 2,
+                pages: 3,
+            },
+            &request,
+        )
+        .words(PagerWords {
+            nav: "Páginas",
+            previous: "Página anterior",
+            next: "Página siguiente",
+        })
+        .render()
+        .unwrap();
+        assert!(html.contains(r#"aria-label="Páginas""#), "{html}");
+        let texts: Vec<String> = links(&html).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(texts, ["‹Página anterior", "1", "3", "Página siguiente›"]);
+        assert!(!html.contains("Previous") && !html.contains("Next"));
     }
 
     #[test]

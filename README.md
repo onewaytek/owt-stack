@@ -1016,6 +1016,39 @@ let _connections = social.connections(me.id).await?; // each with Remove, then "
 # Ok(()) }
 ```
 
+A page in another language passes the words: `{provider}` stands for the provider's
+name. `outcome` is English; such an app shows each of `social::CODES` in its own words,
+and a test of its own can check it has them all.
+
+```rust,no_run
+# async fn demo(social: owt_accounts::social::SocialSignIn, me: owt_accounts::Account) -> anyhow::Result<()> {
+use owt_accounts::social::{ButtonWords, CODES, ConnectionWords};
+
+let _buttons = social.buttons("/es/inicio").words(ButtonWords {
+    continue_with: "Continuar con {provider}",
+    connect: "Conectar {provider}",
+});
+let _connections = social.connections(me.id).await?.words(ConnectionWords {
+    none: "Aún no hay conexiones.",
+    provider: "Proveedor",
+    account: "Cuenta allí",
+    actions: "Acciones",
+    remove: "Quitar",
+    connect: "Conectar {provider}",
+});
+
+// The app's own messages, one per code.
+fn mensaje(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "connected" => "Conectado.",
+        // …one arm per code in `CODES`
+        _ => return None,
+    })
+}
+let _missing: Vec<_> = CODES.iter().filter(|c| mensaje(c).is_none()).collect();
+# Ok(()) }
+```
+
 #### 4. Deploying
 
 - **OpenShift:** keep the credentials in a Secret and add it to the Deployment's
@@ -1334,6 +1367,39 @@ assert!(html.contains(r#"href="/people""#)); // page 1 has one URL, not `/people
 // The body of a 404 or 500, for the app's error shell (see `error_pages`).
 let body = ErrorBody::for_status(axum::http::StatusCode::NOT_FOUND).render()?;
 assert!(body.contains("<h1>Page not found</h1>"));
+# Ok(()) }
+```
+
+**In another language**, the app passes the words. A label, a hint, a message and an
+error page's heading are the app's text already; what a component writes itself has
+English defaults the app replaces: `Pagination::words` (`PagerWords`, read by screen
+readers), and for sign-in with a provider `Buttons::words` and `Connections::words`
+(see "Sign-in with a provider" above). `ErrorBody::for_status` is English: a page in
+another language fills the fields itself.
+
+```rust
+# fn main() -> askama::Result<()> {
+use askama::Template;
+use owt_web::pager::Pager;
+use owt_web::request::RequestInfo;
+use owt_web::ui::{ErrorBody, PagerWords, Pagination};
+
+let request = RequestInfo::at("/es/people?page=2");
+let pages = Pagination::new(Pager { number: 2, pages: 7 }, &request).words(PagerWords {
+    nav: "Páginas",
+    previous: "Página anterior",
+    next: "Página siguiente",
+});
+assert!(pages.render()?.contains("Página siguiente"));
+
+let body = ErrorBody {
+    title: "Página no encontrada",
+    detail: "No hay nada en esta dirección.",
+    home: "/es",
+    home_label: "Volver al inicio",
+    ..ErrorBody::for_status(axum::http::StatusCode::NOT_FOUND)
+};
+assert!(body.render()?.contains("<h1>Página no encontrada</h1>"));
 # Ok(()) }
 ```
 
