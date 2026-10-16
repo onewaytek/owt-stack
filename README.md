@@ -1303,6 +1303,39 @@ assert!(body.contains("<h1>Page not found</h1>"));
 # Ok(()) }
 ```
 
+**In another language**, the app passes the words. A label, a hint, a message and an
+error page's heading are the app's text already; what a component writes itself has
+English defaults the app replaces: `Pagination::words` (`PagerWords`, read by screen
+readers), and for sign-in with a provider `Buttons::words` and `Connections::words`
+(below). `ErrorBody::for_status` is English: a page in another language fills the
+fields itself.
+
+```rust
+# fn main() -> askama::Result<()> {
+use askama::Template;
+use owt_web::pager::Pager;
+use owt_web::request::RequestInfo;
+use owt_web::ui::{ErrorBody, PagerWords, Pagination};
+
+let request = RequestInfo::at("/es/people?page=2");
+let pages = Pagination::new(Pager { number: 2, pages: 7 }, &request).words(PagerWords {
+    nav: "Páginas",
+    previous: "Página anterior",
+    next: "Página siguiente",
+});
+assert!(pages.render()?.contains("Página siguiente"));
+
+let body = ErrorBody {
+    title: "Página no encontrada",
+    detail: "No hay nada en esta dirección.",
+    home: "/es",
+    home_label: "Volver al inicio",
+    ..ErrorBody::for_status(axum::http::StatusCode::NOT_FOUND)
+};
+assert!(body.render()?.contains("<h1>Página no encontrada</h1>"));
+# Ok(()) }
+```
+
 An app with a look of its own sets the tokens once. A dark theme is the same tokens
 again under a media query or a class: `@theme` emits them as custom properties on
 `:root`, and the components read the properties, so whatever redeclares them nearer
