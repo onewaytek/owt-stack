@@ -144,6 +144,11 @@ objects:
                 - {name: metrics, containerPort: 9464}
               env:
                 - {name: BIND_ADDR, value: "0.0.0.0:${PORT}"}
+                # The namespace, for `session::key_for`'s purpose: a secret copied to
+                # another environment is then another key there.
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef: {fieldPath: metadata.namespace}
                 # CNPG-minted; points at <name>-db-rw, so it follows a switchover and
                 # the password rotates without an edit here.
                 - name: DATABASE_URL

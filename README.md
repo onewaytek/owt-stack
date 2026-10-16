@@ -1684,6 +1684,25 @@ The router example under "Wiring an app" composes the layers; beyond it:
   needs real bytes.
 - `RequestInfo::at` always yields a path starting with `/`.
 
+### Authentication
+
+- `oauth::oidc` takes the issuer as its third argument (as the issuer writes its
+  `iss`: a lower-case host, no default port; a trailing `/` is dropped) and returns
+  `Result<Provider, oauth::Error>`: it refuses an issuer or endpoint that is not
+  `https` (`http` only on the loopback host). `Provider` has an `issuer` field: a
+  struct literal adds `issuer: None`, or starts from a preset with `..`.
+- `Client::complete` needs an ID token from an OIDC provider, held to its `iss`, its
+  `aud` (and `azp`) naming this client, its `exp`, and its `sub` being the
+  user-info response's; ask for the `openid` scope. A redirect from the token or
+  user-info endpoint is refused.
+- `oauth::Error` has new variants, `IdToken`, `Config` and `Redirected`; a `match`
+  on it needs arms.
+- An app with its own code exchange (to keep the person's tokens) moves to
+  `Client::complete_with_tokens`, `refresh` and `client_credentials` (see
+  "Authentication"), which make these checks; its own exchange makes none of them.
+- `password::verify_or_decoy` runs the decoy check for any stored hash it cannot
+  verify, not only a missing one; `password::usable` says which those are.
+
 ### Accounts
 
 Install `ALL[1]` (`owt_accounts_roles`) and `ALL[2]` (`owt_accounts_constraints`)
