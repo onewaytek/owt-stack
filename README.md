@@ -2079,6 +2079,19 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - Start `Csp` in report-only mode and read the browser console before enforcing.
   htmx needs `htmx.config.includeIndicatorStyles = false` (or its
   `inlineStyleNonce`) and no `hx-on:*` attributes, which a nonce cannot cover.
+  Nor can a nonce cover a `style="…"` attribute, so `Csp::new()` blocks every one,
+  even those a page writes on purpose (a progress bar's width, a colour swatch, an
+  SVG's presentation styles). Once enforced, those elements render unstyled.
+  `allow_style_attributes()` sends `style-src-attr 'unsafe-inline'`: attributes
+  only, while `<style>` elements still need the nonce. Injected markup could then
+  restyle the element it lands in, a far smaller risk than `'unsafe-inline'` on
+  `style-src`, which lets it bring a stylesheet for the whole page.
+
+  ```rust
+  use owt_web::headers::Csp;
+  // `<div class="bar" style="width: {{ percent }}%">` renders as written.
+  let _csp = Csp::new().allow_style_attributes().report_only(true);
+  ```
 
 ## Upgrading from 0.5
 
