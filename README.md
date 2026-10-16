@@ -452,11 +452,13 @@ refuse to serve while any remain:
 ```rust,no_run
 # async fn start(pool: sqlx::PgPool, sso: owt_auth::oauth::Provider) -> anyhow::Result<()> {
 use owt_accounts::identities;
-let moved = identities::rekey(&pool, "sso", &sso).await?;
+let configured = [&sso, &owt_auth::oauth::google()];
+// Refused when "sso" is still a configured provider's key, or is the issuer's.
+let moved = identities::rekey(&pool, "sso", &sso, &configured).await?;
 // A subject the new key has already: that person signed in between the deploy
 // and the rekey, and has two accounts. Which to keep is a person's decision.
 anyhow::ensure!(moved.conflicts.is_empty(), "identities to reconcile: {:?}", moved.conflicts);
-let stray = identities::unconfigured(&pool, &[&sso, &owt_auth::oauth::google()]).await?;
+let stray = identities::unconfigured(&pool, &configured).await?;
 anyhow::ensure!(stray.is_empty(), "identities under keys no provider gives: {stray:?}");
 # Ok(()) }
 ```

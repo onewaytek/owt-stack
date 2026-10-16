@@ -217,10 +217,42 @@ pub struct Rekeyed {
     pub conflicts: Vec<String>,
 }
 
+/// Why [`rekey`] refused.
+#[derive(Debug, thiserror::Error)]
+pub enum RekeyError {
+    /// `from` is `to`'s key already: there is nothing to move.
+    #[error("the identities are under {0} already")]
+    SameKey(String),
+    /// `from` is a key a configured provider still gives: its people would become the
+    /// other provider's, and a matching subject there would sign in as them.
+    #[error("{0} is still a configured provider's key")]
+    InUse(String),
+    /// The database.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 /// Move the identities stored under `from` (a key the app used to give, such as the
 /// id `sso` an OIDC provider was stored under before its issuer was its key) to
-/// `to`'s [`key`](Provider::key). Run it before serving with the new key.
-pub async fn rekey(pool: &PgPool, from: &str, to: &Provider) -> sqlx::Result<Rekeyed> {
+/// `to`'s [`key`](Provider::key). Run it before serving with the new key, naming in
+/// `configured` every provider the app now has: a `from` one of them still gives is
+/// refused.
+///
+/// # Errors
+///
+/// [`RekeyError`].
+pub async fn rekey(
+    pool: &PgPool,
+    from: &str,
+    to: &Provider,
+    configured: &[&Provider],
+) -> std::result::Result<Rekeyed, RekeyError> {
+    if from == to.key() {
+        return Err(RekeyError::SameKey(from.to_owned()));
+    }
+    if configured.iter().any(|p| p.key() == from) {
+        return Err(RekeyError::InUse(from.to_owned()));
+    }
     let mut tx = pool.begin().await?;
     let moved = sqlx::query(
         "UPDATE account_identities old SET provider = $2
@@ -233,10 +265,15 @@ pub async fn rekey(pool: &PgPool, from: &str, to: &Provider) -> sqlx::Result<Rek
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    // Only the subjects the new key holds: a row an older replica wrote under the old
+    // key meanwhile is moved by the next call (and `unconfigured` reports it).
     let conflicts = sqlx::query_scalar(
-        "SELECT subject FROM account_identities WHERE provider = $1 ORDER BY subject",
+        "SELECT old.subject FROM account_identities old
+         JOIN account_identities new ON new.provider = $2 AND new.subject = old.subject
+         WHERE old.provider = $1 ORDER BY old.subject",
     )
     .bind(from)
+    .bind(to.key())
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

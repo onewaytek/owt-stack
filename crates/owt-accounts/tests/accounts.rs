@@ -975,7 +975,18 @@ async fn identities_under_an_old_key_are_found_and_moved() {
     identities::arrive(&db.pool, &realm, &identity("s2", None, false), open)
         .await
         .unwrap();
-    let done = identities::rekey(&db.pool, "sso", &realm).await.unwrap();
+    let configured = [&realm, &oauth::google()];
+    assert!(matches!(
+        identities::rekey(&db.pool, "google", &realm, &configured).await,
+        Err(identities::RekeyError::InUse(_))
+    ));
+    assert!(matches!(
+        identities::rekey(&db.pool, realm.key(), &realm, &configured).await,
+        Err(identities::RekeyError::SameKey(_))
+    ));
+    let done = identities::rekey(&db.pool, "sso", &realm, &configured)
+        .await
+        .unwrap();
     assert_eq!(done.moved, 1);
     assert_eq!(done.conflicts, vec!["s2".to_owned()]);
     let found = identities::find(&db.pool, &realm, "s1")
