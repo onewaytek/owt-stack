@@ -7,12 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = ["jwt"]
+# `jwt`: bearer-token verification against a JWKS. It brings jsonwebtoken and, through
+# its rust_crypto backend, `rsa` (RUSTSEC-2023-0071, see .cargo/audit.toml); the rest
+# of the crate (oauth's ID-token checks included) needs neither.
+jwt = ["dep:jsonwebtoken"]
+
 [dependencies]
 anyhow.workspace = true
 argon2.workspace = true
 base64.workspace = true
 governor.workspace = true
-jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
+jsonwebtoken = { workspace = true, features = ["rust_crypto"], optional = true }
 rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true

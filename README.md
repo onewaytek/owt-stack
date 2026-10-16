@@ -59,6 +59,8 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
 `owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export,
 `redis` for leases and leased jobs.
 `owt-change`'s: `accounts` (default) for `owt_accounts::Staff` as its admin.
+`owt-auth`'s: `jwt` (default) for bearer-token verification, which brings `rsa` and an
+audit ignore (see "Authentication").
 
 A shared crate is only shared while the majors agree: an app that names `axum`, `sqlx`,
 `askama` or `redis` directly must use the major in this workspace's `Cargo.toml`.
@@ -579,6 +581,32 @@ let claims: jwt::Claims = verifier.verify("eyJ...").await?;
 # let _ = claims; Ok(()) }
 ```
 
+**`jwt` is a feature** of `owt-auth`, on by default. It brings `jsonwebtoken` and,
+through its RustCrypto backend, `rsa`, which carries RUSTSEC-2023-0071 (Marvin) with
+no fixed release, so the app's `cargo audit` fails until it ignores that advisory.
+`oauth` needs neither: it reads the ID token the token endpoint answered over TLS and
+checks its claims (OIDC Core 3.1.3.7), not its signature. An app that names `owt-auth`
+only for passwords, throttles or `oauth` turns the feature off:
+
+<!-- x-release-please-start-version -->
+```toml
+owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0", default-features = false }
+```
+<!-- x-release-please-end -->
+
+An app that verifies bearer tokens keeps it, and says why the advisory does not apply
+in its `.cargo/audit.toml`:
+
+```toml
+[advisories]
+ignore = [
+    # rsa: Marvin, a timing side channel on private-key operations (decryption,
+    # signing); no fixed release. It arrives through owt-auth's `jwt` feature, which
+    # only verifies signatures, a public-key operation.
+    "RUSTSEC-2023-0071",
+]
+```
+
 ### Accounts
 
 `owt-accounts` is the sign-in every app wrote over the pieces above: an `accounts`
@@ -587,6 +615,10 @@ walled extractor, sign-out everywhere. The app keeps its pages (the sign-in form
 its template), its extra columns (`ALTER TABLE accounts ADD COLUMN …` in a migration
 of its own) and the choice of flows (self-signup or not, which providers, whether
 links are minted).
+
+It builds `owt-auth` without the `jwt` feature, so an app on it has neither
+`jsonwebtoken` nor `rsa`, and needs no audit ignore, unless the app turns `jwt` on
+itself (an `owt-auth` dependency with default features does; see above).
 
 **Tables:** write each of `owt_accounts::migrations::ALL`, in order, to the app's
 `migrations/`. A new app writes them first (`0001_owt_accounts.sql`,
@@ -2325,8 +2357,8 @@ and two of them reach further than their names:
 ## Working on owt-stack
 
 `just check` is the gate (fmt, clippy over every crate and feature and over
-`owt-change` without its defaults, the tests with the README doctests, `cargo audit`),
-and CI runs the same command. The Redis tests run when
+`owt-change` and `owt-auth` without their defaults, the tests with the README
+doctests, `cargo audit`), and CI runs the same command. The Redis tests run when
 `REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
 `DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL
 whose certificate the system trusts (`SSL_CERT_FILE=ca.crt` for a test CA; the test's

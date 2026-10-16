@@ -5,10 +5,12 @@
 //! * [`oauth`]: the authorization-code flow (with PKCE where the provider supports
 //!   it) for signing people in with Google, Discord, Twitch or any OIDC provider.
 //! * [`jwt`]: bearer tokens an identity provider issued, verified locally against
-//!   its published keys: signature, issuer, audience, expiry.
+//!   its published keys: signature, issuer, audience, expiry. Behind the `jwt`
+//!   feature (default), which brings `jsonwebtoken` and `rsa`.
 //!
 //! What a session remembers and how an account is stored stay with the app.
 
+#[cfg(feature = "jwt")]
 pub mod jwt;
 pub mod oauth;
 pub mod password;
