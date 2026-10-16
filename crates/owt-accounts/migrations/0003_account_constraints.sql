@@ -11,8 +11,9 @@
 -- it again.
 
 SET LOCAL lock_timeout = '5s';
--- All three at once, links first: 0.4's set_password locks sign_in_links before
--- accounts, so taking them in that order leaves it nothing to deadlock against.
+-- All three at once, sign_in_links first: a replica still serving the release before
+-- this one locks sign_in_links before accounts as it sets a password, so this order
+-- waits behind it rather than deadlocking with it.
 LOCK TABLE sign_in_links, accounts, account_identities IN ACCESS EXCLUSIVE MODE;
 
 -- The username's confusable skeleton (Unicode TS #39), lower-cased: names a reader

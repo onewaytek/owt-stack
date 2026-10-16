@@ -439,8 +439,8 @@ mod tests {
     }
 
     /// A Redis that goes away after the cache connected costs each call its budget,
-    /// not the connection manager's reconnect schedule (which was 9 s against a
-    /// refused port and 23 s against a silent one), and the cache recovers.
+    /// not the connection manager's reconnect schedule (9 s against a refused port,
+    /// 23 s against a silent one), and the cache recovers.
     #[tokio::test]
     async fn an_outage_after_connecting_costs_each_call_its_budget() {
         let Some(url) = crate::env::var("REDIS_URL") else {

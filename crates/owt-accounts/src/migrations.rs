@@ -365,7 +365,7 @@ async fn complete_account(pool: &sqlx::PgPool, id: i64, done: &mut Completed) ->
 const SHIPPED_SHA256: &[&str] = &[
     "743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4",
     "0e6d42a67ddabfb50f56650fe85ff0bc810c4b3230a1115706db467ea27b2338",
-    "e380084b078dbde17960024786addd016418a18c0b77a3cb39e9290e41932bd4",
+    "4e910454cfdd01ef4559772fd8b4140f39d887383ebb2de06c920924161152e0",
 ];
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;

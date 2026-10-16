@@ -618,9 +618,8 @@ mod tests {
         assert_eq!(s.unseal(&s.seal("abc", &Data::default())), None);
     }
 
-    /// A seal is a shape as well as a signature. One made by an older build without
-    /// `i`, or by anything that is not this library, is no session even under the
-    /// right key: a missing field never defaults to "began at zero" or "began now".
+    /// A seal is a shape as well as a signature. One without `i`, or made by anything
+    /// that is not this library, is no session even under the right key: a missing field never defaults to "began at zero" or "began now".
     #[test]
     fn a_correctly_sealed_payload_of_another_shape_is_no_session() {
         let s = sessions();
