@@ -58,7 +58,8 @@ pub fn new_id() -> String {
         .collect()
 }
 
-/// The session secret as a cookie key: base64 of at least 64 random bytes.
+/// The session secret as a cookie key: base64 of at least 64 random bytes. Prefer
+/// [`key_for`], which keeps a secret copied between environments from being one key.
 ///
 /// The secret is everything: whoever holds it seals a session for any account. Give
 /// each app, in each environment, a secret of its own; a staging copy of
@@ -74,10 +75,15 @@ pub fn key_from_base64(secret: &str) -> anyhow::Result<Key> {
 /// HKDF-SHA256. Two deployments whose purposes differ cannot open each other's
 /// cookies even if they were given the same secret. Changing the purpose signs
 /// everyone out, as changing the secret does.
+///
+/// The purpose is taken exactly: one with surrounding whitespace or a control
+/// character is refused rather than trimmed, since `myapp/prod\n` (a stray newline
+/// in a `ConfigMap`) would be another key, splitting replicas or signing everyone out.
 pub fn key_for(secret: &str, purpose: &str) -> anyhow::Result<Key> {
+    anyhow::ensure!(!purpose.is_empty(), "a session key's purpose is empty");
     anyhow::ensure!(
-        !purpose.trim().is_empty(),
-        "a session key's purpose is empty"
+        purpose.trim() == purpose && !purpose.chars().any(char::is_control),
+        "a session key's purpose has surrounding whitespace or a control character: {purpose:?}"
     );
     let master = secret_bytes(secret)?;
     let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(b"owt-web session key v1"), &master);
@@ -87,7 +93,11 @@ pub fn key_for(secret: &str, purpose: &str) -> anyhow::Result<Key> {
     Ok(Key::from(&key))
 }
 
-/// The secret's bytes: base64 of at least 64.
+/// Fewer distinct byte values than this in a secret is a pattern, not randomness:
+/// 64 random bytes take about 57 values, and fewer than 16 has odds of about 1e-40.
+const MIN_DISTINCT_BYTES: usize = 16;
+
+/// The secret's bytes: base64 of at least 64, not a repetition.
 fn secret_bytes(secret: &str) -> anyhow::Result<Vec<u8>> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -97,6 +107,15 @@ fn secret_bytes(secret: &str) -> anyhow::Result<Vec<u8>> {
         bytes.len() >= 64,
         "the session secret must be at least 64 bytes (it is {})",
         bytes.len()
+    );
+    let distinct = bytes
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    anyhow::ensure!(
+        distinct >= MIN_DISTINCT_BYTES,
+        "the session secret is a pattern ({distinct} distinct bytes), not random: \
+         make one with `openssl rand -base64 64`"
     );
     Ok(bytes)
 }
@@ -359,7 +378,8 @@ impl<T: SessionData> Sessions<T> {
     /// never cacheable. A server error (5xx, the `Limits` timeout's 503 included)
     /// keeps the session the request came with: a handler that signed someone in and
     /// then failed, or timed out, leaves them as they were. A sign-out
-    /// ([`Session::flush`]) stands whatever the response.
+    /// ([`Session::flush`]) stands whatever the response: a server error after one
+    /// seals an empty session, dropping anything the handler did after it.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
         let session = Session::<T>::default();
         let (mut refused, mut unchecked) = (false, false);
@@ -388,16 +408,19 @@ impl<T: SessionData> Sessions<T> {
             // replace the cookie with the empty one it was shown, unless it replaced
             // the session outright: a sign-out or sign-in during an outage stands.
             // A server error keeps the session the request came with, except a
-            // sign-out: failing after it must not leave someone signed in.
-            (inner.modified && (!failed || inner.flushed) && (!unchecked || inner.replaced)).then(
-                || {
+            // sign-out: failing after it leaves an empty session, whatever the
+            // handler did after it (a sign-in into the emptied session included).
+            if failed {
+                inner.flushed.then(|| (new_id(), now(), T::default()))
+            } else {
+                (inner.modified && (!unchecked || inner.replaced)).then(|| {
                     (
                         inner.id.clone().unwrap_or_else(new_id),
                         inner.issued.unwrap_or_else(now),
                         inner.data.clone(),
                     )
-                },
-            )
+                })
+            }
         };
         let set = match changed {
             Some((id, issued, data)) => this.set_cookie(&id, issued, &data),
@@ -426,8 +449,8 @@ struct Inner<T> {
     /// The id was replaced ([`Session::cycle_id`], [`Session::flush`]): the handler
     /// means this session, whatever the one presented was.
     replaced: bool,
-    /// Emptied ([`Session::flush`]) and not signed into since: a sign-out, which
-    /// stands even when the response is a server error.
+    /// Emptied ([`Session::flush`]) at some point in the request: a sign-out, which
+    /// stands even when the response is a server error. Nothing clears it.
     flushed: bool,
 }
 
@@ -524,7 +547,6 @@ impl<T: Default + Clone> Session<T> {
         inner.issued = None;
         inner.modified = true;
         inner.replaced = true;
-        inner.flushed = false;
     }
 
     /// A new id and empty data: at sign-out. The cookie it replaces still opens if
@@ -633,17 +655,28 @@ mod tests {
     #[test]
     fn keys_must_be_long_enough() {
         use base64::Engine;
-        let b64 = |n| base64::engine::general_purpose::STANDARD.encode(vec![7u8; n]);
+        let b64 =
+            |n: u8| base64::engine::general_purpose::STANDARD.encode((0..n).collect::<Vec<_>>());
         assert!(key_from_base64(&b64(64)).is_ok());
         assert!(key_from_base64(&b64(32)).is_err());
         assert!(key_from_base64("not base64!").is_err());
+        let pattern = |bytes: &[u8]| {
+            base64::engine::general_purpose::STANDARD.encode(bytes.repeat(64 / bytes.len()))
+        };
+        assert!(key_from_base64(&pattern(&[0])).is_err(), "all zeros");
+        assert!(
+            key_from_base64(&pattern(b"abcd")).is_err(),
+            "a repeated word"
+        );
+        assert!(key_for(&pattern(&[7]), "myapp").is_err());
     }
 
     /// One secret, two purposes: neither opens the other's cookies.
     #[test]
     fn a_key_for_one_purpose_opens_nothing_of_another() {
         use base64::Engine;
-        let secret = base64::engine::general_purpose::STANDARD.encode([7u8; 64]);
+        let secret =
+            base64::engine::general_purpose::STANDARD.encode((0..64u8).collect::<Vec<_>>());
         let at = |purpose| {
             Sessions::<Data>::new(
                 key_for(&secret, purpose).unwrap(),
@@ -662,6 +695,13 @@ mod tests {
                 .is_some()
         );
         assert!(key_for(&secret, " ").is_err());
+        assert!(key_for(&secret, "").is_err());
+        assert!(
+            key_for(&secret, "myapp/production\n").is_err(),
+            "a stray newline"
+        );
+        assert!(key_for(&secret, " myapp/production").is_err());
+        assert!(key_for(&secret, "myapp/\u{0}production").is_err());
         assert!(key_for("short", "myapp").is_err());
     }
 
@@ -694,6 +734,23 @@ mod tests {
                 }),
             )
             .route(
+                "/out-in-then-fail",
+                get(|sess: Session<Data>| async move {
+                    sess.flush();
+                    sess.update(|d| d.user = Some(42));
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }),
+            )
+            .route(
+                "/switch-then-fail",
+                get(|sess: Session<Data>| async move {
+                    sess.flush();
+                    sess.cycle_id();
+                    sess.update(|d| d.user = Some(43));
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }),
+            )
+            .route(
                 "/refused",
                 get(|sess: Session<Data>| async move {
                     sess.update(|d| d.user = Some(3));
@@ -709,13 +766,20 @@ mod tests {
                 .unwrap();
             assert!(res.headers().get(header::SET_COOKIE).is_none(), "{path}");
         }
-        // A sign-out stands even when what follows it fails.
-        let res = app
-            .clone()
-            .oneshot(Request::get("/out-then-fail").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert!(res.headers().get(header::SET_COOKIE).is_some());
+        // A sign-out stands even when what follows it fails, and so does nothing
+        // after it: a sign-in into the emptied session (or an account switch) that
+        // then fails leaves an empty session, not the new account.
+        for path in ["/out-then-fail", "/out-in-then-fail", "/switch-then-fail"] {
+            let res = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let set = res.headers().get(header::SET_COOKIE).expect(path);
+            let set = Cookie::parse_encoded(set.to_str().unwrap()).unwrap();
+            let (_, data) = s.unseal(set.value()).expect(path);
+            assert_eq!(data, Data::default(), "{path}");
+        }
         // A 4xx is an answer, not a failure: its change stands.
         let res = app
             .oneshot(Request::get("/refused").body(Body::empty()).unwrap())

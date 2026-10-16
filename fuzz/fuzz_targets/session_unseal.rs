@@ -14,7 +14,7 @@ struct Data {
 
 fuzz_target!(|value: &str| {
     // A fixed key: the fuzzer may learn the format, never the key.
-    let key = key_from_base64("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBw==").unwrap();
+    let key = key_from_base64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==").unwrap();
     let s: Sessions<Data> = Sessions::new(key, "sid", Duration::from_secs(3600), true);
     assert!(s.unseal(value).is_none(), "an arbitrary value opened: {value:?}");
 });

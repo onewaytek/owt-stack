@@ -217,13 +217,35 @@ the handler and write `<script nonce="{{ nonce }}">`.
   each app and environment, and the purpose makes a copied secret (staging given
   production's) a different key anyway: otherwise a staging account's cookie opens
   production as the account with the same id. Changing either signs everyone out.
-  `key_from_base64` uses the secret as the key directly; moving to `key_for` with
-  `also_open_with(key_from_base64(…))` for a while keeps everyone signed in, but
-  keeps a shared secret's cross-environment cookies opening for that while too.
-  After a leak, rotate without `also_open_with`: the old key must open nothing.
+  The purpose is taken exactly (surrounding whitespace or a control character is an
+  error, not trimmed), and a secret that is a pattern rather than random bytes (all
+  zeros, a repeated word) is refused. `key_from_base64` uses the secret as the key
+  directly; moving to `key_for` with `also_open_with(key_from_base64(…))` for a while
+  keeps everyone signed in, but keeps a shared secret's cross-environment cookies
+  opening for that while too. After a leak, rotate without `also_open_with`: the old
+  key must open nothing.
+
+  ```rust,no_run
+  # fn main() -> anyhow::Result<()> {
+  use owt_web::session::{Sessions, key_for, key_from_base64};
+  # #[derive(Clone, Default, serde::Serialize, serde::Deserialize)] struct SessionData;
+  let secret = owt_runtime::env::required("SESSION_SECRET")?;
+  let purpose = format!("myapp/{}", owt_runtime::env::required("POD_NAMESPACE")?);
+  let sessions = Sessions::<SessionData>::new(
+      key_for(&secret, &purpose)?,
+      "__Host-session",
+      std::time::Duration::from_secs(14 * 86_400),
+      true,
+  )
+  // For one `max_age` after the move, then drop it (never after a leak).
+  .also_open_with(key_from_base64(&secret)?);
+  # Ok(()) }
+  ```
 - **Failed requests change no session:** a 5xx response (the `Limits` timeout's
-  included) carries no `Set-Cookie`, so a handler that signed someone in and then
-  failed leaves them as they were. A sign-out (`flush`) stands whatever follows.
+  included, with `Limits` inside the session layer as above) carries no
+  `Set-Cookie`, so a handler that signed someone in and then failed leaves them as
+  they were. A sign-out (`flush`) stands whatever follows: a 5xx after one seals an
+  empty session, dropping a sign-in made after it.
 - **Trusted origins** (`CrossOrigin::trust`) are `scheme://host[:port]`; anything
   else (`null`, a wildcard, a bare host, a path) panics at start rather than trusting
   every sandboxed frame or silently nothing.
@@ -1596,9 +1618,15 @@ The router example under "Wiring an app" composes the layers; beyond it:
   connection.
 - `CrossOrigin::trust` panics on an entry that is not an `http(s)` origin; blank
   entries are still ignored.
-- A 5xx response no longer seals session changes.
-- `session::key_for` is new; moving to it from `key_from_base64` signs everyone out
-  once.
+- A 5xx response no longer seals session changes, except a sign-out, which then
+  seals an empty session.
+- `session::key_for` is new and recommended: `key_from_base64` makes a secret
+  copied between environments one key. Moving to it signs everyone out, unless the
+  old key opens sessions for a while (`also_open_with`, above).
+- `key_from_base64` and `key_for` refuse a secret that is a pattern rather than
+  random bytes (fewer than 16 distinct byte values); a test fixture of `[7u8; 64]`
+  needs real bytes.
+- `RequestInfo::at` always yields a path starting with `/`.
 
 ## Upgrading from 0.1
 
