@@ -370,8 +370,24 @@ impl Social for Data {
     }
 }
 
-/// What a `?social=` code means, as a message for [`owt_web::ui::Alerts`]; `None`
-/// for a code this module never sends.
+/// Every `?social=` code this module sends. An app that shows the outcomes in its
+/// own words (another language, say) translates each, and a test of its own can hold
+/// it to this list: a code added here is then one it is told about.
+pub const CODES: [&str; 10] = [
+    "expired",
+    "cancelled",
+    "failed",
+    "unknown",
+    "taken",
+    "sign-in-first",
+    "sign-in-again",
+    "connected",
+    "removed",
+    "last-way-in",
+];
+
+/// What a `?social=` code means, in English, as a message for
+/// [`owt_web::ui::Alerts`]; `None` for a code this module never sends ([`CODES`]).
 ///
 /// ```
 /// # fn page(info: owt_web::request::RequestInfo) {
@@ -540,6 +556,7 @@ impl SocialSignIn {
             items: self.items(|_| true),
             next,
             connect: false,
+            words: ButtonWords::ENGLISH,
         }
     }
 
@@ -583,7 +600,11 @@ impl SocialSignIn {
                 .get(id)
                 .is_some_and(|c| !keys.contains(&c.provider.key()))
         });
-        Ok(Connections { rows, items })
+        Ok(Connections {
+            rows,
+            items,
+            words: ConnectionWords::default(),
+        })
     }
 }
 
@@ -594,6 +615,35 @@ struct ButtonItem {
     name: &'static str,
 }
 
+/// What a provider's button says; `{provider}` is replaced by its name (`Google`).
+/// English unless the app passes its own ([`Buttons::words`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ButtonWords<'a> {
+    /// A sign-in button: `Continue with {provider}`.
+    pub continue_with: &'a str,
+    /// A button adding the provider to the signed-in account: `Connect {provider}`.
+    pub connect: &'a str,
+}
+
+impl ButtonWords<'static> {
+    /// `Continue with {provider}`, `Connect {provider}`.
+    pub const ENGLISH: Self = Self {
+        continue_with: "Continue with {provider}",
+        connect: "Connect {provider}",
+    };
+}
+
+impl Default for ButtonWords<'_> {
+    fn default() -> Self {
+        ButtonWords::ENGLISH
+    }
+}
+
+/// `pattern` with the provider's name in place of `{provider}`.
+fn named(pattern: &str, provider: &str) -> String {
+    pattern.replace("{provider}", provider)
+}
+
 /// The sign-in buttons: `{{ buttons }}` on the sign-in page.
 ///
 /// ```html
@@ -601,7 +651,7 @@ struct ButtonItem {
 /// ```
 #[derive(Template, Clone, Debug)]
 #[template(
-    source = r#"{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}">{% if !next.is_empty() %}<input type="hidden" name="next" value="{{ next }}">{% endif %}{% if connect %}<input type="hidden" name="connect" value="1">{% endif %}<button class="owt-button owt-button-secondary" type="submit">{% if connect %}Connect {{ b.name }}{% else %}Continue with {{ b.name }}{% endif %}</button></form>{% endfor %}</div>
+    source = r#"{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}">{% if !next.is_empty() %}<input type="hidden" name="next" value="{{ next }}">{% endif %}{% if connect %}<input type="hidden" name="connect" value="1">{% endif %}<button class="owt-button owt-button-secondary" type="submit">{% if connect %}{{ crate::social::named(words.connect, b.name) }}{% else %}{{ crate::social::named(words.continue_with, b.name) }}{% endif %}</button></form>{% endfor %}</div>
 {% endif %}"#,
     ext = "html"
 )]
@@ -609,8 +659,18 @@ pub struct Buttons<'a> {
     items: Vec<ButtonItem>,
     next: &'a str,
     connect: bool,
+    words: ButtonWords<'a>,
 }
 impl HtmlSafe for Buttons<'_> {}
+
+impl<'a> Buttons<'a> {
+    /// In the page's language.
+    #[must_use]
+    pub fn words(mut self, words: ButtonWords<'a>) -> Self {
+        self.words = words;
+        self
+    }
+}
 
 /// A connected identity.
 #[derive(Clone, Debug)]
@@ -620,23 +680,65 @@ struct ConnectionRow {
     label: String,
 }
 
+/// The words [`Connections`] writes. English unless the app passes its own
+/// ([`Connections::words`]); owned, as the connections are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectionWords {
+    /// Shown when the account has none: `No sign-in connections yet.`
+    pub none: String,
+    /// The provider column's heading.
+    pub provider: String,
+    /// The heading of the column naming the account at the provider.
+    pub account: String,
+    /// The buttons column's heading, read by assistive technology only.
+    pub actions: String,
+    /// The button that removes a connection.
+    pub remove: String,
+    /// A button adding a provider: `Connect {provider}`.
+    pub connect: String,
+}
+
+impl Default for ConnectionWords {
+    /// English.
+    fn default() -> Self {
+        Self {
+            none: "No sign-in connections yet.".into(),
+            provider: "Provider".into(),
+            account: "Account there".into(),
+            actions: "Actions".into(),
+            remove: "Remove".into(),
+            connect: ButtonWords::ENGLISH.connect.into(),
+        }
+    }
+}
+
 /// An account's connections, each with a Remove button, then a Connect button per
 /// provider not yet connected: `{{ connections }}` on the settings page.
 #[derive(Template, Clone, Debug)]
 #[template(
-    source = r#"{% if rows.is_empty() %}<p class="owt-hint">No sign-in connections yet.</p>
-{% else %}<table class="owt-table"><thead><tr><th scope="col">Provider</th><th scope="col">Account there</th><th scope="col"><span class="owt-sr">Actions</span></th></tr></thead><tbody>
-{% for r in rows %}<tr><td>{{ r.provider }}</td><td>{{ r.label }}</td><td><form method="post" action="{{ r.remove }}"><button class="owt-button owt-button-quiet" type="submit">Remove</button></form></td></tr>
+    source = r#"{% if rows.is_empty() %}<p class="owt-hint">{{ words.none }}</p>
+{% else %}<table class="owt-table"><thead><tr><th scope="col">{{ words.provider }}</th><th scope="col">{{ words.account }}</th><th scope="col"><span class="owt-sr">{{ words.actions }}</span></th></tr></thead><tbody>
+{% for r in rows %}<tr><td>{{ r.provider }}</td><td>{{ r.label }}</td><td><form method="post" action="{{ r.remove }}"><button class="owt-button owt-button-quiet" type="submit">{{ words.remove }}</button></form></td></tr>
 {% endfor %}</tbody></table>
-{% endif %}{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}"><input type="hidden" name="connect" value="1"><button class="owt-button owt-button-secondary" type="submit">Connect {{ b.name }}</button></form>{% endfor %}</div>
+{% endif %}{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}"><input type="hidden" name="connect" value="1"><button class="owt-button owt-button-secondary" type="submit">{{ crate::social::named(words.connect.as_str(), b.name) }}</button></form>{% endfor %}</div>
 {% endif %}"#,
     ext = "html"
 )]
 pub struct Connections {
     rows: Vec<ConnectionRow>,
     items: Vec<ButtonItem>,
+    words: ConnectionWords,
 }
 impl HtmlSafe for Connections {}
+
+impl Connections {
+    /// In the page's language.
+    #[must_use]
+    pub fn words(mut self, words: ConnectionWords) -> Self {
+        self.words = words;
+        self
+    }
+}
 
 /// `path?social=code`.
 fn landing(path: &str, code: &str) -> Response {
@@ -973,22 +1075,92 @@ mod tests {
 
     #[test]
     fn every_code_sent_has_a_message() {
-        for code in [
-            "expired",
-            "cancelled",
-            "failed",
-            "unknown",
-            "taken",
-            "sign-in-first",
-            "sign-in-again",
-            "connected",
-            "removed",
-            "last-way-in",
-        ] {
+        for code in CODES {
             assert!(outcome(Some(code)).is_some(), "{code}");
+        }
+        // And every code sent is in `CODES`: the code of each landing call in this file.
+        let source = include_str!("social.rs");
+        let sent: Vec<&str> = source
+            .split("landing(")
+            .skip(1)
+            .filter_map(|call| call.split_once(')').map(|(args, _)| args))
+            .filter_map(|args| {
+                args.rsplit_once(", \"")
+                    .map(|(_, c)| c.trim_end_matches('"'))
+            })
+            .collect();
+        assert!(sent.len() >= 5, "found {sent:?}");
+        for code in sent {
+            assert!(CODES.contains(&code), "{code} is sent but not in CODES");
         }
         assert!(outcome(Some("<script>")).is_none());
         assert!(outcome(None).is_none());
+    }
+
+    #[test]
+    fn the_buttons_and_connections_speak_the_pages_language() {
+        let item = || ButtonItem {
+            action: "/auth/google/start".into(),
+            name: "Google",
+        };
+        let english = Buttons {
+            items: vec![item()],
+            next: "",
+            connect: false,
+            words: ButtonWords::ENGLISH,
+        };
+        assert!(
+            english
+                .render()
+                .unwrap()
+                .contains(">Continue with Google</button>")
+        );
+        let spanish = english.words(ButtonWords {
+            continue_with: "Continuar con {provider}",
+            connect: "Conectar {provider}",
+        });
+        assert!(
+            spanish
+                .render()
+                .unwrap()
+                .contains(">Continuar con Google</button>")
+        );
+
+        let none = Connections {
+            rows: Vec::new(),
+            items: vec![item()],
+            words: ConnectionWords::default(),
+        };
+        let html = none.clone().render().unwrap();
+        assert!(html.contains("No sign-in connections yet.") && html.contains(">Connect Google<"));
+        let html = Connections {
+            rows: vec![ConnectionRow {
+                remove: "/auth/connections/1/remove".into(),
+                provider: "Google".into(),
+                label: "ada@example.com".into(),
+            }],
+            ..none
+        }
+        .words(ConnectionWords {
+            none: "Aún no hay conexiones.".into(),
+            provider: "Proveedor".into(),
+            account: "Cuenta allí".into(),
+            actions: "Acciones".into(),
+            remove: "Quitar".into(),
+            connect: "Conectar {provider}".into(),
+        })
+        .render()
+        .unwrap();
+        for words in [
+            "Proveedor",
+            "Cuenta allí",
+            "Acciones",
+            ">Quitar<",
+            ">Conectar Google<",
+        ] {
+            assert!(html.contains(words), "{words}: {html}");
+        }
+        assert!(!html.contains("Remove") && !html.contains("Provider"));
     }
 
     #[test]

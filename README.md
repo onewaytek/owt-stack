@@ -982,6 +982,39 @@ let _connections = social.connections(me.id).await?; // each with Remove, then "
 # Ok(()) }
 ```
 
+A page in another language passes the words: `{provider}` stands for the provider's
+name. `outcome` is English; such an app shows each of `social::CODES` in its own words,
+and a test of its own can check it has them all.
+
+```rust,no_run
+# async fn demo(social: owt_accounts::social::SocialSignIn, me: owt_accounts::Account) -> anyhow::Result<()> {
+use owt_accounts::social::{ButtonWords, CODES, ConnectionWords};
+
+let _buttons = social.buttons("/es/inicio").words(ButtonWords {
+    continue_with: "Continuar con {provider}",
+    connect: "Conectar {provider}",
+});
+let _connections = social.connections(me.id).await?.words(ConnectionWords {
+    none: "Aún no hay conexiones.".into(),
+    provider: "Proveedor".into(),
+    account: "Cuenta allí".into(),
+    actions: "Acciones".into(),
+    remove: "Quitar".into(),
+    connect: "Conectar {provider}".into(),
+});
+
+// The app's own messages, one per code.
+fn mensaje(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "connected" => "Conectado.",
+        // …one arm per code in `CODES`
+        _ => return None,
+    })
+}
+let _missing: Vec<_> = CODES.iter().filter(|c| mensaje(c).is_none()).collect();
+# Ok(()) }
+```
+
 #### 4. Deploying
 
 - **OpenShift:** keep the credentials in a Secret and add it to the Deployment's
