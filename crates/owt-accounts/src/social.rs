@@ -1078,21 +1078,25 @@ mod tests {
         for code in CODES {
             assert!(outcome(Some(code)).is_some(), "{code}");
         }
-        // And every code sent is in `CODES`: the code of each landing call in this file.
+        // And `CODES` is exactly the codes the landing calls above the tests send. Without
+        // whitespace, a call rustfmt wraps reads like one it doesn't.
         let source = include_str!("social.rs");
-        let sent: Vec<&str> = source
-            .split("landing(")
-            .skip(1)
-            .filter_map(|call| call.split_once(')').map(|(args, _)| args))
-            .filter_map(|args| {
-                args.rsplit_once(", \"")
-                    .map(|(_, c)| c.trim_end_matches('"'))
+        let code: String = source[..source.find("#[cfg(test)]").unwrap()]
+            .split_whitespace()
+            .collect();
+        let sent: std::collections::BTreeSet<&str> = code
+            .match_indices("landing(")
+            .filter(|&(at, _)| !code[..at].ends_with("fn"))
+            .map(|(at, call)| {
+                let args = &code[at + call.len()..];
+                let args = &args[..args.find(')').unwrap()];
+                let last = args.trim_end_matches(',').rsplit(',').next().unwrap();
+                last.strip_prefix('"')
+                    .and_then(|c| c.strip_suffix('"'))
+                    .unwrap_or_else(|| panic!("landing({args}): the code isn't a string literal"))
             })
             .collect();
-        assert!(sent.len() >= 5, "found {sent:?}");
-        for code in sent {
-            assert!(CODES.contains(&code), "{code} is sent but not in CODES");
-        }
+        assert_eq!(sent, CODES.into_iter().collect());
         assert!(outcome(Some("<script>")).is_none());
         assert!(outcome(None).is_none());
     }
