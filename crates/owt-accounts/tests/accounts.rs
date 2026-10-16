@@ -2045,6 +2045,21 @@ async fn a_pending_sign_in_lapses_and_stays_in_its_session() {
         Some("/login?social=expired")
     );
 
+    // A start time from the future (past the minute of skew allowed), and a pending
+    // sign-in from before it was bound to a session, finish nothing either.
+    let state = begin().await;
+    with_pending(&client, |_, started| started.at += 3600);
+    assert_eq!(
+        finish(state).await.location(),
+        Some("/login?social=expired")
+    );
+    let state = begin().await;
+    with_pending(&client, |_, started| started.session.clear());
+    assert_eq!(
+        finish(state).await.location(),
+        Some("/login?social=expired")
+    );
+
     // Untouched, it still works.
     let state = begin().await;
     assert_eq!(finish(state).await.location(), Some("/home"));

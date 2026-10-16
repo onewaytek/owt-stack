@@ -683,6 +683,9 @@ pieces (its sign-in page and a settings page).
   replaces the session's id) finishes nothing. Sessions are sealed cookies, so a
   copy of the cookie made while a sign-in was pending still holds it; within those
   10 minutes such a copy is a stolen session, which can sign in as its owner anyway.
+  And someone at an unlocked browser already signed in who starts a sign-in there
+  can, for those 10 minutes, send its owner a link that signs the browser in to
+  the starter's account: hands on a signed-in browser are beyond what this guards.
 - A callback for one provider cannot finish a sign-in begun with another. `next` is
   followed only when it is a path on this site, and dropped when longer than
   `social::MAX_NEXT` bytes (it rides in the session cookie, which a browser drops
