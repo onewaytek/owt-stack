@@ -91,6 +91,17 @@ pub(crate) fn valid_username(username: &str) -> bool {
         && username.is_single_script()
 }
 
+/// What [`create`] would refuse in this username, before it looks at the other
+/// accounts: [`Refused::Username`] when the name, [`normalize`]d, breaks the rule
+/// (letters, digits and marks of one script, or `-`, `.` and `_`; starting with a
+/// letter or digit; no `@`; at most [`MAX_USERNAME_CHARS`]). A sign-up form that
+/// checks every field at once asks this rather than keep a copy of the rule; a
+/// name taken or too like another's is still `create`'s to refuse.
+#[must_use]
+pub fn username_problem(username: &str) -> Option<Refused> {
+    (!valid_username(&normalize(username))).then_some(Refused::Username)
+}
+
 /// One address: something before one `@`, something after, no whitespace. The
 /// mail that proves it is the app's business.
 fn valid_email(email: &str) -> bool {
@@ -156,10 +167,10 @@ pub async fn create(pool: &PgPool, new: New<'_>) -> Result<Account> {
 
 /// [`create`] on `conn`: inside the caller's transaction, say.
 pub async fn create_in(conn: &mut sqlx::PgConnection, new: New<'_>) -> Result<Account> {
-    let username = normalize(new.username);
-    if !valid_username(&username) {
-        return Err(Refused::Username.into());
+    if let Some(refused) = username_problem(new.username) {
+        return Err(refused.into());
     }
+    let username = normalize(new.username);
     let email = normalize(new.email);
     if !email.is_empty() && !valid_email(&email) {
         return Err(Refused::Email.into());
@@ -292,7 +303,10 @@ pub async fn by_id_in_epoch(
     .await
 }
 
-/// The account (active or not) with this username.
+/// The account with this username, active or not: a deactivated account is found
+/// too, so this is not the account to sign in as. Sign-in goes through
+/// [`authenticate`], which finds active accounts only; code that looks a person up
+/// by name to act as them checks [`Account::is_active`] first.
 pub async fn by_username(db: impl PgExecutor<'_>, username: &str) -> sqlx::Result<Option<Account>> {
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM accounts WHERE username = $1"
@@ -501,6 +515,19 @@ mod tests {
         assert!(!valid_username("tab\there"));
         assert!(!valid_username(&"a".repeat(MAX_USERNAME_CHARS + 1)));
         assert!(valid_username(&"a".repeat(MAX_USERNAME_CHARS)));
+    }
+
+    /// What a form hears is what `create` would say: the name as typed, normalized.
+    #[test]
+    fn a_username_problem_is_the_refusal_create_gives() {
+        let refused = |name: &str| username_problem(name) == Some(Refused::Username);
+        assert_eq!(username_problem("alice"), None);
+        assert_eq!(username_problem("  ＡＬＩＣＥ "), None);
+        assert!(refused("alice@example.com"));
+        assert!(refused("two words"));
+        assert!(refused("   "));
+        assert!(refused("p\u{430}ypal"));
+        assert!(refused(&"a".repeat(MAX_USERNAME_CHARS + 1)));
     }
 
     /// Every name the sweep registered as a distinct `admin`, and the scripts real
