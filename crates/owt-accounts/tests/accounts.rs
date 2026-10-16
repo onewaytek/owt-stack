@@ -1777,3 +1777,671 @@ async fn the_list_pages_and_keeps_its_filter() {
     );
     db.drop().await;
 }
+
+/// A provider on this machine: a token endpoint and a user-info endpoint that
+/// answers with whatever subject the test sets.
+async fn fake_provider(sub: Arc<std::sync::Mutex<String>>) -> String {
+    let fake = Router::new()
+        .route(
+            "/token",
+            post(|| async { serde_json::json!({"access_token": "t"}).to_string() }),
+        )
+        .route(
+            "/userinfo",
+            get(move || {
+                let sub = sub.lock().unwrap().clone();
+                async move {
+                    serde_json::json!({
+                        "sub": sub, "name": "Ada Lovelace",
+                        "email": "ada@example.com", "email_verified": true
+                    })
+                    .to_string()
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, fake).await });
+    base
+}
+
+fn social_sessions() -> Sessions<owt_accounts::social::Data> {
+    let key = owt_web::session::key_from_base64(&base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        (64..128u8).collect::<Vec<_>>(),
+    ))
+    .unwrap();
+    Sessions::new(key, "s", Duration::from_secs(3600), false)
+}
+
+fn social_app(
+    db: &Db,
+    sessions: &Sessions<owt_accounts::social::Data>,
+    social: &owt_accounts::social::SocialSignIn,
+) -> Router {
+    async fn whoami(Maybe(account): Maybe) -> String {
+        account.map_or_else(|| "anonymous".to_owned(), |a| a.username)
+    }
+    let accounts = Accounts::new(db.pool.clone(), "/login");
+    Router::new()
+        .merge(social.routes::<owt_accounts::social::Data, ()>())
+        .route("/whoami", get(whoami))
+        .layer(from_fn_with_state(
+            accounts,
+            Accounts::load::<owt_accounts::social::Data>,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            sessions.clone(),
+            Sessions::layer,
+        ))
+}
+
+/// The `state` a start redirect sent to the provider.
+fn sent_state(location: &str) -> String {
+    url::Url::parse(location)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned()
+}
+
+/// Sign-in with Google pointed at a fake provider answering with subject `sub`.
+async fn social_fixture(
+    db: &Db,
+    sub: Arc<std::sync::Mutex<String>>,
+    welcome: identities::Welcome,
+) -> (owt_accounts::social::SocialSignIn, owt_test::Client) {
+    use owt_accounts::social::{self, Providers, SocialSignIn};
+    use owt_auth::oauth;
+    let base = fake_provider(sub).await;
+    let providers = Providers::new("http://localhost:8000", social::DEFAULT_CALLBACK)
+        .unwrap()
+        .with(
+            oauth::Provider {
+                token_url: format!("{base}/token"),
+                userinfo_url: format!("{base}/userinfo"),
+                ..oauth::google()
+            },
+            "cid",
+            "secret",
+        )
+        .unwrap();
+    assert_eq!(
+        providers.get("google").unwrap().redirect_uri,
+        "http://localhost:8000/auth/google/callback"
+    );
+    let social = SocialSignIn::new(
+        db.pool.clone(),
+        oauth::http_client().unwrap(),
+        providers,
+        welcome,
+    )
+    .after_sign_in("/home");
+    let client = owt_test::Client::new(social_app(db, &social_sessions(), &social));
+    (social, client)
+}
+
+/// A second provider (Discord) on the same fake, for mix-up tests.
+async fn two_provider_fixture(db: &Db, sub: Arc<std::sync::Mutex<String>>) -> owt_test::Client {
+    use owt_accounts::social::{self, Providers, SocialSignIn};
+    use owt_auth::oauth;
+    let base = fake_provider(sub).await;
+    let at = |p: oauth::Provider| oauth::Provider {
+        token_url: format!("{base}/token"),
+        userinfo_url: format!("{base}/userinfo"),
+        ..p
+    };
+    let providers = Providers::new("http://localhost:8000", social::DEFAULT_CALLBACK)
+        .unwrap()
+        .with(at(oauth::google()), "cid", "secret")
+        .unwrap()
+        .with(at(oauth::discord()), "did", "secret")
+        .unwrap();
+    let social = SocialSignIn::new(
+        db.pool.clone(),
+        oauth::http_client().unwrap(),
+        providers,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    );
+    owt_test::Client::new(social_app(db, &social_sessions(), &social))
+}
+
+/// Start at the provider and come back with the state it was sent.
+async fn round_trip(client: &owt_test::Client, fields: &[(&str, &str)]) -> owt_test::Response {
+    let r = client.post_form("/auth/google/start", fields).await;
+    assert_eq!(r.status, 303);
+    let state = sent_state(r.location().unwrap());
+    client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await
+}
+
+#[tokio::test]
+async fn a_provider_sign_in_round_trips_through_the_routes() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (social, client) = social_fixture(
+        &db,
+        sub,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // The sign-in page's buttons.
+    let buttons = social.buttons("/games").to_string();
+    assert!(
+        buttons.contains(r#"action="/auth/google/start""#) && buttons.contains(r#"value="/games""#),
+        "{buttons}"
+    );
+
+    // Start, then the provider sends the browser back with the state and a code.
+    let r = client
+        .post_form("/auth/google/start", &[("next", "/games")])
+        .await;
+    let location = r.location().unwrap().to_owned();
+    assert!(
+        location.starts_with("https://accounts.google.com/"),
+        "{location}"
+    );
+    let callback = format!(
+        "/auth/google/callback?state={}&code=abc",
+        sent_state(&location)
+    );
+    let r = client.get(&callback).await;
+    assert_eq!(r.location(), Some("/games"), "{}", r.text());
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+
+    // The pending sign-in was used up: a replay is refused.
+    let r = client.get(&callback).await;
+    assert_eq!(r.location(), Some("/login?social=expired"));
+
+    // A state that is not the one sent, a cancellation, a `next` off this site.
+    client.post_form("/auth/google/start", &[]).await;
+    let r = client
+        .get("/auth/google/callback?state=forged&code=abc")
+        .await;
+    assert_eq!(r.location(), Some("/login?social=expired"));
+    client.post_form("/auth/google/start", &[]).await;
+    let r = client
+        .get("/auth/google/callback?error=access_denied")
+        .await;
+    assert_eq!(r.location(), Some("/login?social=cancelled"));
+    let r = round_trip(&client, &[("next", "https://evil.example/")]).await;
+    assert_eq!(r.location(), Some("/home"));
+
+    // Unknown providers are not routes.
+    assert_eq!(client.post_form("/auth/nope/start", &[]).await.status, 404);
+    assert_eq!(
+        client
+            .get("/auth/nope/callback?state=x&code=y")
+            .await
+            .status,
+        404
+    );
+    db.drop().await;
+}
+
+/// The session cookie with its pending sign-in rewritten by `edit` (the id too).
+fn with_pending(
+    client: &owt_test::Client,
+    edit: impl FnOnce(&mut String, &mut owt_accounts::social::Started),
+) {
+    let sessions = social_sessions();
+    let (mut id, mut data) = sessions.unseal(&client.cookie("s").unwrap()).unwrap();
+    edit(&mut id, data.started.as_mut().unwrap());
+    client.set_cookie("s", &sessions.seal(&id, &data));
+}
+
+/// A pending sign-in is good for `PENDING_FOR`, and only in the session it began in:
+/// a copy of the cookie kept past it, or a sign-in begun before someone else signed
+/// in on the same browser, finishes nothing.
+#[tokio::test]
+async fn a_pending_sign_in_lapses_and_stays_in_its_session() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (_, client) = social_fixture(
+        &db,
+        sub,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let begin = || async {
+        let r = client.post_form("/auth/google/start", &[]).await;
+        sent_state(r.location().unwrap())
+    };
+    let finish = |state: String| {
+        let client = &client;
+        async move {
+            client
+                .get(&format!("/auth/google/callback?state={state}&code=abc"))
+                .await
+        }
+    };
+    let state = begin().await;
+    with_pending(&client, |_, started| {
+        started.at -= owt_accounts::social::PENDING_FOR.as_secs() + 1;
+    });
+    assert_eq!(
+        finish(state).await.location(),
+        Some("/login?social=expired")
+    );
+
+    // Begun, then the session was replaced (a password sign-in cycles the id).
+    let state = begin().await;
+    with_pending(&client, |id, _| *id = "another-session-id".into());
+    assert_eq!(
+        finish(state).await.location(),
+        Some("/login?social=expired")
+    );
+
+    // A start time from the future (past the minute of skew allowed), and a pending
+    // sign-in from before it was bound to a session, finish nothing either.
+    let state = begin().await;
+    with_pending(&client, |_, started| started.at += 3600);
+    assert_eq!(
+        finish(state).await.location(),
+        Some("/login?social=expired")
+    );
+    let state = begin().await;
+    with_pending(&client, |_, started| started.session.clear());
+    assert_eq!(
+        finish(state).await.location(),
+        Some("/login?social=expired")
+    );
+
+    // Untouched, it still works.
+    let state = begin().await;
+    assert_eq!(finish(state).await.location(), Some("/home"));
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+    db.drop().await;
+}
+
+/// A connect needs a recent sign-in when it comes back, not only when it starts.
+#[tokio::test]
+async fn a_connect_needs_a_recent_sign_in_at_the_callback_too() {
+    use owt_accounts::social::{self, Providers, SocialSignIn};
+    use owt_auth::oauth;
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let base = fake_provider(sub.clone()).await;
+    let providers = Providers::new("http://localhost:8000", social::DEFAULT_CALLBACK)
+        .unwrap()
+        .with(
+            oauth::Provider {
+                token_url: format!("{base}/token"),
+                userinfo_url: format!("{base}/userinfo"),
+                ..oauth::google()
+            },
+            "cid",
+            "secret",
+        )
+        .unwrap();
+    let social = SocialSignIn::new(
+        db.pool.clone(),
+        oauth::http_client().unwrap(),
+        providers,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .connect_within(Duration::from_secs(1));
+    let client = owt_test::Client::new(social_app(&db, &social_sessions(), &social));
+    round_trip(&client, &[]).await;
+    *sub.lock().unwrap() = "g2".into();
+    let r = client
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    let state = sent_state(r.location().unwrap());
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let r = client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(r.location(), Some("/login?social=sign-in-again"));
+    let ada = store::by_username(&db.pool, "adalovelace")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(identities::list(&db.pool, ada.id).await.unwrap().len(), 1);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_provider_is_connected_and_removed_from_settings() {
+    use owt_auth::oauth;
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (social, client) = social_fixture(
+        &db,
+        sub.clone(),
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    round_trip(&client, &[]).await;
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+
+    // Connecting while signed in adds a second identity of the same provider.
+    *sub.lock().unwrap() = "g2".into();
+    let r = round_trip(&client, &[("connect", "1")]).await;
+    assert_eq!(r.location(), Some("/account/connections?social=connected"));
+    let ada = store::by_username(&db.pool, "adalovelace")
+        .await
+        .unwrap()
+        .unwrap();
+    let linked = identities::list(&db.pool, ada.id).await.unwrap();
+    assert_eq!(linked.len(), 2);
+    let page = social.connections(ada.id).await.unwrap().to_string();
+    assert!(
+        page.contains("<td>Google</td>") && page.contains("/auth/connections/"),
+        "{page}"
+    );
+
+    // Removing one goes; removing the last way in does not.
+    let remove = |id: i64| format!("/auth/connections/{id}/remove");
+    let r = client.post_form(&remove(linked[1].id), &[]).await;
+    assert_eq!(r.location(), Some("/account/connections?social=removed"));
+    let r = client.post_form(&remove(linked[0].id), &[]).await;
+    assert_eq!(
+        r.location(),
+        Some("/account/connections?social=last-way-in")
+    );
+    // Someone else's connection is not found.
+    let other = store::create(&db.pool, new("other", "", None))
+        .await
+        .unwrap();
+    let theirs = identities::link(
+        &db.pool,
+        other.id,
+        &oauth::discord(),
+        &identity("d1", None, false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(client.post_form(&remove(theirs.id), &[]).await.status, 404);
+
+    // Anonymous: connecting needs a sign-in first, and Remove is walled.
+    client.clear_cookies();
+    let r = client
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    assert_eq!(r.location(), Some("/login?social=sign-in-first"));
+    assert_eq!(
+        client.post_form(&remove(linked[0].id), &[]).await.status,
+        303
+    );
+    assert_eq!(identities::list(&db.pool, ada.id).await.unwrap().len(), 1);
+    db.drop().await;
+}
+
+/// With self-signup off, a provider identity linked to nothing signs nobody in,
+/// even with a verified email an account here has.
+#[tokio::test]
+async fn without_self_signup_an_unknown_identity_is_turned_away() {
+    let db = db!();
+    store::create(&db.pool, new("ada", "ada@example.com", None))
+        .await
+        .unwrap();
+    let sub = Arc::new(std::sync::Mutex::new("g9".to_owned()));
+    let (_, client) = social_fixture(&db, sub, identities::Welcome::default()).await;
+    let r = round_trip(&client, &[]).await;
+    assert_eq!(r.location(), Some("/login?social=unknown"));
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    db.drop().await;
+}
+
+/// The session id changes at a provider sign-in (no fixation); a failed callback
+/// uses the pending sign-in up too; a callback at another provider's route is
+/// refused; an overlong `next` is dropped rather than losing the sign-in.
+#[tokio::test]
+async fn a_provider_sign_in_survives_nothing_it_should_not() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let client = two_provider_fixture(&db, sub).await;
+    let sessions = social_sessions();
+    let id_of = |client: &owt_test::Client| {
+        sessions
+            .unseal(&client.cookie("s").expect("a session cookie"))
+            .expect("it opens")
+            .0
+    };
+
+    // Fixation: the anonymous session's id is not the signed-in one's.
+    let r = client.post_form("/auth/google/start", &[]).await;
+    let before = id_of(&client);
+    let state = sent_state(r.location().unwrap());
+    client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+    assert_ne!(id_of(&client), before);
+
+    // A forged state uses the pending sign-in up: the real one cannot follow.
+    client.clear_cookies();
+    let r = client.post_form("/auth/google/start", &[]).await;
+    let state = sent_state(r.location().unwrap());
+    let r = client
+        .get("/auth/google/callback?state=forged&code=abc")
+        .await;
+    assert_eq!(r.location(), Some("/login?social=expired"));
+    let r = client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(r.location(), Some("/login?social=expired"));
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+
+    // Mix-up: begun with Google, returned at Discord's callback with its state.
+    let r = client.post_form("/auth/google/start", &[]).await;
+    let state = sent_state(r.location().unwrap());
+    let r = client
+        .get(&format!("/auth/discord/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(r.location(), Some("/login?social=expired"));
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+
+    // `next`: kept when short and local, dropped when long or elsewhere.
+    for (next, lands) in [
+        ("/games?x=1".to_owned(), "/games?x=1"),
+        (format!("/{}", "a".repeat(2000)), "/"),
+        ("//evil.example/".to_owned(), "/"),
+        ("/\\evil.example/".to_owned(), "/"),
+        ("https://evil.example/".to_owned(), "/"),
+    ] {
+        client.clear_cookies();
+        let r = client
+            .post_form("/auth/google/start", &[("next", &next)])
+            .await;
+        assert!(
+            client.cookie("s").unwrap().len() < 3000,
+            "the cookie grew with next"
+        );
+        let state = sent_state(r.location().unwrap());
+        let r = client
+            .get(&format!("/auth/google/callback?state={state}&code=abc"))
+            .await;
+        assert_eq!(r.location(), Some(lands), "{next}");
+    }
+    db.drop().await;
+}
+
+/// A connect: for the account that began it only, after a recent sign-in, back on
+/// the connections page whatever happens.
+#[tokio::test]
+async fn a_connect_belongs_to_the_account_that_began_it() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (_, client) = social_fixture(
+        &db,
+        sub.clone(),
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let sessions = social_sessions();
+    round_trip(&client, &[]).await;
+    let ada = store::by_username(&db.pool, "adalovelace")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Someone else signs in on this browser before the consent comes back.
+    *sub.lock().unwrap() = "g2".into();
+    let r = client
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    let state = sent_state(r.location().unwrap());
+    let bob = store::create(&db.pool, new("bob", "", None)).await.unwrap();
+    let (id, mut data) = sessions.unseal(&client.cookie("s").unwrap()).unwrap();
+    owt_accounts::session::Signed::set_signature(
+        &mut data,
+        Some(owt_accounts::session::Signature {
+            account: bob.id,
+            epoch: bob.session_epoch,
+        }),
+    );
+    client.set_cookie("s", &sessions.seal(&id, &data));
+    let r = client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(r.location(), Some("/login?social=sign-in-first"));
+    assert_eq!(identities::list(&db.pool, bob.id).await.unwrap().len(), 0);
+    assert_eq!(identities::list(&db.pool, ada.id).await.unwrap().len(), 1);
+
+    // Cancelled at the provider: back to the connections page.
+    client.set_cookie(
+        "s",
+        &sessions.seal(&id, &{
+            let mut d = data.clone();
+            d.started = None;
+            owt_accounts::session::Signed::set_signature(
+                &mut d,
+                Some(owt_accounts::session::Signature {
+                    account: ada.id,
+                    epoch: ada.session_epoch,
+                }),
+            );
+            d
+        }),
+    );
+    client
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    let r = client
+        .get("/auth/google/callback?error=access_denied")
+        .await;
+    assert_eq!(r.location(), Some("/account/connections?social=cancelled"));
+
+    // Another account's identity: taken.
+    *sub.lock().unwrap() = "g-bob".into();
+    identities::link(
+        &db.pool,
+        bob.id,
+        &owt_auth::oauth::google(),
+        &identity("g-bob", None, false),
+    )
+    .await
+    .unwrap();
+    let r = round_trip(&client, &[("connect", "1")]).await;
+    assert_eq!(r.location(), Some("/account/connections?social=taken"));
+
+    // A session that began long ago must sign in again first.
+    let old = {
+        let mut d = owt_accounts::social::Data::default();
+        owt_accounts::session::Signed::set_signature(
+            &mut d,
+            Some(owt_accounts::session::Signature {
+                account: ada.id,
+                epoch: ada.session_epoch,
+            }),
+        );
+        d
+    };
+    let demanding = owt_accounts::social::SocialSignIn::new(
+        db.pool.clone(),
+        owt_auth::oauth::http_client().unwrap(),
+        owt_accounts::social::Providers::new("http://localhost:8000", "/auth/{provider}/callback")
+            .unwrap()
+            .with(owt_auth::oauth::google(), "cid", "secret")
+            .unwrap(),
+        identities::Welcome::default(),
+    )
+    .connect_within(Duration::ZERO);
+    let strict = owt_test::Client::new(social_app(&db, &sessions, &demanding));
+    strict.set_cookie("s", &sessions.seal(&owt_web::session::new_id(), &old));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let r = strict
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    assert_eq!(r.location(), Some("/login?social=sign-in-again"));
+    db.drop().await;
+}
+
+/// An identity linked to a deactivated account signs nobody in and creates nothing.
+#[tokio::test]
+async fn a_deactivated_accounts_identity_signs_nobody_in() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (_, client) = social_fixture(
+        &db,
+        sub,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    round_trip(&client, &[]).await;
+    let ada = store::by_username(&db.pool, "adalovelace")
+        .await
+        .unwrap()
+        .unwrap();
+    store::set_active(&db.pool, ada.id, false).await.unwrap();
+    client.clear_cookies();
+    let r = round_trip(&client, &[]).await;
+    assert_eq!(r.location(), Some("/login?social=unknown"));
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    db.drop().await;
+}
+
+/// A builder setting made after `routes()` reaches later routes, not earlier ones,
+/// and is never silently dropped.
+#[tokio::test]
+async fn the_builder_never_drops_a_setting() {
+    use owt_accounts::social::{self, Providers, SocialSignIn};
+    let db = db!();
+    let s = SocialSignIn::new(
+        db.pool.clone(),
+        owt_auth::oauth::http_client().unwrap(),
+        Providers::new("http://localhost:8000", social::DEFAULT_CALLBACK)
+            .unwrap()
+            .with(owt_auth::oauth::google(), "cid", "secret")
+            .unwrap(),
+        identities::Welcome::default(),
+    );
+    let _early = s.routes::<social::Data, ()>();
+    let s = s.sign_in_page("/signin");
+    let client = owt_test::Client::new(social_app(&db, &social_sessions(), &s));
+    let r = client.get("/auth/google/callback?state=x&code=y").await;
+    assert_eq!(r.location(), Some("/signin?social=expired"));
+    db.drop().await;
+}

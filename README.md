@@ -8,7 +8,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
-| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin |
+| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -375,8 +375,9 @@ if password::verify_or_decoy(given, stored_hash).await {
     let _to = redirect::local_or(next, "/"); // `?next=` never leaves this site
 }
 
-// Sign-in with a provider: redirect to `url` and keep `pending` in the session; on
-// the callback, `complete` checks the state and the provider, then trades the code.
+// The protocol underneath `owt_accounts::social`, which is what an app mounts (see
+// "Sign-in with a provider"): `begin` makes the redirect and the pending login;
+// `complete` checks the state and the provider, then trades the code.
 let google = oauth::Client {
     provider: oauth::google(),
     client_id: "id".into(),
@@ -658,6 +659,240 @@ let _app: axum::Router = axum::Router::new()
 Its markup carries only `owt-*` classes from `tailwind/owt.css` (buttons, tables,
 badges, checkboxes), so it takes the app's tokens with no CSS of the app's. A test
 here fails if a template names a class the stylesheet lacks.
+
+### Sign-in with a provider
+
+`owt_accounts::social` is the whole "Continue with Google" feature: the start,
+callback and remove routes, their configuration, the sign-in buttons and the
+connections list. The app writes no OAuth handler. It supplies four things:
+credentials and its public URL (environment), a registration at each provider, a
+session type that can hold a sign-in in progress, and two pages that embed the
+pieces (its sign-in page and a settings page).
+
+**What it does, and refuses:**
+
+- A person is the provider's key plus its subject, never an email (see "Accounts").
+  A first sign-in creates an account when `Welcome { create: true }`; otherwise it
+  is turned away with `?social=unknown`.
+- The start and remove are `POST` forms: layer the app's `CrossOrigin` around them
+  (below). The pending sign-in (state, PKCE verifier, where to land) lives in the
+  session and is used up by the first callback, whatever it brings, so a replayed or
+  forged callback lands on `?social=expired` and so does the real one after it. It
+  lapses after `social::PENDING_FOR` (10 minutes) and finishes only in the session
+  it began in: one begun on a shared browser before its owner signed in (which
+  replaces the session's id) finishes nothing. Sessions are sealed cookies, so a
+  copy of the cookie made while a sign-in was pending still holds it; within those
+  10 minutes such a copy is a stolen session, which can sign in as its owner anyway.
+  And someone at an unlocked browser already signed in who starts a sign-in there
+  can, for those 10 minutes, send its owner a link that signs the browser in to
+  the starter's account: hands on a signed-in browser are beyond what this guards.
+- A callback for one provider cannot finish a sign-in begun with another. `next` is
+  followed only when it is a path on this site, and dropped when longer than
+  `social::MAX_NEXT` bytes (it rides in the session cookie, which a browser drops
+  past about 4 KB). Signing in cycles the session id.
+- Connecting a provider (`connect=1` on the start form) needs a session signed in
+  within the last 15 minutes (`SocialSignIn::connect_within`; older lands on
+  `?social=sign-in-again`, so the sign-in page must let a signed-in person sign in
+  again), checked when it starts and again when it comes back, and links only to the
+  account that began it, even if someone else signs in on the browser meanwhile. A
+  session that is not fresh therefore cannot quietly add a provider that outlives a
+  password reset. Remove never removes the last way in,
+  and never another account's connection (404).
+- An identity linked to a deactivated account signs nobody in and creates nothing:
+  `?social=unknown`.
+- Every outcome redirects with `?social=<code>`, to the sign-in page or, for a
+  connect or remove, the connections page. `social::outcome` turns the code into a
+  message for `owt_web::ui::Alerts`.
+
+#### 1. Configuration
+
+`Providers::from_env(callback)` reads these at start and fails start-up, naming the
+variable, when one is wrong (a credential in `PUBLIC_BASE_URL` is left out of the
+message). A deployment never discovers a typo at a user's first sign-in.
+`Providers::from_values(lookup, callback)` reads the same names through `lookup`
+instead of the environment: a secrets manager, or a test.
+
+| Variable | Required | Value |
+|---|---|---|
+| `PUBLIC_BASE_URL` | when any provider is set | The origin people reach the site at, exactly: `https://myapp.example`. No path, query, fragment or credentials, and no trailing slash (one is trimmed). `https` only, except `http://localhost:<port>`, `http://127.0.0.1:<port>` or `http://[::1]:<port>` for development. Behind a CDN or the OpenShift router, this is the public host, not the pod's. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | both or neither | From the Google Cloud console (below). Neither: no Google button. |
+| `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | both or neither | From the Discord developer portal. |
+| `TWITCH_CLIENT_ID`, `TWITCH_CLIENT_SECRET` | both or neither | From the Twitch developer console. |
+
+With no provider configured, `Providers` is empty: start and callback answer 404
+(remove still answers, as for an account with no connections) and the buttons render
+nothing, so one build serves a deployment with and without sign-in by
+provider. Blank values count as unset. Setting one variable of a pair is an error.
+
+An OpenID Connect issuer (Keycloak, an Entra tenant) is added in code, with its
+issuer URL and endpoints from its discovery document
+(`<issuer>/.well-known/openid-configuration`). Its identities are keyed by the
+issuer, so pointing `sso` at a different realm later starts a fresh set of
+identities rather than mixing two realms' users. The issuer and endpoints must be
+`https` (`oidc` refuses others), and every sign-in must bring an ID token from that
+issuer for this client. An app configuring providers without the environment uses
+`Providers::new(public_base_url, callback)` and `.with(…)` for each:
+
+```rust,no_run
+# fn demo() -> anyhow::Result<()> {
+use owt_accounts::social::{Providers, DEFAULT_CALLBACK};
+use owt_auth::oauth;
+
+let issuer = "https://sso.example/realms/staff";
+let providers = Providers::from_env(DEFAULT_CALLBACK)?.with(
+    oauth::oidc("sso", "Staff SSO", issuer,
+        &format!("{issuer}/protocol/openid-connect/auth"),
+        &format!("{issuer}/protocol/openid-connect/token"),
+        &format!("{issuer}/protocol/openid-connect/userinfo"))?,
+    owt_runtime::env::required("SSO_CLIENT_ID")?,
+    owt_runtime::env::required("SSO_CLIENT_SECRET")?,
+)?;
+# let _ = providers; Ok(()) }
+```
+
+**The callback path** is `/auth/{provider}/callback` (`social::DEFAULT_CALLBACK`).
+An app whose providers are already registered with another path passes that instead
+(`"/accounts/{provider}/login/callback/"`), so existing registrations keep working;
+it must start with `/` and name `{provider}` once, with no other capture, wildcard,
+query or fragment. Start and remove are always
+`/auth/{provider}/start` and `/auth/connections/{id}/remove`.
+
+#### 2. Registering at each provider
+
+Each provider needs the **redirect URI** exactly as the app sends it:
+`PUBLIC_BASE_URL` followed by the callback path with the provider's id, for example
+`https://myapp.example/auth/google/callback`. `Providers::redirect_uri("google")`
+prints it. Scheme, host, port, path and trailing slash must all match, or the
+provider refuses with "redirect_uri_mismatch" before the person sees a consent
+screen. Register one URI per environment (production, staging,
+`http://localhost:8000/...` for development), or one client per environment.
+
+| Provider | Where | What to set |
+|---|---|---|
+| Google (id `google`) | Google Cloud console → APIs & Services → Credentials → Create credentials → OAuth client ID | Application type **Web application**. **Authorized redirect URIs**: the redirect URI above. The OAuth consent screen needs the `openid`, `.../auth/userinfo.profile` and `.../auth/userinfo.email` scopes (the app asks for `profile email`), and must be **published** (not "Testing") for people outside the test-user list. |
+| Discord (id `discord`) | discord.com/developers → Applications → your app → OAuth2 | **Redirects**: the redirect URI. Copy the client id and reset to get the secret. Scopes requested: `identify email`. |
+| Twitch (id `twitch`) | dev.twitch.tv/console → Applications → Register | **OAuth Redirect URLs**: the redirect URI (Twitch allows `http` only for `localhost`). Category: Website Integration. **Client type: Confidential** (a public client gets no secret). Scope requested: `user:read:email`. |
+| OIDC issuer (id of your choice) | The issuer's admin console (Keycloak: Clients → Create) | A **confidential** client with the authorization-code ("standard") flow. **Valid redirect URIs**: the redirect URI. PKCE method **S256** allowed. Scopes: `openid profile email`. |
+
+The client secret belongs in a secret store, never in the repository or the image.
+It is never logged: `oauth::Client`'s `Debug` leaves it out.
+
+#### 3. Wiring the app
+
+```rust,no_run
+# use std::time::Duration;
+# async fn demo(pool: sqlx::PgPool, key: cookie::Key) -> anyhow::Result<()> {
+use axum::{Router, middleware::from_fn_with_state};
+use owt_accounts::identities::Welcome;
+use owt_accounts::social::{self, Providers, SocialSignIn, DEFAULT_CALLBACK};
+use owt_accounts::Accounts;
+use owt_auth::oauth;
+use owt_web::csrf::CrossOrigin;
+use owt_web::headers::Csp;
+use owt_web::session::Sessions;
+
+let providers = Providers::from_env(DEFAULT_CALLBACK)?; // fails start-up on bad config
+// Configure fully before `routes()`: the routes keep the configuration they were made with.
+let social = SocialSignIn::new(pool.clone(), oauth::http_client()?, providers, Welcome { create: true, ..Welcome::default() })
+    .sign_in_page("/login")                  // failures land here with ?social=
+    .connections_page("/account/connections") // connects and removals land here
+    .after_sign_in("/")                      // when the form gave no `next` on this site
+    .connect_within(Duration::from_secs(15 * 60)); // how recent a sign-in a connect needs
+
+// The start form's redirect goes to the provider: allow its origin in form-action.
+let mut form_action = vec!["'self'".to_owned()];
+form_action.extend(social.providers().form_action_sources());
+let _csp = Csp::new().directive("form-action", &form_action.join(" "));
+
+// Session data that can hold a sign-in in progress: `social::Data`, or the app's
+// own type implementing `social::Social` (below). Lax cookies (the default) are
+// required: the provider's redirect back is a cross-site navigation, and a Strict
+// cookie would not come with it. A `__Host-` name keeps a sibling subdomain from
+// planting a cookie of its own for these paths.
+let sessions: Sessions<social::Data> =
+    Sessions::new(key, "__Host-session", Duration::from_secs(14 * 86_400), true);
+let app: Router = Router::new()
+    .merge(social.routes::<social::Data, ()>()) // merge: the paths are absolute
+    .layer(from_fn_with_state(Accounts::new(pool, "/login"), Accounts::load::<social::Data>))
+    .layer(from_fn_with_state(sessions, Sessions::layer))
+    // Outermost: a cross-origin POST (a sibling subdomain is same-site, so Lax
+    // cookies come with it) is refused before it reaches start or remove.
+    .layer(from_fn_with_state(CrossOrigin::new(), CrossOrigin::layer));
+# let _ = app; Ok(()) }
+```
+
+An app with its own session type adds one field and the trait:
+
+```rust
+use owt_accounts::session::{Signature, Signed};
+use owt_accounts::social::{Social, Started};
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct MySession {
+    #[serde(flatten)]
+    signed: owt_accounts::session::Data,
+    #[serde(rename = "o", default, skip_serializing_if = "Option::is_none")]
+    started: Option<Started>,
+    // ...the app's own fields
+}
+impl Signed for MySession {
+    fn signature(&self) -> Option<Signature> { self.signed.signature() }
+    fn set_signature(&mut self, s: Option<Signature>) { self.signed.set_signature(s) }
+}
+impl Social for MySession {
+    fn started(&self) -> Option<&Started> { self.started.as_ref() }
+    fn set_started(&mut self, s: Option<Started>) { self.started = s }
+}
+```
+
+**The two pages** embed the pieces; the app writes the rest of each page.
+`?social=` codes are shown with `outcome`:
+
+```rust,no_run
+# async fn demo(social: owt_accounts::social::SocialSignIn, me: owt_accounts::Account, info: owt_web::request::RequestInfo) -> anyhow::Result<()> {
+// Sign-in page: `{{ alerts }}` and `{{ buttons }}` in its template.
+let flashes: Vec<_> = owt_accounts::social::outcome(info.query_value("social")).into_iter().collect();
+let _alerts = owt_web::ui::Alerts { flashes: &flashes };
+let next = info.query_value("next").unwrap_or("");
+let _buttons = social.buttons(next); // "Continue with Google", one form each
+
+// Settings page (behind `Signed`): `{{ alerts }}` and `{{ connections }}`.
+let _connections = social.connections(me.id).await?; // each with Remove, then "Connect …"
+# Ok(()) }
+```
+
+#### 4. Deploying
+
+- **OpenShift:** keep the credentials in a Secret and add it to the Deployment's
+  environment, with `PUBLIC_BASE_URL` beside it:
+
+  ```sh
+  oc create secret generic myapp-oauth \
+    --from-literal=GOOGLE_CLIENT_ID=... --from-literal=GOOGLE_CLIENT_SECRET=...
+  oc set env deployment/myapp --from=secret/myapp-oauth
+  oc set env deployment/myapp PUBLIC_BASE_URL=https://myapp.example
+  ```
+
+- **Development:** the app's `.env` (which `just` loads) holds
+  `PUBLIC_BASE_URL=http://localhost:8000` and a development client's credentials,
+  registered with `http://localhost:8000/auth/<provider>/callback`. Sessions there
+  need `secure: false` in `Sessions::new`, since the browser will not send a `Secure`
+  cookie over `http`.
+- **Before going live,** for each provider: sign in, sign out, connect a second
+  provider from settings, remove it, and confirm the browser lands where expected each
+  time.
+
+#### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| The provider says `redirect_uri_mismatch` (or "invalid redirect") | The registered URI differs from `Providers::redirect_uri(id)`: scheme, host, port, path or trailing slash. Check `PUBLIC_BASE_URL` against the address bar. |
+| Every sign-in lands on `?social=expired` | The session cookie did not survive the trip: `PUBLIC_BASE_URL`'s host differs from the one the person started on (`www.` or not), the cookie is `Secure` over `http`, the session layer is not around the routes, or the cookie was made `SameSite=Strict`. |
+| Pressing the button does nothing; the console shows a `form-action` violation | The CSP's `form-action` lacks the provider's origin: add `form_action_sources()`. |
+| `?social=failed` | The code exchange or user-info request failed: a wrong secret, a Twitch client that is not Confidential, or the provider unreachable. The server log has a `warn` naming the provider. |
+| `?social=unknown` | `Welcome { create: false }` and no account is linked to that identity, or the linked account is deactivated. The person signs in another way and connects the provider from settings. |
+| Connect always lands on `?social=sign-in-again` | The session began longer ago than `connect_within`; the person signs in again first. If it repeats right after signing in, the sign-in page is not signing a signed-in person in again (it redirects them away instead). |
+| Start-up fails naming a variable | A pair half-set, `PUBLIC_BASE_URL` missing or not an `https` origin, a callback path without `{provider}` (or with another capture), or an OIDC issuer or endpoint that is not `https`. |
 
 ### Change requests
 
@@ -1250,7 +1485,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   refused sign-in checks no password), keyed on `client_ip::Source::client_ip`
   (configured for the proxies actually in front of the app), and
   `redirect::local_or` on `?next=` before redirecting to it (see "Authentication").
-- OAuth: `oauth::http_client()` for the exchange; `Client::complete` checks the
+- OAuth: use `owt_accounts::social` rather than hand-written handlers (see "Sign-in
+  with a provider"); it uses `oauth::http_client()`, and `Client::complete` checks the
   state and the provider itself. Key people by (`Provider::key()`, `Identity::uid`),
   never by `Identity::email`, in the app's own tables too.
 - The bus's Redis is inside the trust boundary: a password or ACL user, a network
