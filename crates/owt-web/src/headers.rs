@@ -95,8 +95,11 @@ pub async fn security(req: Request, next: Next) -> Response {
 /// Start with [`Csp::report_only`] and read the browser console before enforcing.
 /// htmx needs `htmx.config.includeIndicatorStyles = false` (or its
 /// `inlineStyleNonce`) and no `hx-on:*` attributes or `eval`-based features, which a
-/// nonce cannot cover. A page cached for many viewers replays one nonce; give such a
-/// page no inline scripts.
+/// nonce cannot cover. A nonce never covers a `style="…"` attribute either, so the
+/// default policy blocks every one, including those a page writes on purpose (a
+/// progress bar's width, a colour swatch); [`Csp::allow_style_attributes`] allows
+/// them. A page cached for many viewers replays one nonce; give such a page no inline
+/// scripts.
 #[derive(Clone, Debug)]
 pub struct Csp(Arc<CspInner>);
 
@@ -159,6 +162,15 @@ impl Csp {
             inner.directives.push((name.to_owned(), value.to_owned()));
         }
         self
+    }
+
+    /// Allow `style="…"` attributes (`style-src-attr 'unsafe-inline'`), which a nonce
+    /// cannot cover. `<style>` elements and stylesheets still answer to `style-src`:
+    /// injected markup can restyle the element it lands on, but cannot bring a
+    /// stylesheet that reaches the rest of the page.
+    #[must_use]
+    pub fn allow_style_attributes(self) -> Self {
+        self.directive("style-src-attr", "'unsafe-inline'")
     }
 
     /// Send `Content-Security-Policy-Report-Only`: violations are reported in the
@@ -342,6 +354,17 @@ mod tests {
                 .contains_key(header::CONTENT_SECURITY_POLICY_REPORT_ONLY)
         );
         assert!(!res.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    }
+
+    #[test]
+    fn style_attributes_are_allowed_only_when_asked() {
+        assert!(!Csp::new().render("n").contains("style-src-attr"));
+        let policy = Csp::new().allow_style_attributes().render("n");
+        assert!(
+            policy.contains("; style-src-attr 'unsafe-inline'"),
+            "{policy}"
+        );
+        assert!(policy.contains("style-src 'self' 'nonce-n';"), "{policy}");
     }
 
     #[test]
