@@ -69,6 +69,7 @@ impl fmt::Display for Body {
 impl HtmlSafe for Body {}
 
 /// What the app's [`Chrome`] wraps: an admin page.
+#[non_exhaustive]
 pub struct Page<'a> {
     /// The request, for whatever the app's layout reads from it (its extensions hold
     /// the session, the CSP nonce, the signed-in account).
@@ -195,7 +196,8 @@ impl Admin {
             .layer(axum::middleware::from_fn_with_state(
                 CrossOrigin::new(),
                 CrossOrigin::layer,
-            ));
+            ))
+            .layer(axum::middleware::map_response(never_framed));
         Router::new().nest(&base, pages)
     }
 
@@ -781,6 +783,23 @@ async fn detail(
     .await
 }
 
+/// No admin page is shown inside another's frame, whatever the app's own CSP (one in
+/// report-only mode enforces no `frame-ancestors`): framed by a hostile sibling
+/// subdomain, which `SameSite=Lax` and [`CrossOrigin`] treat as the site itself, a
+/// click would act with staff's authority.
+async fn never_framed(mut response: Response) -> Response {
+    let h = response.headers_mut();
+    h.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    h.append(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    response
+}
+
 async fn save(
     State(admin): Shared,
     Staff(me): Staff,
@@ -815,6 +834,8 @@ async fn save(
             return Err(e.into());
         };
         let notice = Notice::error(refused.to_string());
+        // Its locks and connection go before the page takes three more.
+        drop(tx);
         let mut response = show(
             &admin,
             &parts,

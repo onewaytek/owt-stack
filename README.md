@@ -415,13 +415,17 @@ of its own) and the choice of flows (self-signup or not, which providers, whethe
 links are minted).
 
 **Tables:** write each of `owt_accounts::migrations::ALL`, in order, to the app's
-`migrations/` (`0001_owt_accounts.sql`, `0002_owt_accounts_roles.sql`), first, since
-the app's tables reference `accounts(id)`; a test calls `owt_accounts::migrations::assert_installed("migrations")`
-so an edited or missing copy fails the build. sqlx keeps one ledger per database, which
-is why the library does not run a migrator of its own. A shipped migration never
-changes (sqlx would refuse the re-copied file at deploy, its checksum differing from
-the applied one): a later release appends a new entry to `ALL`, which the app copies
-as its next file, and a test here pins each file's SHA-256.
+`migrations/`. A new app writes them first (`0001_owt_accounts.sql`,
+`0002_owt_accounts_roles.sql`), since its tables reference `accounts(id)`. An app
+that has migrations of its own gives a newly released entry its next unused version
+(`0007_owt_accounts_roles.sql` after its `0006_…`), never a number already applied:
+sqlx refuses a file whose version it ran with other contents. A test calls
+`owt_accounts::migrations::assert_installed("migrations")`, which matches the files
+by content, not name, so an edited or missing copy fails the build. sqlx keeps one
+ledger per database, which is why the library does not run a migrator of its own. A
+shipped migration never changes (sqlx would refuse the re-copied file at deploy, its
+checksum differing from the applied one): a later release appends a new entry to
+`ALL`, and a test here pins each file's SHA-256.
 
 **Provider identities are found by subject, never by email.** `identities::arrive`
 looks up the provider's key and the identity's subject, and nothing else. An address
@@ -442,7 +446,12 @@ share people. `identities::list` returns `Linked::provider` as stored, the issue
 URL for an OIDC provider and the id (`google`) for a preset; match it against
 `Provider::key()`, not `Provider::id`.
 
-**Upgrading from 0.4:** identities are stored under `Provider::key()`: the issuer for
+**Upgrading from 0.4 (roles and admin):** install `ALL[1]` (roles) as the app's next
+migration (above). `Account` gains `roles`, read by `store::COLUMNS`, now public; a
+query of the app's own that decodes an `Account` without it reads no roles. The
+admin's `Admin::routes` nests itself at its base: merge it, don't nest it.
+
+**Upgrading from 0.4 (identities):** identities are stored under `Provider::key()`: the issuer for
 an OIDC provider (it used to be the id, `sso`), and `google`, `discord` or `twitch`
 for the presets (unchanged, if the app passed exactly those names). An identity
 under any other key is a stranger at its next sign-in (a second, empty account with

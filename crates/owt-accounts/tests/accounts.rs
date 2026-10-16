@@ -1149,6 +1149,7 @@ async fn the_admin_is_for_staff_and_finds_accounts_by_name_email_and_role() {
     let r = client.get("/staff/accounts").await;
     assert_eq!(r.status, 200);
     assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(r.header("x-frame-options"), Some("DENY"), "never framed");
     let html = r.text();
     assert!(
         html.contains("<title>Accounts</title><p>me: boss</p>"),
@@ -1403,7 +1404,10 @@ async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
         &db.pool,
         &oauth::discord(),
         &identity("d1", None, false),
-        identities::Welcome { create: true },
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();

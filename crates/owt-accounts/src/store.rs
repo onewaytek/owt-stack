@@ -23,6 +23,9 @@ pub struct Account {
     pub session_epoch: i32,
     /// The names of the app's roles it holds (see [`crate::roles`]), sorted; read on
     /// every request with the rest, so a revoked role is gone at the next one.
+    /// A query of the app's own that does not select it (one written before roles,
+    /// say) reads none: it fails closed. Select [`COLUMNS`] to read them.
+    #[sqlx(default)]
     pub roles: Vec<String>,
 }
 
@@ -35,8 +38,9 @@ impl Account {
     }
 }
 
-/// The columns an [`Account`] is read from, for a query on `accounts` (unaliased).
-pub(crate) const COLUMNS: &str = "id, username, email, is_staff, is_active, session_epoch, \
+/// The columns an [`Account`] is read from, for a query on `accounts` (unaliased):
+/// `format!("SELECT {COLUMNS} FROM accounts WHERE …")` with `query_as::<_, Account>`.
+pub const COLUMNS: &str = "id, username, email, is_staff, is_active, session_epoch, \
      ARRAY(SELECT r.role FROM account_roles r WHERE r.account_id = accounts.id ORDER BY r.role) AS roles";
 
 /// The most characters a username has.
