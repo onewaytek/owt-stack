@@ -211,7 +211,8 @@ Templates put the request's nonce on inline scripts: take `owt_web::headers::Non
 the handler and write `<script nonce="{{ nonce }}">`.
 
 - **Session key:** `owt_web::session::key_for(&env::required("SESSION_SECRET")?, &purpose)`,
-  from at least 64 random bytes, where `purpose` names the app and its environment
+  from at least 64 random bytes, base64 on one line (`openssl rand 64 | base64 -w0`;
+  `openssl rand -base64 64` wraps its output, and a newline inside is refused), where `purpose` names the app and its environment
   (`myapp/production`, or `myapp/` plus the pod's namespace from the downward API).
   Whoever holds the key seals a session for any account, so the secret is unique to
   each app and environment, and the purpose makes a copied secret (staging given
@@ -1624,7 +1625,7 @@ The router example under "Wiring an app" composes the layers; beyond it:
   copied between environments one key. Moving to it signs everyone out, unless the
   old key opens sessions for a while (`also_open_with`, above).
 - `key_from_base64` and `key_for` refuse a secret that is a pattern rather than
-  random bytes (fewer than 16 distinct byte values); a test fixture of `[7u8; 64]`
+  random bytes (fewer than 8 distinct byte values); a test fixture of `[7u8; 64]`
   needs real bytes.
 - `RequestInfo::at` always yields a path starting with `/`.
 

@@ -94,8 +94,10 @@ pub fn key_for(secret: &str, purpose: &str) -> anyhow::Result<Key> {
 }
 
 /// Fewer distinct byte values than this in a secret is a pattern, not randomness:
-/// 64 random bytes take about 57 values, and fewer than 16 has odds of about 1e-40.
-const MIN_DISTINCT_BYTES: usize = 16;
+/// 64 random bytes take about 57 values, and fewer than 8 has odds far below 1e-60.
+/// Low enough that base64 of text (hex digits take 16 values) still passes; that
+/// is weaker than raw bytes for its length, but not a pattern.
+const MIN_DISTINCT_BYTES: usize = 8;
 
 /// The secret's bytes: base64 of at least 64, not a repetition.
 fn secret_bytes(secret: &str) -> anyhow::Result<Vec<u8>> {
@@ -115,7 +117,7 @@ fn secret_bytes(secret: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
         distinct >= MIN_DISTINCT_BYTES,
         "the session secret is a pattern ({distinct} distinct bytes), not random: \
-         make one with `openssl rand -base64 64`"
+         make one with `openssl rand 64 | base64 -w0`"
     );
     Ok(bytes)
 }
