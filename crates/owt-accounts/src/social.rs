@@ -578,7 +578,7 @@ impl SocialSignIn {
     /// # Errors
     ///
     /// The database.
-    pub async fn connections(&self, account_id: i64) -> sqlx::Result<Connections> {
+    pub async fn connections(&self, account_id: i64) -> sqlx::Result<Connections<'static>> {
         let linked = identities::list(&self.0.pool, account_id).await?;
         let keys: Vec<&str> = linked.iter().map(|l| l.provider.as_str()).collect();
         let rows = linked
@@ -603,7 +603,7 @@ impl SocialSignIn {
         Ok(Connections {
             rows,
             items,
-            words: ConnectionWords::default(),
+            words: ConnectionWords::ENGLISH,
         })
     }
 }
@@ -681,34 +681,39 @@ struct ConnectionRow {
 }
 
 /// The words [`Connections`] writes. English unless the app passes its own
-/// ([`Connections::words`]); owned, as the connections are.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConnectionWords {
+/// ([`Connections::words`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionWords<'a> {
     /// Shown when the account has none: `No sign-in connections yet.`
-    pub none: String,
+    pub none: &'a str,
     /// The provider column's heading.
-    pub provider: String,
+    pub provider: &'a str,
     /// The heading of the column naming the account at the provider.
-    pub account: String,
+    pub account: &'a str,
     /// The buttons column's heading, read by assistive technology only.
-    pub actions: String,
+    pub actions: &'a str,
     /// The button that removes a connection.
-    pub remove: String,
+    pub remove: &'a str,
     /// A button adding a provider: `Connect {provider}`.
-    pub connect: String,
+    pub connect: &'a str,
 }
 
-impl Default for ConnectionWords {
-    /// English.
+impl ConnectionWords<'static> {
+    /// `No sign-in connections yet.`, `Provider`, `Account there`, `Actions`,
+    /// `Remove`, and [`ButtonWords::ENGLISH`]'s `Connect {provider}`.
+    pub const ENGLISH: Self = Self {
+        none: "No sign-in connections yet.",
+        provider: "Provider",
+        account: "Account there",
+        actions: "Actions",
+        remove: "Remove",
+        connect: ButtonWords::ENGLISH.connect,
+    };
+}
+
+impl Default for ConnectionWords<'_> {
     fn default() -> Self {
-        Self {
-            none: "No sign-in connections yet.".into(),
-            provider: "Provider".into(),
-            account: "Account there".into(),
-            actions: "Actions".into(),
-            remove: "Remove".into(),
-            connect: ButtonWords::ENGLISH.connect.into(),
-        }
+        ConnectionWords::ENGLISH
     }
 }
 
@@ -720,21 +725,21 @@ impl Default for ConnectionWords {
 {% else %}<table class="owt-table"><thead><tr><th scope="col">{{ words.provider }}</th><th scope="col">{{ words.account }}</th><th scope="col"><span class="owt-sr">{{ words.actions }}</span></th></tr></thead><tbody>
 {% for r in rows %}<tr><td>{{ r.provider }}</td><td>{{ r.label }}</td><td><form method="post" action="{{ r.remove }}"><button class="owt-button owt-button-quiet" type="submit">{{ words.remove }}</button></form></td></tr>
 {% endfor %}</tbody></table>
-{% endif %}{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}"><input type="hidden" name="connect" value="1"><button class="owt-button owt-button-secondary" type="submit">{{ crate::social::named(words.connect.as_str(), b.name) }}</button></form>{% endfor %}</div>
+{% endif %}{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}"><input type="hidden" name="connect" value="1"><button class="owt-button owt-button-secondary" type="submit">{{ crate::social::named(words.connect, b.name) }}</button></form>{% endfor %}</div>
 {% endif %}"#,
     ext = "html"
 )]
-pub struct Connections {
+pub struct Connections<'a> {
     rows: Vec<ConnectionRow>,
     items: Vec<ButtonItem>,
-    words: ConnectionWords,
+    words: ConnectionWords<'a>,
 }
-impl HtmlSafe for Connections {}
+impl HtmlSafe for Connections<'_> {}
 
-impl Connections {
+impl<'a> Connections<'a> {
     /// In the page's language.
     #[must_use]
-    pub fn words(mut self, words: ConnectionWords) -> Self {
+    pub fn words(mut self, words: ConnectionWords<'a>) -> Self {
         self.words = words;
         self
     }
@@ -1133,7 +1138,7 @@ mod tests {
         let none = Connections {
             rows: Vec::new(),
             items: vec![item()],
-            words: ConnectionWords::default(),
+            words: ConnectionWords::ENGLISH,
         };
         let html = none.clone().render().unwrap();
         assert!(html.contains("No sign-in connections yet.") && html.contains(">Connect Google<"));
@@ -1146,12 +1151,12 @@ mod tests {
             ..none
         }
         .words(ConnectionWords {
-            none: "Aún no hay conexiones.".into(),
-            provider: "Proveedor".into(),
-            account: "Cuenta allí".into(),
-            actions: "Acciones".into(),
-            remove: "Quitar".into(),
-            connect: "Conectar {provider}".into(),
+            none: "Aún no hay conexiones.",
+            provider: "Proveedor",
+            account: "Cuenta allí",
+            actions: "Acciones",
+            remove: "Quitar",
+            connect: "Conectar {provider}",
         })
         .render()
         .unwrap();

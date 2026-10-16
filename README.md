@@ -995,12 +995,12 @@ let _buttons = social.buttons("/es/inicio").words(ButtonWords {
     connect: "Conectar {provider}",
 });
 let _connections = social.connections(me.id).await?.words(ConnectionWords {
-    none: "Aún no hay conexiones.".into(),
-    provider: "Proveedor".into(),
-    account: "Cuenta allí".into(),
-    actions: "Acciones".into(),
-    remove: "Quitar".into(),
-    connect: "Conectar {provider}".into(),
+    none: "Aún no hay conexiones.",
+    provider: "Proveedor",
+    account: "Cuenta allí",
+    actions: "Acciones",
+    remove: "Quitar",
+    connect: "Conectar {provider}",
 });
 
 // The app's own messages, one per code.
