@@ -301,6 +301,9 @@ jobs:
         run: |
           set -euo pipefail
           tools="$RUNNER_TEMP/cargo-tools"
+          # From outside the checkout: its rust-toolchain.toml (an older pin than
+          # sqlx-cli needs) and its .cargo/ have no say in the tool's build.
+          mkdir -p "$tools" && cd "$tools"
           CARGO_HOME="$tools/home" CARGO_TARGET_DIR="$tools/target" \
             cargo install sqlx-cli@0.9.0 --locked --no-default-features \
             --features postgres,rustls --root "$tools"
