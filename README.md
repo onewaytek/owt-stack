@@ -677,7 +677,12 @@ pieces (its sign-in page and a settings page).
 - The start and remove are `POST` forms: layer the app's `CrossOrigin` around them
   (below). The pending sign-in (state, PKCE verifier, where to land) lives in the
   session and is used up by the first callback, whatever it brings, so a replayed or
-  forged callback lands on `?social=expired` and so does the real one after it.
+  forged callback lands on `?social=expired` and so does the real one after it. It
+  lapses after `social::PENDING_FOR` (10 minutes) and finishes only in the session
+  it began in: one begun on a shared browser before its owner signed in (which
+  replaces the session's id) finishes nothing. Sessions are sealed cookies, so a
+  copy of the cookie made while a sign-in was pending still holds it; within those
+  10 minutes such a copy is a stolen session, which can sign in as its owner anyway.
 - A callback for one provider cannot finish a sign-in begun with another. `next` is
   followed only when it is a path on this site, and dropped when longer than
   `social::MAX_NEXT` bytes (it rides in the session cookie, which a browser drops
@@ -685,9 +690,10 @@ pieces (its sign-in page and a settings page).
 - Connecting a provider (`connect=1` on the start form) needs a session signed in
   within the last 15 minutes (`SocialSignIn::connect_within`; older lands on
   `?social=sign-in-again`, so the sign-in page must let a signed-in person sign in
-  again), and links only to the account that began it, even if someone else signs in
-  on the browser meanwhile. A stolen or borrowed session therefore cannot quietly add
-  a provider that outlives a password reset. Remove never removes the last way in,
+  again), checked when it starts and again when it comes back, and links only to the
+  account that began it, even if someone else signs in on the browser meanwhile. A
+  session that is not fresh therefore cannot quietly add a provider that outlives a
+  password reset. Remove never removes the last way in,
   and never another account's connection (404).
 - An identity linked to a deactivated account signs nobody in and creates nothing:
   `?social=unknown`.
@@ -698,8 +704,10 @@ pieces (its sign-in page and a settings page).
 #### 1. Configuration
 
 `Providers::from_env(callback)` reads these at start and fails start-up, naming the
-variable, when one is wrong. A deployment never discovers a typo at a user's first
-sign-in.
+variable, when one is wrong (a credential in `PUBLIC_BASE_URL` is left out of the
+message). A deployment never discovers a typo at a user's first sign-in.
+`Providers::from_values(lookup, callback)` reads the same names through `lookup`
+instead of the environment: a secrets manager, or a test.
 
 | Variable | Required | Value |
 |---|---|---|
@@ -782,7 +790,7 @@ use owt_web::session::Sessions;
 
 let providers = Providers::from_env(DEFAULT_CALLBACK)?; // fails start-up on bad config
 // Configure fully before `routes()`: the routes keep the configuration they were made with.
-let social = SocialSignIn::new(pool.clone(), oauth::http_client()?, providers, Welcome { create: true })
+let social = SocialSignIn::new(pool.clone(), oauth::http_client()?, providers, Welcome { create: true, ..Welcome::default() })
     .sign_in_page("/login")                  // failures land here with ?social=
     .connections_page("/account/connections") // connects and removals land here
     .after_sign_in("/")                      // when the form gave no `next` on this site

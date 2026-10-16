@@ -238,6 +238,7 @@ impl Providers {
             .filter_map(|c| url::Url::parse(&c.provider.authorize_url).ok())
             .map(|u| u.origin().ascii_serialization())
             .collect();
+        out.sort();
         out.dedup();
         out
     }
@@ -253,7 +254,17 @@ fn env_var(name: &str) -> Option<String> {
 /// `https://host[:port]`, no trailing slash; `http` only for this machine
 /// (`localhost`, `127.0.0.1`, `[::1]`).
 fn origin(raw: &str) -> Result<String, ConfigError> {
-    let bad = || ConfigError::BaseUrl(raw.to_owned());
+    // The error names the value, without any credentials it carries: it is logged.
+    let shown = match url::Url::parse(raw.trim()) {
+        Ok(mut u) if !u.username().is_empty() || u.password().is_some() => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            format!("{u} (with credentials, removed here)")
+        }
+        Err(_) if raw.contains('@') => "(an unparsable URL with an @)".to_owned(),
+        Ok(_) | Err(_) => raw.to_owned(),
+    };
+    let bad = || ConfigError::BaseUrl(shown.clone());
     let url = url::Url::parse(raw.trim()).map_err(|_| bad())?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     let scheme_ok = url.scheme() == "https" || (url.scheme() == "http" && local);
@@ -288,6 +299,11 @@ fn callback_path(raw: &str) -> Result<String, ConfigError> {
 /// browser drops a cookie over about 4 KB (which would lose the sign-in).
 pub const MAX_NEXT: usize = 1024;
 
+/// How long a sign-in begun at a provider may take to come back: the callback after
+/// that is `expired`. A copy of the session cookie made while one was pending opens
+/// nothing once it has passed.
+pub const PENDING_FOR: Duration = Duration::from_secs(10 * 60);
+
 /// A sign-in on its way to a provider and back, kept in the session between the two.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Started {
@@ -301,6 +317,14 @@ pub struct Started {
     /// signing in. The callback links only for that account.
     #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
     pub connect: Option<i64>,
+    /// When it began, in Unix seconds; it lapses [`PENDING_FOR`] later.
+    #[serde(rename = "t", default)]
+    pub at: u64,
+    /// The id of the session it began in. Signing in (or out) replaces the id, so a
+    /// sign-in begun on a shared browser before its owner signed in cannot finish
+    /// in the owner's session.
+    #[serde(rename = "s", default)]
+    pub session: String,
 }
 
 /// Session data that can hold a [`Started`] sign-in as well as the signature. An
@@ -654,24 +678,30 @@ async fn start<T: Social + SessionData>(
     } else {
         redirect::local_or(Some(&form.next), "").to_owned()
     };
+    let session_id = session.ensure_id();
     session.update(|d| {
         d.set_started(Some(Started {
             pending,
             next,
             connect,
+            at: now(),
+            session: session_id,
         }));
     });
     Ok((CachePolicy::no_store(), Redirect::to(&url)).into_response())
 }
 
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// The session began (signed in: signing in starts a new one) within `window`.
 fn signed_in_within<T: SessionData>(session: &Session<T>, window: Duration) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
     session
         .issued()
-        .is_some_and(|issued| now.saturating_sub(issued) <= window.as_secs())
+        .is_some_and(|issued| now().saturating_sub(issued) <= window.as_secs())
 }
 
 #[derive(Deserialize)]
@@ -698,7 +728,15 @@ async fn callback<T: Social + SessionData>(
         d.set_started(None);
         s
     });
-    let Some(started) = started else {
+    // Lapsed, or begun in another session (before a sign-in or sign-out on this
+    // browser): a sign-in nobody here is waiting for.
+    let current = session.id().unwrap_or_default();
+    let Some(started) = started.filter(|s| {
+        now().saturating_sub(s.at) <= PENDING_FOR.as_secs()
+            && s.at <= now().saturating_add(60)
+            && !s.session.is_empty()
+            && s.session == current
+    }) else {
         return Ok(landing(&inner.sign_in_page, "expired"));
     };
     let back = if started.connect.is_some() {
@@ -731,6 +769,12 @@ async fn callback<T: Social + SessionData>(
         let Some(me) = me.filter(|me| me.id == began_as) else {
             return Ok(landing(&inner.sign_in_page, "sign-in-first"));
         };
+        // Recent at the end too, not only at the start: the sign-in that allowed it
+        // must not have aged out while the provider was visited (or a copy of the
+        // cookie waited).
+        if !signed_in_within(&session, inner.connect_within) {
+            return Ok(landing(&inner.sign_in_page, "sign-in-again"));
+        }
         return match identities::link(&inner.pool, me.id, &client.provider, &identity).await {
             Ok(_) => {
                 tracing::info!(account = me.id, provider = %provider, "connected a provider");
@@ -805,6 +849,18 @@ mod tests {
     fn nothing_configured_is_no_providers() {
         let p = Providers::from_values(env(&[]), DEFAULT_CALLBACK).unwrap();
         assert!(p.is_empty());
+    }
+
+    /// The refusal is logged at start: it names the URL without its password.
+    #[test]
+    fn a_refused_base_url_is_shown_without_its_credentials() {
+        let err = origin("https://user:hunter2@myapp.example").unwrap_err();
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("user:"),
+            "{shown}"
+        );
+        assert!(matches!(err, ConfigError::BaseUrl(_)));
     }
 
     #[test]

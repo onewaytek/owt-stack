@@ -1903,7 +1903,10 @@ async fn two_provider_fixture(db: &Db, sub: Arc<std::sync::Mutex<String>>) -> ow
         db.pool.clone(),
         oauth::http_client().unwrap(),
         providers,
-        identities::Welcome { create: true },
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
     );
     owt_test::Client::new(social_app(db, &social_sessions(), &social))
 }
@@ -1922,7 +1925,15 @@ async fn round_trip(client: &owt_test::Client, fields: &[(&str, &str)]) -> owt_t
 async fn a_provider_sign_in_round_trips_through_the_routes() {
     let db = db!();
     let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
-    let (social, client) = social_fixture(&db, sub, identities::Welcome { create: true }).await;
+    let (social, client) = social_fixture(
+        &db,
+        sub,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
 
     // The sign-in page's buttons.
     let buttons = social.buttons("/games").to_string();
@@ -1978,13 +1989,133 @@ async fn a_provider_sign_in_round_trips_through_the_routes() {
     db.drop().await;
 }
 
+/// The session cookie with its pending sign-in rewritten by `edit` (the id too).
+fn with_pending(
+    client: &owt_test::Client,
+    edit: impl FnOnce(&mut String, &mut owt_accounts::social::Started),
+) {
+    let sessions = social_sessions();
+    let (mut id, mut data) = sessions.unseal(&client.cookie("s").unwrap()).unwrap();
+    edit(&mut id, data.started.as_mut().unwrap());
+    client.set_cookie("s", &sessions.seal(&id, &data));
+}
+
+/// A pending sign-in is good for `PENDING_FOR`, and only in the session it began in:
+/// a copy of the cookie kept past it, or a sign-in begun before someone else signed
+/// in on the same browser, finishes nothing.
+#[tokio::test]
+async fn a_pending_sign_in_lapses_and_stays_in_its_session() {
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (_, client) = social_fixture(
+        &db,
+        sub,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let begin = || async {
+        let r = client.post_form("/auth/google/start", &[]).await;
+        sent_state(r.location().unwrap())
+    };
+    let finish = |state: String| {
+        let client = &client;
+        async move {
+            client
+                .get(&format!("/auth/google/callback?state={state}&code=abc"))
+                .await
+        }
+    };
+    let state = begin().await;
+    with_pending(&client, |_, started| {
+        started.at -= owt_accounts::social::PENDING_FOR.as_secs() + 1;
+    });
+    assert_eq!(
+        finish(state).await.location(),
+        Some("/login?social=expired")
+    );
+
+    // Begun, then the session was replaced (a password sign-in cycles the id).
+    let state = begin().await;
+    with_pending(&client, |id, _| *id = "another-session-id".into());
+    assert_eq!(
+        finish(state).await.location(),
+        Some("/login?social=expired")
+    );
+
+    // Untouched, it still works.
+    let state = begin().await;
+    assert_eq!(finish(state).await.location(), Some("/home"));
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+    db.drop().await;
+}
+
+/// A connect needs a recent sign-in when it comes back, not only when it starts.
+#[tokio::test]
+async fn a_connect_needs_a_recent_sign_in_at_the_callback_too() {
+    use owt_accounts::social::{self, Providers, SocialSignIn};
+    use owt_auth::oauth;
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let base = fake_provider(sub.clone()).await;
+    let providers = Providers::new("http://localhost:8000", social::DEFAULT_CALLBACK)
+        .unwrap()
+        .with(
+            oauth::Provider {
+                token_url: format!("{base}/token"),
+                userinfo_url: format!("{base}/userinfo"),
+                ..oauth::google()
+            },
+            "cid",
+            "secret",
+        )
+        .unwrap();
+    let social = SocialSignIn::new(
+        db.pool.clone(),
+        oauth::http_client().unwrap(),
+        providers,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .connect_within(Duration::from_secs(1));
+    let client = owt_test::Client::new(social_app(&db, &social_sessions(), &social));
+    round_trip(&client, &[]).await;
+    *sub.lock().unwrap() = "g2".into();
+    let r = client
+        .post_form("/auth/google/start", &[("connect", "1")])
+        .await;
+    let state = sent_state(r.location().unwrap());
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let r = client
+        .get(&format!("/auth/google/callback?state={state}&code=abc"))
+        .await;
+    assert_eq!(r.location(), Some("/login?social=sign-in-again"));
+    let ada = store::by_username(&db.pool, "adalovelace")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(identities::list(&db.pool, ada.id).await.unwrap().len(), 1);
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn a_provider_is_connected_and_removed_from_settings() {
     use owt_auth::oauth;
     let db = db!();
     let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
-    let (social, client) =
-        social_fixture(&db, sub.clone(), identities::Welcome { create: true }).await;
+    let (social, client) = social_fixture(
+        &db,
+        sub.clone(),
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
     round_trip(&client, &[]).await;
     assert_eq!(client.get("/whoami").await.text(), "adalovelace");
 
@@ -2137,7 +2268,15 @@ async fn a_provider_sign_in_survives_nothing_it_should_not() {
 async fn a_connect_belongs_to_the_account_that_began_it() {
     let db = db!();
     let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
-    let (_, client) = social_fixture(&db, sub.clone(), identities::Welcome { create: true }).await;
+    let (_, client) = social_fixture(
+        &db,
+        sub.clone(),
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
     let sessions = social_sessions();
     round_trip(&client, &[]).await;
     let ada = store::by_username(&db.pool, "adalovelace")
@@ -2242,7 +2381,15 @@ async fn a_connect_belongs_to_the_account_that_began_it() {
 async fn a_deactivated_accounts_identity_signs_nobody_in() {
     let db = db!();
     let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
-    let (_, client) = social_fixture(&db, sub, identities::Welcome { create: true }).await;
+    let (_, client) = social_fixture(
+        &db,
+        sub,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
     round_trip(&client, &[]).await;
     let ada = store::by_username(&db.pool, "adalovelace")
         .await
