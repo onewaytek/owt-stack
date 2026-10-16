@@ -1186,6 +1186,34 @@ let _missing: Vec<_> = CODES.iter().filter(|c| mensaje(c).is_none()).collect();
 # Ok(()) }
 ```
 
+**The app's own code at each arrival:** `on_arrival` runs after the account is found
+or created and before the session is signed in, with the account, whether this
+sign-in created it, and the provider's id. It is for what every new account gets (a
+profile, a default setting) and the app's own sign-in bookkeeping. An error is
+logged and signs nobody in: the person lands on the sign-in page with the `failed`
+outcome. An account it created stays, and arrives with `created` false next time, so
+set-up that must happen should also be done where it is found missing later.
+Connecting a provider signs nobody in and does not call it. A second `on_arrival`
+replaces the first. To unit-test a hook, build its argument with `Arrived::new`
+(account, created, provider).
+
+```rust,no_run
+# fn demo(social: owt_accounts::social::SocialSignIn, pool: sqlx::PgPool) {
+let social = social.on_arrival(move |arrived| {
+    let pool = pool.clone();
+    async move {
+        if arrived.created {
+            sqlx::query("INSERT INTO profiles (account_id) VALUES ($1) ON CONFLICT DO NOTHING")
+                .bind(arrived.account.id)
+                .execute(&pool)
+                .await?;
+        }
+        Ok(())
+    }
+});
+# let _ = social; }
+```
+
 #### 4. Deploying
 
 - **OpenShift:** keep the credentials in a Secret and add it to the Deployment's

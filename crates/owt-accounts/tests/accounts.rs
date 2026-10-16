@@ -1860,6 +1860,16 @@ async fn social_fixture(
     sub: Arc<std::sync::Mutex<String>>,
     welcome: identities::Welcome,
 ) -> (owt_accounts::social::SocialSignIn, owt_test::Client) {
+    social_fixture_with(db, sub, welcome, |social| social).await
+}
+
+/// [`social_fixture`], configured further by `more` before its routes are made.
+async fn social_fixture_with(
+    db: &Db,
+    sub: Arc<std::sync::Mutex<String>>,
+    welcome: identities::Welcome,
+    more: impl FnOnce(owt_accounts::social::SocialSignIn) -> owt_accounts::social::SocialSignIn,
+) -> (owt_accounts::social::SocialSignIn, owt_test::Client) {
     use owt_accounts::social::{self, Providers, SocialSignIn};
     use owt_auth::oauth;
     let base = fake_provider(sub).await;
@@ -1886,6 +1896,7 @@ async fn social_fixture(
         welcome,
     )
     .after_sign_in("/home");
+    let social = more(social);
     let client = owt_test::Client::new(social_app(db, &social_sessions(), &social));
     (social, client)
 }
@@ -1926,6 +1937,66 @@ async fn round_trip(client: &owt_test::Client, fields: &[(&str, &str)]) -> owt_t
     client
         .get(&format!("/auth/google/callback?state={state}&code=abc"))
         .await
+}
+
+#[tokio::test]
+async fn the_app_hears_of_each_arrival_before_it_signs_in() {
+    use owt_accounts::social::{Arrived, Social};
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let heard: Arc<std::sync::Mutex<Vec<(String, bool, String)>>> = Arc::default();
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (log, no) = (heard.clone(), refuse.clone());
+    let (_, client) = social_fixture_with(
+        &db,
+        sub.clone(),
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+        move |social| {
+            social.on_arrival(move |arrived: Arrived| {
+                let (log, no) = (log.clone(), no.clone());
+                async move {
+                    log.lock().unwrap().push((
+                        arrived.account.username,
+                        arrived.created,
+                        arrived.provider,
+                    ));
+                    if no.load(std::sync::atomic::Ordering::SeqCst) {
+                        anyhow::bail!("the app's set-up failed");
+                    }
+                    Ok(())
+                }
+            })
+        },
+    )
+    .await;
+
+    // A first sign-in creates the account; the next finds it.
+    assert_eq!(round_trip(&client, &[]).await.location(), Some("/home"));
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+    round_trip(&client, &[]).await;
+    assert_eq!(
+        *heard.lock().unwrap(),
+        [
+            ("adalovelace".to_owned(), true, "google".to_owned()),
+            ("adalovelace".to_owned(), false, "google".to_owned()),
+        ]
+    );
+
+    // An error signs nobody in, and lands with a message rather than a 500, so the
+    // pending sign-in it took stays used up.
+    refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    client.clear_cookies();
+    let r = round_trip(&client, &[]).await;
+    assert_eq!(r.location(), Some("/login?social=failed"));
+    let (_, data) = social_sessions()
+        .unseal(&client.cookie("s").expect("a session cookie"))
+        .expect("it opens");
+    assert!(data.started().is_none(), "the pending sign-in survived");
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    assert_eq!(heard.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
