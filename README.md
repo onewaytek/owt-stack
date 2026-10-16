@@ -1578,6 +1578,8 @@ the pod for reuse longer than the app's default 30-second keep-alive (its
 "Wiring an app" does, or requests on a connection the app has just closed fail with
 an occasional 502. Each rollout also cuts the app's SSE streams after the 20-second
 drain; their clients reconnect to the new pods ("Bounds" under "Wiring an app").
+The router also cuts a response that sends nothing for 30 s (its `timeout server`),
+so a quiet SSE stream sends `sse::HEARTBEAT` more often than that.
 
 **Backups come with it.** The database takes a volume snapshot nightly
 (`BACKUP_SCHEDULE`, CNPG's six-field cron, seconds first) and once at first apply.
