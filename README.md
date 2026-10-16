@@ -187,15 +187,14 @@ pub struct SessionData {
     pub user_id: Option<i64>,
     /// The account's epoch at sign-in; bumping the account's signs it out everywhere.
     #[serde(default)]
-    pub epoch: i64,
+    pub epoch: i32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<owt_web::flash::Flash>,
 }
 
-/// One indexed read: `SELECT epoch FROM account WHERE id = $1`. `None`: no such
-/// account any more.
-async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<Option<i64>> {
-    sqlx::query_scalar("SELECT epoch FROM account WHERE id = $1")
+/// One indexed read of `owt-accounts`' table. `None`: no such account any more.
+async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<Option<i32>> {
+    sqlx::query_scalar("SELECT session_epoch FROM accounts WHERE id = $1")
         .bind(user_id)
         .fetch_optional(pool)
         .await
