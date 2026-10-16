@@ -575,13 +575,15 @@ lower-cased (`ＡＤＭＩＮ` is `admin`; a composed and a decomposed `é` are 
 username is letters, digits and combining marks that Unicode's identifier profile
 allows (UTS #39), or `-`, `.` and `_`, starting with a letter or digit, in one
 script: no zero-width or filler characters, no bidirectional controls, no Cyrillic
-`а` inside a Latin `admin`. And no new name may look like an existing one: each
-account stores its username's confusable skeleton (`store::skeleton`, Unicode TS #39),
-unique, so `paypa1` beside `paypal`, the all-Cyrillic `сосо` beside `coco`, or `modem`
-beside `modern` is refused (`Refused::UsernameLookalike`); a provider sign-up moves on
-to another name. The skeleton is deliberately broad: `rn` is `m`, `0` is `o`, `1` is
-`l`. Accounts older than the rule that already look like an earlier one keep their
-names; the rule holds every name made after.
+`а` inside a Latin `admin`. `store::username_problem` checks that rule alone, without
+the database, so a sign-up form can show it beside the field with the others. And no
+new name may look like an existing one: each account stores its username's confusable
+skeleton (`store::skeleton`, Unicode TS #39), unique, so `paypa1` beside `paypal`, the
+all-Cyrillic `сосо` beside `coco`, or `modem` beside `modern` is refused
+(`Refused::UsernameLookalike`); a provider sign-up moves on to another name. The
+skeleton is deliberately broad: `rn` is `m`, `0` is `o`, `1` is `l`. Accounts older
+than the rule that already look like an earlier one keep their names; the rule holds
+every name made after.
 
 **Revocation, and what it does not reach:**
 
@@ -638,6 +640,9 @@ session::sign_out_everywhere(&pool, &session).await?; // every session: the epoc
 
 // Accounts: normalized, password rules checked (`owt_accounts::password`), a taken
 // username or email refused by the constraint, so two racing sign-ups cannot both win.
+// A form that checks every field before calling `create` asks the username rule up
+// front: the `Refused::Username` that `create` would return, or `None`.
+assert_eq!(store::username_problem("Ada"), None);
 let ada = store::create(&pool, New {
     username: "Ada", email: "ada@example.com", password: Some("correct horse battery"), is_staff: false,
 }).await?;

@@ -413,7 +413,7 @@ pub fn assert_installed(dir: impl AsRef<Path>) {
             ),
             None => panic!(
                 "owt-accounts' `{}` migration is not in {}: write owt_accounts::migrations::ALL[..].sql \
-                 to a file there (first, before the app's tables)",
+                 to a file there, under its next unused version (never one already applied)",
                 migration.name,
                 dir.display()
             ),
