@@ -62,7 +62,7 @@ pub struct ServeOptions {
     /// connection, so also how long a kept-alive connection may sit idle. Default 30
     /// seconds: keep it above the idle time of whatever proxy reuses connections to
     /// the app, or a request it sends just as the app closes one fails (a 502).
-    /// The OpenShift router's is 300 seconds by default (HAProxy's
+    /// The `OpenShift` router's is 300 seconds by default (`HAProxy`'s
     /// `timeout http-keep-alive`); it reads request heads itself, so a longer wait
     /// here costs an idle socket, not slow-client protection.
     pub header_read_timeout: Duration,
