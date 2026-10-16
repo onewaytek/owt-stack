@@ -977,29 +977,38 @@ async fn callback<T: Social + SessionData>(
             Err(e) if e.refused() == Some(&Refused::NoSubject) => {
                 Ok(landing(&inner.connections_page, "failed"))
             }
-            Err(e) => Err(e.into()),
+            // A redirect, not a 500: a 5xx seals no session change, and the pending
+            // sign-in taken above must stay used up.
+            Err(e) => {
+                tracing::error!(account = me.id, provider = %provider, error = %e, "connecting a provider failed");
+                Ok(landing(&inner.connections_page, "failed"))
+            }
         };
     }
-    let arrival =
-        match identities::arrive(&inner.pool, &client.provider, &identity, inner.welcome).await {
-            Ok(arrival) => arrival,
-            Err(e) if e.refused() == Some(&Refused::NoSubject) => {
-                return Ok(landing(&inner.sign_in_page, "failed"));
-            }
-            // A connect of the same identity, elsewhere, won the race.
-            Err(e) if e.refused() == Some(&Refused::IdentityTaken) => {
-                return Ok(landing(&inner.sign_in_page, "taken"));
-            }
-            Err(e) => return Err(e.into()),
-        };
+    let arrival = match identities::arrive(&inner.pool, &client.provider, &identity, inner.welcome)
+        .await
+    {
+        Ok(arrival) => arrival,
+        Err(e) if e.refused() == Some(&Refused::NoSubject) => {
+            return Ok(landing(&inner.sign_in_page, "failed"));
+        }
+        // A connect of the same identity, elsewhere, won the race.
+        Err(e) if e.refused() == Some(&Refused::IdentityTaken) => {
+            return Ok(landing(&inner.sign_in_page, "taken"));
+        }
+        // A redirect, not a 500, as above.
+        Err(e) => {
+            tracing::error!(provider = %provider, error = %e, "a provider sign-in failed on the database");
+            return Ok(landing(&inner.sign_in_page, "failed"));
+        }
+    };
     // Unknown: nothing linked and no self-signup, or linked to a deactivated
     // account; one message for both.
     let Some(account) = arrival.account() else {
         return Ok(landing(&inner.sign_in_page, "unknown"));
     };
     let created = matches!(arrival, Arrival::Created(_));
-    // A redirect, not a 500: a 5xx seals no session change, and the pending sign-in
-    // taken above must stay used up.
+    // A redirect, not a 500, as above.
     if !inner.heard(account, created, &provider).await {
         return Ok(landing(&inner.sign_in_page, "failed"));
     }

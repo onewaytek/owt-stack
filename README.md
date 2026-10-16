@@ -991,7 +991,11 @@ pieces (its sign-in page and a settings page).
 It keeps who signed in and nothing the provider granted. An app that calls the
 provider's APIs as the person writes its own callback over
 `oauth::Client::complete_with_tokens` (see "Authentication"), then hands the
-identity to `identities::arrive` or `link` as `social` does.
+identity to `identities::arrive` or `link` as `social` does. Like `social`'s, such a
+callback takes the pending sign-in out of the session first and answers every
+failure after that, the database's included, with a redirect, never a 5xx: a 5xx
+seals no session change, so the pending sign-in would outlive the callback that was
+meant to use it up.
 
 **What it does, and refuses:**
 
@@ -1025,7 +1029,8 @@ identity to `identities::arrive` or `link` as `social` does.
 - An identity linked to a deactivated account signs nobody in and creates nothing:
   `?social=unknown`.
 - Every outcome redirects with `?social=<code>`, to the sign-in page or, for a
-  connect or remove, the connections page. `social::outcome` turns the code into a
+  connect or remove, the connections page; a database failure in the callback is
+  logged at error level and lands on `?social=failed`. `social::outcome` turns the code into a
   message for `owt_web::ui::Alerts`.
 
 #### 1. Configuration
