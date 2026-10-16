@@ -70,17 +70,17 @@ pub async fn redeem(pool: &sqlx::PgPool, token: &str, from: &str) -> Result<Acco
     // One transaction, the account read under a share lock: a revocation (which
     // voids this link and bumps the epoch in one statement) is either before it,
     // and the link is spent, or after it, and the session this signs in is revoked.
+    // The account is locked before the link, the order a revocation takes them in,
+    // so the two cannot deadlock.
     let mut tx = pool.begin().await?;
-    let account_id = sqlx::query_scalar::<_, i64>(
-        "UPDATE sign_in_links SET used_at = now(), used_from = $2
-         WHERE token_sha256 = $1 AND used_at IS NULL AND expires_at > now()
-         RETURNING account_id",
+    let digest = digest(token);
+    let Some(account_id) = sqlx::query_scalar::<_, i64>(
+        "SELECT account_id FROM sign_in_links WHERE token_sha256 = $1",
     )
-    .bind(digest(token))
-    .bind(from)
+    .bind(&digest)
     .fetch_optional(&mut *tx)
-    .await?;
-    let Some(account_id) = account_id else {
+    .await?
+    else {
         return Err(Refused::Link.into());
     };
     let account = sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
@@ -90,8 +90,21 @@ pub async fn redeem(pool: &sqlx::PgPool, token: &str, from: &str) -> Result<Acco
     .bind(account_id)
     .fetch_optional(&mut *tx)
     .await?;
+    let spent = sqlx::query(
+        "UPDATE sign_in_links SET used_at = now(), used_from = $2
+         WHERE token_sha256 = $1 AND used_at IS NULL AND expires_at > now()",
+    )
+    .bind(&digest)
+    .bind(from)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    let Some(account) = account.filter(|_| spent) else {
+        return Err(Refused::Link.into());
+    };
     tx.commit().await?;
-    account.ok_or_else(|| Refused::Link.into())
+    Ok(account)
 }
 
 /// Void every unused link of an account (its password was reset another way, say).

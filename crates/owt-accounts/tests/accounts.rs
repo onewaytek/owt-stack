@@ -2584,7 +2584,10 @@ async fn a_reset_by_staff_beats_a_change_in_flight() {
 #[tokio::test]
 async fn a_common_name_in_any_script_always_gets_an_account() {
     let db = db!();
-    let open = identities::Welcome { create: true };
+    let open = identities::Welcome {
+        create: true,
+        ..Default::default()
+    };
     for n in 0..23 {
         let mut who = identity(&format!("ivan-{n}"), None, false);
         who.display_name = Some("Иван".into());
@@ -2625,7 +2628,10 @@ async fn a_lookalike_of_an_existing_username_is_refused() {
         &db.pool,
         &oauth::google(),
         &who,
-        identities::Welcome { create: true },
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
     )
     .await
     .unwrap();

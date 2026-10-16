@@ -53,7 +53,10 @@ pub const MAX_USERNAME_CHARS: usize = 150;
 pub fn normalize(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     let compatible: String = name.trim().nfkc().collect();
-    compatible.to_lowercase().nfkc().collect()
+    let lowered: String = compatible.to_lowercase().nfkc().collect();
+    // Trimmed again: NFKC turns some characters into a space and a mark (`´` is
+    // U+0020 U+0301), so a name that began with one would begin with a space.
+    lowered.trim().to_owned()
 }
 
 /// A name people read as one thing, and as no one else's. A login is a username or
