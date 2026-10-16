@@ -71,11 +71,35 @@ jobs:
           echo "CHANNEL=${CHANNEL}" >> "$GITHUB_ENV"
           echo "building v${VERSION} (${CHANNEL}), floating tags: ${FLOATING}"
 
-      # Fails fast if the tag does not exist: only released code is built.
+      # Fails fast if the tag does not exist: only released code is built. The ref is
+      # qualified: checkout prefers a branch to a tag of the same short name, so a
+      # branch named `v1.5.0` would otherwise be built as the release.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: v${{ env.VERSION }}
+          ref: refs/tags/v${{ env.VERSION }}
+          fetch-depth: 0
           persist-credentials: false
+
+      # A stable image (X.Y, latest) is what production follows: its tag must be on
+      # main, which only reviewed changes reach. A tag pushed from anywhere else (an
+      # rc branch carrying unreviewed code) gets no stable image.
+      - name: A stable tag is on main
+        if: ${{ env.CHANNEL == 'stable' }}
+        run: |
+          set -euo pipefail
+          # fetch-depth 0 fetched every branch already; a fetch here would need
+          # credentials, which the checkout does not keep. Every ref is written in
+          # full: a tag named `origin/main` would otherwise stand for main, and a
+          # branch named like the tag for the tag.
+          tagged="$(git rev-parse --verify --end-of-options "refs/tags/v${VERSION}^{commit}")"
+          if [ "$(git rev-parse --verify HEAD)" != "$tagged" ]; then
+            echo "the checkout is not the commit v${VERSION} names" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tagged" refs/remotes/origin/main; then
+            echo "v${VERSION} is not on main: refusing to build a stable image of it" >&2
+            exit 1
+          fi
 
       - name: Resolve tags
         id: tags

@@ -3,8 +3,9 @@ name: Conventional Commits
 # release-please reads the history on main to choose each version, so what lands
 # there must follow Conventional Commits (https://www.conventionalcommits.org):
 # the pull request title, which a squash merge uses as the commit, and every commit,
-# which a merge commit keeps. Nothing here runs the pull request's code, so it runs
-# for forks too, on GitHub-hosted runners.
+# which a merge commit keeps. commitlint reads the pull request's commitlint
+# configuration, which is JavaScript and runs: so this job holds no secrets and only
+# a read token, and runs on GitHub-hosted runners, where a fork's code may run.
 
 on:
   pull_request:

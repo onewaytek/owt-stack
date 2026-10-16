@@ -14,7 +14,14 @@ name: App release (reusable)
 #       permissions: {contents: read, packages: write}
 #       uses: onewaytek/owt-stack/.github/workflows/image.yml@vX.Y.Z  # the release the app uses
 #       with: {version: "${{ needs.release.outputs.version }}"}
-#       secrets: inherit
+#
+# rc carries code no one has reviewed yet (promote-rc merges open pull requests
+# into it), and this job holds a token that can push tags. So on rc nothing in the
+# checkout configures the release: the repository's own semantic-release
+# configuration is removed (a package.json `release` key fails the run), as is any
+# committed node_modules a plugin could be loaded from, and the tooling is installed
+# away from the checkout's .npmrc. A version from rc must be a prerelease and one
+# from main must not, or the run fails before anything downstream builds it.
 #
 # The bump is semantic-release's reading of the commits since the branch's last
 # tag: `feat` is minor, `fix` and `perf` are patch, `!` or a BREAKING CHANGE footer
@@ -35,8 +42,11 @@ on:
       version-command:
         description: >-
           Shell run with VERSION set to the new version before the release commit,
-          e.g. `uv version "$VERSION" && uv lock`. It runs in bash, without the
-          release's token. Empty: the version lives only in the tag.
+          e.g. `uv version "$VERSION" && uv lock`. It runs in bash on main only, with
+          GITHUB_TOKEN unset, but as a child of the process holding it, which it
+          could read (/proc/$PPID/environ): only code main has reviewed, and
+          dependencies the app trusts, belong in it. Empty: the version lives only
+          in the tag.
         type: string
         default: ""
       version-files:
@@ -90,14 +100,24 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
+          # Its cache would be keyed by and restored for the checkout's files
+          # (packageManager in package.json, the lockfile, .npmrc's cache path), and
+          # what an rc job wrote there would be installed below.
+          package-manager-cache: false
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         if: ${{ inputs.uv }}
       - name: Install semantic-release
-        # Outside the checkout, so the app's package.json and lockfile are neither
-        # consulted nor touched. No lifecycle scripts: the packages below need none,
-        # and this job's token can write to the repository.
+        # Outside the checkout, so the app's package.json, lockfile and .npmrc (which
+        # could name another registry) are neither consulted nor touched. No lifecycle
+        # scripts: the packages below need none, and this job's token can write to the
+        # repository.
+        working-directory: ${{ runner.temp }}
         run: |
-          npm install --prefix "$RUNNER_TEMP/semrel" --no-audit --no-fund --no-save --ignore-scripts \
+          mkdir -p semrel npm-cache
+          # A cache of this job's own, empty: nothing another job wrote is installed.
+          npm install --prefix "$RUNNER_TEMP/semrel" --registry https://registry.npmjs.org/ \
+            --cache "$RUNNER_TEMP/npm-cache" --prefer-online \
+            --no-audit --no-fund --no-save --ignore-scripts \
             semantic-release@25.0.9 \
             @semantic-release/exec@7.1.0 \
             @semantic-release/git@11.0.1 \
@@ -114,14 +134,32 @@ jobs:
           CHANGELOG: ${{ inputs.changelog }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_REF_NAME" = rc ]; then
+            # Unreviewed code: nothing in it may configure or extend the release.
+            # semantic-release finds its configuration with cosmiconfig, which first
+            # reads a "meta" configuration (package.json, package.yaml,
+            # .config/config.*: JavaScript among them, run as it loads) that can add
+            # search places of its own; then .releaserc*, .config/releaserc*,
+            # release.config.*. All of them go, and node_modules a plugin could load
+            # from.
+            rm -rf .releaserc* release.config.* .config package.yaml node_modules
+            if [ -f package.json ] && node -e 'const p = require("./package.json"); process.exit("release" in p || "cosmiconfig" in p ? 0 : 1)'; then
+              echo "package.json configures semantic-release or cosmiconfig; rc releases use the generated configuration only" >&2
+              exit 1
+            fi
+          fi
           if ls .releaserc* release.config.* >/dev/null 2>&1; then
             echo "using the repository's own semantic-release configuration"
             exit 0
           fi
           node - <<'JS' > "$RUNNER_TEMP/releaserc.json"
-          const files = (process.env.VERSION_FILES || "").split(/\s+/).filter(Boolean);
-          const changelog = process.env.CHANGELOG === "true";
-          const command = process.env.VERSION_COMMAND || "";
+          // On rc no repository code runs at all: no version command (it would be
+          // a child of the process holding the token, which can read its parent's
+          // environment), and nothing committed back. A prerelease needs neither.
+          const rc = process.env.GITHUB_REF_NAME === "rc";
+          const files = rc ? [] : (process.env.VERSION_FILES || "").split(/\s+/).filter(Boolean);
+          const changelog = !rc && process.env.CHANGELOG === "true";
+          const command = rc ? "" : (process.env.VERSION_COMMAND || "");
           const plugins = [
             ["@semantic-release/commit-analyzer", { preset: "conventionalcommits" }],
             ["@semantic-release/release-notes-generator", { preset: "conventionalcommits" }],
@@ -137,6 +175,8 @@ jobs:
             // pushes the release is unset first: the command may run code the
             // repository doesn't control (a dependency's build, under `uv lock`).
             prepareCmd: command ? `unset GITHUB_TOKEN GH_TOKEN; set -euo pipefail; export VERSION=\${nextRelease.version}; eval "$VERSION_COMMAND"` : "true",
+            // Before anything is tagged: rc makes prereleases and main releases.
+            verifyReleaseCmd: `v=\${nextRelease.version}; if [ "$GITHUB_REF_NAME" = rc ]; then [[ $v == *-rc.* ]]; else [[ $v != *-* ]]; fi || { echo "$GITHUB_REF_NAME would release $v" >&2; exit 1; }`,
             publishCmd: "echo \"version=${nextRelease.version}\" >> \"$GITHUB_OUTPUT\" && echo \"channel=${nextRelease.channel || 'stable'}\" >> \"$GITHUB_OUTPUT\"",
           }]);
           const assets = [...files, ...(changelog ? ["CHANGELOG.md"] : [])];
@@ -164,4 +204,31 @@ jobs:
           # The generated configuration is not the app's file to commit.
           git update-index --assume-unchanged .releaserc.json 2>/dev/null || true
           echo ".releaserc.json" >> .git/info/exclude
-          "$RUNNER_TEMP/semrel/node_modules/.bin/semantic-release"
+          # semantic-release prints commit messages: a line in one shaped like a
+          # workflow command (`::set-output …`) must not be obeyed.
+          stop="$(od -An -N16 -tx1 /dev/urandom | tr -d " \n")"
+          echo "::stop-commands::${stop}"
+          status=0
+          "$RUNNER_TEMP/semrel/node_modules/.bin/semantic-release" || status=$?
+          echo "::${stop}::"
+          exit "$status"
+      - name: The version fits the branch
+        # rc makes prereleases and main makes releases, whatever a configuration said.
+        env:
+          VERSION: ${{ steps.semrel.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -n "$VERSION" ] || exit 0
+          # The tag this run made: on the commit it released (HEAD, or the release
+          # commit it added), not an older tag a stray output could name.
+          tagged="$(git rev-parse -q --verify --end-of-options "refs/tags/v${VERSION}^{commit}" || true)"
+          if [ "$tagged" != "$(git rev-parse --verify HEAD)" ]; then
+            echo "v${VERSION} is not the tag this run made" >&2
+            exit 1
+          fi
+          case "$GITHUB_REF_NAME:$VERSION" in
+            rc:*-rc.*) ;;
+            main:*-*) echo "main released a prerelease version: $VERSION" >&2; exit 1 ;;
+            main:*) ;;
+            *) echo "$GITHUB_REF_NAME released $VERSION, which is not an rc prerelease" >&2; exit 1 ;;
+          esac
