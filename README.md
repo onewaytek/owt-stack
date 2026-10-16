@@ -1506,7 +1506,9 @@ jobs:
   one at a time and only while no run is waiting (a re-run is itself a new arrival in
   the group). A run that failed its checks is left alone, and so is one already on
   its fifth attempt (`max-attempts`). Run it after each promotion, so one hands on to
-  the next, and on a schedule, for when none follows.
+  the next, and on a schedule, for when none follows. It sees waiting *runs*, not
+  waiting jobs, so put the `promote-rc` concurrency group on the workflow, as below:
+  on a job, a re-run can cancel that job while it waits (a later requeue picks it up).
 
 ```yaml
 # in pr.yml, with concurrency: {group: promote-rc, cancel-in-progress: false}
