@@ -1340,8 +1340,8 @@ assert!(body.contains("<h1>Page not found</h1>"));
 error page's heading are the app's text already; what a component writes itself has
 English defaults the app replaces: `Pagination::words` (`PagerWords`, read by screen
 readers), and for sign-in with a provider `Buttons::words` and `Connections::words`
-(below). `ErrorBody::for_status` is English: a page in another language fills the
-fields itself.
+(see "Sign-in with a provider" above). `ErrorBody::for_status` is English: a page in
+another language fills the fields itself.
 
 ```rust
 # fn main() -> askama::Result<()> {
