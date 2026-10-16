@@ -88,7 +88,9 @@ fn warn_if_unverified(opts: &PgConnectOptions) {
 /// Apply `migrator` under the advisory lock `lock_id`, held on one connection for the
 /// whole run, so replicas starting together (or a migrate Job racing a rollout)
 /// migrate once and the rest wait. sqlx takes its own lock too; an explicit id lets
-/// another migrator (a predecessor app on the same schema) exclude this one.
+/// another migrator (a predecessor app on the same schema) exclude this one. When the
+/// run fails, that connection is closed rather than pooled: sqlx's failed run leaves
+/// its lock held on it, so the pool stays usable (to retry, or to ask what failed).
 pub async fn migrate_locked(
     pool: &PgPool,
     migrator: &Migrator,
@@ -100,11 +102,19 @@ pub async fn migrate_locked(
         .execute(&mut *conn)
         .await?;
     let result = migrator.run(&mut *conn).await;
-    sqlx::query("SELECT pg_advisory_unlock($1)")
+    let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(lock_id)
         .execute(&mut *conn)
-        .await?;
+        .await;
+    if result.is_err() || unlocked.is_err() {
+        // A failed run returns before sqlx releases its own advisory lock (one per
+        // database), and a failed unlock leaves this one: back in the pool, the
+        // connection would hold them, and every later migration would wait on it. So
+        // it is closed instead, which ends the session and its locks.
+        let _ = tokio::time::timeout(Duration::from_secs(5), conn.close()).await;
+    }
     result?;
+    unlocked?;
     tracing::info!("migrations applied");
     Ok(())
 }

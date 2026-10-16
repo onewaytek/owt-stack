@@ -3166,7 +3166,15 @@ async fn an_apps_own_accounts_table_is_named_until_renamed() {
         said.contains("accounts is already a table") && said.contains("before owt-accounts"),
         "{said}"
     );
-    assert!(MIGRATOR.run(&db.pool).await.is_err());
+    // As an app migrates: a bare `MIGRATOR.run` that fails returns before releasing
+    // sqlx's advisory lock (one per database, so every test's), and its pooled
+    // connection would hold it; migrate_locked closes that connection.
+    let lock_id = i64::from(rand::random::<u32>());
+    assert!(
+        owt_runtime::db::migrate_locked(&db.pool, &MIGRATOR, lock_id)
+            .await
+            .is_err()
+    );
 
     // The rename an app writes before owt-accounts' files: the table and what was
     // named after it.

@@ -676,7 +676,10 @@ keeps the names of its indexes and sequences, so rename those
 too (`ALTER INDEX accounts_pkey RENAME TO holdings_pkey`, and so on). When the
 migrations fail, `owt_accounts::migrations::conflicts(&pool)` names each name
 something else holds, skipping migrations sqlx's ledger records as applied; a test
-can call it against a copy of the app's schema before adopting the crate:
+can call it against a copy of the app's schema before adopting the crate. Migrate with
+`migrate_locked`, not `Migrator::run` on the pool: a failed `run` keeps sqlx's
+database-wide advisory lock on the connection it returns to the pool, where every later
+migration waits on it, while `migrate_locked` closes that connection.
 
 ```rust,no_run
 # async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
