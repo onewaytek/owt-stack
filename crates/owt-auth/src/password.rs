@@ -235,10 +235,10 @@ mod tests {
         );
     }
 
-    /// Legacy Django hashes are not verified any more (0.3 dropped them). A row that
-    /// still holds one must match nothing, the empty password included, and must
-    /// not be honoured as a PBKDF2 request: an iteration count of `4294967295`
-    /// would otherwise hold a permit, and a core, for most of an hour.
+    /// Django hashes are not verified. A row that holds one must match nothing, the
+    /// empty password included, and must not be honoured as a PBKDF2 request: an
+    /// iteration count of `4294967295` would otherwise hold a permit, and a core, for
+    /// most of an hour.
     #[tokio::test]
     async fn django_hashes_match_nothing_and_cost_nothing() {
         let digest = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";

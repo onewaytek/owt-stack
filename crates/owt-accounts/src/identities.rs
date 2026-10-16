@@ -248,11 +248,10 @@ pub enum RekeyError {
     Db(#[from] sqlx::Error),
 }
 
-/// Move the identities stored under `from` (a key the app used to give, such as the
-/// id `sso` an OIDC provider was stored under before its issuer was its key) to
-/// `to`'s [`key`](Provider::key). Run it before serving with the new key, naming in
-/// `configured` every provider the app now has: a `from` one of them still gives is
-/// refused.
+/// Move the identities stored under `from`, a key no configured provider gives (an
+/// OIDC provider's id `sso`, say, where the key is its issuer), to `to`'s
+/// [`key`](Provider::key). Run it before serving with `to`, naming in `configured`
+/// every provider the app has: a `from` one of them gives is refused.
 ///
 /// # Errors
 ///

@@ -568,8 +568,8 @@ mod tests {
         assert!(client(twitch()).begin().unwrap().1.verifier.is_none());
     }
 
-    /// A pending login stored by an older build, without the provider it was begun
-    /// with, does not load as "any provider": the mix-up check needs the field, so a
+    /// A stored pending login without the provider it was begun with does not load
+    /// as "any provider": the mix-up check needs the field, so a
     /// session carrying such a value has no pending login and begins again.
     #[test]
     fn a_stored_pending_login_without_its_provider_does_not_load() {

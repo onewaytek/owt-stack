@@ -2053,7 +2053,7 @@ async fn a_pending_sign_in_lapses_and_stays_in_its_session() {
     );
 
     // A start time from the future (past the minute of skew allowed), and a pending
-    // sign-in from before it was bound to a session, finish nothing either.
+    // sign-in bound to no session, finish nothing either.
     let state = begin().await;
     with_pending(&client, |_, started| started.at += 3600);
     assert_eq!(
@@ -2684,7 +2684,7 @@ async fn the_schema_refuses_rows_the_library_would_misread() {
     db.drop().await;
 }
 
-/// A database that ran 0001 and 0002 for a while, with rows 0.4 let through (some
+/// A database that ran 0001 and 0002 for a while, holding rows those admit (some
 /// written around the library), comes through 0003 and `complete` in the state a
 /// new one starts in: every constraint validated for every row, no one who could
 /// sign in locked out, and the renames reported.
@@ -2698,7 +2698,7 @@ async fn existing_rows_come_through_the_constraints_migration() {
     let argon = owt_auth::password::hash("correct horse battery")
         .await
         .unwrap();
-    // A PHC string without its version field: the verifier takes it (as 0.4 did).
+    // A PHC string without its version field: the verifier takes it.
     let unversioned = argon.replacen("$v=19", "", 1);
     // Its parameters in another order (the verifier takes any), and a salt with no
     // hash (which opens nothing).

@@ -1690,8 +1690,8 @@ Install `ALL[1]` (`owt_accounts_roles`) and `ALL[2]` (`owt_accounts_constraints`
 as the app's next unused migration versions (an app's own migrations hold the low
 numbers; see "Tables"), and **await `owt_accounts::migrations::complete(&pool)`
 after the migrations run and before serving**, at every start. An app with an OIDC
-provider moves its identities to the issuer's key first (see "Upgrading from 0.4
-(identities)"); `Welcome::match_verified_email` and `Arrival::Matched` are gone.
+provider moves its identities to the issuer's key first (see "Upgrading from 0.4 (identities)" under
+"Accounts"); `Welcome::match_verified_email` and `Arrival::Matched` are gone.
 
 `0003` changes only the schema, under a 5-second lock timeout (a deploy that cannot
 have its locks fails and is run again): the `username_skeleton` column, and
