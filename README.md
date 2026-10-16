@@ -500,9 +500,21 @@ already there along with the schema, so a database that has run the library for 
 ends in the state a new one starts in. The constraints hold what the library assumes
 (names in stored form, Argon2 hashes or none, links of 30 days at most, non-empty
 subjects), so a row written around it (an import, a console) cannot be one it would
-misread. After the migrations run, at every start, the app calls
-`owt_accounts::migrations::complete(&pool)`: it fills what SQL cannot compute (the
-lookalike key below) for rows that lack it, and does nothing once they all have it.
+misread. After the migrations run, at every start and before serving, the app awaits
+`owt_accounts::migrations::complete(&pool)`: it moves rows made before a migration
+to the stored form (in Rust, as sign-in normalizes) and validates the constraints
+the migration added; once done it reads an index and the catalog.
+
+```rust,no_run
+# async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
+owt_runtime::db::migrate_locked(&pool, migrator, 8_531_207).await?;
+let done = owt_accounts::migrations::complete(&pool).await?;
+for r in &done.renamed {
+    eprintln!("account {} is now {:?} (was {:?}): tell its owner", r.id, r.to, r.from);
+}
+// ... then serve.
+# Ok(()) }
+```
 
 **Provider identities are found by subject, never by email.** `identities::arrive`
 looks up the provider's key and the identity's subject, and nothing else. An address
@@ -1674,30 +1686,60 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ### Accounts
 
-Copy `0002_owt_accounts_roles.sql` (`ALL[1]`) and `0003_owt_accounts_constraints.sql`
-(`ALL[2]`) into the app's migrations after `0001`, and call
-`owt_accounts::migrations::complete(&pool)` after the migrations run. An app with an
-OIDC provider rewrites its identities' provider key first (see "Upgrading from 0.4
-with an OIDC provider" above); `Welcome::match_verified_email` and
-`Arrival::Matched` are gone. `0003` moves existing rows to the form the library now
-stores, then adds the constraints:
+Install `ALL[1]` (`owt_accounts_roles`) and `ALL[2]` (`owt_accounts_constraints`)
+as the app's next unused migration versions (an app's own migrations hold the low
+numbers; see "Tables"), and **await `owt_accounts::migrations::complete(&pool)`
+after the migrations run and before serving**, at every start. An app with an OIDC
+provider moves its identities to the issuer's key first (see "Upgrading from 0.4
+(identities)"); `Welcome::match_verified_email` and `Arrival::Matched` are gone.
 
-- **Usernames are NFKC-normalized** (a fullwidth `ａｄｍｉｎ` becomes `admin`), since
-  sign-in input is. One that would become another account's name keeps its id as a
-  suffix (`admin-42`); its owner can still sign in by email or a provider.
+`0003` changes only the schema, under a 5-second lock timeout (a deploy that cannot
+have its locks fails and is run again): the `username_skeleton` column, and
+constraints added `NOT VALID`, which bind every write from then on, a 0.4 replica's
+still running included (it gets an error for a row it would write in the old form).
+`complete` then moves each account made before it, in Rust, as sign-in normalizes
+what is typed, and validates the constraints once every row holds them:
+
+- **Usernames are NFKC-normalized** (a fullwidth `ａｄｍｉｎ` becomes `admin`, `´bob`
+  a name without the leading space NFKC gives it), and `@` becomes `-`. One that
+  would become another account's name takes its id as a suffix (`admin-42`), or the
+  first free name after that. Its owner signs in with the new name, or by email or
+  a provider; typing the old one now reaches the account it became like (`admin`),
+  so tell them: `Completed::renamed` lists every rename, and it is logged.
 - **Emails are NFKC-normalized and lower-cased.** One that would become another
-  account's address is cleared, and one with nothing before its `@` is cleared.
-- **A password hash that is not Argon2 is cleared.** Such a hash never opened the
-  account, so no one loses a way in.
-- **Sign-in links still out for longer than 30 days are cut to 30.**
-- **Identities with an empty provider or subject are deleted.** They matched no one.
-- **A `username_skeleton` column** holds the lookalike key, filled by `complete`.
+  account's address, or has nothing before its `@`, is cleared
+  (`Completed::emails_cleared`).
+- **A password hash the library cannot verify is cleared** (a legacy format, a
+  damaged value; `Completed::passwords_cleared`). It never opened the account. An
+  Argon2 hash without its version field is kept: it verifies.
+- **A negative session epoch becomes 0.**
+- **Each account gets its lookalike key.** An old account whose name is a lookalike
+  of an earlier one keeps it, under a key carrying its id; new names are held to the
+  rule. A row an older replica writes during the rollout has no key until the next
+  `complete`; `store::create` compares a new name against such rows too.
+- **Identities with an empty provider or subject are deleted** (they matched no
+  one), **sign-in links are cut to 30 days**, and links whose digest is not a
+  SHA-256 (no token could match one) are deleted.
+
+`complete` never fails a start over one account: one it cannot move is logged and
+listed in `Completed::failed`, and tried again next time; `Completed::validated` is
+`true` once every constraint holds for every row.
 
 Also:
 
+- `store::create` takes a pool; `store::create_in` takes a connection (inside a
+  transaction, say).
 - `links::MAX_TTL` is 30 days (it was a century); longer `ttl`s are capped.
-- `store::authenticate` fails a sign-in whose password changed while it was checked.
+- `store::authenticate` fails a sign-in whose password changed while it was checked;
+  `store::change_password` is new.
 - `Refused` has `CurrentPassword` and `UsernameLookalike` variants.
+- `owt_auth::password::usable(hash)` says whether a stored hash can open an account;
+  `needs_rehash` is true for a hash of an older Argon2 version too.
+- `jwt::Verifier` refetches keys older than `jwt::KEYS_MAX_AGE` (an hour), refuses
+  encryption keys, and refuses every token once its keys could not be refetched for
+  `jwt::KEYS_STALE_LIMIT` (a day).
+- `Linked::label` shows an email only when the provider verified it.
+- The social routes refuse cross-origin `POST`s themselves.
 
 ## Upgrading from 0.1
 

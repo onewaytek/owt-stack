@@ -147,8 +147,15 @@ pub fn skeleton(username: &str) -> String {
 /// Create an account. Refuses an invalid username or email, a password that breaks
 /// a rule, a username or email another account has, and a username too like another
 /// account's ([`skeleton`]): by the constraints, so two racing sign-ups cannot both
-/// win.
-pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
+/// win. An account [`migrations::complete`](crate::migrations::complete) has yet to
+/// reach (one an older replica wrote during a deploy) has no stored skeleton, so its
+/// name's is computed here and compared too.
+pub async fn create(pool: &PgPool, new: New<'_>) -> Result<Account> {
+    create_in(&mut *pool.acquire().await?, new).await
+}
+
+/// [`create`] on `conn`: inside the caller's transaction, say.
+pub async fn create_in(conn: &mut sqlx::PgConnection, new: New<'_>) -> Result<Account> {
     let username = normalize(new.username);
     if !valid_username(&username) {
         return Err(Refused::Username.into());
@@ -169,6 +176,14 @@ pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
                 .map_err(Error::Hash)?
         }
     };
+    let key = skeleton(&username);
+    let unkeyed: Vec<String> =
+        sqlx::query_scalar("SELECT username FROM accounts WHERE username_skeleton IS NULL")
+            .fetch_all(&mut *conn)
+            .await?;
+    if unkeyed.iter().any(|old| skeleton(old) == key) {
+        return Err(Refused::UsernameLookalike(username).into());
+    }
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
         "INSERT INTO accounts (username, username_skeleton, email, password_hash, is_staff)
          VALUES ($1, $5, $2, $3, $4) RETURNING {COLUMNS}"
@@ -177,8 +192,8 @@ pub async fn create(db: impl PgExecutor<'_>, new: New<'_>) -> Result<Account> {
     .bind(&email)
     .bind(&hash)
     .bind(new.is_staff)
-    .bind(skeleton(&username))
-    .fetch_one(db)
+    .bind(&key)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|e| match taken(&e, &new) {
         Some(refused) => refused.into(),
@@ -206,7 +221,7 @@ pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<
     // At most one row: no username has an `@`, every email does, and each is unique.
     let row = sqlx::query_as::<_, (i64, String)>(
         "SELECT id, password_hash FROM accounts
-         WHERE is_active AND (username = $1 OR (email <> '' AND email = $1))",
+         WHERE is_active AND (username = $1 OR (email <> '' AND lower(email) = $1))",
     )
     .bind(&login)
     .fetch_optional(pool)
@@ -290,7 +305,7 @@ pub async fn by_email(db: impl PgExecutor<'_>, email: &str) -> sqlx::Result<Opti
         return Ok(None);
     }
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM accounts WHERE email = $1 AND is_active"
+        "SELECT {COLUMNS} FROM accounts WHERE email <> '' AND lower(email) = $1 AND is_active"
     )))
     .bind(email)
     .fetch_optional(db)

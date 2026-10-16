@@ -46,6 +46,9 @@ impl Db {
             .await
             .unwrap();
         MIGRATOR.run(&pool).await.unwrap();
+        // As an app does before serving.
+        let done = owt_accounts::migrations::complete(&pool).await.unwrap();
+        assert!(done.validated, "{done:?}");
         Some(Self {
             pool,
             schema,
@@ -2682,107 +2685,163 @@ async fn the_schema_refuses_rows_the_library_would_misread() {
     db.drop().await;
 }
 
-/// A database that ran 0001 and 0002 for a while, with rows written around the
-/// library, comes through 0003 and `complete` in the state a new one starts in:
-/// every constraint holds for every row, and no one loses a way in that worked.
+/// A database that ran 0001 and 0002 for a while, with rows 0.4 let through (some
+/// written around the library), comes through 0003 and `complete` in the state a
+/// new one starts in: every constraint validated for every row, no one who could
+/// sign in locked out, and the renames reported.
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one upgrade, seeded and checked")]
 async fn existing_rows_come_through_the_constraints_migration() {
-    use owt_accounts::migrations::{ALL, complete};
+    use owt_accounts::migrations::{ALL, Renamed, complete};
     let Some((pool, drop_schema)) = schema_after(&ALL[..2]).await else {
         return;
     };
-    // What 0.4 let through: a fullwidth name (and one that becomes it), a legacy
-    // hash, a working Argon2 hash, an upper-case and an empty-local email, a century
-    // link, an identity with no subject.
     let argon = owt_auth::password::hash("correct horse battery")
         .await
         .unwrap();
-    let ids: Vec<i64> = sqlx::query_scalar(
-        "INSERT INTO accounts (username, email, password_hash) VALUES
-            ('admin', 'ADA@EXAMPLE.COM', $1),
-            ('ａｄｍｉｎ', '', 'pbkdf2_sha256$600000$s$h'),
-            ('ｃｏｃｏ', '@nowhere', ''),
-            ('paypal', '', ''),
-            ('paypa1', '', '')
-         RETURNING id",
+    // A PHC string without its version field: the verifier takes it (as 0.4 did).
+    let unversioned = argon.replacen("$v=19", "", 1);
+    sqlx::query(
+        "INSERT INTO accounts (id, username, email, password_hash, session_epoch)
+         OVERRIDING SYSTEM VALUE VALUES
+            (1, 'admin', 'ADA@EXAMPLE.COM', $1, 0),
+            (2, 'admin-3', '', '', 0),
+            (3, 'ａdmin', '', 'pbkdf2_sha256$600000$s$h', 0),
+            (4, '´bob', '', '', 0),
+            (5, 'x𝚺', '', '', 0),
+            (6, 'ｃｏｃｏ', '@nowhere', '', 0),
+            (7, 'paypal', '', '', 0),
+            (8, 'pаypal', '', '', 0),
+            (9, 'carol', '', $2, 0),
+            (10, 'dave', 'Ａda@example.com', '', 0),
+            (11, 'erin', '', '', -5)",
     )
     .bind(&argon)
-    .fetch_all(&pool)
+    .bind(&unversioned)
+    .execute(&pool)
     .await
     .unwrap();
+    sqlx::query("SELECT setval(pg_get_serial_sequence('accounts', 'id'), 100)")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query(
-        "INSERT INTO sign_in_links (token_sha256, account_id, expires_at)
-         VALUES (sha256('t'), $1, now() + interval '100 years')",
+        "INSERT INTO sign_in_links (token_sha256, account_id, expires_at) VALUES
+            (sha256('t'), 1, now() + interval '100 years'),
+            ('\\x010203', 1, now() + interval '1 day')",
     )
-    .bind(ids[0])
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO account_identities (account_id, provider, subject)
-         VALUES ($1, 'google', ''), ($1, 'google', 'g1')",
+         VALUES (1, 'google', ''), (1, 'google', 'g1')",
     )
-    .bind(ids[0])
     .execute(&pool)
     .await
     .unwrap();
 
+    // As sqlx runs a migration: in a transaction.
+    let mut tx = pool.begin().await.unwrap();
     sqlx::raw_sql(sqlx::AssertSqlSafe(ALL[2].sql))
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .unwrap();
-    assert_eq!(complete(&pool).await.unwrap(), 5);
-    assert_eq!(complete(&pool).await.unwrap(), 0, "done once");
-
-    let rows: Vec<(String, String, bool, Option<String>)> = sqlx::query_as(
-        "SELECT username, email, password_hash <> '', username_skeleton FROM accounts ORDER BY id",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    tx.commit().await.unwrap();
+    let done = complete(&pool).await.unwrap();
+    let renamed = |id, from: &str, to: &str| Renamed {
+        id,
+        from: from.into(),
+        to: to.into(),
+    };
     assert_eq!(
-        names,
+        done.renamed,
         [
-            "admin",
-            &*format!("admin-{}", ids[1]),
-            "coco",
-            "paypal",
-            "paypa1"
+            renamed(3, "ａdmin", "admin-3-2"),
+            renamed(4, "´bob", &store::normalize("´bob")),
+            renamed(5, "x𝚺", "xς"),
+            renamed(6, "ｃｏｃｏ", "coco"),
         ]
     );
-    assert_eq!(rows[0].1, "ada@example.com");
-    assert_eq!(rows[2].1, "", "no address before its @");
-    assert_eq!(
-        rows.iter().map(|r| r.2).collect::<Vec<_>>(),
-        [true, false, false, false, false],
-        "the working hash kept, the legacy one cleared"
-    );
-    assert!(rows.iter().all(|r| r.3.is_some()));
-    // The later lookalike keeps its name under a key of its own.
-    assert_eq!(rows[4].3.as_deref(), Some(&*format!("paypal#{}", ids[4])));
-    // Ways in that worked still do; the library reads every row.
-    assert!(
-        store::authenticate(&pool, "Ada@Example.com", "correct horse battery")
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(identities::list(&pool, ids[0]).await.unwrap().len(), 1);
-    let left: bool = sqlx::query_scalar(
-        "SELECT expires_at <= created_at + interval '30 days' FROM sign_in_links",
+    assert_eq!(done.emails_cleared, [6, 10]);
+    assert_eq!(done.passwords_cleared, [3]);
+    assert_eq!(done.keyed, 11);
+    assert!(done.failed.is_empty() && done.validated, "{done:?}");
+    let again = complete(&pool).await.unwrap();
+    assert!(again.keyed == 0 && again.renamed.is_empty() && again.validated);
+    let unvalidated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE NOT convalidated
+         AND conrelid::regclass::text IN ('accounts', 'account_identities', 'sign_in_links')",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(left);
-    // And new names are held to the lookalike rule against the old ones.
+    assert_eq!(unvalidated, 0);
+
+    // Ways in that worked still do, typed as their owners type them.
+    for (login, password) in [
+        ("Ada@Example.com", "correct horse battery"),
+        ("carol", "correct horse battery"),
+    ] {
+        assert!(
+            store::authenticate(&pool, login, password)
+                .await
+                .unwrap()
+                .is_some(),
+            "{login}"
+        );
+    }
+    assert_eq!(
+        store::by_username(&pool, "x𝚺").await.unwrap().map(|a| a.id),
+        Some(5)
+    );
+    let skeleton: Option<String> =
+        sqlx::query_scalar("SELECT username_skeleton FROM accounts WHERE id = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        skeleton.as_deref(),
+        Some("paypal@8"),
+        "the later lookalike's own key"
+    );
+    let epoch: i32 = sqlx::query_scalar("SELECT session_epoch FROM accounts WHERE id = 11")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(epoch, 0);
+    assert_eq!(identities::list(&pool, 1).await.unwrap().len(), 1);
+    let links: Vec<bool> = sqlx::query_scalar(
+        "SELECT expires_at <= created_at + interval '30 days' FROM sign_in_links",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        links,
+        [true],
+        "the century link cut, the digest-less one gone"
+    );
+
+    // New names are held to the lookalike rule against the old ones, and against a
+    // row an older replica wrote after the migration, before complete reached it.
     let err = store::create(&pool, new("c0co", "", None))
         .await
         .unwrap_err();
     assert_eq!(
         err.refused(),
         Some(&owt_accounts::Refused::UsernameLookalike("c0co".into()))
+    );
+    sqlx::query("INSERT INTO accounts (username) VALUES ('mike')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = store::create(&pool, new("rnike", "", None))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.refused(),
+        Some(&owt_accounts::Refused::UsernameLookalike("rnike".into()))
     );
     pool.close().await;
     drop_schema.await;

@@ -588,8 +588,8 @@ async fn create(
     let form = Posted(pairs);
     let mut tx = admin.pool.begin().await?;
     lock(&mut tx, &me, me.id).await?;
-    let made = store::create(
-        &mut *tx,
+    let made = store::create_in(
+        &mut tx,
         New {
             username: form.value("username"),
             email: form.value("email"),

@@ -14,8 +14,9 @@
 //!
 //! A migration moves the rows already there as well as the schema, so an app that
 //! has run the library's migrations for a while is in the same state as a new one.
-//! What SQL cannot compute (a username's lookalike key) [`complete`] fills in: call
-//! it after the migrations run, at every start (it does nothing once done).
+//! What SQL cannot do exactly (normalizing old rows as sign-in does, a username's
+//! lookalike key) [`complete`] does: await it after the migrations run and before
+//! serving, at every start (it does next to nothing once done).
 
 use std::path::Path;
 
@@ -45,51 +46,309 @@ pub const ALL: &[Migration] = &[
     },
 ];
 
-/// Finish what [`ALL`] cannot do in SQL: the lookalike key
-/// ([`store::skeleton`](crate::store::skeleton)) of every account made before it was
-/// stored. Run it after the migrations, at each start: it reads nothing but the rows
-/// still missing one, so it is free once done. An old account whose name is a
-/// lookalike of an earlier one keeps it, under a key no other name can take (it
-/// carries the id), so only new names are held to the rule. Returns how many rows it
-/// filled.
+/// What [`complete`] changed, for the operator to read (it is logged too). An owner
+/// whose username was renamed signs in with the new one, or by email or a provider;
+/// tell them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Completed {
+    /// Accounts whose username changed: normalized to the form sign-in looks up, and
+    /// given a suffix where that form was another account's.
+    pub renamed: Vec<Renamed>,
+    /// Accounts whose email was cleared: not an address, or the same address as
+    /// another account's once normalized.
+    pub emails_cleared: Vec<i64>,
+    /// Accounts whose password hash was cleared: one the library cannot verify (a
+    /// legacy format), which never opened the account.
+    pub passwords_cleared: Vec<i64>,
+    /// Accounts given their lookalike key.
+    pub keyed: u64,
+    /// Accounts that could not be completed this time (the error is logged); the next
+    /// call tries them again.
+    pub failed: Vec<i64>,
+    /// Every constraint of [`ALL`] now holds for every row.
+    pub validated: bool,
+}
+
+/// An account [`complete`] renamed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Renamed {
+    /// The account.
+    pub id: i64,
+    /// Its username before.
+    pub from: String,
+    /// Its username now.
+    pub to: String,
+}
+
+/// The constraints `0003` adds `NOT VALID`, by table, validated once the rows hold them.
+const DEFERRED: &[(&str, &str)] = &[
+    ("accounts", "accounts_password_hash_form"),
+    ("accounts", "accounts_username_nfkc"),
+    ("accounts", "accounts_email_form"),
+    ("accounts", "accounts_session_epoch_check"),
+    ("account_identities", "account_identities_named"),
+    ("sign_in_links", "sign_in_links_lifetime"),
+    ("sign_in_links", "sign_in_links_digest"),
+];
+
+/// Finish what [`ALL`] cannot do in SQL, and await it before serving: move every
+/// account made before `0003` to the form the library stores, in Rust, as sign-in
+/// normalizes what is typed (SQL's `normalize` and `lower` differ from it at the
+/// edges: the final sigma, a database's locale, its Unicode version). For each
+/// account without a lookalike key, in its own short transaction:
+///
+/// - the username is [normalized](crate::store::normalize) (`@` becomes `-`); one
+///   that would become another account's takes its id as a suffix (`admin-42`), or
+///   the first free name after it;
+/// - the email is normalized, and cleared when it is not an address or would become
+///   another account's;
+/// - a password hash the library cannot verify is cleared (it opened nothing);
+/// - a negative session epoch becomes 0;
+/// - the lookalike key ([`store::skeleton`](crate::store::skeleton)) is stored; an old
+///   account whose name is a lookalike of an earlier one keeps it, under a key that
+///   carries its id, so only new names are held to the rule.
+///
+/// Then identities with no subject are deleted, sign-in links are cut to 30 days,
+/// and the constraints `0003` added are validated (which locks no writer out). Call
+/// it at every start: once done it reads one index and the catalog. An account it
+/// cannot complete is logged and left for the next call; it never fails the start
+/// over one row.
 ///
 /// # Errors
 ///
-/// The database.
-pub async fn complete(pool: &sqlx::PgPool) -> sqlx::Result<u64> {
-    let missing: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, username FROM accounts WHERE username_skeleton IS NULL ORDER BY id",
+/// The database, for anything but one account's completion.
+pub async fn complete(pool: &sqlx::PgPool) -> sqlx::Result<Completed> {
+    let mut done = Completed::default();
+    let mut after = i64::MIN;
+    loop {
+        let batch: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM accounts WHERE username_skeleton IS NULL AND id > $1
+             ORDER BY id LIMIT 500",
+        )
+        .bind(after)
+        .fetch_all(pool)
+        .await?;
+        let Some(&last) = batch.last() else { break };
+        after = last;
+        for id in batch {
+            if let Err(e) = complete_account(pool, id, &mut done).await {
+                tracing::error!(account = id, error = %e, "could not complete an account");
+                done.failed.push(id);
+            }
+        }
+    }
+    let pending: Vec<(String, String)> = sqlx::query_as(
+        "SELECT conrelid::regclass::text, conname FROM pg_constraint
+         WHERE NOT convalidated AND conname = ANY($1)",
     )
+    .bind(DEFERRED.iter().map(|(_, c)| *c).collect::<Vec<_>>())
     .fetch_all(pool)
     .await?;
-    let mut filled = 0;
-    for (id, username) in missing {
-        let key = crate::store::skeleton(&username);
-        let set = |key: String| {
-            sqlx::query(
-                "UPDATE accounts SET username_skeleton = $2
-                 WHERE id = $1 AND username_skeleton IS NULL",
-            )
-            .bind(id)
-            .bind(key)
-            .execute(pool)
-        };
-        let done = match set(key.clone()).await {
-            Err(e)
-                if e.as_database_error()
-                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
-            {
-                // `#` is in no username, so no skeleton has one.
-                set(format!("{key}#{id}")).await?
+    let unkeyed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE username_skeleton IS NULL)",
+    )
+    .fetch_one(pool)
+    .await?;
+    let mut validated = true;
+    for (table, constraint) in DEFERRED {
+        if !pending.iter().any(|(_, c)| c == constraint) {
+            continue;
+        }
+        if *table == "accounts" && unkeyed {
+            // Rows not yet moved (an older replica still writing, or a failed one).
+            validated = false;
+            continue;
+        }
+        match *constraint {
+            "account_identities_named" => {
+                let gone = sqlx::query(
+                    "DELETE FROM account_identities WHERE provider = '' OR subject = ''",
+                )
+                .execute(pool)
+                .await?
+                .rows_affected();
+                if gone > 0 {
+                    tracing::info!(gone, "deleted identities with no subject");
+                }
             }
-            other => other?,
+            "sign_in_links_lifetime" => {
+                sqlx::query(
+                    "UPDATE sign_in_links SET expires_at = created_at + interval '30 days'
+                     WHERE expires_at > created_at + interval '30 days'",
+                )
+                .execute(pool)
+                .await?;
+            }
+            // Not a SHA-256: no token could ever match it.
+            "sign_in_links_digest" => {
+                sqlx::query("DELETE FROM sign_in_links WHERE octet_length(token_sha256) <> 32")
+                    .execute(pool)
+                    .await?;
+            }
+            _ => {}
+        }
+        // Each name is one of DEFERRED's, never input.
+        let sql = format!("ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}");
+        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(pool).await {
+            tracing::warn!(constraint, error = %e, "a constraint does not hold for every row yet");
+            validated = false;
+        }
+    }
+    done.validated = validated;
+    if done.keyed > 0 || !done.failed.is_empty() {
+        tracing::info!(
+            renamed = ?done.renamed,
+            emails_cleared = ?done.emails_cleared,
+            passwords_cleared = ?done.passwords_cleared,
+            keyed = done.keyed,
+            failed = ?done.failed,
+            validated = done.validated,
+            "completed the accounts tables"
+        );
+    }
+    Ok(done)
+}
+
+/// A unique violation of `constraint`.
+fn violates(e: &sqlx::Error, constraint: &str) -> bool {
+    e.as_database_error()
+        .is_some_and(|d| d.is_unique_violation() && d.constraint() == Some(constraint))
+}
+
+/// The first of `base`, `base-<id>`, `base-<id>-<n>` no other account has.
+async fn free_username(conn: &mut sqlx::PgConnection, base: &str, id: i64) -> sqlx::Result<String> {
+    let mut name = base.to_owned();
+    for n in 1.. {
+        let taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM accounts WHERE username = $1 AND id <> $2)",
+        )
+        .bind(&name)
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !taken {
+            break;
+        }
+        name = if n == 1 {
+            format!("{base}-{id}")
+        } else {
+            format!("{base}-{id}-{n}")
         };
-        filled += done.rows_affected();
     }
-    if filled > 0 {
-        tracing::info!(filled, "filled the lookalike keys of existing accounts");
+    Ok(name)
+}
+
+/// Store `key` as the account's lookalike key; an old lookalike's carries its id,
+/// which no username's can (`@` is in none, so in no skeleton of one), with a count
+/// after if even that is somehow held.
+async fn store_skeleton(conn: &mut sqlx::PgConnection, id: i64, key: &str) -> sqlx::Result<()> {
+    let mut candidate = key.to_owned();
+    for n in 1..=100 {
+        let mut attempt = sqlx::Connection::begin(&mut *conn).await?;
+        let set = sqlx::query("UPDATE accounts SET username_skeleton = $2 WHERE id = $1")
+            .bind(id)
+            .bind(&candidate)
+            .execute(&mut *attempt)
+            .await;
+        match set {
+            Ok(_) => return attempt.commit().await,
+            Err(e) if violates(&e, "accounts_username_skeleton_key") => {
+                attempt.rollback().await?;
+                candidate = if n == 1 {
+                    format!("{key}@{id}")
+                } else {
+                    format!("{key}@{id}@{n}")
+                };
+            }
+            Err(e) => return Err(e),
+        }
     }
-    Ok(filled)
+    Err(sqlx::Error::Protocol(format!(
+        "no free lookalike key for account {id}"
+    )))
+}
+
+/// One account, in its own transaction, under its row's lock.
+async fn complete_account(pool: &sqlx::PgPool, id: i64, done: &mut Completed) -> sqlx::Result<()> {
+    use crate::store::{normalize, skeleton};
+    let mut tx = pool.begin().await?;
+    let Some((username, email, hash)) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT username, email, password_hash FROM accounts
+         WHERE id = $1 AND username_skeleton IS NULL FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // The username: the first of its stored form, then that with the id, then with a
+    // count, that no other account has.
+    let base = match normalize(&username).replace('@', "-") {
+        b if b.is_empty() => format!("user-{id}"),
+        b => b,
+    };
+    let name = if base == username {
+        base
+    } else {
+        free_username(&mut tx, &base, id).await?
+    };
+
+    // The email: stored form, an address, and no one else's.
+    let mut address = normalize(&email);
+    let shaped = address
+        .split_once('@')
+        .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+    if !shaped {
+        address.clear();
+    } else if address != email {
+        let taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM accounts
+                            WHERE email <> '' AND lower(email) = lower($1) AND id <> $2)",
+        )
+        .bind(&address)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if taken {
+            address.clear();
+        }
+    }
+
+    let hash_kept = hash.is_empty() || owt_auth::password::usable(&hash);
+    sqlx::query(
+        "UPDATE accounts SET username = $2, email = $3,
+                password_hash = CASE WHEN $4 THEN password_hash ELSE '' END,
+                session_epoch = greatest(session_epoch, 0)
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&name)
+    .bind(&address)
+    .bind(hash_kept)
+    .execute(&mut *tx)
+    .await?;
+
+    store_skeleton(&mut tx, id, &skeleton(&name)).await?;
+    tx.commit().await?;
+
+    if name != username {
+        done.renamed.push(Renamed {
+            id,
+            from: username,
+            to: name,
+        });
+    }
+    if address.is_empty() && !email.is_empty() {
+        done.emails_cleared.push(id);
+    }
+    if !hash_kept {
+        done.passwords_cleared.push(id);
+    }
+    done.keyed += 1;
+    Ok(())
 }
 
 /// The SHA-256 of each of [`ALL`], in order, as released. A changed digest means a
@@ -99,7 +358,7 @@ pub async fn complete(pool: &sqlx::PgPool) -> sqlx::Result<u64> {
 const SHIPPED_SHA256: &[&str] = &[
     "743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4",
     "0e6d42a67ddabfb50f56650fe85ff0bc810c4b3230a1115706db467ea27b2338",
-    "1bdb03527bb36d2314329cf13b6ad6cf8456713cc226351eba524d280d67d9cd",
+    "1a38211fe1973722b7e8d1afe128d7d2228d05575c670784872a55ed899b1b1f",
 ];
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;
