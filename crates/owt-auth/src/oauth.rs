@@ -197,17 +197,7 @@ pub fn oidc(
     token: &str,
     userinfo: &str,
 ) -> Result<Provider, Error> {
-    let issuer = issuer.trim_end_matches('/');
-    let parsed = checked_url("issuer", issuer)?;
-    if parsed.query().is_some() {
-        return Err(Error::Config(format!("the issuer {issuer:?} has a query")));
-    }
-    let canonical = parsed.as_str().trim_end_matches('/');
-    if canonical != issuer {
-        return Err(Error::Config(format!(
-            "the issuer {issuer:?} is not in canonical form: write {canonical:?}"
-        )));
-    }
+    let issuer = checked_issuer(issuer)?;
     for (what, url) in [
         ("authorize", authorize),
         ("token", token),
@@ -227,6 +217,23 @@ pub fn oidc(
         client_id_header: false,
         identity: oidc_identity,
     })
+}
+
+/// `issuer` without a trailing `/`, once it is a URL [`oidc`] accepts, with no query
+/// and in canonical form.
+fn checked_issuer(issuer: &str) -> Result<&str, Error> {
+    let issuer = issuer.trim_end_matches('/');
+    let parsed = checked_url("issuer", issuer)?;
+    if parsed.query().is_some() {
+        return Err(Error::Config(format!("the issuer {issuer:?} has a query")));
+    }
+    let canonical = parsed.as_str().trim_end_matches('/');
+    if canonical != issuer {
+        return Err(Error::Config(format!(
+            "the issuer {issuer:?} is not in canonical form: write {canonical:?}"
+        )));
+    }
+    Ok(issuer)
 }
 
 /// An [`oidc`] provider read from its issuer's discovery document, and where it
@@ -250,7 +257,8 @@ pub struct Discovered {
 /// # Errors
 ///
 /// [`Error::Http`] if the document cannot be fetched or read, [`Error::Redirected`]
-/// if it is somewhere else, and [`Error::Config`] if it names another issuer, lacks
+/// if it is somewhere else, and [`Error::Config`] if `issuer` is one [`oidc`] refuses
+/// (checked before anything is fetched), or the document names another issuer, lacks
 /// an endpoint, or names one [`oidc`] refuses (`end_session_endpoint` included).
 pub async fn discover(
     http: &reqwest::Client,
@@ -258,8 +266,7 @@ pub async fn discover(
     name: &'static str,
     issuer: &str,
 ) -> Result<Discovered, Error> {
-    let issuer = issuer.trim_end_matches('/');
-    checked_url("issuer", issuer)?;
+    let issuer = checked_issuer(issuer)?;
     let url = format!("{issuer}/.well-known/openid-configuration");
     let res = http
         .get(&url)
@@ -498,8 +505,10 @@ pub enum Error {
     /// The provider could not be reached or refused the exchange.
     #[error("talking to the provider: {0}")]
     Http(#[from] reqwest::Error),
-    /// The token response carried no access token.
-    #[error("the token response had no access_token")]
+    /// The token endpoint granted no access token: its answer carried none, or it
+    /// refused the grant with the OAuth error `invalid_grant` (RFC 6749 §5.2: an
+    /// expired, revoked or unknown code or refresh token).
+    #[error("the token endpoint granted no access token")]
     NoToken,
     /// The user-info response carried no id.
     #[error("the user-info response had no id")]
@@ -530,21 +539,21 @@ fn not_redirected(res: reqwest::Response, asked: &str) -> Result<reqwest::Respon
 }
 
 impl Error {
-    /// The provider answered and said no: a 4xx other than 408 or 429 (an expired,
-    /// revoked or unknown grant answers `400 invalid_grant`), or a token response
-    /// with no access token. For a refresh, that means the person signs in again; an
-    /// outage, a timeout or a throttle is not this, and the grant may still be good.
+    /// The token endpoint refused the grant itself: it answered a 4xx (other than
+    /// 408 or 429) whose JSON body's OAuth `error` is `invalid_grant` (RFC 6749
+    /// §5.2; an expired, revoked or unknown code or refresh token), or a success
+    /// with no access token. Both are [`Error::NoToken`]. For a refresh, that means
+    /// the person signs in again.
+    ///
+    /// Nothing else is: not `invalid_client` (a wrong or rotated client secret,
+    /// often a 401), `unauthorized_client` or any other code, not a 4xx whose body
+    /// names no code (a 404 from an endpoint that moved, a 400 that is not JSON),
+    /// and not an outage, a timeout or a throttle. Those are the app's configuration
+    /// or the provider's availability, and the grant may still be good: an app that
+    /// dropped grants on them would drop every person's on one mistake.
     #[must_use]
     pub fn is_rejected(&self) -> bool {
-        match self {
-            Self::NoToken => true,
-            Self::Http(e) => e.status().is_some_and(|s| {
-                s.is_client_error()
-                    && s != reqwest::StatusCode::REQUEST_TIMEOUT
-                    && s != reqwest::StatusCode::TOO_MANY_REQUESTS
-            }),
-            _ => false,
-        }
+        matches!(self, Self::NoToken)
     }
 }
 
@@ -739,11 +748,24 @@ impl Client {
             .form(&form)
             .send()
             .await?;
-        let token: Value = not_redirected(res, &self.provider.token_url)?
-            .error_for_status()?
-            .json()
-            .await?;
-        Tokens::read(&token)
+        let res = not_redirected(res, &self.provider.token_url)?;
+        if let Some(e) = res.error_for_status_ref().err() {
+            // RFC 6749 §5.2: the error response names what was wrong. Only
+            // `invalid_grant` says the grant itself is gone (see `Error::is_rejected`).
+            let status = res.status();
+            if status.is_client_error()
+                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                && res
+                    .json::<Value>()
+                    .await
+                    .is_ok_and(|v| v["error"].as_str() == Some("invalid_grant"))
+            {
+                return Err(Error::NoToken);
+            }
+            return Err(e.into());
+        }
+        Tokens::read(&res.json().await?)
     }
 
     /// The claims of the token response's ID token, once its `iss` is `issuer`, its
@@ -1403,45 +1425,59 @@ mod tests {
         ));
     }
 
-    /// A refused grant is told apart from a provider that is merely unavailable, so
-    /// an app drops a refresh token only when it is really gone.
+    /// A refused grant is told apart from a misconfigured client, a moved endpoint
+    /// and a provider that is merely unavailable, so an app drops a refresh token
+    /// only when it is really gone.
     #[tokio::test]
-    async fn a_refused_grant_is_rejected_and_an_outage_is_not() {
+    async fn a_refused_grant_is_rejected_and_an_outage_or_a_config_error_is_not() {
         use axum::extract::Path;
         use axum::http::StatusCode;
+        use axum::response::IntoResponse;
         let base = serve(axum::Router::new().route(
-            "/{status}/token",
-            post(|Path(status): Path<u16>| async move {
-                (
-                    StatusCode::from_u16(status).unwrap(),
-                    Json(serde_json::json!({"error": "invalid_grant"})),
-                )
+            "/{status}/{error}/token",
+            post(|Path((status, error)): Path<(u16, String)>| async move {
+                let status = StatusCode::from_u16(status).unwrap();
+                match error.as_str() {
+                    "none" => (status, "not json").into_response(),
+                    "empty" => (status, Json(serde_json::json!({}))).into_response(),
+                    _ => (status, Json(serde_json::json!({ "error": error }))).into_response(),
+                }
             }),
         ))
         .await;
         let http = http_client().unwrap();
-        for (status, rejected) in [
-            (400, true),
-            (401, true),
-            (403, true),
-            (408, false),
-            (429, false),
-            (500, false),
-            (503, false),
+        for (status, error, rejected) in [
+            (400, "invalid_grant", true),
+            (401, "invalid_grant", true),
+            (400, "invalid_client", false),
+            (401, "invalid_client", false),
+            (400, "unauthorized_client", false),
+            (400, "invalid_request", false),
+            (400, "none", false),
+            (400, "empty", false),
+            (403, "none", false),
+            (404, "none", false),
+            (408, "invalid_grant", false),
+            (429, "invalid_grant", false),
+            (500, "invalid_grant", false),
+            (503, "none", false),
         ] {
             let c = client(Provider {
-                token_url: format!("{base}/{status}/token"),
+                token_url: format!("{base}/{status}/{error}/token"),
                 ..google()
             });
             let e = c.refresh(&http, "rt", "42").await.unwrap_err();
-            assert_eq!(e.is_rejected(), rejected, "{status}: {e}");
+            assert_eq!(e.is_rejected(), rejected, "{status} {error}: {e}");
+            if !rejected {
+                assert!(matches!(e, Error::Http(_)), "{status} {error}: {e}");
+            }
         }
         assert!(Error::NoToken.is_rejected());
         assert!(!Error::Redirected.is_rejected());
     }
 
     #[test]
-    fn tokens_debug_output_keeps_every_token() {
+    fn tokens_debug_output_leaves_out_every_token() {
         let mut t = Tokens::bearer("access-secret");
         t.refresh = Some("refresh-secret".into());
         t.id_token = Some("id-secret".into());
@@ -1526,5 +1562,20 @@ mod tests {
             find(good, "http://sso.example/realms/x".into()).await,
             Err(Error::Config(_))
         ));
+        // An issuer oidc() refuses is refused before any request: these hosts do
+        // not resolve, so a fetch would be an Error::Http.
+        for issuer in [
+            "https://SSO.invalid/realms/x",
+            "https://sso.invalid:443/realms/x",
+            "https://sso.invalid/realms/x?tenant=1",
+        ] {
+            assert!(
+                matches!(
+                    discover(&http, "sso", "SSO", issuer).await,
+                    Err(Error::Config(_))
+                ),
+                "{issuer}"
+            );
+        }
     }
 }
