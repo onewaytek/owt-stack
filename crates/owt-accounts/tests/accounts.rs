@@ -1808,7 +1808,7 @@ async fn fake_provider(sub: Arc<std::sync::Mutex<String>>) -> String {
 fn social_sessions() -> Sessions<owt_accounts::social::Data> {
     let key = owt_web::session::key_from_base64(&base64::Engine::encode(
         &base64::engine::general_purpose::STANDARD,
-        [9u8; 64],
+        (64..128u8).collect::<Vec<_>>(),
     ))
     .unwrap();
     Sessions::new(key, "s", Duration::from_secs(3600), false)
