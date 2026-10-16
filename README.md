@@ -169,7 +169,7 @@ async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<Option
         .await
 }
 
-pub fn router(key: cookie::Key, assets: Assets, trusted: &[String], pool: sqlx::PgPool) -> Router {
+pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool: sqlx::PgPool) -> Router {
     // `__Host-`: browsers refuse a copy set over plain HTTP or by a sibling subdomain.
     let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_secs(14 * 86_400), true)
         .validate_with(move |s: Presented<SessionData>| {
@@ -192,7 +192,7 @@ pub fn router(key: cookie::Key, assets: Assets, trusted: &[String], pool: sqlx::
     let pages = Limits::default()
         .apply(routes)
         .layer(from_fn_with_state(sessions, Sessions::<SessionData>::layer))
-        .layer(from_fn_with_state(CrossOrigin::new().trust(trusted), CrossOrigin::layer));
+        .layer(from_fn_with_state(cross_origin, CrossOrigin::layer));
     Router::new()
         .nest(
             "/static",
@@ -247,9 +247,22 @@ the handler and write `<script nonce="{{ nonce }}">`.
   `Set-Cookie`, so a handler that signed someone in and then failed leaves them as
   they were. A sign-out (`flush`) stands whatever follows: a 5xx after one seals an
   empty session, dropping a sign-in made after it.
-- **Trusted origins** (`CrossOrigin::trust`) are `scheme://host[:port]`; anything
-  else (`null`, a wildcard, a bare host, a path) panics at start rather than trusting
-  every sandboxed frame or silently nothing.
+- **Trusted origins** are `scheme://host[:port]`; anything else (`null`, a wildcard,
+  a bare host, a path, or `https://` from `https://$HOST` with `HOST` blank) is
+  refused at start rather than trusting every sandboxed frame or silently nothing.
+  `CrossOrigin::try_trust` returns a `BadOrigin` naming the entry, so origins from the
+  environment fail start-up with a config error; `trust` panics with the same
+  message, for origins written in the code. Blank entries are skipped.
+
+  ```rust
+  # fn main() -> anyhow::Result<()> {
+  use anyhow::Context;
+  use owt_web::csrf::CrossOrigin;
+  let cross_origin = CrossOrigin::new()
+      .try_trust(owt_runtime::env::list("CSRF_TRUSTED_ORIGINS"))
+      .context("CSRF_TRUSTED_ORIGINS")?;
+  # Ok(()) }
+  ```
 - **Static URLs:** `Assets::new("static", "/static").watch(cfg!(debug_assertions))`;
   templates call a function that returns `assets.url("css/app.css")`, which carries
   the content hash and is served `immutable`.
