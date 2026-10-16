@@ -1695,13 +1695,24 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `aud` (and `azp`) naming this client, its `exp`, and its `sub` being the
   user-info response's; ask for the `openid` scope. A redirect from the token or
   user-info endpoint is refused.
+- `complete` holds a hand-built `Provider` whose `issuer` is `Some` to the form
+  `oidc` gives (no trailing `/` on the issuer; issuer, token and user-info URLs
+  `https`, or `http` on the loopback host, with no credentials), or fails with
+  `Error::Config`.
+- The `google`, `discord` and `twitch` presets (and `oidc`'s) return no identity for
+  an empty `sub` or `id`, so `complete` fails with `Error::NoIdentity`.
 - `oauth::Error` has new variants, `IdToken`, `Config` and `Redirected`; a `match`
   on it needs arms.
-- An app with its own code exchange (to keep the person's tokens) moves to
-  `Client::complete_with_tokens`, `refresh` and `client_credentials` (see
-  "Authentication"), which make these checks; its own exchange makes none of them.
+- An app with its own code exchange (to keep the person's tokens) makes none of
+  these checks. The next release brings `Client::complete_with_tokens`, `refresh`
+  and `client_credentials`, which make them; move to those then.
 - `password::verify_or_decoy` runs the decoy check for any stored hash it cannot
-  verify, not only a missing one; `password::usable` says which those are.
+  verify, not only a missing one; `password::usable(hash)` says which those are.
+- `password::needs_rehash` is true for a hash of an older Argon2 version (`v=16`)
+  too, even at today's costs.
+- `jwt::Verifier` refetches keys older than `jwt::KEYS_MAX_AGE` (an hour), refuses
+  encryption keys, and refuses every token once its keys could not be refetched for
+  `jwt::KEYS_STALE_LIMIT` (a day).
 
 ### Accounts
 
@@ -1752,11 +1763,6 @@ Also:
 - `store::authenticate` fails a sign-in whose password changed while it was checked;
   `store::change_password` is new.
 - `Refused` has `CurrentPassword` and `UsernameLookalike` variants.
-- `owt_auth::password::usable(hash)` says whether a stored hash can open an account;
-  `needs_rehash` is true for a hash of an older Argon2 version too.
-- `jwt::Verifier` refetches keys older than `jwt::KEYS_MAX_AGE` (an hour), refuses
-  encryption keys, and refuses every token once its keys could not be refetched for
-  `jwt::KEYS_STALE_LIMIT` (a day).
 - `Linked::label` shows an email only when the provider verified it.
 - The social routes refuse cross-origin `POST`s themselves.
 
