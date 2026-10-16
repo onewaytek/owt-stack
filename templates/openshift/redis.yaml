@@ -1,0 +1,133 @@
+# An optional Redis for an app deployed from app.yaml, for the cache, the bus and job
+# leases (owt_runtime::cache, owt_bus, owt_runtime::jobs::lease). Run as compose.yaml
+# runs it: nothing on disk, bounded by maxmemory, least recently used keys evicted.
+#
+#   pw=$(openssl rand -hex 24)
+#   oc create secret generic myapp-redis -n myapp --from-literal=password="$pw" \
+#     --from-literal=url="redis://:$pw@myapp-redis:6379"
+#   oc process -f redis.yaml -p NAME=myapp -p NAMESPACE=myapp | oc apply -f -
+#
+# The password is a Secret made once, by hand: a template that generated it would
+# mint a new one on every apply. app.yaml's Deployment reads REDIS_URL from the
+# Secret's `url` whenever the Secret exists, so the app finds this Redis after its
+# next rollout (`oc rollout restart deployment/myapp`); until the Secret exists,
+# REDIS_URL is unset.
+#
+# Eviction can drop a job lease: an app whose leased work must never run twice sets
+# MAXMEMORY_POLICY=noeviction, and then a full Redis refuses writes instead.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: owt-app-redis
+  annotations:
+    description: An in-memory Redis for an owt-stack app, reachable by it alone.
+parameters:
+  - name: NAME
+    description: The app's name, as given to app.yaml.
+    required: true
+  - name: NAMESPACE
+    required: true
+  - name: IMAGE
+    description: >-
+      The Redis image. Docker Hub's official image through Google's mirror, out of
+      reach of Docker Hub's anonymous pull limit; it runs under the arbitrary UID
+      restricted-v2 assigns.
+    value: mirror.gcr.io/library/redis:8-alpine
+  - name: MAXMEMORY
+    description: What Redis holds before it evicts (or, with noeviction, refuses).
+    value: 128mb
+  - name: MAXMEMORY_POLICY
+    description: allkeys-lru for a cache; noeviction when a lost lease must not happen.
+    value: allkeys-lru
+  - name: MEMORY_LIMIT
+    description: The container's limit, above MAXMEMORY for Redis's own overhead.
+    value: 256Mi
+objects:
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: ${NAME}-redis
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      replicas: 1
+      # Recreate, never two at once: replicas connected to two different Redis
+      # would each hear only half of the bus. A restart empties the cache, and the
+      # bus resubscribes and resyncs.
+      strategy: {type: Recreate}
+      selector:
+        matchLabels: {app: "${NAME}-redis"}
+      template:
+        metadata:
+          # Not `app: ${NAME}`: that label is what the app's Service sends traffic to.
+          labels: {app: "${NAME}-redis"}
+        spec:
+          automountServiceAccountToken: false
+          containers:
+            - name: redis
+              image: ${IMAGE}
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: "${NAME}-redis", key: password}
+              # Kubernetes expands $(REDIS_PASSWORD) when it starts the container;
+              # the Deployment itself holds no password.
+              command:
+                - redis-server
+                - --save
+                - ""
+                - --appendonly
+                - "no"
+                - --maxmemory
+                - ${MAXMEMORY}
+                - --maxmemory-policy
+                - ${MAXMEMORY_POLICY}
+                - --requirepass
+                - $(REDIS_PASSWORD)
+              ports:
+                - {name: redis, containerPort: 6379}
+              readinessProbe:
+                tcpSocket: {port: redis}
+                periodSeconds: 10
+              livenessProbe:
+                tcpSocket: {port: redis}
+                periodSeconds: 30
+              resources:
+                requests: {cpu: 20m, memory: 64Mi}
+                limits: {memory: "${MEMORY_LIMIT}"}
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                # With no persistence, Redis writes nothing.
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+                seccompProfile: {type: RuntimeDefault}
+
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: ${NAME}-redis
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      selector: {app: "${NAME}-redis"}
+      ports:
+        - {name: redis, port: 6379, targetPort: redis}
+
+  # The app's pods and nothing else; a CronJob or worker made from cronjob.yaml
+  # brings its own rule.
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME}-redis
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      podSelector:
+        matchLabels: {app: "${NAME}-redis"}
+      policyTypes: [Ingress]
+      ingress:
+        - from:
+            - podSelector:
+                matchLabels: {app: "${NAME}"}
+          ports: [{port: redis}]

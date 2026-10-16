@@ -17,8 +17,14 @@
 # Migrations need no Job: the binary applies its embedded SQLx migrations at startup
 # under an advisory lock (owt_runtime::db::migrate_locked), so replicas serialize.
 #
-# App-specific environment (REDIS_URL, SESSION_SECRET, ...) is added by patching the
-# Deployment after processing, or by copying this file into the app's repository.
+# The app's own environment (SESSION_SECRET, provider credentials, its tuning) lives
+# in a Secret named <NAME>-env, which the Deployment reads whole when it exists:
+#
+#   oc create secret generic myapp-env --from-literal=SESSION_SECRET=...
+#
+# Variables set below win over the Secret's. Alongside this template, redis.yaml adds
+# a Redis (the Deployment reads REDIS_URL from <NAME>-redis when it exists), and
+# cronjob.yaml a scheduled task in the app's image with the same database access.
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
@@ -160,6 +166,10 @@ objects:
               ports:
                 - {name: http, containerPort: "${{PORT}}"}
                 - {name: metrics, containerPort: 9464}
+              # The app's own variables, from a Secret made by hand (optional: until
+              # it exists, the app runs without them).
+              envFrom:
+                - secretRef: {name: "${NAME}-env", optional: true}
               env:
                 - {name: BIND_ADDR, value: "0.0.0.0:${PORT}"}
                 # The namespace, for `session::key_for`'s purpose: a secret copied to
@@ -176,6 +186,11 @@ objects:
                 # cluster (sqlx reads both variables; the URL names no sslmode).
                 - {name: PGSSLMODE, value: verify-full}
                 - {name: PGSSLROOTCERT, value: /etc/db-ca/ca.crt}
+                # redis.yaml's Redis, once its Secret exists, and unset until then.
+                # Read when the pod starts.
+                - name: REDIS_URL
+                  valueFrom:
+                    secretKeyRef: {name: "${NAME}-redis", key: url, optional: true}
                 - {name: RUST_LOG, value: "info"}
               volumeMounts:
                 - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}

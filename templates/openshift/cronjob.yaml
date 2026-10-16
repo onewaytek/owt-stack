@@ -1,0 +1,154 @@
+# A scheduled task for an app deployed from app.yaml: the app's own image, run with
+# other arguments, with the Deployment's database, TLS and environment.
+#
+#   oc process -f cronjob.yaml -p NAME=myapp -p NAMESPACE=myapp -p JOB=digest \
+#     -p SCHEDULE="0 6 * * *" -p ARGS='["send-digest"]' | oc apply -f -
+#
+# The image's entrypoint is the app's binary, so ARGS picks the subcommand. Process
+# the template once per job. A worker that runs all the time is the same pod spec in
+# a Deployment (copy app.yaml's strategy and image trigger, with this fieldPath's
+# Deployment form), with the same label and NetworkPolicies.
+#
+# What makes it a member, for anything copied by hand:
+# - The label `app: <NAME>-<JOB>`, never `app: <NAME>`: the app's Service sends
+#   traffic to every pod with that label. The NetworkPolicies below admit this label
+#   to the database and to Redis (redis.yaml); app.yaml's admit the app's pods only.
+# - The env: DATABASE_URL from <NAME>-<DB_SUFFIX>-app, PGSSLMODE=verify-full and
+#   PGSSLROOTCERT at the mounted <NAME>-<DB_SUFFIX>-ca, POD_NAMESPACE, REDIS_URL from
+#   <NAME>-redis, and the rest from <NAME>-env, as the Deployment has them.
+# - The same image, kept current by the trigger annotation on the CronJob.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: owt-app-cronjob
+  annotations:
+    description: A scheduled task in an owt-stack app's image, with its database.
+parameters:
+  - name: NAME
+    description: The app's name, as given to app.yaml.
+    required: true
+  - name: NAMESPACE
+    required: true
+  - name: JOB
+    description: The task's name; its objects are <NAME>-<JOB>.
+    required: true
+  - name: SCHEDULE
+    description: A five-field Kubernetes cron line, UTC unless the cluster says otherwise.
+    required: true
+  - name: ARGS
+    description: The binary's arguments, as a JSON array (["send-digest"]).
+    required: true
+  - name: CHANNEL
+    description: The channel the app follows, as given to app.yaml.
+    value: rc
+  - name: DB_SUFFIX
+    description: The database cluster is <NAME>-<DB_SUFFIX>, as given to app.yaml.
+    value: db
+  - name: MEMORY_LIMIT
+    value: 256Mi
+objects:
+  - apiVersion: batch/v1
+    kind: CronJob
+    metadata:
+      name: ${NAME}-${JOB}
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+      annotations:
+        # The app's ImageStream tag, as the Deployment follows it: each new digest
+        # rewrites the image, so the next run uses the release the app runs.
+        image.openshift.io/triggers: >-
+          [{"from": {"kind": "ImageStreamTag", "name": "${NAME}:${CHANNEL}"},
+          "fieldPath": "spec.jobTemplate.spec.template.spec.containers[?(@.name==\"job\")].image"}]
+    spec:
+      schedule: ${SCHEDULE}
+      # A run still going when the next is due keeps going, alone.
+      concurrencyPolicy: Forbid
+      startingDeadlineSeconds: 300
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 3
+      jobTemplate:
+        spec:
+          # A failed run waits for the next schedule rather than repeating at once:
+          # a task that did half its work is not retried blind.
+          backoffLimit: 0
+          template:
+            metadata:
+              labels: {app: "${NAME}-${JOB}"}
+            spec:
+              automountServiceAccountToken: false
+              restartPolicy: Never
+              containers:
+                - name: job
+                  # Placeholder the trigger resolves (lookupPolicy.local).
+                  image: ${NAME}:${CHANNEL}
+                  args: ${{ARGS}}
+                  # Optional: the app's own environment, as the Deployment reads it.
+                  envFrom:
+                    - secretRef: {name: "${NAME}-env", optional: true}
+                  env:
+                    - name: POD_NAMESPACE
+                      valueFrom:
+                        fieldRef: {fieldPath: metadata.namespace}
+                    - name: DATABASE_URL
+                      valueFrom:
+                        secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-app", key: uri}
+                    - {name: PGSSLMODE, value: verify-full}
+                    - {name: PGSSLROOTCERT, value: /etc/db-ca/ca.crt}
+                    - name: REDIS_URL
+                      valueFrom:
+                        secretKeyRef: {name: "${NAME}-redis", key: url, optional: true}
+                    - {name: RUST_LOG, value: "info"}
+                  volumeMounts:
+                    - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+                    - {name: tmp, mountPath: /tmp}
+                  resources:
+                    requests: {cpu: 50m, memory: 128Mi}
+                    limits: {memory: "${MEMORY_LIMIT}"}
+                  securityContext:
+                    runAsNonRoot: true
+                    allowPrivilegeEscalation: false
+                    readOnlyRootFilesystem: true
+                    capabilities: {drop: [ALL]}
+                    seccompProfile: {type: RuntimeDefault}
+              volumes:
+                - name: db-ca
+                  secret:
+                    secretName: ${NAME}-${DB_SUFFIX}-ca
+                    items: [{key: ca.crt, path: ca.crt}]
+                - name: tmp
+                  emptyDir: {medium: Memory, sizeLimit: 64Mi}
+
+  # Policies add up: this one lets the task's pods reach Postgres beside app.yaml's,
+  # which admits the app's.
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME}-${JOB}-db
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      podSelector:
+        matchLabels: {cnpg.io/cluster: "${NAME}-${DB_SUFFIX}"}
+      policyTypes: [Ingress]
+      ingress:
+        - from:
+            - podSelector:
+                matchLabels: {app: "${NAME}-${JOB}"}
+          ports: [{port: 5432}]
+
+  # And Redis, if redis.yaml made one; without it, this selects nothing.
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME}-${JOB}-redis
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      podSelector:
+        matchLabels: {app: "${NAME}-redis"}
+      policyTypes: [Ingress]
+      ingress:
+        - from:
+            - podSelector:
+                matchLabels: {app: "${NAME}-${JOB}"}
+          ports: [{port: 6379}]
