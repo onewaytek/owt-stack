@@ -2,8 +2,9 @@
 //! what it may do. Mount it once; the app keeps its own pages for anything else it
 //! stores about a person, and the admin links to them ([`Admin::more`]).
 //!
-//! - **Find:** search by username or email, filter by staff, by each of the app's
-//!   [roles](crate::roles), or deactivated; paged.
+//! - **Find:** search by username or email, and by the app's own columns
+//!   ([`Admin::search`]); filter by staff, by each of the app's [roles](crate::roles),
+//!   or deactivated; paged.
 //! - **Create:** username, email, staff and roles; no password. The way in is
 //!   given afterwards, once: a generated password or a sign-in link.
 //! - **Change:** email, active, staff, each role; reset to a generated password,
@@ -29,6 +30,8 @@
 //! too: a sibling subdomain is same-site, so `SameSite=Lax` alone would let it post.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,6 +107,9 @@ where
 
 type LinkUrl = Box<dyn Fn(&str) -> String + Send + Sync>;
 type MoreHref = Box<dyn Fn(&Account) -> String + Send + Sync>;
+type Search = Box<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<i64>>> + Send>> + Send + Sync,
+>;
 
 /// The admin, configured. Build it, then merge [`Admin::routes`] into the app.
 pub struct Admin {
@@ -113,6 +119,7 @@ pub struct Admin {
     chrome: Box<dyn Chrome>,
     links: Option<(Duration, LinkUrl)>,
     more: Option<(&'static str, MoreHref)>,
+    search: Option<(&'static str, Search)>,
 }
 
 impl fmt::Debug for Admin {
@@ -144,6 +151,7 @@ impl Admin {
             chrome: Box::new(chrome),
             links: None,
             more: None,
+            search: None,
         }
     }
 
@@ -176,6 +184,25 @@ impl Admin {
         href: impl Fn(&Account) -> String + Send + Sync + 'static,
     ) -> Self {
         self.more = Some((label, Box::new(href)));
+        self
+    }
+
+    /// Also find accounts by the app's own columns (a nickname in its profile table),
+    /// named `what` in the search box (`nickname`). `find` gets the term as typed,
+    /// trimmed, and answers the ids of the accounts it matches; the list shows those
+    /// with the username and email matches, once each, in the same order and filters
+    /// and pages. An id with no account is ignored. It is not asked when the term is
+    /// empty. When it fails, the error is logged at `warn` and the list shows the
+    /// username and email matches alone, saying so.
+    ///
+    /// The term is the staff member's text: bind it, never format it into SQL.
+    #[must_use]
+    pub fn search<F, Fut>(mut self, what: &'static str, find: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<Vec<i64>>> + Send + 'static,
+    {
+        self.search = Some((what, Box::new(move |term| Box::pin(find(term)))));
         self
     }
 
@@ -339,6 +366,8 @@ struct Row {
 struct ListPage<'a> {
     base: &'a str,
     q: &'a str,
+    placeholder: String,
+    notice: Option<Notice>,
     role: &'a str,
     filters: Vec<(String, String)>,
     total: i64,
@@ -362,10 +391,12 @@ fn like_escaped(term: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// The search's rows: a term in the username or email, and a filter (`staff`,
-/// `inactive`, or a role's name, staff counted when the role says so).
+/// The search's rows: a term in the username or email or one of the app's matches
+/// (`$4`), and a filter (`staff`, `inactive`, or a role's name, staff counted when the
+/// role says so).
 const FROM: &str = "FROM accounts
-     WHERE ($1 = '' OR username ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%')
+     WHERE ($1 = '' OR username ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%'
+            OR id = ANY($4))
        AND CASE $2
            WHEN '' THEN true
            WHEN 'staff' THEN is_staff
@@ -388,10 +419,12 @@ async fn list(
         _ => role.map_or("", |r| r.name),
     };
     let staff_hold = role.is_some_and(|r| r.staff);
+    let (matched, notice) = app_matches(&admin, query.q.trim()).await;
     let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) {FROM}")))
         .bind(&term)
         .bind(filter)
         .bind(staff_hold)
+        .bind(&matched)
         .fetch_one(&admin.pool)
         .await?;
     let pager = Pager::clamped(
@@ -405,11 +438,12 @@ async fn list(
         (i64, String, String, bool, bool, i32, Vec<String>, String),
     >(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS}, coalesce(to_char(last_sign_in, 'YYYY-MM-DD'), '') {FROM}
-             ORDER BY username LIMIT $4 OFFSET $5"
+             ORDER BY username LIMIT $5 OFFSET $6"
     )))
     .bind(&term)
     .bind(filter)
     .bind(staff_hold)
+    .bind(&matched)
     .bind(i64::try_from(PER_PAGE).unwrap_or(50))
     .bind(offset)
     .fetch_all(&admin.pool)
@@ -453,6 +487,11 @@ async fn list(
     let page = ListPage {
         base: &admin.base,
         q: query.q.trim(),
+        placeholder: admin.search.as_ref().map_or_else(
+            || "Username or email".to_owned(),
+            |(what, _)| format!("Username, email or {what}"),
+        ),
+        notice,
         role: filter,
         filters,
         total,
@@ -460,6 +499,24 @@ async fn list(
         pagination: Pagination::new(pager, &info),
     };
     Ok(admin.render(&parts, &me, "Accounts", &page))
+}
+
+/// The accounts the app's own search matches for `term`: none when it has none, the
+/// term is empty, or it failed (with a notice saying so).
+async fn app_matches(admin: &Admin, term: &str) -> (Vec<i64>, Option<Notice>) {
+    let Some((what, find)) = admin.search.as_ref().filter(|_| !term.is_empty()) else {
+        return (Vec::new(), None);
+    };
+    match find(term.to_owned()).await {
+        Ok(ids) => (ids, None),
+        Err(e) => {
+            tracing::warn!(error = ?e, "the app's admin search failed");
+            let notice = Notice::error(format!(
+                "Searching by {what} failed, so these are username and email matches only."
+            ));
+            (Vec::new(), Some(notice))
+        }
+    }
 }
 
 fn badges(roles: &[Role], a: &Account) -> Vec<Badge> {

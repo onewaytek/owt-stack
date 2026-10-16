@@ -801,10 +801,10 @@ accounts WHERE can_host`, then drops the column.
 #### The accounts admin
 
 `owt_accounts::admin` is the staff pages for accounts, mounted once: find (search by
-username or email; filter by staff, each role, or deactivated; paged), create
-(username, email, staff, roles; no password), and change (email, active, staff, each
-role; a generated password or a sign-in link, shown once; sign out everywhere; remove
-a sign-in connection). Lists show `admin::PER_PAGE` accounts a page.
+username, email or the app's own columns; filter by staff, each role, or deactivated;
+paged), create (username, email, staff, roles; no password), and change (email,
+active, staff, each role; a generated password or a sign-in link, shown once; sign out
+everywhere; remove a sign-in connection). Lists show `admin::PER_PAGE` accounts a page.
 
 - **Who:** only `Staff`, and each change re-checks inside its transaction that its
   author is still active staff (locking both rows, so two staff removing each other at
@@ -820,9 +820,16 @@ a sign-in connection). Lists show `admin::PER_PAGE` accounts a page.
 - **What is kept:** every page is `no-store`; a password or link is shown once; each
   change is logged at `info` with who made it and what changed.
 
-The app gives it a layout and, optionally, its roles, a sign-in-link route and a link
+The app gives it a layout and, optionally, its roles, a sign-in-link route, a link
 to its own page about each account (what the admin does not show: a nickname, what
-they own):
+they own) and a search of its own columns. `Admin::search` names what it searches
+(the box reads "Username, email or nickname") and gets the trimmed term, never an
+empty one; it answers the ids of the accounts it matches, which the list shows with
+the username and email matches, once each, under the same filters, order and pages.
+An id with no account is ignored. Bind the term, never format it into SQL (and in a
+`LIKE` its `%` and `_` are wildcards; `strpos` takes it as text). When it fails, the
+admin logs the error at `warn` and lists the username and email matches alone, saying
+so on the page.
 
 ```rust,no_run
 # fn demo(pool: sqlx::PgPool, accounts: owt_accounts::Accounts) {
@@ -844,12 +851,25 @@ let chrome = |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
     let html = Shell { title: page.title, body: page.body }.render().map_err(|e| owt_web::Error::Internal(e.into()))?;
     Ok(Html(html).into_response())
 };
+let profiles = pool.clone();
 let admin = Admin::new(pool, "/staff/accounts", chrome)
     .roles(&[Host::ROLE])
     .sign_in_links(std::time::Duration::from_secs(86_400), |token| {
         format!("https://myapp.example/login/link/{token}") // the app's `links::redeem` route
     })
-    .more("Profile", |a| format!("/staff/profiles/{}", a.id));
+    .more("Profile", |a| format!("/staff/profiles/{}", a.id))
+    .search("nickname", move |term| {
+        let pool = profiles.clone();
+        async move {
+            let ids: Vec<i64> = sqlx::query_scalar(
+                "SELECT account_id FROM profiles WHERE strpos(lower(nickname), lower($1)) > 0",
+            )
+            .bind(term)
+            .fetch_all(&pool)
+            .await?;
+            Ok(ids)
+        }
+    });
 let _app: axum::Router = axum::Router::new()
     .merge(admin.routes()) // at /staff/accounts; `Staff` only, same-origin posts only
     .layer(axum::middleware::from_fn_with_state(accounts, owt_accounts::Accounts::load::<owt_accounts::session::Data>));
