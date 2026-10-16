@@ -6,6 +6,9 @@
 #   oc process -f app.yaml -p NAME=myapp -p NAMESPACE=myapp \
 #     -p IMAGE=ghcr.io/onewaytek/myapp -p CHANNEL=rc -p PORT=8000 | oc apply -f -
 #
+# Re-applying it to an app that is already running: pass -p POSTGRES_MAJOR=<the
+# major its database runs>, and read `oc diff -f -` of the same output first.
+#
 # Deploys are pull-based. The cluster API is on RFC1918 and nothing in CI pushes to
 # it: CI publishes ghcr.io/<org>/<app>:<channel>, the ImageStream re-imports it on
 # OpenShift's schedule (~15 min), and the Deployment's image trigger rolls out each
@@ -39,9 +42,24 @@ parameters:
     value: "8000"
   - name: REPLICAS
     value: "1"
+  # The default is for a new app. An app whose cluster already exists passes the
+  # major it runs on every apply (the tag of `oc get cluster.postgresql.cnpg.io
+  # <name>-db -o jsonpath='{.spec.imageName}'`). A different one changes the
+  # Cluster's imageName, which CNPG 1.26 and later carry out as an in-place major
+  # upgrade (Postgres down meanwhile, and once it succeeds, the way back is a
+  # backup) and earlier versions refuse. Moving up is a deliberate step of its own
+  # (the README's "Upgrading Postgres").
   - name: POSTGRES_MAJOR
-    description: Postgres major version; CI's service image must match.
+    description: >-
+      Postgres major version. An existing cluster passes the major it runs: another
+      value upgrades it in place. Compose and CI's service image must match.
     value: "18"
+  - name: DB_SUFFIX
+    description: >-
+      The database cluster is <NAME>-<DB_SUFFIX>, and its Secrets, backups and
+      NetworkPolicy are named after it. Changed only to move the app onto a cluster
+      imported at a new major (the README's "Upgrading Postgres").
+    value: db
   - name: DB_SIZE
     value: 2Gi
   - name: STORAGE_CLASS
@@ -153,7 +171,7 @@ objects:
                 # the password rotates without an edit here.
                 - name: DATABASE_URL
                   valueFrom:
-                    secretKeyRef: {name: "${NAME}-db-app", key: uri}
+                    secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-app", key: uri}
                 # Postgres over TLS, verified against the CA CNPG minted for this
                 # cluster (sqlx reads both variables; the URL names no sslmode).
                 - {name: PGSSLMODE, value: verify-full}
@@ -189,7 +207,7 @@ objects:
           volumes:
             - name: db-ca
               secret:
-                secretName: ${NAME}-db-ca
+                secretName: ${NAME}-${DB_SUFFIX}-ca
                 items: [{key: ca.crt, path: ca.crt}]
             - name: tmp
               emptyDir: {medium: Memory, sizeLimit: 64Mi}
@@ -228,7 +246,7 @@ objects:
   - apiVersion: postgresql.cnpg.io/v1
     kind: Cluster
     metadata:
-      name: ${NAME}-db
+      name: ${NAME}-${DB_SUFFIX}
       namespace: ${NAMESPACE}
       labels: {app: "${NAME}"}
     spec:
@@ -236,7 +254,8 @@ objects:
       # availability during drains, not durability.
       instances: 1
       # CNPG's image, not docker.io/postgres: the stock image needs a passwd entry
-      # for its UID, and restricted-v2 assigns an arbitrary one.
+      # for its UID, and restricted-v2 assigns an arbitrary one. Changing the major
+      # here upgrades the running cluster (see POSTGRES_MAJOR).
       imageName: ghcr.io/cloudnative-pg/postgresql:${POSTGRES_MAJOR}
       primaryUpdateStrategy: unsupervised
       bootstrap:
@@ -268,7 +287,7 @@ objects:
   - apiVersion: postgresql.cnpg.io/v1
     kind: ScheduledBackup
     metadata:
-      name: ${NAME}-db-nightly
+      name: ${NAME}-${DB_SUFFIX}-nightly
       namespace: ${NAMESPACE}
       labels: {app: "${NAME}"}
     spec:
@@ -279,7 +298,7 @@ objects:
       # must not delete the archive.
       backupOwnerReference: none
       cluster:
-        name: ${NAME}-db
+        name: ${NAME}-${DB_SUFFIX}
       method: volumeSnapshot
 
   # Retention is a job, not a field: CNPG's `retentionPolicy` is barman-only and does
@@ -352,7 +371,7 @@ objects:
                   # Values reach the script through the environment: the template
                   # substitutes ${PARAMETERS}, so the script itself uses none.
                   env:
-                    - {name: CLUSTER, value: "${NAME}-db"}
+                    - {name: CLUSTER, value: "${NAME}-${DB_SUFFIX}"}
                     - {name: KEEP_DAYS, value: "${BACKUP_KEEP_DAYS}"}
                     - {name: KEEP_AT_LEAST, value: "${BACKUP_KEEP_AT_LEAST}"}
                   # bash, with pipefail and each step's output in a file: a prune that
@@ -423,12 +442,12 @@ objects:
   - apiVersion: networking.k8s.io/v1
     kind: NetworkPolicy
     metadata:
-      name: ${NAME}-db
+      name: ${NAME}-${DB_SUFFIX}
       namespace: ${NAMESPACE}
       labels: {app: "${NAME}"}
     spec:
       podSelector:
-        matchLabels: {cnpg.io/cluster: "${NAME}-db"}
+        matchLabels: {cnpg.io/cluster: "${NAME}-${DB_SUFFIX}"}
       policyTypes: [Ingress]
       ingress:
         # Postgres: the app, and the cluster's own instances (replication).
@@ -436,7 +455,7 @@ objects:
             - podSelector:
                 matchLabels: {app: "${NAME}"}
             - podSelector:
-                matchLabels: {cnpg.io/cluster: "${NAME}-db"}
+                matchLabels: {cnpg.io/cluster: "${NAME}-${DB_SUFFIX}"}
           ports: [{port: 5432}]
         # The instance manager's status port, which the CNPG operator calls from its
         # own namespace. Postgres metrics (9187) are not open: add a rule for the
