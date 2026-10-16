@@ -458,12 +458,41 @@ let who = google.complete(&http, &pending, state, code).await?;
 println!("{} <{:?}>", who.uid, who.email);
 // Any OIDC issuer: its subjects are keyed by the issuer, not the `sso` id. The
 // issuer and endpoints must be https (http only on localhost); `complete` refuses an
-// ID token whose `iss`, `aud` or `sub` is not this issuer, this client and the
-// user-info subject.
+// ID token whose `iss`, `aud`, `azp` or `sub` is not this issuer, this client and
+// the user-info subject, or whose `exp` has passed.
 let _sso = oauth::oidc("sso", "SSO", "https://sso.example/realms/x",
     "https://sso.example/realms/x/protocol/openid-connect/auth",
     "https://sso.example/realms/x/protocol/openid-connect/token",
     "https://sso.example/realms/x/protocol/openid-connect/userinfo")?;
+// Or from its discovery document, which must be the issuer's own; `end_session`
+// is its RP-Initiated Logout endpoint, if it has one.
+let found = oauth::discover(&http, "sso", "SSO", "https://sso.example/realms/x").await?;
+let sso = oauth::Client {
+    provider: found.provider,
+    client_id: "myapp".into(),
+    client_secret: "secret".into(),
+    redirect_uri: "https://app.example/auth/callback".into(),
+};
+
+// An app that calls the provider's APIs as the person keeps what the token endpoint
+// granted, after every check `complete` makes. Store the tokens sealed, never in
+// the clear; turn the relative lifetimes into instants at once.
+let (who, tokens) = sso.complete_with_tokens(&http, &pending, state, code).await?;
+let _expires = std::time::SystemTime::now() + tokens.access_lifetime();
+if let Some(refresh) = &tokens.refresh {
+    match sso.refresh(&http, refresh, &who.uid).await {
+        // No refresh token in the answer: the one held stays good.
+        Ok(fresh) => { let _ = fresh.refresh.as_ref().unwrap_or(refresh); }
+        // The grant is gone (`invalid_grant`: expired, revoked): forget it and sign
+        // in again.
+        Err(e) if e.is_rejected() => {}
+        // The provider is unavailable, or the app's client is misconfigured
+        // (`invalid_client`, a moved endpoint): keep the grant, try again later.
+        Err(e) => return Err(e.into()),
+    }
+}
+// A token for the app itself, with no person behind it.
+let _own = sso.client_credentials(&http, Some("api")).await?;
 
 // Machine clients with an IdP's token: the keys are refetched once they are an hour
 // old (`jwt::KEYS_MAX_AGE`), so a key the IdP withdrew stops verifying within the
@@ -789,6 +818,11 @@ connections list. The app writes no OAuth handler. It supplies four things:
 credentials and its public URL (environment), a registration at each provider, a
 session type that can hold a sign-in in progress, and two pages that embed the
 pieces (its sign-in page and a settings page).
+
+It keeps who signed in and nothing the provider granted. An app that calls the
+provider's APIs as the person writes its own callback over
+`oauth::Client::complete_with_tokens` (see "Authentication"), then hands the
+identity to `identities::arrive` or `link` as `social` does.
 
 **What it does, and refuses:**
 
@@ -1634,8 +1668,10 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `redirect::local_or` on `?next=` before redirecting to it (see "Authentication").
 - OAuth: use `owt_accounts::social` rather than hand-written handlers (see "Sign-in
   with a provider"); it uses `oauth::http_client()`, and `Client::complete` checks the
-  state and the provider itself. Key people by (`Provider::key()`, `Identity::uid`),
-  never by `Identity::email`, in the app's own tables too.
+  state and the provider itself. An app that needs the person's tokens uses
+  `Client::complete_with_tokens`, `refresh` and `client_credentials`, never its own
+  exchange, which would skip the ID-token checks. Key people by (`Provider::key()`,
+  `Identity::uid`), never by `Identity::email`, in the app's own tables too.
 - The bus's Redis is inside the trust boundary: a password or ACL user, a network
   only the app reaches, `rediss://` where the path leaves the node.
 - `Limits` bounds the time to a response; `serve::serve` bounds the time to a request
