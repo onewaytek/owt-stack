@@ -16,6 +16,13 @@
 //! once per [`Verifier::min_refresh`] (a failed fetch is retried after five seconds), so
 //! a stream of forged `kid`s cannot turn into a stream of requests to the provider,
 //! even while it is down. A fetch never holds up tokens signed with keys already known.
+//!
+//! A cached set is good for [`KEYS_MAX_AGE`]; past it, the next token refetches the
+//! set first, so a key the provider withdrew (a compromised one, rotated out) stops
+//! verifying within the hour rather than at the next restart. If that fetch fails, the
+//! keys already held keep verifying until one succeeds: an outage at the provider
+//! does not refuse every token. A key published for encryption (`use: enc`) verifies
+//! nothing.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +49,14 @@ pub const ASYMMETRIC: &[Algorithm] = &[
 /// than [`Verifier::min_refresh`]): a provider's blip should not lock clients out for
 /// the whole interval.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5);
+
+/// How long a fetched key set is trusted before the next token refetches it.
+pub const KEYS_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// How long keys held through failed refetches keep verifying: past this, a provider
+/// (or a network path) that keeps the refetch failing does not keep a withdrawn key
+/// alive, and tokens are refused until a fetch succeeds.
+pub const KEYS_STALE_LIMIT: Duration = Duration::from_secs(24 * 3600);
 
 /// How long a fetch of the provider's keys (or its discovery document) may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -83,12 +98,15 @@ struct Config {
     leeway: u64,
     min_refresh: Duration,
     retry_after_failure: Duration,
+    keys_max_age: Duration,
+    keys_stale_limit: Duration,
     http: reqwest::Client,
 }
 
 struct Inner {
     config: Config,
-    keys: RwLock<Option<JwkSet>>,
+    /// The key set, and when it came.
+    keys: RwLock<Option<(JwkSet, Instant)>>,
     /// When the keys were last asked for, and whether they came. Held across the
     /// fetch, so one caller fetches and the rest wait for its answer.
     attempted: Mutex<Option<(Instant, bool)>>,
@@ -122,6 +140,8 @@ impl Verifier {
             leeway: 5,
             min_refresh: Duration::from_secs(60),
             retry_after_failure: RETRY_AFTER_FAILURE,
+            keys_max_age: KEYS_MAX_AGE,
+            keys_stale_limit: KEYS_STALE_LIMIT,
             http,
         })
     }
@@ -194,6 +214,10 @@ impl Verifier {
     }
 
     async fn fetch(&self) -> Result<JwkSet, Error> {
+        // `new` takes the URL as given; `discover` checked it already.
+        if !safe_url(&self.0.config.jwks_uri) {
+            return Err(Error::Discovery("its jwks_uri is not https"));
+        }
         let fetch = async {
             self.0
                 .config
@@ -213,7 +237,14 @@ impl Verifier {
     /// The key `kid` among the cached ones, checked against the token's algorithm.
     async fn cached(&self, kid: &str, alg: Algorithm) -> Option<Result<DecodingKey, Error>> {
         let keys = self.0.keys.read().await;
-        let jwk = keys.as_ref()?.find(kid)?;
+        let jwk = keys.as_ref()?.0.find(kid)?;
+        // A key for encryption signs nothing.
+        if matches!(
+            jwk.common.public_key_use,
+            Some(jsonwebtoken::jwk::PublicKeyUse::Encryption)
+        ) {
+            return Some(Err(Error::UnknownKey));
+        }
         // A key published for one algorithm verifies no other.
         if let Some(published) = jwk.common.key_algorithm
             && Algorithm::try_from(published).ok() != Some(alg)
@@ -223,10 +254,17 @@ impl Verifier {
         Some(DecodingKey::from_jwk(jwk).map_err(Error::from))
     }
 
-    /// The key `kid`, refetching the set if it is unknown and the last attempt is old
-    /// enough.
+    /// The key `kid`, refetching the set if it is unknown or the set is older than
+    /// [`KEYS_MAX_AGE`], and the last attempt is old enough.
     async fn key(&self, kid: &str, alg: Algorithm) -> Result<DecodingKey, Error> {
-        if let Some(found) = self.cached(kid, alg).await {
+        let fresh = self
+            .0
+            .keys
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() < self.0.config.keys_max_age);
+        if fresh && let Some(found) = self.cached(kid, alg).await {
             return found;
         }
         {
@@ -243,10 +281,28 @@ impl Verifier {
             if due {
                 // Before the fetch, so a failure counts as an attempt too.
                 *attempted = Some((Instant::now(), false));
-                let set = self.fetch().await?;
-                *self.0.keys.write().await = Some(set);
-                *attempted = Some((Instant::now(), true));
+                match self.fetch().await {
+                    Ok(set) => {
+                        *self.0.keys.write().await = Some((set, Instant::now()));
+                        *attempted = Some((Instant::now(), true));
+                    }
+                    // Stale keys keep verifying through an outage at the provider.
+                    Err(e) if fresh || self.0.keys.read().await.is_none() => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not refresh the issuer's keys; using the ones held");
+                    }
+                }
             }
+        }
+        let expired = self
+            .0
+            .keys
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= self.0.config.keys_stale_limit);
+        if expired {
+            return Err(Error::UnknownKey);
         }
         // Whether this caller fetched or waited for one that did.
         self.cached(kid, alg)
@@ -290,22 +346,24 @@ mod tests {
         base: String,
         key: EncodingKey,
         fetches: Arc<AtomicUsize>,
+        /// What `/jwks` answers; a test may withdraw or change the keys.
+        jwks: Arc<std::sync::Mutex<serde_json::Value>>,
     }
 
     async fn idp() -> Idp {
         let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let b64 = |b: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-        let jwks = serde_json::json!({"keys": [{
+        let jwks = Arc::new(std::sync::Mutex::new(serde_json::json!({"keys": [{
             "kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
             "n": b64(private.n().to_bytes_be()), "e": b64(private.e().to_bytes_be()),
-        }]});
+        }]})));
         let fetches = Arc::new(AtomicUsize::new(0));
-        let f = fetches.clone();
+        let (f, served) = (fetches.clone(), jwks.clone());
         let app = axum::Router::new().route(
             "/jwks",
             get(move || {
                 f.fetch_add(1, Ordering::SeqCst);
-                let jwks = jwks.clone();
+                let jwks = served.lock().unwrap().clone();
                 async move { Json(jwks) }
             }),
         );
@@ -313,7 +371,95 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
         let key = EncodingKey::from_rsa_der(private.to_pkcs1_der().unwrap().as_bytes());
-        Idp { base, key, fetches }
+        Idp {
+            base,
+            key,
+            fetches,
+            jwks,
+        }
+    }
+
+    /// A verifier whose cached keys age out after `max_age`, refetching freely.
+    fn ageing(idp: &Idp, max_age: Duration) -> Verifier {
+        let mut config = verifier(idp).0.config.clone();
+        config.keys_max_age = max_age;
+        config.min_refresh = Duration::ZERO;
+        Verifier::with(config)
+    }
+
+    /// A key the provider withdrew (rotated out after a compromise) stops verifying
+    /// once the cached set ages out; while the provider is unreachable, the keys held
+    /// keep verifying.
+    #[tokio::test]
+    async fn a_withdrawn_key_stops_verifying_once_the_cache_ages() {
+        let idp = idp().await;
+        let v = ageing(&idp, Duration::from_millis(100));
+        let t = token(&idp, "k1", "my-app", 60);
+        v.verify::<Claims>(&t).await.unwrap();
+        let published = idp.jwks.lock().unwrap().clone();
+        *idp.jwks.lock().unwrap() = serde_json::json!({"keys": []});
+        // Still fresh: no refetch, still verifies.
+        v.verify::<Claims>(&t).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(matches!(
+            v.verify::<Claims>(&t).await,
+            Err(Error::UnknownKey)
+        ));
+        // The provider down: the keys held (here, the set that came back with it)
+        // keep verifying.
+        *idp.jwks.lock().unwrap() = published;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        v.verify::<Claims>(&t).await.unwrap();
+        let down = {
+            let mut c = v.0.config.clone();
+            c.jwks_uri = "http://127.0.0.1:9/jwks".into();
+            Verifier::with(c)
+        };
+        assert!(down.verify::<Claims>(&t).await.is_err(), "nothing held yet");
+        *down.0.keys.write().await = v.0.keys.read().await.clone();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        down.verify::<Claims>(&t).await.unwrap();
+        // But not for ever: past the stale limit, nothing held verifies.
+        let limited = {
+            let mut c = down.0.config.clone();
+            c.keys_stale_limit = Duration::from_millis(400);
+            Verifier::with(c)
+        };
+        *limited.0.keys.write().await = down.0.keys.read().await.clone();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(matches!(
+            limited.verify::<Claims>(&t).await,
+            Err(Error::UnknownKey)
+        ));
+    }
+
+    /// A key published for encryption verifies no signature.
+    #[tokio::test]
+    async fn an_encryption_key_verifies_nothing() {
+        let idp = idp().await;
+        idp.jwks.lock().unwrap()["keys"][0]["use"] = "enc".into();
+        assert!(matches!(
+            verifier(&idp)
+                .verify::<Claims>(&token(&idp, "k1", "my-app", 60))
+                .await,
+            Err(Error::UnknownKey)
+        ));
+    }
+
+    /// `new` takes the key URL as given: one that is not https fetches nothing.
+    #[tokio::test]
+    async fn a_plain_http_key_url_is_refused() {
+        let idp = idp().await;
+        let v = Verifier::new(
+            reqwest::Client::new(),
+            "https://idp.test",
+            "my-app",
+            "http://idp.example/jwks",
+        );
+        assert!(matches!(
+            v.verify::<Claims>(&token(&idp, "k1", "my-app", 60)).await,
+            Err(Error::Discovery(_))
+        ));
     }
 
     fn token(idp: &Idp, kid: &str, aud: &str, exp_in: i64) -> String {

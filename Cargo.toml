@@ -60,6 +60,7 @@ tracing = "0.1"
 tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
+unicode-security = "0.1.2"
 url = "2.5"
 
 owt-web = { path = "crates/owt-web" }

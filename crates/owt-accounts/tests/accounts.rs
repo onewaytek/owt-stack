@@ -46,6 +46,9 @@ impl Db {
             .await
             .unwrap();
         MIGRATOR.run(&pool).await.unwrap();
+        // As an app does before serving.
+        let done = owt_accounts::migrations::complete(&pool).await.unwrap();
+        assert!(done.validated, "{done:?}");
         Some(Self {
             pool,
             schema,
@@ -170,10 +173,11 @@ async fn a_username_is_never_an_address_so_no_account_shadows_anothers_email() {
     .await
     .unwrap_err();
     assert_eq!(err.refused(), Some(&owt_accounts::Refused::Username));
-    let around_the_library = sqlx::query("INSERT INTO accounts (username) VALUES ('x@y')")
-        .execute(&db.pool)
-        .await
-        .unwrap_err();
+    let around_the_library =
+        sqlx::query("INSERT INTO accounts (username, username_skeleton) VALUES ('x@y', 'x@y')")
+            .execute(&db.pool)
+            .await
+            .unwrap_err();
     assert!(
         around_the_library
             .as_database_error()
@@ -1168,9 +1172,7 @@ async fn the_admin_is_for_staff_and_finds_accounts_by_name_email_and_role() {
         .await
         .unwrap();
     store::set_staff(&db.pool, boss.id, true).await.unwrap();
-    let cy = store::create(&db.pool, new("cy_50%", "", None))
-        .await
-        .unwrap();
+    let cy = legacy_account(&db.pool, "cy_50%").await;
     roles::grant(&db.pool, cy.id, &EDITOR, None).await.unwrap();
     client.set_cookie("s", &cookie_for(&sessions, &ada));
     assert_eq!(client.get("/staff/accounts").await.status, 403);
@@ -1721,9 +1723,13 @@ async fn a_username_is_text_on_every_admin_page() {
     store::set_staff(&db.pool, boss.id, true).await.unwrap();
     let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
     client.set_cookie("s", &cookie_for(&sessions, &boss));
-    let evil = store::create(&db.pool, new("</title><svg/onload=alert(1)>", "", None))
-        .await
-        .unwrap();
+    // Today's rules refuse it; an older row may have it.
+    assert!(
+        store::create(&db.pool, new("</title><svg/onload=alert(1)>", "", None))
+            .await
+            .is_err()
+    );
+    let evil = legacy_account(&db.pool, "</title><svg/onload=alert(1)>").await;
     for path in [
         "/staff/accounts".to_owned(),
         format!("/staff/accounts/{}", evil.id),
@@ -1748,8 +1754,9 @@ async fn the_list_pages_and_keeps_its_filter() {
     client.set_cookie("s", &cookie_for(&sessions, &boss));
     sqlx::query(
         "WITH made AS (
-            INSERT INTO accounts (username, email, password_hash)
-            SELECT 'ed' || lpad(n::text, 3, '0'), '', '' FROM generate_series(1, 55) n
+            INSERT INTO accounts (username, username_skeleton)
+            SELECT 'ed' || lpad(n::text, 3, '0'), 'ed' || lpad(n::text, 3, '0')
+            FROM generate_series(1, 55) n
             RETURNING id)
          INSERT INTO account_roles (account_id, role) SELECT id, 'editor' FROM made",
     )
@@ -2444,4 +2451,456 @@ async fn the_builder_never_drops_a_setting() {
     let r = client.get("/auth/google/callback?state=x&code=y").await;
     assert_eq!(r.location(), Some("/signin?social=expired"));
     db.drop().await;
+}
+
+/// A sign-in with the old password, still checking it when the password changes
+/// (the owner's reset, staff answering a compromise), does not stand: it would
+/// otherwise get the new session epoch and outlive the change.
+#[tokio::test]
+async fn a_sign_in_in_flight_does_not_outlive_a_password_change() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let replacement = owt_auth::password::hash("a different passphrase")
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let signing_in =
+        tokio::spawn(
+            async move { store::authenticate(&pool, "ada", "correct horse battery").await },
+        );
+    // The check is under way (Argon2 takes far longer than this); change the
+    // password and sign out everywhere in one statement, as set_password does.
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    sqlx::query(
+        "UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1 WHERE id = $2",
+    )
+    .bind(&replacement)
+    .bind(ada.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(signing_in.await.unwrap().unwrap(), None);
+    let now = store::by_id(&db.pool, ada.id).await.unwrap().unwrap();
+    assert!(
+        store::authenticate(&db.pool, "ada", "a different passphrase")
+            .await
+            .unwrap()
+            .is_some_and(|a| a.session_epoch == now.session_epoch)
+    );
+    db.drop().await;
+}
+
+/// The account's own change needs its current password; a legacy hash is no
+/// password at all (it opens nothing, so it is not a way in).
+#[tokio::test]
+async fn changing_a_password_needs_the_current_one() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let err = store::change_password(&db.pool, &ada, "wrong guess", "a different passphrase")
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::CurrentPassword));
+    assert!(
+        store::change_password(
+            &db.pool,
+            &ada,
+            "correct horse battery",
+            "a different passphrase"
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        store::authenticate(&db.pool, "ada", "a different passphrase")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.drop().await;
+}
+
+/// The token never reaches a log through `Debug`.
+#[test]
+fn a_minted_link_keeps_its_token_out_of_debug() {
+    let minted = links::Minted {
+        token: "secret-token-value".into(),
+    };
+    assert!(!format!("{minted:?}").contains("secret"));
+}
+
+/// An account whose username the library would refuse, inserted around it (a
+/// console session, a script): the table's constraints let the shape through, and the
+/// pages must still treat it as text.
+async fn legacy_account(pool: &PgPool, username: &str) -> store::Account {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (username, username_skeleton) VALUES ($1, $1) RETURNING id",
+    )
+    .bind(username)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    store::by_id(pool, id).await.unwrap().unwrap()
+}
+
+/// The account's own change, still checking the current password when staff reset
+/// it, is refused: the reset stands.
+#[tokio::test]
+async fn a_reset_by_staff_beats_a_change_in_flight() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let (pool, a) = (db.pool.clone(), ada.clone());
+    let changing = async move {
+        store::change_password(&pool, &a, "correct horse battery", "the attackers choice").await
+    };
+    let changing = tokio::spawn(changing);
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(
+        store::set_password(&db.pool, &ada, "staff reset passphrase")
+            .await
+            .unwrap()
+    );
+    let err = changing.await.unwrap().unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::CurrentPassword));
+    for (password, opens) in [
+        ("staff reset passphrase", true),
+        ("the attackers choice", false),
+    ] {
+        assert_eq!(
+            store::authenticate(&db.pool, "ada", password)
+                .await
+                .unwrap()
+                .is_some(),
+            opens,
+            "{password}"
+        );
+    }
+    db.drop().await;
+}
+
+/// However many people share a non-Latin name, a first sign-in gets an account.
+#[tokio::test]
+async fn a_common_name_in_any_script_always_gets_an_account() {
+    let db = db!();
+    let open = identities::Welcome {
+        create: true,
+        ..Default::default()
+    };
+    for n in 0..23 {
+        let mut who = identity(&format!("ivan-{n}"), None, false);
+        who.display_name = Some("Иван".into());
+        let arrival = identities::arrive(&db.pool, &oauth::google(), &who, open)
+            .await
+            .unwrap();
+        let name = &arrival.account().unwrap().username;
+        assert!(name.starts_with("иван"), "{name}");
+    }
+    db.drop().await;
+}
+
+/// A name a reader could not tell from an existing one is refused, by the table.
+#[tokio::test]
+async fn a_lookalike_of_an_existing_username_is_refused() {
+    let db = db!();
+    for (first, second) in [
+        ("paypal", "paypa1"),
+        // All Cyrillic: one script, so only the skeleton tells it from `coco`.
+        ("coco", "\u{441}\u{43e}\u{441}\u{43e}"),
+        ("modern", "modem"),
+        ("code", "c0de"),
+    ] {
+        store::create(&db.pool, new(first, "", None)).await.unwrap();
+        let err = store::create(&db.pool, new(second, "", None))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.refused(),
+            Some(&owt_accounts::Refused::UsernameLookalike(second.into())),
+            "{first} / {second}"
+        );
+    }
+    // A provider sign-up moves on to another name rather than failing.
+    let mut who = identity("lookalike", None, false);
+    who.display_name = Some("paypa1".into());
+    let arrival = identities::arrive(
+        &db.pool,
+        &oauth::google(),
+        &who,
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(arrival.account().is_some());
+    db.drop().await;
+}
+
+/// The table refuses what the library would never write: a hash that opens nothing,
+/// a name not in stored form, a link that outlives the limit, an empty subject.
+#[tokio::test]
+async fn the_schema_refuses_rows_the_library_would_misread() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let refused = |sql: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let err = sqlx::query(sql)
+                .bind(ada.id)
+                .execute(&pool)
+                .await
+                .expect_err(sql);
+            assert!(
+                err.as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_check_violation),
+                "{sql}: {err}"
+            );
+        }
+    };
+    refused("UPDATE accounts SET password_hash = 'pbkdf2_sha256$600000$s$h' WHERE id = $1").await;
+    refused("UPDATE accounts SET username = 'ＡＤＡ' WHERE id = $1").await;
+    refused("UPDATE accounts SET username = 'Ada' WHERE id = $1").await;
+    refused("UPDATE accounts SET email = 'Ada@Example.com' WHERE id = $1").await;
+    refused("UPDATE accounts SET email = '@example.com' WHERE id = $1").await;
+    refused(
+        "INSERT INTO sign_in_links (token_sha256, account_id, expires_at)
+         VALUES (sha256('x'), $1, now() + interval '31 days')",
+    )
+    .await;
+    refused(
+        "INSERT INTO account_identities (account_id, provider, subject) VALUES ($1, 'google', '')",
+    )
+    .await;
+    // And what the library writes, it takes.
+    links::mint(&db.pool, ada.id, links::MAX_TTL, "longest")
+        .await
+        .unwrap();
+    db.drop().await;
+}
+
+/// A database that ran 0001 and 0002 for a while, with rows 0.4 let through (some
+/// written around the library), comes through 0003 and `complete` in the state a
+/// new one starts in: every constraint validated for every row, no one who could
+/// sign in locked out, and the renames reported.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one upgrade, seeded and checked")]
+async fn existing_rows_come_through_the_constraints_migration() {
+    use owt_accounts::migrations::{ALL, Renamed, complete};
+    let Some((pool, drop_schema)) = schema_after(&ALL[..2]).await else {
+        return;
+    };
+    let argon = owt_auth::password::hash("correct horse battery")
+        .await
+        .unwrap();
+    // A PHC string without its version field: the verifier takes it (as 0.4 did).
+    let unversioned = argon.replacen("$v=19", "", 1);
+    // Its parameters in another order (the verifier takes any), and a salt with no
+    // hash (which opens nothing).
+    let (params, rest) = {
+        let mut parts = argon.splitn(5, '$');
+        let (_, alg, v, params, rest) = (
+            parts.next(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        let mut p: Vec<&str> = params.split(',').collect();
+        p.reverse();
+        (format!("${alg}${v}${}", p.join(",")), rest.to_owned())
+    };
+    let reordered = format!("{params}${rest}");
+    let saltless = format!("{params}${}", rest.split('$').next().unwrap());
+    sqlx::query(
+        "INSERT INTO accounts (id, username, email, password_hash, session_epoch)
+         OVERRIDING SYSTEM VALUE VALUES
+            (1, 'admin', 'ADA@EXAMPLE.COM', $1, 0),
+            (2, 'admin-3', '', '', 0),
+            (3, 'ａdmin', '', 'pbkdf2_sha256$600000$s$h', 0),
+            (4, '´bob', '', '', 0),
+            (5, 'x𝚺', '', '', 0),
+            (6, 'ｃｏｃｏ', '@nowhere', '', 0),
+            (7, 'paypal', '', '', 0),
+            (8, 'pаypal', '', '', 0),
+            (9, 'carol', '', $2, 0),
+            (10, 'dave', 'Ａda@example.com', '', 0),
+            (11, 'erin', '', '', -5),
+            (12, 'frank', '', $3, 0),
+            (13, 'gina', '', $4, 0)",
+    )
+    .bind(&argon)
+    .bind(&unversioned)
+    .bind(&reordered)
+    .bind(&saltless)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT setval(pg_get_serial_sequence('accounts', 'id'), 100)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO sign_in_links (token_sha256, account_id, expires_at) VALUES
+            (sha256('t'), 1, now() + interval '100 years'),
+            ('\\x010203', 1, now() + interval '1 day')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO account_identities (account_id, provider, subject)
+         VALUES (1, 'google', ''), (1, 'google', 'g1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // As sqlx runs a migration: in a transaction.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(ALL[2].sql))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let done = complete(&pool).await.unwrap();
+    let renamed = |id, from: &str, to: &str| Renamed {
+        id,
+        from: from.into(),
+        to: to.into(),
+    };
+    assert_eq!(
+        done.renamed,
+        [
+            renamed(3, "ａdmin", "admin-3-2"),
+            renamed(4, "´bob", &store::normalize("´bob")),
+            renamed(5, "x𝚺", "xς"),
+            renamed(6, "ｃｏｃｏ", "coco"),
+        ]
+    );
+    assert_eq!(done.emails_cleared, [6, 10]);
+    assert_eq!(done.passwords_cleared, [3, 13]);
+    assert_eq!(done.keyed, 13);
+    assert!(done.failed.is_empty() && done.validated, "{done:?}");
+    let again = complete(&pool).await.unwrap();
+    assert!(again.keyed == 0 && again.renamed.is_empty() && again.validated);
+    let unvalidated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE NOT convalidated
+         AND conrelid::regclass::text IN ('accounts', 'account_identities', 'sign_in_links')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unvalidated, 0);
+
+    // Ways in that worked still do, typed as their owners type them.
+    for (login, password) in [
+        ("Ada@Example.com", "correct horse battery"),
+        ("carol", "correct horse battery"),
+        ("frank", "correct horse battery"),
+    ] {
+        assert!(
+            store::authenticate(&pool, login, password)
+                .await
+                .unwrap()
+                .is_some(),
+            "{login}"
+        );
+    }
+    assert_eq!(
+        store::by_username(&pool, "x𝚺").await.unwrap().map(|a| a.id),
+        Some(5)
+    );
+    let skeleton: Option<String> =
+        sqlx::query_scalar("SELECT username_skeleton FROM accounts WHERE id = 8")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        skeleton.as_deref(),
+        Some("paypal@8"),
+        "the later lookalike's own key"
+    );
+    let epoch: i32 = sqlx::query_scalar("SELECT session_epoch FROM accounts WHERE id = 11")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(epoch, 0);
+    assert_eq!(identities::list(&pool, 1).await.unwrap().len(), 1);
+    let links: Vec<bool> = sqlx::query_scalar(
+        "SELECT expires_at <= created_at + interval '30 days' FROM sign_in_links",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        links,
+        [true],
+        "the century link cut, the digest-less one gone"
+    );
+
+    // New names are held to the lookalike rule against the old ones, and against a
+    // row an older replica wrote after the migration, before complete reached it.
+    let err = store::create(&pool, new("c0co", "", None))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.refused(),
+        Some(&owt_accounts::Refused::UsernameLookalike("c0co".into()))
+    );
+    sqlx::query("INSERT INTO accounts (username) VALUES ('mike')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = store::create(&pool, new("rnike", "", None))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.refused(),
+        Some(&owt_accounts::Refused::UsernameLookalike("rnike".into()))
+    );
+    pool.close().await;
+    drop_schema.await;
+}
+
+/// A schema of its own with these migrations applied, as a database that stopped at
+/// them; and the future that drops it.
+async fn schema_after(
+    migrations: &[owt_accounts::migrations::Migration],
+) -> Option<(PgPool, impl Future<Output = ()>)> {
+    let url = owt_runtime::env::var("DATABASE_URL")?;
+    let schema = format!(
+        "owt_upgrade_{}_{}",
+        std::process::id(),
+        rand::random::<u32>()
+    );
+    let admin = PgPool::connect(&url).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let opts: PgConnectOptions = url.parse().unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(opts.options([("search_path", schema.as_str())]))
+        .await
+        .unwrap();
+    for m in migrations {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(m.sql))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let drop_schema = async move {
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+    };
+    Some((pool, drop_schema))
 }

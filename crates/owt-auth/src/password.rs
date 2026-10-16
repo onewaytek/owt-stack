@@ -81,12 +81,13 @@ fn verify_blocking(password: &str, stored: &str) -> bool {
 }
 
 /// Check `password` for an account that may not exist: `stored` is its hash, or `None`
-/// if no account matched. `None` still costs a full Argon2 check (against a hash
-/// nothing matches), so the time a sign-in takes does not say whether the account
-/// exists.
+/// if no account matched. `None`, or a hash that is not one [`verify`] reads (a
+/// legacy format, an empty or damaged value), still costs a full Argon2 check
+/// against a hash nothing matches, so the time a sign-in takes says neither whether
+/// the account exists nor what its hash looks like.
 pub async fn verify_or_decoy(password: &str, stored: Option<&str>) -> bool {
     static DECOY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-    if let Some(stored) = stored {
+    if let Some(stored) = stored.filter(|s| usable(s)) {
         return verify(password, stored).await;
     }
     // Hashed with today's parameters, so it costs what a real check costs.
@@ -97,6 +98,16 @@ pub async fn verify_or_decoy(password: &str, stored: Option<&str>) -> bool {
         verify(password, decoy).await;
     }
     false
+}
+
+/// Whether `stored` is a hash [`verify`] can check: an Argon2 PHC string with an
+/// output and parameters Argon2 takes. Anything else (empty, a legacy format, a salt
+/// with no hash) opens nothing.
+#[must_use]
+pub fn usable(stored: &str) -> bool {
+    stored.starts_with("$argon2")
+        && PasswordHash::new(stored)
+            .is_ok_and(|h| h.hash.is_some() && argon2::Params::try_from(&h).is_ok())
 }
 
 /// `stored` is not an Argon2id hash at least as strong as [`hash`] makes today: rehash
@@ -112,6 +123,7 @@ pub fn needs_rehash(stored: &str) -> bool {
     };
     let now = argon2::Params::default();
     !stored.starts_with("$argon2id$")
+        || parsed.version != Some(argon2::Version::V0x13.into())
         || params.m_cost() < now.m_cost()
         || params.t_cost() < now.t_cost()
         || params.p_cost() < now.p_cost()
@@ -128,6 +140,29 @@ mod tests {
         assert!(!verify("wrong", &h).await);
         assert!(!verify("x", "not-a-hash").await);
         assert!(!needs_rehash(&h));
+        // Argon2 version 0x10 (an old library's) is rehashed even at today's costs.
+        let v10 = h.replacen("$v=19$", "$v=16$", 1);
+        assert!(needs_rehash(&v10));
+    }
+
+    /// A legacy or damaged hash costs what a real check costs, so its timing does not
+    /// mark the account as one that has never signed in since an import.
+    #[tokio::test]
+    async fn an_unreadable_hash_costs_a_full_check() {
+        let real = hash("correct horse").await.unwrap();
+        let time = |stored: Option<String>| async move {
+            let began = std::time::Instant::now();
+            assert!(!verify_or_decoy("guess", stored.as_deref()).await);
+            began.elapsed()
+        };
+        time(None).await; // the decoy is made once
+        let legacy = time(Some("pbkdf2_sha256$600000$salt$hash".into())).await;
+        let genuine = time(Some(real)).await;
+        assert!(
+            legacy * 3 > genuine,
+            "legacy {legacy:?} against a real check's {genuine:?}"
+        );
+        assert!(!usable("pbkdf2_sha256$600000$salt$hash") && !usable(""));
     }
 
     #[tokio::test(flavor = "current_thread")]

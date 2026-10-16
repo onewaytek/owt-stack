@@ -543,7 +543,7 @@ fn new_page<'a>(admin: &'a Admin, form: &'a Posted, error: Option<String>) -> Ne
             .autofocus(),
         email: Field::email("email", "Email")
             .value(form.value("email"))
-            .hint("Optional. Contact only: it never decides who someone is."),
+            .hint("Optional. It signs in with the password, as the username does; a provider sign-in never matches it."),
         staff: form.ticked("staff"),
         roles: boxes(&admin.roles, &form.roles()),
     }
@@ -588,8 +588,8 @@ async fn create(
     let form = Posted(pairs);
     let mut tx = admin.pool.begin().await?;
     lock(&mut tx, &me, me.id).await?;
-    let made = store::create(
-        &mut *tx,
+    let made = store::create_in(
+        &mut tx,
         New {
             username: form.value("username"),
             email: form.value("email"),
@@ -732,7 +732,7 @@ async fn show(
         email: Field::email("email", "Email")
             .value(&email_shown)
             .error(error.as_deref())
-            .hint("Contact only: it never decides who someone is."),
+            .hint("It signs in with the password, as the username does; a provider sign-in never matches it."),
         roles: boxes(&admin.roles, &account.roles),
         undeclared: undeclared(&admin.roles, &account.roles).cloned().collect(),
         has_password,

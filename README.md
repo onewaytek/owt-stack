@@ -465,7 +465,9 @@ let _sso = oauth::oidc("sso", "SSO", "https://sso.example/realms/x",
     "https://sso.example/realms/x/protocol/openid-connect/token",
     "https://sso.example/realms/x/protocol/openid-connect/userinfo")?;
 
-// Machine clients with an IdP's token: signature, algorithm, issuer, audience,
+// Machine clients with an IdP's token: the keys are refetched once they are an hour
+// old (`jwt::KEYS_MAX_AGE`), so a key the IdP withdrew stops verifying within the
+// hour; keys published for encryption verify nothing. Signature, algorithm, issuer, audience,
 // expiry and not-before.
 let verifier = jwt::Verifier::discover(http, "https://sso.example/realms/x", "myapp").await?;
 let claims: jwt::Claims = verifier.verify("eyJ...").await?;
@@ -483,16 +485,36 @@ links are minted).
 
 **Tables:** write each of `owt_accounts::migrations::ALL`, in order, to the app's
 `migrations/`. A new app writes them first (`0001_owt_accounts.sql`,
-`0002_owt_accounts_roles.sql`), since its tables reference `accounts(id)`. An app
-that has migrations of its own gives a newly released entry its next unused version
-(`0007_owt_accounts_roles.sql` after its `0006_…`), never a number already applied:
-sqlx refuses a file whose version it ran with other contents. A test calls
+`0002_owt_accounts_roles.sql`, `0003_owt_accounts_constraints.sql`), since its
+tables reference `accounts(id)`. An app that has migrations of its own gives a newly
+released entry its next unused version (`0007_owt_accounts_roles.sql` after its
+`0006_…`), never a number already applied: sqlx refuses a file whose version it ran
+with other contents. A test calls
 `owt_accounts::migrations::assert_installed("migrations")`, which matches the files
 by content, not name, so an edited or missing copy fails the build. sqlx keeps one
 ledger per database, which is why the library does not run a migrator of its own. A
 shipped migration never changes (sqlx would refuse the re-copied file at deploy, its
 checksum differing from the applied one): a later release appends a new entry to
-`ALL`, and a test here pins each file's SHA-256.
+`ALL`, and a test here pins each file's SHA-256. A migration moves the rows
+already there along with the schema, so a database that has run the library for years
+ends in the state a new one starts in. The constraints hold what the library assumes
+(names in stored form, Argon2 hashes or none, links of 30 days at most, non-empty
+subjects), so a row written around it (an import, a console) cannot be one it would
+misread. After the migrations run, at every start and before serving, the app awaits
+`owt_accounts::migrations::complete(&pool)`: it moves rows made before a migration
+to the stored form (in Rust, as sign-in normalizes) and validates the constraints
+the migration added; once done it reads an index and the catalog.
+
+```rust,no_run
+# async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
+owt_runtime::db::migrate_locked(&pool, migrator, 8_531_207).await?;
+let done = owt_accounts::migrations::complete(&pool).await?;
+for r in &done.renamed {
+    eprintln!("account {} is now {:?} (was {:?}): tell its owner", r.id, r.to, r.from);
+}
+// ... then serve.
+# Ok(()) }
+```
 
 **Provider identities are found by subject, never by email.** `identities::arrive`
 looks up the provider's key and the identity's subject, and nothing else. An address
@@ -546,7 +568,34 @@ trailing `/`); `oidc` refuses another spelling, since it would match no token's
 **Logins:** a username is one token without `@`; an email always has one. So a login
 is never both, and nobody can register a username equal to someone else's email to
 shadow their sign-in. The table's `CHECK` enforces it on writes made around the
-library.
+library. An email is a sign-in name too (with the password), not only contact data.
+
+**Usernames cannot pass for one another.** Logins are stored NFKC-normalized and
+lower-cased (`ＡＤＭＩＮ` is `admin`; a composed and a decomposed `é` are one name). A new
+username is letters, digits and combining marks that Unicode's identifier profile
+allows (UTS #39), or `-`, `.` and `_`, starting with a letter or digit, in one
+script: no zero-width or filler characters, no bidirectional controls, no Cyrillic
+`а` inside a Latin `admin`. And no new name may look like an existing one: each
+account stores its username's confusable skeleton (`store::skeleton`, Unicode TS #39),
+unique, so `paypa1` beside `paypal`, the all-Cyrillic `сосо` beside `coco`, or `modem`
+beside `modern` is refused (`Refused::UsernameLookalike`); a provider sign-up moves on
+to another name. The skeleton is deliberately broad: `rn` is `m`, `0` is `o`, `1` is
+`l`. Accounts older than the rule that already look like an earlier one keep their
+names; the rule holds every name made after.
+
+**Revocation, and what it does not reach:**
+
+- `session::sign_out` replaces this browser's cookie; a copy of it taken earlier
+  still opens until it expires. Only `sign_out_everywhere` (the epoch) revokes.
+- A password change, deactivation or a demotion ends every session at its next
+  request, but a stream opened before (SSE, a WebSocket) was checked at its start:
+  an app that streams to signed-in people re-checks `store::by_id_in_epoch` on
+  each event, or closes streams on a schedule.
+- `store::authenticate` stands only if the hash it checked is still the account's,
+  so a sign-in with the old password that finishes after a change fails.
+- The sign-in throttle counts each login string: an account's username and its
+  email are two budgets. An app that wants one per account also charges the
+  throttle with the account's id once the login resolves.
 
 ```rust,no_run
 # async fn demo(
@@ -592,7 +641,10 @@ session::sign_out_everywhere(&pool, &session).await?; // every session: the epoc
 let ada = store::create(&pool, New {
     username: "Ada", email: "ada@example.com", password: Some("correct horse battery"), is_staff: false,
 }).await?;
-store::set_password(&pool, &ada, "a different passphrase").await?; // same rules; signs out everywhere
+store::set_password(&pool, &ada, "a different passphrase").await?; // staff or a link's reset: signs out everywhere
+// The account's own change asks for the current password (Refused::CurrentPassword),
+// so whoever holds a session cannot also take the password; throttle it like a sign-in.
+store::change_password(&pool, &ada, "a different passphrase", "yet another passphrase").await?;
 store::set_staff(&pool, ada.id, true).await?; // revoking signs out; granting does not
 
 // A provider's identity (from `oauth::Client::complete`) becomes an account per policy:
@@ -607,7 +659,10 @@ if let Some(account) = identities::arrive(&pool, &google, &who, welcome).await?.
 identities::link(&pool, ada.id, &owt_auth::oauth::discord(), &discord_who).await?;
 
 // A one-time sign-in link, minted by an operator; only its SHA-256 is stored. The
-// lifetime is capped at `links::MAX_TTL`.
+// lifetime is capped at `links::MAX_TTL` (30 days), and `Minted`'s Debug leaves the
+// token out. It travels in the URL, so it reaches access logs and link scanners that
+// open it: the app's route shows a page with a button that POSTs it, and redeems on
+// that POST, not on the GET.
 let minted = links::mint(&pool, ada.id, std::time::Duration::from_secs(900), "new account").await?;
 let _url = format!("https://app.example/login/link/{}", minted.token);
 let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Refused::Link when spent
@@ -1628,6 +1683,63 @@ The router example under "Wiring an app" composes the layers; beyond it:
   random bytes (fewer than 8 distinct byte values); a test fixture of `[7u8; 64]`
   needs real bytes.
 - `RequestInfo::at` always yields a path starting with `/`.
+
+### Accounts
+
+Install `ALL[1]` (`owt_accounts_roles`) and `ALL[2]` (`owt_accounts_constraints`)
+as the app's next unused migration versions (an app's own migrations hold the low
+numbers; see "Tables"), and **await `owt_accounts::migrations::complete(&pool)`
+after the migrations run and before serving**, at every start. An app with an OIDC
+provider moves its identities to the issuer's key first (see "Upgrading from 0.4
+(identities)"); `Welcome::match_verified_email` and `Arrival::Matched` are gone.
+
+`0003` changes only the schema, under a 5-second lock timeout (a deploy that cannot
+have its locks fails and is run again): the `username_skeleton` column, and
+constraints added `NOT VALID`, which bind every write from then on, a 0.4 replica's
+still running included (it gets an error for a row it would write in the old form).
+`complete` then moves each account made before it, in Rust, as sign-in normalizes
+what is typed, and validates the constraints once every row holds them:
+
+- **Usernames are NFKC-normalized** (a fullwidth `ａｄｍｉｎ` becomes `admin`, `´bob`
+  a name without the leading space NFKC gives it), and `@` becomes `-`. One that
+  would become another account's name takes its id as a suffix (`admin-42`), or the
+  first free name after that. Its owner signs in with the new name, or by email or
+  a provider; typing the old one now reaches the account it became like (`admin`),
+  so tell them: `Completed::renamed` lists every rename, and it is logged.
+- **Emails are NFKC-normalized and lower-cased.** One that would become another
+  account's address, or has nothing before its `@`, is cleared
+  (`Completed::emails_cleared`).
+- **A password hash the library cannot verify is cleared** (a legacy format, a
+  damaged value; `Completed::passwords_cleared`). It never opened the account. An
+  Argon2 hash without its version field is kept: it verifies.
+- **A negative session epoch becomes 0.**
+- **Each account gets its lookalike key.** An old account whose name is a lookalike
+  of an earlier one keeps it, under a key carrying its id; new names are held to the
+  rule. A row an older replica writes during the rollout has no key until the next
+  `complete`; `store::create` compares a new name against such rows too.
+- **Identities with an empty provider or subject are deleted** (they matched no
+  one), **sign-in links are cut to 30 days**, and links whose digest is not a
+  SHA-256 (no token could match one) are deleted.
+
+`complete` never fails a start over one account: one it cannot move is logged and
+listed in `Completed::failed`, and tried again next time; `Completed::validated` is
+`true` once every constraint holds for every row.
+
+Also:
+
+- `store::create` takes a pool; `store::create_in` takes a connection (inside a
+  transaction, say).
+- `links::MAX_TTL` is 30 days (it was a century); longer `ttl`s are capped.
+- `store::authenticate` fails a sign-in whose password changed while it was checked;
+  `store::change_password` is new.
+- `Refused` has `CurrentPassword` and `UsernameLookalike` variants.
+- `owt_auth::password::usable(hash)` says whether a stored hash can open an account;
+  `needs_rehash` is true for a hash of an older Argon2 version too.
+- `jwt::Verifier` refetches keys older than `jwt::KEYS_MAX_AGE` (an hour), refuses
+  encryption keys, and refuses every token once its keys could not be refetched for
+  `jwt::KEYS_STALE_LIMIT` (a day).
+- `Linked::label` shows an email only when the provider verified it.
+- The social routes refuse cross-origin `POST`s themselves.
 
 ## Upgrading from 0.1
 

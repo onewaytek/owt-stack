@@ -47,7 +47,9 @@ pub use store::{Account, New, normalize};
 pub enum Refused {
     /// The username is empty, too long, or has an `@`, whitespace or control
     /// characters.
-    #[error("Enter a username: up to 150 characters, with no spaces and no “@”.")]
+    #[error(
+        "Enter a username: up to 150 letters and digits of one alphabet (plus - . _), starting with a letter or digit, with no spaces and no “@”."
+    )]
     Username,
     /// The email is not one address.
     #[error("Enter a valid email address.")]
@@ -55,6 +57,10 @@ pub enum Refused {
     /// Another account has that username.
     #[error("There is already an account named “{0}”.")]
     UsernameTaken(String),
+    /// The username is too like another account's to tell apart (see
+    /// [`store::skeleton`]).
+    #[error("“{0}” is too like an existing account's name to tell apart. Choose another.")]
+    UsernameLookalike(String),
     /// Another account has that email.
     #[error("An account already uses the email address “{0}”.")]
     EmailTaken(String),
@@ -67,6 +73,9 @@ pub enum Refused {
     /// A provider identity with an empty subject: nobody in particular.
     #[error("That sign-in did not say who you are. Try again.")]
     NoSubject,
+    /// The current password, asked for before a change, is not the account's.
+    #[error("That is not your current password.")]
+    CurrentPassword,
     /// Unlinking would leave the account with no way to sign in.
     #[error("Your account has no password, so its only connection cannot be removed.")]
     LastWayIn,

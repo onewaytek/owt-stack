@@ -35,6 +35,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use owt_auth::oauth;
 use owt_web::cache::CachePolicy;
+use owt_web::csrf::CrossOrigin;
 use owt_web::flash::{Flash, Level};
 use owt_web::redirect;
 use owt_web::session::{Session, SessionData};
@@ -511,7 +512,9 @@ impl SocialSignIn {
     }
 
     /// The routes, at full paths (merge them; do not nest), for session data `T`.
-    /// Install them inside the session layer and the accounts layer.
+    /// Install them inside the session layer and the accounts layer. They refuse a
+    /// cross-origin `POST` themselves ([`CrossOrigin`]), whatever the app layers: a
+    /// sibling subdomain is same-site, so its forms come with `Lax` cookies.
     pub fn routes<T, S>(&self) -> Router<S>
     where
         T: Social + SessionData,
@@ -522,6 +525,10 @@ impl SocialSignIn {
             .route(&self.0.providers.callback, get(callback::<T>))
             .route(REMOVE, post(remove))
             .with_state(self.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                CrossOrigin::new(),
+                CrossOrigin::layer,
+            ))
     }
 
     /// The sign-in buttons, one form per provider, landing on `next` afterwards
@@ -794,6 +801,10 @@ async fn callback<T: Social + SessionData>(
             Ok(arrival) => arrival,
             Err(e) if e.refused() == Some(&Refused::NoSubject) => {
                 return Ok(landing(&inner.sign_in_page, "failed"));
+            }
+            // A connect of the same identity, elsewhere, won the race.
+            Err(e) if e.refused() == Some(&Refused::IdentityTaken) => {
+                return Ok(landing(&inner.sign_in_page, "taken"));
             }
             Err(e) => return Err(e.into()),
         };
