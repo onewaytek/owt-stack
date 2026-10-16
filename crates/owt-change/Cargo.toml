@@ -7,10 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = ["accounts"]
+# `Admin` for `owt_accounts::Staff`. An app that implements `Admin` itself can do
+# without it.
+accounts = ["dep:owt-accounts"]
+
 [dependencies]
 askama.workspace = true
 axum = { workspace = true, features = ["tokio", "http1", "json", "query"] }
-owt-accounts.workspace = true
+owt-accounts = { workspace = true, optional = true }
 owt-web.workspace = true
 reqwest.workspace = true
 serde.workspace = true

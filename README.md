@@ -58,6 +58,7 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
 
 `owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export,
 `redis` for leases and leased jobs.
+`owt-change`'s: `accounts` (default) for `owt_accounts::Staff` as its admin.
 
 A shared crate is only shared while the majors agree: an app that names `axum`, `sqlx`,
 `askama` or `redis` directly must use the major in this workspace's `Cargo.toml`.
@@ -1267,8 +1268,9 @@ let _ = Shell { change_button: changes.button("/staff", viewer_is_staff) };
 # let _ = app; Ok(()) }
 ```
 
-An app without `owt-accounts` implements `owt_change::Admin` on its own extractor and
-names it in `routes::<MyAdmin, _>()`.
+An app without `owt-accounts` implements `owt_change::Admin` on its own extractor,
+names it in `routes::<MyAdmin, _>()`, and can leave out the `Staff` implementation
+and the dependency it brings: `owt-change = { …, default-features = false }`.
 
 **The button** is `change.js`, served by the routes, immutable under its `?v=` hash. It
 runs under the default Content-Security-Policy: no inline script, no style
@@ -2101,8 +2103,9 @@ and two of them reach further than their names:
 
 ## Working on owt-stack
 
-`just check` is the gate (fmt, clippy over every crate and feature, the tests with the
-README doctests, `cargo audit`), and CI runs the same command. The Redis tests run when
+`just check` is the gate (fmt, clippy over every crate and feature and over
+`owt-change` without its defaults, the tests with the README doctests, `cargo audit`),
+and CI runs the same command. The Redis tests run when
 `REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
 `DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL
 whose certificate the system trusts (`SSL_CERT_FILE=ca.crt` for a test CA; the test's

@@ -13,6 +13,9 @@
 //!   [`Button`] renders nothing, so an app can ship the wiring everywhere and turn it
 //!   on per deployment.
 //!
+//! [`Admin`] is implemented for `owt_accounts::Staff` under the default feature
+//! `accounts`; an app with its own admin extractor can turn that off.
+//!
 //! The button is `change.js`, served by these routes under the default
 //! Content-Security-Policy: no inline script, no style attributes, only the
 //! `owt-change-*` classes `tailwind/owt.css` defines.
@@ -226,6 +229,7 @@ pub trait Admin {
     fn requester(&self) -> Requester;
 }
 
+#[cfg(feature = "accounts")]
 impl Admin for owt_accounts::Staff {
     fn requester(&self) -> Requester {
         Requester {
