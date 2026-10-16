@@ -2664,7 +2664,6 @@ async fn the_schema_refuses_rows_the_library_would_misread() {
         }
     };
     refused("UPDATE accounts SET password_hash = 'pbkdf2_sha256$600000$s$h' WHERE id = $1").await;
-    refused("UPDATE accounts SET password_hash = '$argon2id$garbage' WHERE id = $1").await;
     refused("UPDATE accounts SET username = 'ＡＤＡ' WHERE id = $1").await;
     refused("UPDATE accounts SET username = 'Ada' WHERE id = $1").await;
     refused("UPDATE accounts SET email = 'Ada@Example.com' WHERE id = $1").await;
@@ -2701,6 +2700,23 @@ async fn existing_rows_come_through_the_constraints_migration() {
         .unwrap();
     // A PHC string without its version field: the verifier takes it (as 0.4 did).
     let unversioned = argon.replacen("$v=19", "", 1);
+    // Its parameters in another order (the verifier takes any), and a salt with no
+    // hash (which opens nothing).
+    let (params, rest) = {
+        let mut parts = argon.splitn(5, '$');
+        let (_, alg, v, params, rest) = (
+            parts.next(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        let mut p: Vec<&str> = params.split(',').collect();
+        p.reverse();
+        (format!("${alg}${v}${}", p.join(",")), rest.to_owned())
+    };
+    let reordered = format!("{params}${rest}");
+    let saltless = format!("{params}${}", rest.split('$').next().unwrap());
     sqlx::query(
         "INSERT INTO accounts (id, username, email, password_hash, session_epoch)
          OVERRIDING SYSTEM VALUE VALUES
@@ -2714,10 +2730,14 @@ async fn existing_rows_come_through_the_constraints_migration() {
             (8, 'pаypal', '', '', 0),
             (9, 'carol', '', $2, 0),
             (10, 'dave', 'Ａda@example.com', '', 0),
-            (11, 'erin', '', '', -5)",
+            (11, 'erin', '', '', -5),
+            (12, 'frank', '', $3, 0),
+            (13, 'gina', '', $4, 0)",
     )
     .bind(&argon)
     .bind(&unversioned)
+    .bind(&reordered)
+    .bind(&saltless)
     .execute(&pool)
     .await
     .unwrap();
@@ -2764,8 +2784,8 @@ async fn existing_rows_come_through_the_constraints_migration() {
         ]
     );
     assert_eq!(done.emails_cleared, [6, 10]);
-    assert_eq!(done.passwords_cleared, [3]);
-    assert_eq!(done.keyed, 11);
+    assert_eq!(done.passwords_cleared, [3, 13]);
+    assert_eq!(done.keyed, 13);
     assert!(done.failed.is_empty() && done.validated, "{done:?}");
     let again = complete(&pool).await.unwrap();
     assert!(again.keyed == 0 && again.renamed.is_empty() && again.validated);
@@ -2782,6 +2802,7 @@ async fn existing_rows_come_through_the_constraints_migration() {
     for (login, password) in [
         ("Ada@Example.com", "correct horse battery"),
         ("carol", "correct horse battery"),
+        ("frank", "correct horse battery"),
     ] {
         assert!(
             store::authenticate(&pool, login, password)

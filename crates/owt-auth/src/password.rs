@@ -100,11 +100,14 @@ pub async fn verify_or_decoy(password: &str, stored: Option<&str>) -> bool {
     false
 }
 
-/// Whether `stored` is a hash [`verify`] can check: an Argon2 PHC string. Anything
-/// else (empty, a legacy format) opens nothing.
+/// Whether `stored` is a hash [`verify`] can check: an Argon2 PHC string with an
+/// output and parameters Argon2 takes. Anything else (empty, a legacy format, a salt
+/// with no hash) opens nothing.
 #[must_use]
 pub fn usable(stored: &str) -> bool {
-    stored.starts_with("$argon2") && PasswordHash::new(stored).is_ok()
+    stored.starts_with("$argon2")
+        && PasswordHash::new(stored)
+            .is_ok_and(|h| h.hash.is_some() && argon2::Params::try_from(&h).is_ok())
 }
 
 /// `stored` is not an Argon2id hash at least as strong as [`hash`] makes today: rehash

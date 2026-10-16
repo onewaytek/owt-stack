@@ -132,10 +132,17 @@ pub async fn complete(pool: &sqlx::PgPool) -> sqlx::Result<Completed> {
         let Some(&last) = batch.last() else { break };
         after = last;
         for id in batch {
-            if let Err(e) = complete_account(pool, id, &mut done).await {
-                tracing::error!(account = id, error = %e, "could not complete an account");
+            if complete_account(pool, id, &mut done).await.is_err() {
                 done.failed.push(id);
             }
+        }
+    }
+    // Once more for those that failed: most often a race (another replica, or a
+    // sign-up, took the free name or address first), which a second look resolves.
+    for id in std::mem::take(&mut done.failed) {
+        if let Err(e) = complete_account(pool, id, &mut done).await {
+            tracing::error!(account = id, error = %e, "could not complete an account");
+            done.failed.push(id);
         }
     }
     let pending: Vec<(String, String)> = sqlx::query_as(
@@ -358,7 +365,7 @@ async fn complete_account(pool: &sqlx::PgPool, id: i64, done: &mut Completed) ->
 const SHIPPED_SHA256: &[&str] = &[
     "743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4",
     "0e6d42a67ddabfb50f56650fe85ff0bc810c4b3230a1115706db467ea27b2338",
-    "1a38211fe1973722b7e8d1afe128d7d2228d05575c670784872a55ed899b1b1f",
+    "e380084b078dbde17960024786addd016418a18c0b77a3cb39e9290e41932bd4",
 ];
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;

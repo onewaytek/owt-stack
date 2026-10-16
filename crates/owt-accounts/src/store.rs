@@ -181,7 +181,11 @@ pub async fn create_in(conn: &mut sqlx::PgConnection, new: New<'_>) -> Result<Ac
         sqlx::query_scalar("SELECT username FROM accounts WHERE username_skeleton IS NULL")
             .fetch_all(&mut *conn)
             .await?;
-    if unkeyed.iter().any(|old| skeleton(old) == key) {
+    // As complete will key them: the skeleton of the name each becomes.
+    if unkeyed
+        .iter()
+        .any(|old| skeleton(&normalize(old).replace('@', "-")) == key)
+    {
         return Err(Refused::UsernameLookalike(username).into());
     }
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(

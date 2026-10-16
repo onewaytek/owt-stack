@@ -11,8 +11,9 @@
 -- it again.
 
 SET LOCAL lock_timeout = '5s';
--- All three at once, in one order, so no running 0.4 statement deadlocks with this.
-LOCK TABLE accounts, account_identities, sign_in_links IN ACCESS EXCLUSIVE MODE;
+-- All three at once, links first: 0.4's set_password locks sign_in_links before
+-- accounts, so taking them in that order leaves it nothing to deadlock against.
+LOCK TABLE sign_in_links, accounts, account_identities IN ACCESS EXCLUSIVE MODE;
 
 -- The username's confusable skeleton (Unicode TS #39), lower-cased: names a reader
 -- cannot tell apart (`paypal` and `paypa1`, `coco` and the Cyrillic `сосо`) share one,
@@ -22,11 +23,12 @@ ALTER TABLE accounts ADD COLUMN username_skeleton text
     CONSTRAINT accounts_username_skeleton_form CHECK (username_skeleton <> '');
 CREATE UNIQUE INDEX accounts_username_skeleton_key ON accounts (username_skeleton);
 
--- A password hash is an Argon2 PHC string (its version field optional, as the
--- verifier takes it) or nothing; complete clears the rest (a legacy format, a damaged
--- value), which open nothing.
+-- A password hash is Argon2 or nothing; complete clears what the verifier cannot
+-- check (a legacy format, a damaged value), which opens nothing. The shape is the
+-- verifier's to judge (it takes its parameters in any order), so the table asks no
+-- more than the prefix: a stricter pattern would refuse hashes that work.
 ALTER TABLE accounts ADD CONSTRAINT accounts_password_hash_form
-    CHECK (password_hash = '' OR password_hash LIKE '$argon2%$%m=%,t=%,p=%$%$%') NOT VALID;
+    CHECK (password_hash = '' OR password_hash LIKE '$argon2%') NOT VALID;
 
 -- Usernames NFKC-normalized, as owt_accounts::store::normalize stores them, so the
 -- owner's login (normalized as it is typed) matches.
