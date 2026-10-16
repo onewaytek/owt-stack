@@ -1,0 +1,15 @@
+<article class="owt-document">
+<header>
+<h1>{{ doc.title }}</h1>
+<p class="owt-hint">Version {{ doc.number() }} · Last updated {{ doc.effective_date }}{% if !current %} · <strong>Not the current version.</strong> <a href="/{{ doc.kind }}">Read the current version</a>{% endif %}</p>
+</header>
+{% if let Some(mine) = mine %}<div class="owt-alert owt-alert-info" role="status">You agreed to version {{ mine.version }} on {{ mine.accepted_at }}.{% if mine.version != doc.number() %} <a href="/{{ doc.kind }}/v/{{ mine.version }}">Read the version you agreed to</a>.{% endif %}</div>
+{% endif %}<div class="owt-prose">
+{{ body }}</div>
+{% if versions.len() > 1 %}<section class="owt-section">
+<h2>Versions on record</h2>
+<ul>
+{% for (n, date) in versions %}<li>{% if *n == doc.number() %}Version {{ n }}{% else %}<a href="/{{ doc.kind }}/v/{{ n }}">Version {{ n }}</a>{% endif %}, last updated {{ date }}</li>
+{% endfor %}</ul>
+</section>
+{% endif %}</article>

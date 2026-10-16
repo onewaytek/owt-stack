@@ -44,6 +44,10 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_constraints",
         sql: include_str!("../migrations/0003_account_constraints.sql"),
     },
+    Migration {
+        name: "owt_accounts_policies",
+        sql: include_str!("../migrations/0004_policies.sql"),
+    },
 ];
 
 /// What [`complete`] changed, for the operator to read (it is logged too). An owner
@@ -366,6 +370,7 @@ const SHIPPED_SHA256: &[&str] = &[
     "743f8095a1df80c56eccc7a101df0e6ad6bcbaf567a68dc82f50d2f5f2f631b4",
     "0e6d42a67ddabfb50f56650fe85ff0bc810c4b3230a1115706db467ea27b2338",
     "4e910454cfdd01ef4559772fd8b4140f39d887383ebb2de06c920924161152e0",
+    "629cca392e80505f93a71a9eb9d13683ef82f31790d682363d346ebfb2f32f52",
 ];
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;
@@ -461,6 +466,8 @@ mod tests {
         std::fs::write(&roles, ALL[1].sql).unwrap();
         let constraints = dir.join("0003_owt_accounts_constraints.sql");
         std::fs::write(&constraints, ALL[2].sql).unwrap();
+        let policies = dir.join("0004_owt_accounts_policies.sql");
+        std::fs::write(&policies, ALL[3].sql).unwrap();
         assert_installed(&dir);
         std::fs::write(&file, format!("{}\n-- edited", ALL[0].sql)).unwrap();
         let err = std::panic::catch_unwind(|| assert_installed(&dir)).unwrap_err();
@@ -475,6 +482,7 @@ mod tests {
         assert!(text.contains("is not in"), "{text}");
         std::fs::remove_file(&roles).unwrap();
         std::fs::remove_file(&constraints).unwrap();
+        std::fs::remove_file(&policies).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
 }

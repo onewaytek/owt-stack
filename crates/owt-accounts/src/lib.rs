@@ -19,6 +19,8 @@
 //! - [`admin`]: the staff pages that find and change accounts.
 //! - [`social`]: sign-in with a provider: the routes, their configuration, the
 //!   buttons and the connections list.
+//! - [`policies`]: the site's policies (terms, privacy notice) with versions, the
+//!   gate that asks each account to agree to the current ones, and their pages.
 //!
 //! What stays in the app: its pages (the sign-in form is an app's template, with
 //! its look), its extra columns (`ALTER TABLE accounts ADD COLUMN …` in a
@@ -33,6 +35,7 @@ pub mod layer;
 pub mod links;
 pub mod migrations;
 pub mod password;
+pub mod policies;
 pub mod roles;
 pub mod session;
 pub mod social;
