@@ -22,7 +22,8 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tower-http.workspace = true
+tokio.workspace = true
+tower.workspace = true
 tracing.workspace = true
 unicode-normalization.workspace = true
 url.workspace = true
@@ -30,8 +31,6 @@ url.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 http-body-util.workspace = true
-tokio.workspace = true
-tower.workspace = true
 
 [lints]
 workspace = true

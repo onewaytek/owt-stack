@@ -278,6 +278,31 @@ the handler and write `<script nonce="{{ nonce }}">`.
   `Set-Cookie`, so a handler that signed someone in and then failed leaves them as
   they were. A sign-out (`flush`) stands whatever follows: a 5xx after one seals an
   empty session, dropping a sign-in made after it.
+- **A slow route** (a staff action that runs a batch inline, a first request that
+  builds something expensive) gets its own `Limits`, layered on the route itself
+  (or with `.route_layer` on a router before `apply`). The bounds nearest the
+  handler win, longer or shorter than the router's: the route's timeout moves the
+  deadline the outer one waits on, still counted from when the request reached it,
+  and its body limit replaces the router's. No second router is needed.
+
+  ```rust
+  use axum::{Router, routing::{get, post}};
+  use owt_web::limits::Limits;
+  use std::time::Duration;
+  # async fn page() {}
+  # async fn reindex() {}
+  let slow = Limits { request_timeout: Duration::from_secs(120), ..Limits::default() };
+  let routes: Router = Router::new()
+      .route("/", get(page))
+      .route("/staff/reindex", post(reindex).layer(slow)); // 120 s; `/` keeps 30 s
+  let _pages = Limits::default().apply(routes);
+  ```
+
+  A timeout answers 503 and drops the handler's future where it stands: what it was
+  awaiting is abandoned and its open transaction rolls back, but work it handed to
+  `tokio::spawn` (or a job queue) runs on. The client then sees a failure for work
+  that completes, and a retry does it again; such a route is idempotent, or answers
+  before the long part and lets the page poll for the result.
 - **Trusted origins** are `scheme://host[:port]`; anything else (`null`, a wildcard,
   a bare host, a path, or `https://` from `https://$HOST` with `HOST` blank) is
   refused at start rather than trusting every sandboxed frame or silently nothing.
