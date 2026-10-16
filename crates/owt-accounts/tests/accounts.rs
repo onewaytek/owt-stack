@@ -2088,6 +2088,59 @@ async fn the_app_hears_of_each_arrival_before_it_signs_in() {
     assert_eq!(heard.lock().unwrap().len(), 3);
 }
 
+/// A database failure after the callback took the pending sign-in lands with a
+/// message rather than a 500: a 5xx seals no session change, and the pending sign-in
+/// would survive it.
+#[tokio::test]
+async fn a_database_failure_in_the_callback_still_uses_up_the_pending_sign_in() {
+    use owt_accounts::social::Social;
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let (_, client) = social_fixture(
+        &db,
+        sub.clone(),
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    round_trip(&client, &[]).await;
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+    // From here every write of an identity fails, as a database that went away would.
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS
+            $$ BEGIN RAISE EXCEPTION 'the database is unavailable'; END $$;
+         CREATE TRIGGER refuse BEFORE INSERT OR UPDATE ON account_identities
+            FOR EACH ROW EXECUTE FUNCTION refuse();",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let pending = |client: &owt_test::Client| {
+        let (_, data) = social_sessions()
+            .unseal(&client.cookie("s").expect("a session cookie"))
+            .expect("it opens");
+        data.started().is_some()
+    };
+
+    // A connect lands on the connections page, still signed in as before.
+    *sub.lock().unwrap() = "g2".into();
+    let r = round_trip(&client, &[("connect", "1")]).await;
+    assert_eq!(r.location(), Some("/account/connections?social=failed"));
+    assert!(!pending(&client), "the pending connect survived");
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+
+    // A sign-in signs nobody in.
+    *sub.lock().unwrap() = "g1".into();
+    client.clear_cookies();
+    let r = round_trip(&client, &[]).await;
+    assert_eq!(r.location(), Some("/login?social=failed"));
+    assert!(!pending(&client), "the pending sign-in survived");
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn a_provider_sign_in_round_trips_through_the_routes() {
     let db = db!();
