@@ -386,7 +386,17 @@ let google = oauth::Client {
 let (_url, _pending) = google.begin()?;
 let http = oauth::http_client()?; // timeouts, no redirects followed
 let who = google.complete(&http, &pending, state, code).await?;
+// The person is (`google.provider.key()`, `who.uid`). `who.email` is contact data:
+// never look an account up by it (see "Accounts" below).
 println!("{} <{:?}>", who.uid, who.email);
+// Any OIDC issuer: its subjects are keyed by the issuer, not the `sso` id. The
+// issuer and endpoints must be https (http only on localhost); `complete` refuses an
+// ID token whose `iss`, `aud` or `sub` is not this issuer, this client and the
+// user-info subject.
+let _sso = oauth::oidc("sso", "SSO", "https://sso.example/realms/x",
+    "https://sso.example/realms/x/protocol/openid-connect/auth",
+    "https://sso.example/realms/x/protocol/openid-connect/token",
+    "https://sso.example/realms/x/protocol/openid-connect/userinfo")?;
 
 // Machine clients with an IdP's token: signature, algorithm, issuer, audience,
 // expiry and not-before.
@@ -413,6 +423,50 @@ changes (sqlx would refuse the re-copied file at deploy, its checksum differing 
 the applied one): a later release appends a new entry to `ALL`, which the app copies
 as its next file, and a test here pins each file's SHA-256.
 
+**Provider identities are found by subject, never by email.** `identities::arrive`
+looks up the provider's key and the identity's subject, and nothing else. An address
+changes at the provider and can pass to someone else (a recycled workplace mailbox, a
+re-registered domain, an issuer that vouches loosely), so a newcomer whose verified
+email matches an account is still a stranger: they get a new account without the
+address (or `Unknown` without self-signup). A person adds a provider to their account
+by signing in to it first and calling `identities::link` from that session. Two first
+sign-ins with one identity at once (a callback opened twice) wait for each other and
+resolve to one account. A created account takes the provider's verified address as
+its own sign-in email only with `Welcome::record_email`, for providers whose
+verification the app trusts; otherwise the address stays in the identity's claims,
+and no loosely vouched address can be taken before its owner registers.
+
+An OIDC issuer is operator configuration, never a tenant's or a visitor's input: it
+is the namespace its subjects are trusted in, so two configurations naming one issuer
+share people. `identities::list` returns `Linked::provider` as stored, the issuer's
+URL for an OIDC provider and the id (`google`) for a preset; match it against
+`Provider::key()`, not `Provider::id`.
+
+**Upgrading from 0.4:** identities are stored under `Provider::key()`: the issuer for
+an OIDC provider (it used to be the id, `sso`), and `google`, `discord` or `twitch`
+for the presets (unchanged, if the app passed exactly those names). An identity
+under any other key is a stranger at its next sign-in (a second, empty account with
+self-signup on; refused without). At start, before serving, move the old rows and
+refuse to serve while any remain:
+
+```rust,no_run
+# async fn start(pool: sqlx::PgPool, sso: owt_auth::oauth::Provider) -> anyhow::Result<()> {
+use owt_accounts::identities;
+let configured = [&sso, &owt_auth::oauth::google()];
+// Refused when "sso" is still a configured provider's key, or is the issuer's.
+let moved = identities::rekey(&pool, "sso", &sso, &configured).await?;
+// A subject the new key has already: that person signed in between the deploy
+// and the rekey, and has two accounts. Which to keep is a person's decision.
+anyhow::ensure!(moved.conflicts.is_empty(), "identities to reconcile: {:?}", moved.conflicts);
+let stray = identities::unconfigured(&pool, &configured).await?;
+anyhow::ensure!(stray.is_empty(), "identities under keys no provider gives: {stray:?}");
+# Ok(()) }
+```
+
+An issuer is written in canonical form (a lower-case host, no default port, no
+trailing `/`); `oidc` refuses another spelling, since it would match no token's
+`iss`.
+
 **Logins:** a username is one token without `@`; an email always has one. So a login
 is never both, and nobody can register a username equal to someone else's email to
 shadow their sign-in. The table's `CHECK` enforces it on writes made around the
@@ -422,6 +476,7 @@ library.
 # async fn demo(
 #     pool: sqlx::PgPool, session: owt_web::session::Session<owt_accounts::session::Data>,
 #     ip: std::net::IpAddr, login: &str, given: &str, who: owt_auth::oauth::Identity,
+#     discord_who: owt_auth::oauth::Identity,
 # ) -> anyhow::Result<()> {
 use axum::{Router, middleware::from_fn_with_state, routing::get};
 use owt_accounts::{Accounts, Maybe, New, Signed, Staff, identities, links, session, store};
@@ -465,11 +520,15 @@ store::set_password(&pool, &ada, "a different passphrase").await?; // same rules
 store::set_staff(&pool, ada.id, true).await?; // revoking signs out; granting does not
 
 // A provider's identity (from `oauth::Client::complete`) becomes an account per policy:
-// linked already, matched by a verified email, created, or unknown.
-let welcome = identities::Welcome { match_verified_email: true, create: true };
-if let Some(account) = identities::arrive(&pool, "google", &who, welcome).await?.account() {
+// linked already (by subject), created, or unknown.
+// `record_email`: a created account takes the provider's verified address.
+let welcome = identities::Welcome { create: true, record_email: false };
+let google = owt_auth::oauth::google();
+if let Some(account) = identities::arrive(&pool, &google, &who, welcome).await?.account() {
     session::sign_in(&session, account);
 }
+// Adding a provider: only from a session signed in to the account (`Signed(me)`).
+identities::link(&pool, ada.id, &owt_auth::oauth::discord(), &discord_who).await?;
 
 // A one-time sign-in link, minted by an operator; only its SHA-256 is stored. The
 // lifetime is capped at `links::MAX_TTL`.
@@ -1075,7 +1134,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   (configured for the proxies actually in front of the app), and
   `redirect::local_or` on `?next=` before redirecting to it (see "Authentication").
 - OAuth: `oauth::http_client()` for the exchange; `Client::complete` checks the
-  state and the provider itself.
+  state and the provider itself. Key people by (`Provider::key()`, `Identity::uid`),
+  never by `Identity::email`, in the app's own tables too.
 - The bus's Redis is inside the trust boundary: a password or ACL user, a network
   only the app reaches, `rediss://` where the path leaves the node.
 - `Limits` bounds the time to a response, not the time a client takes to send a
