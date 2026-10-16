@@ -210,7 +210,10 @@ where
     tracing::info!(addr = %listener.local_addr()?, "metrics listening");
     // This port has no router or `Limits` in front to bound a slow client, so each
     // connection gets a lifetime (a scrape takes well under one), and few at once.
+    // A scraper sends its request at once: a short head timeout frees a slot an idle
+    // socket holds well inside a scrape's timeout (Prometheus waits 10 s).
     let options = crate::serve::ServeOptions {
+        header_read_timeout: std::time::Duration::from_secs(3),
         max_connection_age: Some(std::time::Duration::from_secs(15)),
         max_connections: 64,
         ..crate::serve::ServeOptions::default()

@@ -74,7 +74,8 @@ pub struct ServeOptions {
     /// for none. The head timeout bounds a client that sends nothing, not one that
     /// uploads a byte a minute or never reads its response; `Limits` bounds those for
     /// the app's routes. A listener with no `Limits` in front (metrics) sets this.
-    /// It ends upgraded connections (`WebSocket`s) too.
+    /// An upgraded connection (a `WebSocket`) leaves the server's hands at the upgrade:
+    /// it is counted, aged and drained by none of these, so its handler bounds it.
     pub max_connection_age: Option<Duration>,
 }
 

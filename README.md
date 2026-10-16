@@ -1122,7 +1122,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   head (30 s), the connections open at once (4096) and a stop (20 s of draining). It
   does not bound a client that uploads slowly or never reads its response: `Limits`
   does, for the app's routes. The metrics listener, which nothing fronts, also caps
-  each connection's life at 15 s and holds 64 at most. A handler that reads `Body` or `Request` itself is
+  each connection's life at 15 s, gives a request head 3 s, and holds 64 at most;
+  a `NetworkPolicy` letting only the scraper reach it keeps others from filling them. A handler that reads `Body` or `Request` itself is
   outside `DefaultBodyLimit`; it bounds what it reads.
 - The metrics middleware labels by matched route and by method, an invented method
   counting as `other`, so no client can grow the label set (each new set is a
@@ -1142,9 +1143,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
   not carry credentials, a query or a fragment.
 - `serve::serve` closes a connection whose request head (or the next one on a
   kept-alive connection) takes over 30 seconds, holds 4096 connections at most, and
-  stops draining after 20 seconds, which also ends an SSE stream or WebSocket still
+  stops draining after 20 seconds, which also ends an SSE stream still
   open then; `serve_with` sets other bounds (`ServeOptions` is `non_exhaustive`:
-  start from `default()`). It serves HTTP/1.1 only: no h2c.
+  start from `default()`). It serves HTTP/1.1 only: no h2c. A WebSocket leaves the
+  server at its upgrade and is bounded by none of these: its handler limits how many
+  it holds and for how long.
 - `jobs::singleton` aborts a run whose lock is no longer seen held. Behind a
   transaction-mode pooler (PgBouncer) the check lands on another server connection,
   so every run longer than `jobs::LOCK_CHECK` is aborted: give singletons a direct

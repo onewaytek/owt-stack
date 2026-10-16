@@ -67,7 +67,12 @@ pub fn init(opts: &Options) -> Guard {
             // image with no system bundle (scratch, distroless) falls back to the
             // public web's roots alone.
             let build = |tls: Option<ClientTlsConfig>| {
-                let builder = opentelemetry_otlp::SpanExporter::builder().with_tonic();
+                use opentelemetry_otlp::WithExportConfig as _;
+                // The endpoint whose scheme was checked, not one the exporter would
+                // read from its own variables (a traces-only one, say).
+                let builder = opentelemetry_otlp::SpanExporter::builder()
+                    .with_tonic()
+                    .with_endpoint(endpoint.clone());
                 match tls {
                     Some(tls) => builder.with_tls_config(tls).build(),
                     None => builder.build(),
