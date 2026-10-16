@@ -465,6 +465,134 @@ fn sso(issuer: &str) -> oauth::Provider {
     .unwrap()
 }
 
+/// Arrive as `g1` on `tx`, then keep that account's tokens there.
+async fn keep(tx: &mut sqlx::PgConnection, welcome: identities::Welcome) -> store::Account {
+    let arrival =
+        identities::arrive_in(tx, &oauth::google(), &identity("g1", None, false), welcome)
+            .await
+            .unwrap();
+    let account = arrival.account().unwrap().clone();
+    sqlx::query("INSERT INTO provider_tokens VALUES ($1, 'sealed')")
+        .bind(account.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    account
+}
+
+/// `arrive_in` inside the app's transaction: what the app writes beside it commits
+/// with the arrival, or neither does.
+#[tokio::test]
+async fn an_arrival_can_share_the_apps_transaction() {
+    let db = db!();
+    let open = identities::Welcome {
+        create: true,
+        ..Default::default()
+    };
+    sqlx::raw_sql(
+        "CREATE TABLE provider_tokens (
+            account_id bigint PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            sealed text NOT NULL)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let counts = async || {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM accounts), (SELECT count(*) FROM account_identities),
+                    (SELECT count(*) FROM provider_tokens)",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+
+    // Rolled back: no account, identity or tokens.
+    let mut tx = db.pool.begin().await.unwrap();
+    keep(&mut tx, open).await;
+    tx.rollback().await.unwrap();
+    assert_eq!(counts().await, (0, 0, 0));
+
+    // A refusal undoes only its own writes: the transaction goes on.
+    let mut tx = db.pool.begin().await.unwrap();
+    let ada = keep(&mut tx, open).await;
+    let err = identities::arrive_in(&mut tx, &oauth::google(), &identity("", None, false), open)
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::NoSubject));
+    tx.commit().await.unwrap();
+    assert_eq!(counts().await, (1, 1, 1));
+    // And the plain arrival finds it.
+    let again = identities::arrive(
+        &db.pool,
+        &oauth::google(),
+        &identity("g1", None, false),
+        open,
+    )
+    .await
+    .unwrap();
+    assert_eq!(again, identities::Arrival::Known(ada));
+    db.drop().await;
+}
+
+/// The README's trigger on `accounts.session_epoch`: every way an account's sessions
+/// are revoked forgets what the app kept for it, in the same statement, and nothing
+/// else does.
+#[tokio::test]
+async fn a_trigger_on_the_epoch_hears_every_revocation() {
+    let db = db!();
+    let readme = include_str!("../../../README.md");
+    let at = readme
+        .find("CREATE TABLE provider_tokens")
+        .expect("the README's example");
+    let start = readme[..at].rfind("```sql\n").unwrap() + "```sql\n".len();
+    let end = at + readme[at..].find("```").unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(&readme[start..end]))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let keep = async || {
+        sqlx::query("INSERT INTO provider_tokens VALUES ($1, 'sealed') ON CONFLICT DO NOTHING")
+            .bind(ada.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    };
+    let kept = async || {
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM provider_tokens)")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    };
+
+    keep().await;
+    store::sign_out_everywhere(&db.pool, ada.id).await.unwrap();
+    assert!(!kept().await, "sign_out_everywhere");
+    keep().await;
+    store::set_password(&db.pool, &ada, "another good passphrase")
+        .await
+        .unwrap();
+    assert!(!kept().await, "set_password");
+
+    // Granting, and setting what is already so, revoke nothing.
+    keep().await;
+    store::set_staff(&db.pool, ada.id, true).await.unwrap();
+    store::set_active(&db.pool, ada.id, true).await.unwrap();
+    store::set_email(&db.pool, ada.id, "ada@example.com")
+        .await
+        .unwrap();
+    assert!(kept().await, "nothing was revoked");
+    store::set_staff(&db.pool, ada.id, false).await.unwrap();
+    assert!(!kept().await, "set_staff");
+    keep().await;
+    store::set_active(&db.pool, ada.id, false).await.unwrap();
+    assert!(!kept().await, "set_active");
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn an_identity_arrives_by_its_subject_or_creates_an_account() {
     let db = db!();
@@ -2031,9 +2159,11 @@ async fn round_trip(client: &owt_test::Client, fields: &[(&str, &str)]) -> owt_t
 #[tokio::test]
 async fn the_app_hears_of_each_arrival_before_it_signs_in() {
     use owt_accounts::social::{Arrived, Social};
+    /// Who arrived, whether created, with which provider and access token.
+    type Heard = Arc<std::sync::Mutex<Vec<(String, bool, String, String)>>>;
     let db = db!();
     let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
-    let heard: Arc<std::sync::Mutex<Vec<(String, bool, String)>>> = Arc::default();
+    let heard: Heard = Arc::default();
     let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (log, no) = (heard.clone(), refuse.clone());
     let (_, client) = social_fixture_with(
@@ -2051,6 +2181,7 @@ async fn the_app_hears_of_each_arrival_before_it_signs_in() {
                         arrived.account.username,
                         arrived.created,
                         arrived.provider,
+                        arrived.tokens.access,
                     ));
                     if no.load(std::sync::atomic::Ordering::SeqCst) {
                         anyhow::bail!("the app's set-up failed");
@@ -2069,8 +2200,8 @@ async fn the_app_hears_of_each_arrival_before_it_signs_in() {
     assert_eq!(
         *heard.lock().unwrap(),
         [
-            ("adalovelace".to_owned(), true, "google".to_owned()),
-            ("adalovelace".to_owned(), false, "google".to_owned()),
+            ("adalovelace".into(), true, "google".into(), "t".into()),
+            ("adalovelace".into(), false, "google".into(), "t".into()),
         ]
     );
 
@@ -2086,6 +2217,66 @@ async fn the_app_hears_of_each_arrival_before_it_signs_in() {
     assert!(data.started().is_none(), "the pending sign-in survived");
     assert_eq!(client.get("/whoami").await.text(), "anonymous");
     assert_eq!(heard.lock().unwrap().len(), 3);
+}
+
+/// A connect hands the app the provider's tokens; the app's error lands on the
+/// connections page and leaves the identity linked.
+#[tokio::test]
+async fn the_app_hears_of_each_connect_with_its_tokens() {
+    use owt_accounts::social::Connected;
+    let db = db!();
+    let sub = Arc::new(std::sync::Mutex::new("g1".to_owned()));
+    let heard: Arc<std::sync::Mutex<Vec<(String, String, String)>>> = Arc::default();
+    let refuse = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (log, no) = (heard.clone(), refuse.clone());
+    let (_, client) = social_fixture_with(
+        &db,
+        sub.clone(),
+        identities::Welcome {
+            create: true,
+            ..Default::default()
+        },
+        move |social| {
+            social.on_connect(move |connected: Connected| {
+                let (log, no) = (log.clone(), no.clone());
+                async move {
+                    log.lock().unwrap().push((
+                        connected.account.username,
+                        connected.provider,
+                        connected.tokens.access,
+                    ));
+                    if no.load(std::sync::atomic::Ordering::SeqCst) {
+                        anyhow::bail!("the app could not keep the tokens");
+                    }
+                    Ok(())
+                }
+            })
+        },
+    )
+    .await;
+    // A sign-in is not a connect.
+    round_trip(&client, &[]).await;
+    assert!(heard.lock().unwrap().is_empty());
+
+    *sub.lock().unwrap() = "g2".into();
+    let r = round_trip(&client, &[("connect", "1")]).await;
+    assert_eq!(r.location(), Some("/account/connections?social=connected"));
+    assert_eq!(
+        *heard.lock().unwrap(),
+        [("adalovelace".into(), "google".into(), "t".into())]
+    );
+
+    refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    *sub.lock().unwrap() = "g3".into();
+    let r = round_trip(&client, &[("connect", "1")]).await;
+    assert_eq!(r.location(), Some("/account/connections?social=failed"));
+    let ada = store::by_username(&db.pool, "adalovelace")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(identities::list(&db.pool, ada.id).await.unwrap().len(), 3);
+    assert_eq!(client.get("/whoami").await.text(), "adalovelace");
+    db.drop().await;
 }
 
 /// A database failure after the callback took the pending sign-in lands with a

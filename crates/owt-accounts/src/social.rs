@@ -448,11 +448,16 @@ pub struct Arrived {
     pub created: bool,
     /// The provider's id (`google`).
     pub provider: String,
+    /// What the provider's token endpoint granted at this sign-in, for an app that
+    /// calls the provider's APIs as the person. Nothing here keeps them: store them
+    /// sealed, never in the clear. Their `Debug` leaves the tokens out.
+    pub tokens: oauth::Tokens,
 }
 
 impl Arrived {
     /// An arrival built by hand, for an app's tests of its own hook: the callback
-    /// builds the real ones.
+    /// builds the real ones. Its tokens are an empty bearer token until
+    /// [`with_tokens`](Self::with_tokens).
     #[doc(hidden)]
     #[must_use]
     pub fn new(account: Account, created: bool, provider: impl Into<String>) -> Self {
@@ -460,12 +465,57 @@ impl Arrived {
             account,
             created,
             provider: provider.into(),
+            tokens: oauth::Tokens::bearer(""),
         }
+    }
+
+    /// This arrival with `tokens` granted.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_tokens(mut self, tokens: oauth::Tokens) -> Self {
+        self.tokens = tokens;
+        self
     }
 }
 
-type OnArrival =
-    Arc<dyn Fn(Arrived) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
+/// A provider just connected to the signed-in `account`, for
+/// [`SocialSignIn::on_connect`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Connected {
+    /// The account it was connected to.
+    pub account: Account,
+    /// The provider's id (`google`).
+    pub provider: String,
+    /// What the provider's token endpoint granted, as [`Arrived::tokens`].
+    pub tokens: oauth::Tokens,
+}
+
+impl Connected {
+    /// A connection built by hand, for an app's tests of its own hook, as
+    /// [`Arrived::new`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(account: Account, provider: impl Into<String>) -> Self {
+        Self {
+            account,
+            provider: provider.into(),
+            tokens: oauth::Tokens::bearer(""),
+        }
+    }
+
+    /// This connection with `tokens` granted.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_tokens(mut self, tokens: oauth::Tokens) -> Self {
+        self.tokens = tokens;
+        self
+    }
+}
+
+/// An app's hook, boxed.
+type Hook<A> =
+    Arc<dyn Fn(A) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 
 /// Sign-in with providers, configured. Cheap to clone: keep one in the app's state
 /// for the pages that show [`Buttons`] and [`Connections`], and merge
@@ -484,7 +534,8 @@ struct Inner {
     connections_page: String,
     after_sign_in: String,
     connect_within: Duration,
-    on_arrival: Option<OnArrival>,
+    on_arrival: Option<Hook<Arrived>>,
+    on_connect: Option<Hook<Connected>>,
 }
 
 impl fmt::Debug for SocialSignIn {
@@ -517,6 +568,7 @@ impl SocialSignIn {
             after_sign_in: "/".into(),
             connect_within: Duration::from_secs(15 * 60),
             on_arrival: None,
+            on_connect: None,
         }))
     }
 
@@ -558,21 +610,40 @@ impl SocialSignIn {
 
     /// Run the app's own code for each sign-in with a provider, after the account is
     /// found or created and before the session is signed in: what every new account
-    /// gets (a profile), or a stamp of its own. An error is logged and signs nobody
-    /// in: the person lands on the sign-in page with the `failed` outcome, and the
-    /// pending sign-in stays used up. An account it created stays, and its next
+    /// gets (a profile), a stamp of its own, or keeping the provider's tokens
+    /// ([`Arrived::tokens`]). An error is logged and signs nobody in: the person
+    /// lands on the sign-in page with the `failed` outcome, and the pending sign-in
+    /// stays used up. An account it created stays, and its next
     /// sign-in arrives with `created` false, so set-up that must happen should also be
     /// done where it is missing later (on first use), not only here. Connecting a
-    /// provider to a signed-in account signs nobody in and does not call it. Calling
-    /// this again replaces the earlier hook.
+    /// provider to a signed-in account signs nobody in and does not call it
+    /// ([`on_connect`](Self::on_connect) does). Calling this again replaces the
+    /// earlier hook.
     #[must_use]
     pub fn on_arrival<F, Fut>(self, f: F) -> Self
     where
         F: Fn(Arrived) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        let f: OnArrival = Arc::new(move |arrived| Box::pin(f(arrived)));
+        let f: Hook<Arrived> = Arc::new(move |arrived| Box::pin(f(arrived)));
         self.edit(|i| i.on_arrival = Some(f))
+    }
+
+    /// Run the app's own code each time a provider is connected to the signed-in
+    /// account, after the identity is linked: for an app that keeps the provider's
+    /// tokens ([`Connected::tokens`]), which a person who signed up another way
+    /// hands over here first. An error is logged and the person lands on the
+    /// connections page with the `failed` outcome; the identity stays linked, and
+    /// signing in with it calls [`on_arrival`](Self::on_arrival) with fresh tokens.
+    /// Calling this again replaces the earlier hook.
+    #[must_use]
+    pub fn on_connect<F, Fut>(self, f: F) -> Self
+    where
+        F: Fn(Connected) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let f: Hook<Connected> = Arc::new(move |connected| Box::pin(f(connected)));
+        self.edit(|i| i.on_connect = Some(f))
     }
 
     /// The providers.
@@ -879,25 +950,28 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
-impl Inner {
-    /// Whether the app's [`SocialSignIn::on_arrival`] hook, if any, let `account`
-    /// in; its error is logged.
-    async fn heard(&self, account: &Account, created: bool, provider: &str) -> bool {
-        let Some(on_arrival) = &self.on_arrival else {
-            return true;
-        };
-        let arrived = Arrived::new(account.clone(), created, provider);
-        match on_arrival(arrived).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::error!(
-                    account = account.id,
-                    provider = %provider,
-                    error = %e,
-                    "the app's on_arrival failed"
-                );
-                false
-            }
+/// Whether the app's hook `name`, if there is one, took `arg` (for `account`); its
+/// error is logged.
+async fn heard<A>(
+    hook: Option<&Hook<A>>,
+    name: &str,
+    arg: A,
+    account: i64,
+    provider: &str,
+) -> bool {
+    let Some(hook) = hook else {
+        return true;
+    };
+    match hook(arg).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                account,
+                provider = %provider,
+                error = %e,
+                "the app's {name} failed"
+            );
+            false
         }
     }
 }
@@ -941,11 +1015,11 @@ async fn callback<T: Social + SessionData>(
     let (Some(state), Some(code)) = (q.state, q.code) else {
         return Ok(landing(back, "failed"));
     };
-    let identity = match client
-        .complete(&inner.http, &started.pending, &state, &code)
+    let (identity, tokens) = match client
+        .complete_with_tokens(&inner.http, &started.pending, &state, &code)
         .await
     {
-        Ok(identity) => identity,
+        Ok(done) => done,
         Err(oauth::Error::State | oauth::Error::Provider) => {
             return Ok(landing(back, "expired"));
         }
@@ -966,24 +1040,7 @@ async fn callback<T: Social + SessionData>(
         if !signed_in_within(&session, inner.connect_within) {
             return Ok(landing(&inner.sign_in_page, "sign-in-again"));
         }
-        return match identities::link(&inner.pool, me.id, &client.provider, &identity).await {
-            Ok(_) => {
-                tracing::info!(account = me.id, provider = %provider, "connected a provider");
-                Ok(landing(&inner.connections_page, "connected"))
-            }
-            Err(e) if e.refused() == Some(&Refused::IdentityTaken) => {
-                Ok(landing(&inner.connections_page, "taken"))
-            }
-            Err(e) if e.refused() == Some(&Refused::NoSubject) => {
-                Ok(landing(&inner.connections_page, "failed"))
-            }
-            // A redirect, not a 500: a 5xx seals no session change, and the pending
-            // sign-in taken above must stay used up.
-            Err(e) => {
-                tracing::error!(account = me.id, provider = %provider, error = %e, "connecting a provider failed");
-                Ok(landing(&inner.connections_page, "failed"))
-            }
-        };
+        return Ok(connect(inner, me, client, &identity, tokens).await);
     }
     let arrival = match identities::arrive(&inner.pool, &client.provider, &identity, inner.welcome)
         .await
@@ -996,7 +1053,7 @@ async fn callback<T: Social + SessionData>(
         Err(e) if e.refused() == Some(&Refused::IdentityTaken) => {
             return Ok(landing(&inner.sign_in_page, "taken"));
         }
-        // A redirect, not a 500, as above.
+        // A redirect, not a 500, as for a connect (`connect`).
         Err(e) => {
             tracing::error!(provider = %provider, error = %e, "a provider sign-in failed on the database");
             return Ok(landing(&inner.sign_in_page, "failed"));
@@ -1009,7 +1066,21 @@ async fn callback<T: Social + SessionData>(
     };
     let created = matches!(arrival, Arrival::Created(_));
     // A redirect, not a 500, as above.
-    if !inner.heard(account, created, &provider).await {
+    let arrived = Arrived {
+        account: account.clone(),
+        created,
+        provider: provider.clone(),
+        tokens,
+    };
+    if !heard(
+        inner.on_arrival.as_ref(),
+        "on_arrival",
+        arrived,
+        account.id,
+        &provider,
+    )
+    .await
+    {
         return Ok(landing(&inner.sign_in_page, "failed"));
     }
     session::sign_in(&session, account);
@@ -1021,6 +1092,53 @@ async fn callback<T: Social + SessionData>(
     );
     let to = redirect::local_or(Some(&started.next), &inner.after_sign_in).to_owned();
     Ok((CachePolicy::no_store(), Redirect::to(&to)).into_response())
+}
+
+/// The end of a connect: link `identity` to `me`, then tell the app. Every outcome
+/// is a redirect, never a 500: a 5xx seals no session change, and the pending
+/// sign-in the callback took must stay used up.
+async fn connect(
+    inner: &Inner,
+    me: Account,
+    client: &oauth::Client,
+    identity: &oauth::Identity,
+    tokens: oauth::Tokens,
+) -> Response {
+    let provider = client.provider.id;
+    match identities::link(&inner.pool, me.id, &client.provider, identity).await {
+        Ok(_) => {
+            tracing::info!(account = me.id, provider, "connected a provider");
+            let id = me.id;
+            let connected = Connected {
+                account: me,
+                provider: provider.to_owned(),
+                tokens,
+            };
+            if heard(
+                inner.on_connect.as_ref(),
+                "on_connect",
+                connected,
+                id,
+                provider,
+            )
+            .await
+            {
+                landing(&inner.connections_page, "connected")
+            } else {
+                landing(&inner.connections_page, "failed")
+            }
+        }
+        Err(e) if e.refused() == Some(&Refused::IdentityTaken) => {
+            landing(&inner.connections_page, "taken")
+        }
+        Err(e) if e.refused() == Some(&Refused::NoSubject) => {
+            landing(&inner.connections_page, "failed")
+        }
+        Err(e) => {
+            tracing::error!(account = me.id, provider, error = %e, "connecting a provider failed");
+            landing(&inner.connections_page, "failed")
+        }
+    }
 }
 
 async fn remove(
