@@ -1700,8 +1700,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - `serve::serve` closes a connection whose request head (or the next one on a
   kept-alive connection) takes over 30 seconds, holds 4096 connections at most, and
   stops draining after 20 seconds, which also ends an SSE stream still
-  open then; `serve_with` sets other bounds (`ServeOptions` is `non_exhaustive`:
-  start from `default()`). It serves HTTP/1.1 only: no h2c. A WebSocket leaves the
+  open then; the new `serve_with` sets other bounds (build its `ServeOptions` from
+  `default()`). It serves HTTP/1.1 only: no h2c. A WebSocket leaves the
   server at its upgrade and is bounded by none of these: its handler limits how many
   it holds and for how long.
 - `jobs::singleton` aborts a run whose lock is no longer seen held. Behind a
@@ -1719,6 +1719,36 @@ The router example under "Wiring an app" composes the layers; beyond it:
   random bytes (fewer than 8 distinct byte values); a test fixture of `[7u8; 64]`
   needs real bytes.
 - `RequestInfo::at` always yields a path starting with `/`.
+
+### Authentication
+
+- `oauth::oidc` takes the issuer as its third argument (as the issuer writes its
+  `iss`: a lower-case host, no default port; a trailing `/` is dropped) and returns
+  `Result<Provider, oauth::Error>`: it refuses an issuer or endpoint that is not
+  `https` (`http` only on the loopback host). `Provider` has an `issuer` field: a
+  struct literal adds `issuer: None`, or starts from a preset with `..`.
+- `Client::complete` needs an ID token from an OIDC provider, held to its `iss`, its
+  `aud` (and `azp`) naming this client, its `exp`, and its `sub` being the
+  user-info response's; ask for the `openid` scope. A redirect from the token or
+  user-info endpoint is refused.
+- `complete` holds a hand-built `Provider` whose `issuer` is `Some` to the form
+  `oidc` gives (no trailing `/` on the issuer; issuer, token and user-info URLs
+  `https`, or `http` on the loopback host, with no credentials), or fails with
+  `Error::Config`.
+- The `google`, `discord` and `twitch` presets (and `oidc`'s) return no identity for
+  an empty `sub` or `id`, so `complete` fails with `Error::NoIdentity`.
+- `oauth::Error` has new variants, `IdToken`, `Config` and `Redirected`; a `match`
+  on it needs arms.
+- An app with its own code exchange (to keep the person's tokens) makes none of
+  these checks. The next release brings `Client::complete_with_tokens`, `refresh`
+  and `client_credentials`, which make them; move to those then.
+- `password::verify_or_decoy` runs the decoy check for any stored hash it cannot
+  verify, not only a missing one; `password::usable(hash)` says which those are.
+- `password::needs_rehash` is true for a hash of an older Argon2 version (`v=16`)
+  too, even at today's costs.
+- `jwt::Verifier` refetches keys older than `jwt::KEYS_MAX_AGE` (an hour), refuses
+  encryption keys, and refuses every token once its keys could not be refetched for
+  `jwt::KEYS_STALE_LIMIT` (a day).
 
 ### Accounts
 
@@ -1769,11 +1799,6 @@ Also:
 - `store::authenticate` fails a sign-in whose password changed while it was checked;
   `store::change_password` is new.
 - `Refused` has `CurrentPassword` and `UsernameLookalike` variants.
-- `owt_auth::password::usable(hash)` says whether a stored hash can open an account;
-  `needs_rehash` is true for a hash of an older Argon2 version too.
-- `jwt::Verifier` refetches keys older than `jwt::KEYS_MAX_AGE` (an hour), refuses
-  encryption keys, and refuses every token once its keys could not be refetched for
-  `jwt::KEYS_STALE_LIMIT` (a day).
 - `Linked::label` shows an email only when the provider verified it.
 - The social routes refuse cross-origin `POST`s themselves.
 
