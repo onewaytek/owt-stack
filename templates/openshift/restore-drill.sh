@@ -9,11 +9,20 @@
 #      "true"), then writes a second row;
 #   3. bootstraps a second cluster from that Backup, exactly as a restore would;
 #   4. passes if the restored database has the first row and not the second;
-#   5. deletes everything it made, whatever happened.
+#   5. with UPGRADE_TO set, upgrades the restored cluster to that major in place
+#      (as a new POSTGRES_MAJOR would) and checks the row survived it;
+#   6. deletes everything it made, whatever happened.
 #
 # It creates and deletes cluster objects, so it needs a namespace admin and is never
 # run by CI. Run it after changing how backups are taken (the snapshot class, online
 # or offline, the CNPG version), and record the result in the pull request.
+#
+# Before moving an app's Postgres to a new major, rehearse at the app's majors:
+#
+#   POSTGRES_MAJOR=16 UPGRADE_TO=18 templates/openshift/restore-drill.sh <namespace>
+#
+# proves that a backup taken at 16 restores, and that this operator upgrades the
+# result to 18. SNAPSHOT_CLASS and STORAGE_CLASS name classes other than lvms-vg1.
 set -euo pipefail
 
 NS=${1:?usage: restore-drill.sh <namespace> [online]}
@@ -21,6 +30,7 @@ ONLINE=${2:-false}
 SNAPSHOT_CLASS=${SNAPSHOT_CLASS:-lvms-vg1}
 STORAGE_CLASS=${STORAGE_CLASS:-lvms-vg1}
 POSTGRES_MAJOR=${POSTGRES_MAJOR:-18}
+UPGRADE_TO=${UPGRADE_TO:-}
 SRC=owt-drill-src
 DST=owt-drill-restored
 BACKUP=owt-drill-backup
@@ -99,5 +109,34 @@ if [ "$rows" = "before the backup" ]; then
   echo "PASS: the backup restores, to the moment it was taken (online=$ONLINE)"
 else
   echo "FAIL: expected only 'before the backup'"
+  exit 1
+fi
+
+[ -n "$UPGRADE_TO" ] || exit 0
+
+echo "== in-place upgrade of $DST from $POSTGRES_MAJOR to $UPGRADE_TO"
+oc_ns patch "cluster.postgresql.cnpg.io/$DST" --type=merge \
+  -p "{\"spec\": {\"imageName\": \"ghcr.io/cloudnative-pg/postgresql:$UPGRADE_TO\"}}"
+# The operator stops the instance, runs pg_upgrade in a Job and starts it again at
+# the new major, and the Cluster can read Ready before the upgrade has begun: wait
+# for the server's own answer instead. An operator older than 1.26 refuses the patch.
+major=
+for _ in $(seq 180); do
+  num=$(psql_in "$DST" "SHOW server_version_num" 2>/dev/null) || num=
+  major=${num:+$((num / 10000))}
+  [ "$major" = "$UPGRADE_TO" ] && break
+  sleep 5
+done
+if [ "$major" != "$UPGRADE_TO" ]; then
+  oc_ns get "cluster.postgresql.cnpg.io/$DST" -o jsonpath='{.status.phase}{"\n"}{.status.phaseReason}{"\n"}'
+  oc_ns get jobs -l "cnpg.io/cluster=$DST" || true
+  echo "FAIL: $DST is not running $UPGRADE_TO after 15 minutes (the server says: ${major:-nothing})"
+  exit 1
+fi
+rows=$(psql_in "$DST" "SELECT note FROM drill ORDER BY note")
+if [ "$rows" = "before the backup" ]; then
+  echo "PASS: the restored cluster upgrades in place to $UPGRADE_TO with its data"
+else
+  echo "FAIL: after the upgrade, expected only 'before the backup', got: $rows"
   exit 1
 fi

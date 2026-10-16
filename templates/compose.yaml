@@ -12,6 +12,8 @@ services:
     # as CNPG's images have, so text sorts (and indexes) as in production, and a
     # volume made by one libc is never opened by the other. 18 keeps its data
     # under /var/lib/postgresql/18/, so the volume mounts /var/lib/postgresql.
+    # An app whose cluster runs an earlier major names it here, with a volume of
+    # its own (pgdata16) mounted at /var/lib/postgresql/data, where those keep it.
     image: docker.io/library/postgres:18
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}

@@ -28,7 +28,7 @@ Outside the crates:
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
-| `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters |
+| `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters, and rehearses a Postgres major upgrade |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
 | `tailwind/owt.css` | font stacks, htmx state variants (`htmx-request:opacity-50`), and the `owt-*` classes the shared components and the change-request button use |
 
@@ -1684,7 +1684,7 @@ jobs:
     with:
       check-command: just check
       database: myapp        # empty for no Postgres
-      postgres-major: "18"   # match the CNPG image
+      postgres-major: "18"   # the major the CNPG cluster runs
       redis: true
       css-script: css:build  # empty to skip the stylesheet job
       extra-env: |           # test-only values, never real secrets
@@ -1838,6 +1838,20 @@ The ImageStream polls ghcr for the channel's tag (`rc` or `latest`), and the
 Deployment's trigger rolls out each new digest. App-specific environment is a patch
 on the Deployment.
 
+**An app whose database already exists passes the major it runs**, on every apply:
+`-p POSTGRES_MAJOR=16` if
+`oc get cluster.postgresql.cnpg.io myapp-db -o jsonpath='{.spec.imageName}'` ends in
+`:16`. Compose's `postgres` image and CI's `postgres-major` stay on the same major.
+The default (18) is for a new app: given to a cluster on another major, it changes
+the Cluster's image, which CNPG 1.26 and later carry out as an in-place major upgrade
+and earlier versions refuse. Moving up is a step of its own ("Upgrading Postgres",
+below). Read what an apply will change before making it:
+
+```sh
+oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
+  -p IMAGE=ghcr.io/onewaytek/myapp -p POSTGRES_MAJOR=16 | oc diff -f -
+```
+
 The Route sends traffic through the router (HAProxy), which keeps idle connections to
 the pod for reuse longer than the app's default 30-second keep-alive (its
 `timeout http-keep-alive` is 300 s). Serve with a `header_read_timeout` above that, as
@@ -1875,7 +1889,108 @@ bootstrap:
 
 `templates/openshift/restore-drill.sh <namespace>` proves the arrangement end to end
 on throwaway clusters: it backs one up, restores it into another and checks the data.
-Run it (it needs a namespace admin) whenever how backups are taken changes.
+Run it (it needs a namespace admin) whenever how backups are taken changes. A Backup
+restores only at the major it was taken at: re-create the Cluster with that
+`POSTGRES_MAJOR`.
+
+**Upgrading Postgres** to a new major is planned downtime, never a side effect of
+re-applying the template. Rehearse it first, at the app's majors:
+
+```sh
+POSTGRES_MAJOR=16 UPGRADE_TO=18 templates/openshift/restore-drill.sh myapp
+```
+
+On throwaway clusters, this proves a backup taken at 16 restores, then upgrades the
+restored cluster in place and checks its data survived. It fails at the upgrade if the
+operator cannot do one. Then take one of two paths.
+
+*In place,* with CloudNativePG 1.26 or later (`oc get csv -A | grep cloudnative-pg`
+shows the version), keeping every name. CNPG stops Postgres, runs `pg_upgrade --link`
+in a Job and starts the new major. The app is unavailable until that finishes, which
+the drill timed. Both images must be built on the same Debian release. The template's
+`ghcr.io/cloudnative-pg/postgresql:<major>` tags are, so moving from one to another
+qualifies. A cluster moved to other tags (`18-minimal-trixie`) upgrades only within
+their flavour.
+
+1. Take a backup and wait for it. Like the nightly ones, it is pruned after
+   `BACKUP_KEEP_DAYS`:
+
+   ```sh
+   oc create -f - <<EOF
+   apiVersion: postgresql.cnpg.io/v1
+   kind: Backup
+   metadata: {name: myapp-db-before-18}
+   spec: {cluster: {name: myapp-db}, method: volumeSnapshot}
+   EOF
+   oc wait backup.postgresql.cnpg.io/myapp-db-before-18 \
+     --for=jsonpath='{.status.phase}'=completed --timeout=10m
+   ```
+
+2. Apply the template with `-p POSTGRES_MAJOR=18`, and pass it on every apply from
+   then on.
+3. If the upgrade Job fails, apply again with the old major: the operator deletes the
+   Job and starts the old one again. Once the upgrade succeeds, the only way back is
+   that backup, restored at the old major ("Restoring", above).
+4. `pg_upgrade` carries no planner statistics, so gather them:
+   `oc exec myapp-db-1 -c postgres -- vacuumdb -U postgres --all --analyze-in-stages`.
+5. Move compose's image and CI's `postgres-major` to the new major. The local volume
+   is new (`pgdata18`); `just db` makes and migrates it.
+
+*Into a new cluster* works with any CNPG version and leaves the old cluster as it was,
+to switch back to. The new cluster imports the app's database with `pg_dump` (`bootstrap.initdb.import`),
+and the template's `DB_SUFFIX` then moves the app onto it (`DATABASE_URL`'s Secret, the
+CA, the backups and the NetworkPolicy follow the name):
+
+1. Stop the app, since writes after the dump would be lost:
+   `oc scale deployment/myapp --replicas=0`.
+2. Let the new cluster's pods reach the old database, which admits only the app:
+
+   ```yaml
+   apiVersion: networking.k8s.io/v1
+   kind: NetworkPolicy
+   metadata: {name: myapp-db-import, namespace: myapp}
+   spec:
+     podSelector: {matchLabels: {cnpg.io/cluster: myapp-db}}
+     policyTypes: [Ingress]
+     ingress:
+       - from: [{podSelector: {matchLabels: {cnpg.io/cluster: myapp-db18}}}]
+         ports: [{port: 5432}]
+   ```
+
+3. Render the template with `-p POSTGRES_MAJOR=18 -p DB_SUFFIX=db18 -o yaml`, take its
+   `Cluster` (`myapp-db18`), add the import to its spec, and create it with
+   `oc create -f` (not `apply`, so the template's later applies leave the import
+   alone). The import connects as the app's own user, which owns its database:
+
+   ```yaml
+   bootstrap:
+     initdb:
+       database: myapp
+       owner: myapp
+       import:
+         type: microservice
+         databases: [myapp]
+         source: {externalCluster: previous}
+   externalClusters:
+     - name: previous
+       connectionParameters:
+         host: myapp-db-rw
+         user: myapp
+         dbname: myapp
+         sslmode: verify-full
+       password: {name: myapp-db-app, key: password}
+       sslRootCert: {name: myapp-db-ca, key: ca.crt}
+   ```
+
+4. When `oc wait cluster.postgresql.cnpg.io/myapp-db18 --for=condition=Ready` returns,
+   apply the template with `-p POSTGRES_MAJOR=18 -p DB_SUFFIX=db18`, as every apply
+   will from now on (and `monitoring.yaml` with the same `DB_SUFFIX`). The Deployment
+   is back at `REPLICAS`, reading the new cluster's Secret.
+5. To switch back, apply with the old major and no `DB_SUFFIX`. Once the app is
+   settled, delete the old `myapp-db` Cluster, its `myapp-db-nightly` ScheduledBackup
+   and the `myapp-db` and `myapp-db-import` NetworkPolicies. The pruning follows the
+   new cluster, so the old cluster's Backups stay until deleted by hand.
+6. Move compose and CI as in step 5 above.
 
 An app that already has hand-written backup objects under the same names
 (`<name>-db-nightly`, `<name>-backup-prune`) replaces them by applying this template.
@@ -1965,6 +2080,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
   next unused migration version (see "Tables" under "Accounts"), whether or not the
   app uses site policies: `assert_installed` expects every entry. Its tables stay
   empty until the app wires `policies::Policies` ("Site policies").
+- **Re-applying the OpenShift template:** pass `-p POSTGRES_MAJOR=<the major the
+  cluster runs>`, and keep compose and CI's `postgres-major` on it. The default, 18,
+  upgrades an older cluster in place (or is refused before CNPG 1.26). Moving to a
+  new major is its own step: "Upgrading Postgres" under "Commands, CI, releases and
+  deployment". The new `DB_SUFFIX` parameter leaves the default render as it was.
 
 ### Authentication
 
