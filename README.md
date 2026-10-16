@@ -39,19 +39,19 @@ file as its docs), so an API change that breaks these instructions fails CI.
 <!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.4" }
-owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.4" }
+owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
+owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
 # As needed:
-owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.4" }
-owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.4" }
-owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.4" }
-owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.4" }
+owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
+owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
+owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
+owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
 
 [dev-dependencies]
-owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.4.4" }
+owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.5.0" }
 ```
 <!-- x-release-please-end -->
 
@@ -1406,7 +1406,7 @@ and a slot past 20 GiB starts over.
 ```yaml
 jobs:
   checks:
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.4.4
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.5.0
     with:
       check-command: just check
       database: myapp        # empty for no Postgres
@@ -1450,12 +1450,12 @@ jobs:
   release:
     needs: ci
     permissions: {contents: write, issues: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/release.yml@v0.4.4
+    uses: onewaytek/owt-stack/.github/workflows/release.yml@v0.5.0
   image:
     needs: release
     if: needs.release.outputs.version != ''
     permissions: {contents: read, packages: write}
-    uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.4.4
+    uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.5.0
     with: {version: "${{ needs.release.outputs.version }}"}   # needs only its own token
 ```
 
@@ -1496,24 +1496,24 @@ jobs:
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.4.4
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.5.0
     with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}", candidate: true}
   check-rc:
     needs: candidate
     if: needs.candidate.outputs.changed == 'true'
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.4.4
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.5.0
     with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
   promote:
     needs: [candidate, check-rc]
     permissions: {contents: write, actions: write}
-    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@v0.4.4
+    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@v0.5.0
     with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
 # in release.yml
   sync-rc:
     needs: release
     if: github.ref_name == 'main'
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.4.4
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.5.0
     with: {source: main, dispatch-release: false}
 ```
 <!-- x-release-please-end -->
@@ -1590,7 +1590,7 @@ the exporter's port to Prometheus alone.
 
 <!-- x-release-please-start-version -->
 ```json
-"devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.4.4" }
+"devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.5.0" }
 ```
 <!-- x-release-please-end -->
 

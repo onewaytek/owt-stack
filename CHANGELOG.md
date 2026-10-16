@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.5.0](https://github.com/onewaytek/owt-stack/compare/v0.4.4...v0.5.0) (2026-10-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** apps install ALL[2] (0003) as their next unused migration version and await owt_accounts::migrations::complete before serving; it returns Completed (renames, cleared emails and passwords, failures) instead of a count. Usernames that collide once normalized are renamed. store::create takes &PgPool; store::create_in takes a connection. links::MAX_TTL is 30 days. Refused has CurrentPassword and UsernameLookalike variants.
+* **web:** CrossOrigin::trust panics on an entry that is not an http(s) origin. A 5xx response no longer carries session changes, except a sign-out. key_from_base64 and key_for refuse a secret with fewer than 8 distinct byte values. Moving from key_from_base64 to key_for signs everyone out unless the old key is kept with also_open_with for a while.
+* Bus::redis errors on a prefix outside [A-Za-z0-9_.-] or a zero beat_every. CHANGE_REQUESTS_URL must be https except to localhost or a cluster service named absolutely (….svc.cluster.local., with the final dot). Cache keys move to <prefix>:c: (the cache starts cold once). ServeOptions is non_exhaustive (start from default()). The server does not answer h2c.
+* **accounts:** install owt_accounts::migrations::ALL[1] (roles) as the app's next unused migration version; assert_installed fails until it is there. store::Account has a `roles` field (a struct literal adds `roles: Vec::new()`). Admin::routes() returns the routes at the base given to Admin::new; merge them instead of nesting. Role cannot be built with a struct literal, and `inactive` is a reserved role name.
+* **accounts:** Welcome::match_verified_email and Arrival::Matched are gone; a person adds a provider by signing in first and calling identities::link from that session. identities::arrive, find and link take &oauth::Provider (and link takes the &Identity). oauth::oidc takes the issuer as its third argument, returns Result<Provider, oauth::Error>, and refuses a non-canonical issuer; Provider has an `issuer` field. oauth::Error has IdToken, Config and Redirected variants. identities::arrive returns Err(Refused::NoSubject) for an empty subject. Welcome has a record_email field, off by default, so created accounts no longer take the provider's email unless it is set. An app with OIDC identities stored under the provider's id moves them with
+
+### Features
+
+* **accounts:** roles an app declares, and the staff accounts admin ([#40](https://github.com/onewaytek/owt-stack/issues/40)) ([a97307b](https://github.com/onewaytek/owt-stack/commit/a97307b9a83f46a85fb11ff402a63ad96e57df73))
+* **accounts:** sign-in with a provider, as routes an app mounts ([#41](https://github.com/onewaytek/owt-stack/issues/41)) ([8fcfee6](https://github.com/onewaytek/owt-stack/commit/8fcfee62dc4ba84add9a0893fcf6d18ac306a439))
+
+
+### Bug Fixes
+
+* **accounts:** find provider identities by subject only, never by email ([#39](https://github.com/onewaytek/owt-stack/issues/39)) ([630a9fd](https://github.com/onewaytek/owt-stack/commit/630a9fd7512b8f4f899e7dc6fda0d9f2142eca38))
+* **accounts:** no lookalike usernames, no sign-in outliving a password change ([#45](https://github.com/onewaytek/owt-stack/issues/45)) ([a8903f0](https://github.com/onewaytek/owt-stack/commit/a8903f0af40aeabfe2a0ef3bf0e386576ee23fd8))
+* bound metric labels, request heads and drains; stop a singleton without its lock ([#42](https://github.com/onewaytek/owt-stack/issues/42)) ([316fcf7](https://github.com/onewaytek/owt-stack/commit/316fcf7f81c4556ca65928973ddf3d1653a5f437))
+* **ci:** keep unreviewed rc code from configuring a release or a stable image ([#43](https://github.com/onewaytek/owt-stack/issues/43)) ([946d58a](https://github.com/onewaytek/owt-stack/commit/946d58a6b552899cdaaabc1aeb949879f0af1041))
+* **web:** a key per app and environment; no session sealed into a 5xx; trusted origins checked ([#44](https://github.com/onewaytek/owt-stack/issues/44)) ([7653807](https://github.com/onewaytek/owt-stack/commit/76538075fed892180fbad27fac5ede3c0f76f2bb))
+
 ## [0.4.4](https://github.com/onewaytek/owt-stack/compare/v0.4.3...v0.4.4) (2026-10-14)
 
 
