@@ -23,6 +23,7 @@ Outside the crates:
 | `.github/workflows/image.yml` | reusable image build for a released tag, pushed to ghcr with the channel's floating tags |
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease, or into `rc-candidate` for checking first |
 | `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
+| `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
@@ -1583,7 +1584,7 @@ set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
 Every app then answers to the same commands:
 
 ```sh
-just setup        # npm ci, sqlx-cli, cargo-audit
+just setup        # npm ci, sqlx-cli and cargo-audit at CI's versions
 just db           # Postgres 18 and Redis 8 (compose.yaml), then the migrations
 just dev          # the app, with the stylesheet rebuilt on change
 just check        # the gate: fmt, clippy, rustdoc, .sqlx freshness, audit, tests
@@ -1598,9 +1599,14 @@ app's `.env` (`POSTGRES_PORT`, `POSTGRES_DB`, ...), so two apps' stacks can run 
 by side.
 
 **CI:** call the reusable check workflow with the app's gate. It runs on ARC, with
-Postgres and Redis as services, installs `just`, `sqlx-cli` and `cargo-audit`,
-migrates, then runs `check-command`. Without `check-command`, it runs its own fmt,
-audit, sqlx, clippy and test steps.
+Postgres and Redis as services, installs `just` and `cargo-audit` (and `sqlx-cli`
+for an app with a `.sqlx/` or `migrations/`), migrates, then runs `check-command`.
+Without `check-command`, it runs its own fmt, audit, sqlx, clippy and test steps. The
+tools are pinned (`templates/justfile`'s `setup` installs the same versions), and
+`sqlx-cli`, which has no prebuilt binary, is built once per job image and kept in the
+GitHub cache. The job runs in `container` (default
+`mirror.gcr.io/library/rust:1-trixie`), and the services come from the same mirror of
+Docker Hub's official images, out of reach of Docker Hub's anonymous pull limit.
 
 Its Rust build cache is GitHub's, unless the job pod has a writable volume at `/cache`
 (an ARC pod template can mount one). Then the cargo registry is kept there, shared by
@@ -1695,6 +1701,20 @@ jobs:
   goes to `rc-candidate`, the app's checks run on it, and `rc` fast-forwards to it
   only if they pass and `rc` hasn't moved since. `rust-ci.yml` also fails on two
   migrations with one version.
+- **A promotion can be lost** in the candidate flow, two ways. GitHub keeps one
+  *pending* run per concurrency group, so a third PR updated while one promotion runs
+  and another waits cancels the waiting one, not queues it. And `publish-rc.yml`
+  refuses a candidate when `rc` moved while it was checked (a `sync-rc`, say): that
+  run fails at "Move rc to the candidate" rather than publish a merge nobody checked.
+  Either way the PR is left out of `rc` until it is pushed again, unless
+  `requeue-rc.yml` re-runs it. It looks for open PRs whose head isn't in `rc` and
+  whose latest run was cancelled or failed at that step, and re-runs the oldest one,
+  one at a time and only while no run is waiting (a re-run is itself a new arrival in
+  the group). A run that failed its checks is left alone, and so is one already on
+  its fifth attempt (`max-attempts`). Run it after each promotion, so one hands on to
+  the next, and on a schedule, for when none follows. It sees waiting *runs*, not
+  waiting jobs, so put the `promote-rc` concurrency group on the workflow, as below:
+  on a job, a re-run can cancel that job while it waits (a later requeue picks it up).
 
 ```yaml
 # in pr.yml, with concurrency: {group: promote-rc, cancel-in-progress: false}
@@ -1714,6 +1734,14 @@ jobs:
     permissions: {contents: write, actions: write}
     uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@v0.5.0
     with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
+  requeue:
+    needs: promote
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    permissions: {actions: write, contents: read, pull-requests: read}
+    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@v0.5.0
+    with: {workflow: pr.yml}  # this file
+# in requeue-rc.yml, on {schedule: [{cron: "*/30 * * * *"}], workflow_dispatch: {}}:
+# the requeue job above, without its needs and if
 # in release.yml
   sync-rc:
     needs: release

@@ -13,11 +13,11 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list --unsorted
 
-# Install the tools the recipes use.
+# Install the tools the recipes use, at the versions owt-stack's rust-ci.yml runs.
 setup:
     npm ci
-    cargo install sqlx-cli --locked --no-default-features --features postgres,rustls
-    cargo install cargo-audit --locked
+    cargo install sqlx-cli@0.9.0 --locked --no-default-features --features postgres,rustls
+    cargo install cargo-audit@0.22.2 --locked
 
 # Start Postgres and Redis (compose.yaml) and apply the migrations.
 db:
