@@ -111,17 +111,33 @@ pub async fn link(
 
 /// Unlink identity `id` from `account_id`. Refused when it is the account's only
 /// way in (no password, no other identity); `false` when no such link exists.
+///
+/// Two unlinks at once are serialized on the account's row, and each counts the
+/// identities only once it holds it: counted in the statement that waited, the
+/// second would see the first's identity still there, and both would go.
 pub async fn unlink(pool: &PgPool, account_id: i64, id: i64) -> Result<bool> {
     let mut tx = pool.begin().await?;
-    let (has_password, count) = sqlx::query_as::<_, (bool, i64)>(
-        "SELECT password_hash <> '',
-                (SELECT count(*) FROM account_identities WHERE account_id = $1)
-         FROM accounts WHERE id = $1 FOR UPDATE",
+    let Some(has_password) = sqlx::query_scalar::<_, bool>(
+        "SELECT password_hash <> '' FROM accounts WHERE id = $1 FOR UPDATE",
     )
     .bind(account_id)
     .fetch_optional(&mut *tx)
     .await?
-    .unwrap_or((false, 0));
+    else {
+        return Ok(false);
+    };
+    // A statement after the lock reads what committed before it was granted.
+    let (theirs, count) = sqlx::query_as::<_, (bool, i64)>(
+        "SELECT EXISTS (SELECT 1 FROM account_identities WHERE id = $2 AND account_id = $1),
+                (SELECT count(*) FROM account_identities WHERE account_id = $1)",
+    )
+    .bind(account_id)
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !theirs {
+        return Ok(false);
+    }
     if !has_password && count <= 1 {
         return Err(Refused::LastWayIn.into());
     }
@@ -140,6 +156,13 @@ pub struct Welcome {
     /// An identity linked to nothing creates an account. Off: the sign-in is refused
     /// as [`Arrival::Unknown`], for an app with no self-signup.
     pub create: bool,
+    /// A created account takes the provider's verified email as its own, which is a
+    /// sign-in name (with a password) and unique. Off (the default), the address
+    /// stays in the identity's claims only: an issuer that vouches loosely could
+    /// otherwise give a stranger an address its owner has yet to register, and the
+    /// owner's sign-up would find it taken. Turn it on only for providers whose
+    /// verification the app trusts.
+    pub record_email: bool,
 }
 
 /// How a provider sign-in resolved.
@@ -162,6 +185,62 @@ impl Arrival {
             Self::Unknown => None,
         }
     }
+}
+
+/// The stored provider keys no configured provider has, with how many identities
+/// each holds: rows no sign-in can reach. An app checks it at start and refuses to
+/// serve while it is not empty, since a person whose identity is stored under a key
+/// the app no longer uses is a stranger at their next sign-in (a second, empty
+/// account with self-signup on). [`rekey`] moves them.
+pub async fn unconfigured(
+    db: impl PgExecutor<'_>,
+    providers: &[&Provider],
+) -> sqlx::Result<Vec<(String, i64)>> {
+    let keys: Vec<&str> = providers.iter().map(|p| p.key()).collect();
+    sqlx::query_as::<_, (String, i64)>(
+        "SELECT provider, count(*) FROM account_identities
+         WHERE provider <> ALL($1) GROUP BY provider ORDER BY provider",
+    )
+    .bind(&keys)
+    .fetch_all(db)
+    .await
+}
+
+/// What [`rekey`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Rekeyed {
+    /// Identities moved to the new key.
+    pub moved: u64,
+    /// Subjects left under the old key because the new key has them already: the
+    /// person signed in after the deploy and before the rekey, so has two accounts.
+    /// Which one to keep is a person's decision; the old one is untouched.
+    pub conflicts: Vec<String>,
+}
+
+/// Move the identities stored under `from` (a key the app used to give, such as the
+/// id `sso` an OIDC provider was stored under before its issuer was its key) to
+/// `to`'s [`key`](Provider::key). Run it before serving with the new key.
+pub async fn rekey(pool: &PgPool, from: &str, to: &Provider) -> sqlx::Result<Rekeyed> {
+    let mut tx = pool.begin().await?;
+    let moved = sqlx::query(
+        "UPDATE account_identities old SET provider = $2
+         WHERE old.provider = $1 AND NOT EXISTS (
+            SELECT 1 FROM account_identities new
+            WHERE new.provider = $2 AND new.subject = old.subject)",
+    )
+    .bind(from)
+    .bind(to.key())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    let conflicts = sqlx::query_scalar(
+        "SELECT subject FROM account_identities WHERE provider = $1 ORDER BY subject",
+    )
+    .bind(from)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Rekeyed { moved, conflicts })
 }
 
 /// The first key of the advisory lock [`arrive`] takes per identity (the second is a
@@ -201,9 +280,12 @@ pub async fn arrive(
         }
     } else if welcome.create {
         let email = identity.email.as_deref().unwrap_or("");
-        // Only a verified email is worth recording, as contact data; an account
-        // holding it already keeps it, and learns nothing of this sign-in.
-        let email = if identity.email_verified && store::by_email(&mut *tx, email).await?.is_none()
+        // Only a verified email is worth recording, and only when the app trusts the
+        // provider's word for it; an account holding it already keeps it, and
+        // learns nothing of this sign-in.
+        let email = if welcome.record_email
+            && identity.email_verified
+            && store::by_email(&mut *tx, email).await?.is_none()
         {
             email
         } else {

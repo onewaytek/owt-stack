@@ -175,8 +175,14 @@ pub fn twitch() -> Provider {
 ///
 /// [`Error::Config`] when the issuer or an endpoint is not an absolute `https` URL
 /// (`http` is allowed for `localhost`, `127.0.0.1` and `[::1]`, for development),
-/// carries credentials or a fragment, or (the issuer) a query. A trailing `/` on
-/// the issuer is dropped, so `…/realms/x` and `…/realms/x/` are one key.
+/// carries credentials or a fragment, or (the issuer) a query, and when the issuer
+/// is not written in its canonical form (a lower-case host, no default port, as
+/// the issuer itself writes its `iss`): `https://SSO.example:443/realms/x` would
+/// match no token, and would be a second key for the same people. A trailing `/`
+/// on the issuer is dropped, so `…/realms/x` and `…/realms/x/` are one key.
+///
+/// An issuer whose `iss` varies (a multi-tenant endpoint that writes each tenant's
+/// own issuer) refuses every sign-in: configure one provider per tenant.
 pub fn oidc(
     id: &'static str,
     name: &'static str,
@@ -186,8 +192,15 @@ pub fn oidc(
     userinfo: &str,
 ) -> Result<Provider, Error> {
     let issuer = issuer.trim_end_matches('/');
-    if checked_url("issuer", issuer)?.query().is_some() {
+    let parsed = checked_url("issuer", issuer)?;
+    if parsed.query().is_some() {
         return Err(Error::Config(format!("the issuer {issuer:?} has a query")));
+    }
+    let canonical = parsed.as_str().trim_end_matches('/');
+    if canonical != issuer {
+        return Err(Error::Config(format!(
+            "the issuer {issuer:?} is not in canonical form: write {canonical:?}"
+        )));
     }
     for (what, url) in [
         ("authorize", authorize),
@@ -339,6 +352,19 @@ pub enum Error {
     /// A configured URL is not a URL.
     #[error("bad provider URL: {0}")]
     Url(#[from] url::ParseError),
+    /// The token or user-info endpoint answered with a redirect, or the client
+    /// followed one: use [`http_client`], which follows none.
+    #[error("the provider's endpoint redirected")]
+    Redirected,
+}
+
+/// The response, unless it is a redirect or the end of one.
+fn not_redirected(res: reqwest::Response, asked: &str) -> Result<reqwest::Response, Error> {
+    let same = url::Url::parse(asked).is_ok_and(|u| &u == res.url());
+    if res.status().is_redirection() || !same {
+        return Err(Error::Redirected);
+    }
+    Ok(res)
 }
 
 impl Client {
@@ -372,6 +398,11 @@ impl Client {
 
     /// Trade the callback's `code` for the person's identity, if its `state` is the
     /// pending login's and that login was begun with this provider.
+    ///
+    /// `http` is [`http_client`] or one built like it, following no redirects: a
+    /// client that follows one re-sends the client secret wherever it points, and an
+    /// ID token is trusted for having come straight from the token endpoint. A
+    /// redirect, followed or not, is [`Error::Redirected`].
     pub async fn complete(
         &self,
         http: &reqwest::Client,
@@ -395,12 +426,13 @@ impl Client {
         if let Some(v) = &pending.verifier {
             form.push(("code_verifier", v));
         }
-        let token: Value = http
+        let res = http
             .post(&self.provider.token_url)
             .header("accept", "application/json")
             .form(&form)
             .send()
-            .await?
+            .await?;
+        let token: Value = not_redirected(res, &self.provider.token_url)?
             .error_for_status()?
             .json()
             .await?;
@@ -413,7 +445,11 @@ impl Client {
         if self.provider.client_id_header {
             req = req.header("Client-Id", &self.client_id);
         }
-        let info: Value = req.send().await?.error_for_status()?.json().await?;
+        let res = req.send().await?;
+        let info: Value = not_redirected(res, &self.provider.userinfo_url)?
+            .error_for_status()?
+            .json()
+            .await?;
         let identity = (self.provider.identity)(info).ok_or(Error::NoIdentity)?;
         // OIDC Core 5.3.2: the user-info `sub` must be the ID token's.
         if let Some(claims) = id_token
@@ -446,19 +482,36 @@ impl Client {
         if claims["iss"].as_str().map(|i| i.trim_end_matches('/')) != Some(issuer) {
             return Err(Error::IdToken("its iss is another issuer"));
         }
-        let for_us = match &claims["aud"] {
-            Value::String(a) => *a == self.client_id,
-            Value::Array(all) => all.iter().any(|a| a.as_str() == Some(&self.client_id)),
-            _ => false,
+        let (for_us, several) = match &claims["aud"] {
+            Value::String(a) => (*a == self.client_id, false),
+            Value::Array(all) => (
+                all.iter().any(|a| a.as_str() == Some(&self.client_id)),
+                all.len() > 1,
+            ),
+            _ => (false, false),
         };
         if !for_us {
             return Err(Error::IdToken("its aud is not this client"));
+        }
+        // OIDC Core 3.1.3.7: a token for several audiences names the one it was
+        // issued to, and an `azp` that is present is this client.
+        match claims["azp"].as_str() {
+            Some(azp) if azp != self.client_id => {
+                return Err(Error::IdToken("its azp is another client"));
+            }
+            None if several => {
+                return Err(Error::IdToken("it has several audiences and no azp"));
+            }
+            _ => {}
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         // A minute's leeway for clock skew.
-        if claims["exp"].as_u64().is_none_or(|exp| exp + 60 < now) {
+        if claims["exp"]
+            .as_u64()
+            .is_none_or(|exp| exp.saturating_add(60) < now)
+        {
             return Err(Error::IdToken("it has expired"));
         }
         Ok(claims)
@@ -602,6 +655,9 @@ mod tests {
             "https://user:pw@sso.example",
             "https://sso.example/x?tenant=1",
             "https://sso.example/x#f",
+            "https://SSO.example/x",
+            "https://sso.example:443/x",
+            "https://sso.example/a/../x",
         ] {
             assert!(
                 matches!(with(issuer, ok), Err(Error::Config(_))),
@@ -654,7 +710,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let good = serde_json::json!({
-            "iss": "https://sso.example/realms/x", "aud": ["cid", "other"],
+            "iss": "https://sso.example/realms/x", "aud": ["cid", "other"], "azp": "cid",
             "sub": "42", "exp": now + 300,
         });
         let id_token: Arc<Mutex<Option<String>>> = Arc::default();
@@ -698,6 +754,10 @@ mod tests {
         let mut slash = good.clone();
         slash["iss"] = "https://sso.example/realms/x/".into();
         assert!(attempt(Some(jwt(&slash))).await.is_ok());
+        // The far future does not overflow the leeway.
+        let mut far = good.clone();
+        far["exp"] = u64::MAX.into();
+        assert!(attempt(Some(jwt(&far))).await.is_ok());
         assert!(matches!(attempt(None).await, Err(Error::IdToken(_))));
         assert!(matches!(
             attempt(Some("not-a-jwt".into())).await,
@@ -711,6 +771,8 @@ mod tests {
             ("sub", serde_json::json!("43")),
             ("exp", serde_json::json!(now - 3600)),
             ("exp", Value::Null),
+            ("azp", serde_json::json!("other")),
+            ("azp", Value::Null),
         ] {
             let mut bad = good.clone();
             bad[claim] = value.clone();

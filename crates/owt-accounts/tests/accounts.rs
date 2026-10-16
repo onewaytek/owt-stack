@@ -464,7 +464,10 @@ fn sso(issuer: &str) -> oauth::Provider {
 #[tokio::test]
 async fn an_identity_arrives_by_its_subject_or_creates_an_account() {
     let db = db!();
-    let open = identities::Welcome { create: true };
+    let open = identities::Welcome {
+        create: true,
+        record_email: true,
+    };
     // Unknown, with nothing allowed.
     let arrival = identities::arrive(
         &db.pool,
@@ -572,7 +575,10 @@ async fn an_identity_arrives_by_its_subject_or_creates_an_account() {
 #[tokio::test]
 async fn the_last_way_in_cannot_be_unlinked() {
     let db = db!();
-    let open = identities::Welcome { create: true };
+    let open = identities::Welcome {
+        create: true,
+        ..Default::default()
+    };
     // Unlinking the only way in is refused; with a password it goes.
     let lone = identities::arrive(
         &db.pool,
@@ -605,7 +611,10 @@ async fn the_last_way_in_cannot_be_unlinked() {
 #[tokio::test]
 async fn a_verified_email_never_opens_someone_elses_account() {
     let db = db!();
-    let open = identities::Welcome { create: true };
+    let open = identities::Welcome {
+        create: true,
+        record_email: true,
+    };
     let ada = store::create(
         &db.pool,
         new("ada", "ada@example.com", Some("correct horse battery")),
@@ -656,7 +665,10 @@ async fn a_verified_email_never_opens_someone_elses_account() {
 #[tokio::test]
 async fn an_oidc_subject_belongs_to_its_issuer() {
     let db = db!();
-    let open = identities::Welcome { create: true };
+    let open = identities::Welcome {
+        create: true,
+        ..Default::default()
+    };
     let first = identities::arrive(
         &db.pool,
         &sso("https://sso.example/realms/a"),
@@ -775,7 +787,10 @@ async fn the_wall_under_a_nested_router_keeps_the_prefix_in_next() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_first_sign_ins_make_one_account() {
     let db = db!();
-    let open = identities::Welcome { create: true };
+    let open = identities::Welcome {
+        create: true,
+        record_email: true,
+    };
     // Every connection open first, so the racers start together.
     let mut warm = Vec::new();
     for _ in 0..4 {
@@ -813,4 +828,160 @@ async fn racing_first_sign_ins_make_one_account() {
         .await
         .unwrap();
     assert_eq!(total, 10);
+    db.drop().await;
+}
+
+/// Two unlinks at once on an account whose identities are its only way in: one of
+/// them goes, never both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_unlinks_leave_a_way_in() {
+    let db = db!();
+    let open = identities::Welcome {
+        create: true,
+        ..Default::default()
+    };
+    for round in 0..10 {
+        let first = identity(&format!("u{round}"), None, false);
+        let identities::Arrival::Created(account) =
+            identities::arrive(&db.pool, &oauth::google(), &first, open)
+                .await
+                .unwrap()
+        else {
+            panic!("not created")
+        };
+        identities::link(
+            &db.pool,
+            account.id,
+            &oauth::discord(),
+            &identity(&format!("d{round}"), None, false),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<i64> = identities::list(&db.pool, account.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|l| l.id)
+            .collect();
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut racing = tokio::task::JoinSet::new();
+        for id in ids {
+            let (pool, start) = (db.pool.clone(), start.clone());
+            racing.spawn(async move {
+                start.wait().await;
+                identities::unlink(&pool, account.id, id).await
+            });
+        }
+        while racing.join_next().await.is_some() {}
+        let left = identities::list(&db.pool, account.id).await.unwrap();
+        assert_eq!(left.len(), 1, "round {round}");
+    }
+    db.drop().await;
+}
+
+/// Unlinking an identity that is not the account's is "no such link", even on an
+/// account whose only way in is one identity.
+#[tokio::test]
+async fn unlinking_another_accounts_identity_is_no_such_link() {
+    let db = db!();
+    let open = identities::Welcome {
+        create: true,
+        ..Default::default()
+    };
+    let arrive = |uid: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            match identities::arrive(&pool, &oauth::google(), &identity(uid, None, false), open)
+                .await
+                .unwrap()
+            {
+                identities::Arrival::Created(a) => a,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    let (lone, other) = (arrive("x1").await, arrive("x2").await);
+    let theirs = identities::list(&db.pool, other.id).await.unwrap()[0].id;
+    assert!(!identities::unlink(&db.pool, lone.id, theirs).await.unwrap());
+    assert!(
+        !identities::unlink(&db.pool, lone.id, i64::MAX)
+            .await
+            .unwrap()
+    );
+    assert_eq!(identities::list(&db.pool, other.id).await.unwrap().len(), 1);
+    db.drop().await;
+}
+
+/// A created account takes the provider's address only when the app says so.
+#[tokio::test]
+async fn a_created_account_records_the_email_only_when_asked() {
+    let db = db!();
+    let created = |uid: &'static str, record_email| {
+        let pool = db.pool.clone();
+        async move {
+            let welcome = identities::Welcome {
+                create: true,
+                record_email,
+            };
+            let who = identity(uid, Some(&format!("{uid}@example.com")), true);
+            match identities::arrive(&pool, &oauth::google(), &who, welcome)
+                .await
+                .unwrap()
+            {
+                identities::Arrival::Created(a) => a,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    assert_eq!(created("e1", false).await.email, "");
+    assert_eq!(created("e2", true).await.email, "e2@example.com");
+    db.drop().await;
+}
+
+/// Identities stored under a key no provider gives are found, and moved; a subject
+/// the new key has already stays where it is, for a person to decide.
+#[tokio::test]
+async fn identities_under_an_old_key_are_found_and_moved() {
+    let db = db!();
+    let open = identities::Welcome {
+        create: true,
+        ..Default::default()
+    };
+    let realm = sso("https://sso.example/realms/x");
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let bob = store::create(&db.pool, new("bob", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    for (account, subject) in [(ada.id, "s1"), (bob.id, "s2")] {
+        sqlx::query(
+            "INSERT INTO account_identities (account_id, provider, subject, claims)
+             VALUES ($1, 'sso', $2, '{}')",
+        )
+        .bind(account)
+        .bind(subject)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        identities::unconfigured(&db.pool, &[&realm, &oauth::google()])
+            .await
+            .unwrap(),
+        vec![("sso".to_owned(), 2)]
+    );
+    // Bob signed in after the deploy and before the rekey: a second account.
+    identities::arrive(&db.pool, &realm, &identity("s2", None, false), open)
+        .await
+        .unwrap();
+    let done = identities::rekey(&db.pool, "sso", &realm).await.unwrap();
+    assert_eq!(done.moved, 1);
+    assert_eq!(done.conflicts, vec!["s2".to_owned()]);
+    let found = identities::find(&db.pool, &realm, "s1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.account_id, ada.id);
+    db.drop().await;
 }

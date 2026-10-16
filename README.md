@@ -431,7 +431,10 @@ email matches an account is still a stranger: they get a new account without the
 address (or `Unknown` without self-signup). A person adds a provider to their account
 by signing in to it first and calling `identities::link` from that session. Two first
 sign-ins with one identity at once (a callback opened twice) wait for each other and
-resolve to one account.
+resolve to one account. A created account takes the provider's verified address as
+its own sign-in email only with `Welcome::record_email`, for providers whose
+verification the app trusts; otherwise the address stays in the identity's claims,
+and no loosely vouched address can be taken before its owner registers.
 
 An OIDC issuer is operator configuration, never a tenant's or a visitor's input: it
 is the namespace its subjects are trusted in, so two configurations naming one issuer
@@ -439,18 +442,28 @@ share people. `identities::list` returns `Linked::provider` as stored, the issue
 URL for an OIDC provider and the id (`google`) for a preset; match it against
 `Provider::key()`, not `Provider::id`.
 
-**Upgrading from 0.4 with an OIDC provider:** identities used to be stored under the
-provider's id (`sso`) and are now stored under its issuer. Before deploying the new
-version, rewrite them, or every existing person signing in with it is a stranger
-(a second, empty account with self-signup on; refused without):
+**Upgrading from 0.4:** identities are stored under `Provider::key()`: the issuer for
+an OIDC provider (it used to be the id, `sso`), and `google`, `discord` or `twitch`
+for the presets (unchanged, if the app passed exactly those names). An identity
+under any other key is a stranger at its next sign-in (a second, empty account with
+self-signup on; refused without). At start, before serving, move the old rows and
+refuse to serve while any remain:
 
-```sql
-UPDATE account_identities SET provider = 'https://sso.example/realms/x'
- WHERE provider = 'sso';
+```rust,no_run
+# async fn start(pool: sqlx::PgPool, sso: owt_auth::oauth::Provider) -> anyhow::Result<()> {
+use owt_accounts::identities;
+let moved = identities::rekey(&pool, "sso", &sso).await?;
+// A subject the new key has already: that person signed in between the deploy
+// and the rekey, and has two accounts. Which to keep is a person's decision.
+anyhow::ensure!(moved.conflicts.is_empty(), "identities to reconcile: {:?}", moved.conflicts);
+let stray = identities::unconfigured(&pool, &[&sso, &owt_auth::oauth::google()]).await?;
+anyhow::ensure!(stray.is_empty(), "identities under keys no provider gives: {stray:?}");
+# Ok(()) }
 ```
 
-The issuer is written as `oidc` stores it, without a trailing `/`. Rows for `google`,
-`discord` and `twitch` are unchanged.
+An issuer is written in canonical form (a lower-case host, no default port, no
+trailing `/`); `oidc` refuses another spelling, since it would match no token's
+`iss`.
 
 **Logins:** a username is one token without `@`; an email always has one. So a login
 is never both, and nobody can register a username equal to someone else's email to
@@ -506,7 +519,8 @@ store::set_staff(&pool, ada.id, true).await?; // revoking signs out; granting do
 
 // A provider's identity (from `oauth::Client::complete`) becomes an account per policy:
 // linked already (by subject), created, or unknown.
-let welcome = identities::Welcome { create: true };
+// `record_email`: a created account takes the provider's verified address.
+let welcome = identities::Welcome { create: true, record_email: false };
 let google = owt_auth::oauth::google();
 if let Some(account) = identities::arrive(&pool, &google, &who, welcome).await?.account() {
     session::sign_in(&session, account);
