@@ -36,7 +36,7 @@
 <p>{% if !v.password_sign_in %}Password sign-in off: no password opens it.{% else if v.has_password %}Has a password.{% else %}No password.{% endif %}</p>
 <div class="owt-actions">
 {% if v.password_sign_in %}<form method="post" action="{{ v.set_password }}"><button class="owt-button owt-button-secondary" type="submit">Set a generated password</button></form>
-{% if !v.myself %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="off"><button class="owt-button owt-button-secondary" type="submit">Turn password sign-in off</button></form>
+{% if !v.myself %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="off"><button class="owt-button owt-button-danger" type="submit">Turn password sign-in off</button></form>
 {% endif %}{% else %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="on"><button class="owt-button owt-button-secondary" type="submit">Turn password sign-in on</button></form>
 {% endif %}{% if let Some(issue) = v.issue_link %}<form method="post" action="{{ issue }}"><button class="owt-button owt-button-secondary" type="submit">Issue a sign-in link ({{ v.link_lifetime }})</button></form>
 {% endif %}<form method="post" action="{{ v.sign_out }}"><button class="owt-button owt-button-danger" type="submit">Sign out everywhere</button></form>

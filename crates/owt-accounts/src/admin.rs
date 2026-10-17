@@ -1528,7 +1528,13 @@ async fn forget_local(
     if !theirs {
         return Err(owt_web::Error::NotFound);
     }
-    identities::forget_as(&mut *tx, key, subject).await?;
+    // The account forget_as signed out must be this one; anything else rolls back.
+    let forgotten = identities::forget_as(&mut *tx, key, subject).await?;
+    if forgotten != Some(id) {
+        return Err(owt_web::Error::Internal(anyhow::anyhow!(
+            "retiring a local identity of account {id} reached {forgotten:?}"
+        )));
+    }
     tx.commit().await?;
     tracing::info!(
         by = me.id,
