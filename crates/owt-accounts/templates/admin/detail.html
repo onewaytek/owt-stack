@@ -33,10 +33,12 @@
 </form>
 <section class="owt-section">
 <h2>Ways in</h2>
-<p>{% if v.has_password %}Has a password.{% else %}No password.{% endif %}</p>
+<p>{% if !v.password_sign_in %}Password sign-in off: no password opens it.{% else if v.has_password %}Has a password.{% else %}No password.{% endif %}</p>
 <div class="owt-actions">
-<form method="post" action="{{ v.set_password }}"><button class="owt-button owt-button-secondary" type="submit">Set a generated password</button></form>
-{% if let Some(issue) = v.issue_link %}<form method="post" action="{{ issue }}"><button class="owt-button owt-button-secondary" type="submit">Issue a sign-in link ({{ v.link_lifetime }})</button></form>
+{% if v.password_sign_in %}<form method="post" action="{{ v.set_password }}"><button class="owt-button owt-button-secondary" type="submit">Set a generated password</button></form>
+{% if !v.myself %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="off"><button class="owt-button owt-button-secondary" type="submit">Turn password sign-in off</button></form>
+{% endif %}{% else %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="on"><button class="owt-button owt-button-secondary" type="submit">Turn password sign-in on</button></form>
+{% endif %}{% if let Some(issue) = v.issue_link %}<form method="post" action="{{ issue }}"><button class="owt-button owt-button-secondary" type="submit">Issue a sign-in link ({{ v.link_lifetime }})</button></form>
 {% endif %}<form method="post" action="{{ v.sign_out }}"><button class="owt-button owt-button-danger" type="submit">Sign out everywhere</button></form>
 </div>
 <h3>Sign-in connections</h3>
@@ -45,6 +47,14 @@
 <thead><tr><th scope="col">Provider</th><th scope="col">Shown as</th><th scope="col"><span class="owt-sr">Actions</span></th></tr></thead>
 <tbody>
 {% for i in v.connections %}<tr><td>{{ i.provider }}</td><td>{{ i.label }}</td><td><form method="post" action="{{ i.unlink }}"><button class="owt-button owt-button-quiet" type="submit">Remove</button></form></td></tr>
+{% endfor %}</tbody>
+</table>
+{% endif %}{% if !v.local_identities.is_empty() %}<h3>Local identities</h3>
+<p class="owt-hint">How the app itself reaches this account. Retiring one signs the account out everywhere.</p>
+<table class="owt-table">
+<thead><tr><th scope="col">Key</th><th scope="col">Subject</th><th scope="col">Added</th><th scope="col">Last sign-in</th><th scope="col"><span class="owt-sr">Actions</span></th></tr></thead>
+<tbody>
+{% for l in v.local_identities %}<tr><td>{{ l.key }}</td><td>{{ l.subject }}</td><td>{{ l.created }}</td><td>{{ l.last_sign_in }}</td><td>{% if !v.myself %}<form method="post" action="{{ l.forget }}"><input type="hidden" name="key" value="{{ l.key }}"><input type="hidden" name="subject" value="{{ l.subject }}"><button class="owt-button owt-button-quiet" type="submit">Retire</button></form>{% endif %}</td></tr>
 {% endfor %}</tbody>
 </table>
 {% endif %}</section>

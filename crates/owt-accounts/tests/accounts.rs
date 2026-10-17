@@ -1318,6 +1318,182 @@ async fn the_admin_sets_no_password_where_password_sign_in_is_off() {
     db.drop().await;
 }
 
+/// An account with password sign-in off says so, in the list and on its page, which
+/// offers no password; staff turn it on, and then a password may be set.
+#[tokio::test]
+async fn the_admin_shows_and_turns_password_sign_in() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(admin_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let arrival = identities::arrive_as(&db.pool, "system", "jobs", Some("jobs"))
+        .await
+        .unwrap();
+    let jobs = arrival.account().unwrap().clone();
+    let at = format!("/staff/accounts/{}", jobs.id);
+
+    let html = client.get("/staff/accounts?q=jobs").await.text();
+    assert!(
+        html.contains(r#"<span class="owt-badge owt-badge-quiet">Password sign-in off</span>"#),
+        "{html}"
+    );
+    let html = client.get("/staff/accounts?q=boss").await.text();
+    assert!(!html.contains("Password sign-in off"), "{html}");
+    let html = client.get(&at).await.text();
+    assert!(
+        html.contains("Password sign-in off: no password opens it.")
+            && !html.contains("Set a generated password")
+            && html.contains(r#"name="password_sign_in" value="on""#),
+        "{html}"
+    );
+
+    let r = client
+        .post_form(
+            &format!("{at}/password-sign-in"),
+            &[("password_sign_in", "maybe")],
+        )
+        .await;
+    assert_eq!(r.status, 422);
+    let r = client
+        .post_form(
+            &format!("{at}/password-sign-in"),
+            &[("password_sign_in", "on")],
+        )
+        .await;
+    assert_eq!(r.status, 303);
+    let html = client.get(r.location().unwrap()).await.text();
+    assert!(
+        html.contains("Password sign-in is on.")
+            && html.contains("No password.")
+            && html.contains("Set a generated password"),
+        "{html}"
+    );
+    let r = client.post_form(&format!("{at}/password"), &[]).await;
+    assert_eq!(r.status, 200);
+    let password = secret(&r.text());
+    assert!(
+        store::authenticate(&db.pool, "jobs", &password)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Off again: the password goes and every session with it.
+    let r = client
+        .post_form(
+            &format!("{at}/password-sign-in"),
+            &[("password_sign_in", "off")],
+        )
+        .await;
+    assert_eq!(r.status, 303);
+    let now = store::by_id(&db.pool, jobs.id).await.unwrap().unwrap();
+    assert!(now.session_epoch > jobs.session_epoch);
+    assert!(!store::has_password(&db.pool, jobs.id).await.unwrap());
+    assert!(
+        store::authenticate(&db.pool, "jobs", &password)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Never on yourself: it would end your own sessions and your password.
+    let mine = format!("/staff/accounts/{}/password-sign-in", boss.id);
+    let r = client
+        .post_form(&mine, &[("password_sign_in", "off")])
+        .await;
+    assert_eq!(r.status, 403);
+    let html = client
+        .get(&format!("/staff/accounts/{}", boss.id))
+        .await
+        .text();
+    assert!(!html.contains("Turn password sign-in off"), "{html}");
+    let still = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    assert_eq!(still.session_epoch, boss.session_epoch);
+    db.drop().await;
+}
+
+/// The account's page lists its local identities; staff retire one of that
+/// account's (never another's, never their own), and its sessions end.
+#[tokio::test]
+async fn the_admin_lists_and_retires_local_identities() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(admin_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let arrive = |key: &'static str, subject: &'static str, name: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            identities::arrive_as(&pool, key, subject, Some(name))
+                .await
+                .unwrap()
+                .account()
+                .unwrap()
+                .clone()
+        }
+    };
+    let desk = arrive("kiosk", "desk-1", "desk").await;
+    let other = arrive("kiosk", "desk-2", "other").await;
+    let at = format!("/staff/accounts/{}", desk.id);
+    let forget = format!("{at}/local-identities/forget");
+
+    let html = client.get(&at).await.text();
+    assert!(
+        html.contains("<h3>Local identities</h3>")
+            && html.contains("<td>kiosk</td><td>desk-1</td>")
+            && html.contains(&format!(r#"action="{forget}""#))
+            && !html.contains("desk-2"),
+        "{html}"
+    );
+    let html = client
+        .get(&format!("/staff/accounts/{}", boss.id))
+        .await
+        .text();
+    assert!(!html.contains("Local identities"), "{html}");
+
+    // Another account's pair, through this account's URL: nothing happens.
+    let r = client
+        .post_form(&forget, &[("key", "kiosk"), ("subject", "desk-2")])
+        .await;
+    assert_eq!(r.status, 404);
+    let known = identities::arrive_as(&db.pool, "kiosk", "desk-2", None)
+        .await
+        .unwrap();
+    assert_eq!(known.account().map(|a| a.id), Some(other.id));
+
+    let r = client
+        .post_form(&forget, &[("key", "kiosk"), ("subject", "desk-1")])
+        .await;
+    assert_eq!(r.status, 303);
+    let html = client.get(r.location().unwrap()).await.text();
+    assert!(
+        html.contains("Local identity retired") && !html.contains("Local identities"),
+        "{html}"
+    );
+    let gone = identities::arrive_as(&db.pool, "kiosk", "desk-1", None)
+        .await
+        .unwrap();
+    assert!(gone.account().is_none());
+    let now = store::by_id(&db.pool, desk.id).await.unwrap().unwrap();
+    assert!(now.session_epoch > desk.session_epoch);
+
+    let mine = format!("/staff/accounts/{}/local-identities/forget", boss.id);
+    let r = client
+        .post_form(&mine, &[("key", "kiosk"), ("subject", "desk-2")])
+        .await;
+    assert_eq!(r.status, 403);
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn the_last_way_in_cannot_be_unlinked() {
     let db = db!();
@@ -2324,12 +2500,15 @@ async fn the_admin_refuses_everyone_but_staff_and_every_other_origin() {
         format!("{at}/link"),
         format!("{at}/sign-out"),
         format!("{at}/identities/{}/unlink", linked.id),
+        format!("{at}/password-sign-in"),
+        format!("{at}/local-identities/forget"),
     ];
     let fields = [
         ("username", "x"),
         ("email", ""),
         ("active", "on"),
         ("staff", "on"),
+        ("password_sign_in", "off"),
     ];
 
     client.set_cookie("s", &cookie_for(&sessions, &ada));
@@ -2582,7 +2761,7 @@ mod plain {
     #[derive(Template)]
     #[template(
         source = r#"<ul class="pf-list" data-total="{{ v.total }}" data-filter="{{ v.filter }}">
-{% for r in v.rows %}<li><a href="{{ r.href }}">{{ r.username }}</a>{% for b in r.badges %} [{{ b.text }}]{% endfor %}</li>
+{% for r in v.rows %}<li data-pw="{{ r.password_sign_in }}"><a href="{{ r.href }}">{{ r.username }}</a>{% for b in r.badges %} [{{ b.text }}]{% endfor %}</li>
 {% endfor %}</ul>{% for i in v.pagination.items() %}{% match i.kind %}
 {% when Kind::Previous %}<a class="pf-prev" href="{{ i.href }}">Previous</a>
 {% when Kind::Next %}<a class="pf-next" href="{{ i.href }}">Next</a>
@@ -2610,7 +2789,9 @@ mod plain {
     #[template(
         source = r#"<h1 class="pf-title">{{ v.account.username }}</h1>{% if let Some(n) = v.notice %}<p class="pf-notice" data-error="{{ n.is_error() }}">{{ n.text }}</p>{% endif %}{% if let Some(s) = v.secret %}<output class="pf-secret">{{ s.value }}</output>{% endif %}
 <form action="{{ v.save }}" method="post"></form><form action="{{ v.set_password }}" method="post"></form>{% if let Some(l) = v.issue_link %}<form action="{{ l }}" method="post">{{ v.link_lifetime }}</form>{% endif %}<form action="{{ v.sign_out }}" method="post"></form>
-{% for c in v.connections %}<form action="{{ c.unlink }}" method="post">{{ c.provider }}</form>{% endfor %}"#,
+{% for c in v.connections %}<form action="{{ c.unlink }}" method="post">{{ c.provider }}</form>{% endfor %}
+<p class="pf-pw" data-on="{{ v.password_sign_in }}"></p>{% if v.password_sign_in %}<form action="{{ v.set_password_sign_in }}" method="post"><input name="password_sign_in" value="off"></form>{% endif %}
+{% for l in v.local_identities %}<form class="pf-local" action="{{ l.forget }}" method="post"><input name="key" value="{{ l.key }}"><input name="subject" value="{{ l.subject }}"></form>{% endfor %}"#,
         ext = "html"
     )]
     struct Account<'a, 'b> {
@@ -2847,6 +3028,53 @@ async fn an_app_draws_the_admin_with_its_own_templates() {
             .unwrap()
             .is_some()
     );
+    db.drop().await;
+}
+
+/// An app's templates get password sign-in and the local identities from the view
+/// models, with the URLs to change them, and their forms work.
+#[tokio::test]
+async fn an_apps_templates_show_password_sign_in_and_local_identities() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(plain_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let arrival = identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("desk"))
+        .await
+        .unwrap();
+    let desk = arrival.account().unwrap().clone();
+    let at = format!("/staff/accounts/{}", desk.id);
+
+    let html = client.get("/staff/accounts").await.text();
+    assert!(
+        html.contains(&format!(
+            r#"<li data-pw="false"><a href="{at}">desk</a> [User] [Password sign-in off]</li>"#
+        )) && html.contains(r#"<li data-pw="true"><a href"#),
+        "{html}"
+    );
+    let html = client.get(&at).await.text();
+    assert!(
+        html.contains(r#"<p class="pf-pw" data-on="false">"#)
+            && html.contains(&format!(
+                r#"<form class="pf-local" action="{at}/local-identities/forget" method="post"><input name="key" value="kiosk"><input name="subject" value="desk-1"></form>"#
+            ))
+            && !html.contains("owt-"),
+        "{html}"
+    );
+    let r = client
+        .post_form(
+            &format!("{at}/local-identities/forget"),
+            &[("key", "kiosk"), ("subject", "desk-1")],
+        )
+        .await;
+    assert_eq!(r.status, 303);
+    let html = client.get(&at).await.text();
+    assert!(!html.contains("pf-local"), "{html}");
     db.drop().await;
 }
 
