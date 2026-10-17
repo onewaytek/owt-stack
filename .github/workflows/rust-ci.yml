@@ -90,6 +90,22 @@ on:
           that passed.
         type: string
         default: ""
+      sccache-redis:
+        description: >-
+          The Redis that sccache reads and writes compiled objects through
+          (SCCACHE_REDIS_ENDPOINT), reachable from the runners; empty for no sccache.
+          It is used only when the SCCACHE_REDIS_PASSWORD secret is given too.
+        type: string
+        default: redis://sccache-redis.sccache.svc:6379
+    secrets:
+      # Named as the organization secret, because `secrets: inherit` passes a
+      # caller's secrets under their own names.
+      SCCACHE_REDIS_PASSWORD:
+        description: >-
+          The password of that Redis. An app passes `secrets: inherit`, so the
+          organization secret of this name reaches it; without it the job compiles
+          without sccache.
+        required: false
 
 # The jobs read the repository and nothing else.
 permissions:
@@ -183,132 +199,84 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      # On ARC the job pod can mount a persistent volume at /cache, shared by every job
-      # of every repository on the scale set. When it does, the cargo registry and git
-      # checkouts live there, with cargo's package-cache locks beside them so jobs in
-      # other pods take turns. Every repository's jobs on the scale set can write the
-      # volume, so a job trusts only what it can check: archives against Cargo.lock,
-      # sources extracted afresh. Target dirs (whose artifacts cannot be checked) are
-      # the residual risk: give each repository a volume of its own, or none, where
-      # one repository's CI must not be able to affect another's. Target dirs live
-      # there too, keyed by repository,
-      # toolchain and image. Each key has a few slots, and a job claims one for itself
-      # (released by "Release the cache slot"): sqlx prepare and the 20 GiB reset
-      # work outside cargo's own lock, so a target dir is never shared by two jobs at
-      # once. Cargo decides freshness by mtime, and the slot's last build may be newer
-      # than this checkout, so the checkout is dated to the claim: every build in the
-      # slot before it is older, so this repository's crates rebuild once and its
-      # dependencies come from the cache. Anything unused for a week is removed. With
-      # no volume, every slot taken, less than 5 GiB free on it, or a write to it
-      # failing, the GitHub cache is used instead, with a warning when the volume is
-      # full. The week-old prune runs first, so a full volume frees itself.
-      - name: Cargo cache volume
-        id: cache-volume
-        shell: bash
-        env:
-          CONTAINER: ${{ inputs.container }}
-        run: |
-          github_cache() { echo "$1: using the GitHub cache"; exit 0; }
-          # The volume is full, or a write on it failed: give back the slot, if one
-          # was claimed (and the claim output, which a later line overrides), and fall
-          # back rather than fail the job.
-          volume_failed() {
-            echo "::warning::$1; using the GitHub cache"
-            if [ -n "${slot:-}" ]; then
-              rmdir "$slots/$slot.claim" 2>/dev/null || true
-              echo "claim=" >> "$GITHUB_OUTPUT"
-            fi
-            exit 0
-          }
-          [ -d /cache ] || github_cache "no /cache volume"
-          mkdir -p /cache/cargo/registry /cache/cargo/git /cache/target 2>/dev/null \
-            && touch /cache/cargo/.package-cache /cache/cargo/.package-cache-mutate 2>/dev/null \
-            && [ -w /cache/cargo/registry ] && [ -w /cache/cargo/git ] && [ -w /cache/target ] \
-            || github_cache "/cache is not writable"
-          key=$( { rustc -vV; cat /etc/os-release 2>/dev/null || true; echo "$CONTAINER"; } | sha256sum | cut -c1-12)
-          slots="/cache/target/$GITHUB_REPOSITORY/$key"
-          # Key and slot dirs unused for a week, in any repository, unless claimed.
-          # Before anything is written, so that a full volume (say, every key new after
-          # a toolchain release) still sheds the old ones.
-          find /cache/target -mindepth 3 -maxdepth 4 -type d ! -name '*.claim' -mtime +7 -print0 \
-            2>/dev/null | while IFS= read -r -d '' d; do
-              [ -e "$d.claim" ] || compgen -G "$d/*.claim" >/dev/null || rm -rf "$d" 2>/dev/null || true
-            done
-          # A full volume usually still has this repository's slot dirs, so creating
-          # them proves nothing, and a build in a claimed slot would fail for space.
-          avail=$(df -Pk /cache | awk 'NR == 2 { print $4 }') || avail=0
-          [ "${avail:-0}" -ge $((5 * 1024 * 1024)) ] \
-            || volume_failed "/cache has $((${avail:-0} / 1024)) MiB free, under 5 GiB"
-          mkdir -p "$slots" || volume_failed "creating $slots failed"
-          slot=
-          for n in 0 1 2 3; do
-            # A claim older than the 6-hour job limit belongs to a job that is gone; one
-            # job's mv wins, so two can't both take it over.
-            if [ -n "$(find "$slots/$n.claim" -maxdepth 0 -mmin +360 2>/dev/null)" ] \
-              && mv "$slots/$n.claim" "$slots/$n.stale.$$" 2>/dev/null; then
-              rmdir "$slots/$n.stale.$$" 2>/dev/null || true
-            fi
-            if mkdir "$slots/$n.claim" 2>/dev/null; then slot=$n; break; fi
-          done
-          [ -n "$slot" ] || github_cache "every cache slot for $GITHUB_REPOSITORY is in use"
-          # At once, so a job cancelled from here on still gives the slot back.
-          echo "claim=$slots/$slot.claim" >> "$GITHUB_OUTPUT"
-          target="$slots/$slot"
-          { mkdir -p "$target" && touch "$slots" "$target"; } || volume_failed "preparing $target failed"
-          if [ "$(du -sk "$target" | cut -f1)" -gt $((20 * 1024 * 1024)) ]; then
-            echo "$target passed 20 GiB: starting it over"
-            { rm -rf "$target" && mkdir -p "$target"; } || volume_failed "starting $target over failed"
-          fi
-          home="${CARGO_HOME:-$HOME/.cargo}"
-          # Shared: the index and git databases (git checks its own objects). Not
-          # shared: the .crate archives cargo builds from, the extracted sources and
-          # git checkouts, which cargo never re-checks once it has them; every job on
-          # the scale set can write /cache. An archive comes from the shared copy
-          # only into this job's own cache, and only if its SHA-256, taken of that
-          # private copy (after the copy, so no other job can swap it between check
-          # and use), is the lockfile's. Another lockfile's crates are downloaded and
-          # checked against this lockfile's checksums by cargo. The shared index is
-          # trusted only where the lockfile pins a checksum: nothing here runs `cargo
-          # install`, which would take a crate's version, checksum and download URL
-          # from that index (the gate's tools come prebuilt or, sqlx-cli, are built
-          # under a cargo home of the job's own, below). The slot's
-          # release adds this job's archives back for the next.
-          mkdir -p "$home/registry/cache" "$home/git" /cache/cargo/registry/index \
-            /cache/cargo/registry/cache /cache/cargo/git/db \
-            || volume_failed "creating the shared cargo directories failed"
-          for f in registry/index git/db .package-cache .package-cache-mutate; do
-            rm -rf "${home:?}/${f:?}"
-            ln -s "/cache/cargo/$f" "$home/$f"
-          done
-          if [ -f Cargo.lock ]; then
-            awk '{ sub(/\r$/, "") }
-                 /^\[\[package\]\]/{n="";v="";c=""} /^name = /{n=$3} /^version = /{v=$3}
-                 /^checksum = /{c=$3; gsub(/"/,"",n); gsub(/"/,"",v); gsub(/"/,"",c); print n"-"v".crate", c}' Cargo.lock |
-            while read -r file sum; do
-              case "$file" in */*|.*) continue ;; esac
-              for f in /cache/cargo/registry/cache/*/"$file"; do
-                [ -f "$f" ] || continue
-                mine="$home/registry/cache/$(basename "$(dirname "$f")")"
-                mkdir -p "$mine"
-                cp "$f" "${mine:?}/${file:?}.part" 2>/dev/null || continue
-                if [ "$(sha256sum "${mine:?}/${file:?}.part" | cut -d' ' -f1)" = "$sum" ]; then
-                  mv "${mine:?}/${file:?}.part" "${mine:?}/${file:?}"
-                else
-                  echo "::warning::$f does not match Cargo.lock; downloading it afresh"
-                  rm -f "${mine:?}/${file:?}.part"
-                fi
-              done
-            done
-          fi
-          find . -path ./.git -prune -o -exec touch -h {} +
-          # The index's stat data is stale now; refresh it so plumbing like
-          # `git diff-index --quiet HEAD` doesn't see every file as changed.
-          git update-index -q --refresh >/dev/null 2>&1 || true
-          echo "CARGO_TARGET_DIR=$target" >> "$GITHUB_ENV"
-          echo "$GITHUB_REPOSITORY slot $slot of $key"
-          df -h /cache
+      # The cargo registry and git checkouts come from GitHub's cache, keyed by the
+      # lockfile and the toolchain. Nothing of target/ is cached that way: compiled
+      # crates come from sccache instead, so a job never inherits another job's build
+      # directory (a shared target dir cannot be checked; an sccache entry is keyed by
+      # the compiler, its flags and the exact inputs, and a miss costs one compile).
+      # The job needs no volume.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: ${{ steps.cache-volume.outputs.claim == '' }}
+        with:
+          cache-targets: "false"
+      # sccache, with one Redis shared by every job on the scale set. A Rust entry's key
+      # holds absolute paths (the source, CARGO_MANIFEST_DIR, the working directory)
+      # and the toolchain's own files, so a hit needs the same crate built at the same
+      # paths by the same toolchain: jobs in one image share registry crates, and a
+      # repository's own crates with its earlier runs; a developer machine, whose
+      # paths differ, keeps entries of its own.
+      # Prebuilt and checksummed, as the gate's tools are. Only with the secret: a job
+      # without it compiles without sccache. The Redis is bounded (maxmemory, least
+      # recently used evicted) and holds only objects whose key names their inputs, so
+      # a poisoned entry needs a write to the Redis, which the password guards; every
+      # repository on the scale set shares that trust.
+      # A step's `if` cannot read secrets, so this step decides for the two after it.
+      - name: Is sccache configured
+        id: sccache
+        env:
+          PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+          ENDPOINT: ${{ inputs.sccache-redis }}
+        shell: bash
+        run: |
+          if [ -n "$ENDPOINT" ] && [ -n "$PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No sccache-redis endpoint or no SCCACHE_REDIS_PASSWORD secret: compiling without sccache"
+          fi
+      - name: Install sccache
+        if: ${{ steps.sccache.outputs.enabled == 'true' }}
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: sccache@0.18.0
+          fallback: none
+      # The server checks the Redis as it starts (it reads and writes a check key), so
+      # an unreachable Redis or a wrong password stops it here, within about ten
+      # seconds; the job then warns and compiles without sccache.
+      #
+      # The password reaches the server and nothing else: it is in a config file only
+      # while the server starts (before any of the app's code has run), and not in the
+      # server's environment, nor in any later step's, where the gate, every build
+      # script and every test could read it. The server lives for the job
+      # (SCCACHE_IDLE_TIMEOUT=0). Should it exit anyway, the next compile starts one
+      # without the config, which caches on local disk, and SCCACHE_IGNORE_SERVER_IO_ERROR
+      # compiles directly when no server answers: either way the build goes on.
+      - name: Start sccache
+        if: ${{ steps.sccache.outputs.enabled == 'true' }}
+        env:
+          PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+          ENDPOINT: ${{ inputs.sccache-redis }}
+        shell: bash
+        run: |
+          conf="$RUNNER_TEMP/sccache.toml"
+          # A TOML basic string: backslashes and quotes escaped.
+          pw=${PASSWORD//\\/\\\\}
+          pw=${pw//\"/\\\"}
+          (
+            umask 077
+            # A month unused and an entry may go; the Redis evicts sooner if full.
+            printf '[cache.redis]\nendpoint = "%s"\npassword = "%s"\nexpiration = 2592000\n' \
+              "$ENDPOINT" "$pw" > "$conf"
+          )
+          if env -u PASSWORD SCCACHE_CONF="$conf" SCCACHE_IDLE_TIMEOUT=0 sccache --start-server; then
+            rm -f "$conf"
+            {
+              echo "RUSTC_WRAPPER=sccache"
+              echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
+            } >> "$GITHUB_ENV"
+          else
+            rm -f "$conf"
+            sccache --stop-server > /dev/null 2>&1 || true
+            echo "::warning::sccache could not use the Redis at $ENDPOINT (above): compiling without it"
+          fi
       # Its own step, so a pin the lockfile can't satisfy fails here by name.
       - name: Fetch dependencies
         run: cargo fetch --locked
@@ -323,8 +291,8 @@ jobs:
           tool: just@1.58.0,cargo-audit@0.22.2
           fallback: none
       # sqlx publishes no binaries, so sqlx-cli is built: under a cargo home and a
-      # target of this job's own, from crates.io afresh, never through the shared
-      # index (whose entries name a crate's checksum and download URL). The binary
+      # target of this job's own, from crates.io afresh, with the checkout's
+      # configuration left out, and through sccache when it is on. The binary
       # is kept in the GitHub cache (scoped to the repository and branch, like
       # rust-cache's), keyed by its version and features and by the image it was
       # built in, so it is built once per image rather than every run. It is
@@ -426,16 +394,21 @@ jobs:
         shell: bash
         # Unquoted on purpose: several arguments.
         run: cargo test --locked $TEST_ARGS
-      - name: Release the cache slot
-        if: ${{ always() && steps.cache-volume.outputs.claim != '' }}
-        env:
-          CLAIM: ${{ steps.cache-volume.outputs.claim }}
+      # Never fails the job. A server that restarted during the job counts only
+      # what it served since.
+      - name: sccache statistics
+        if: ${{ always() && env.RUSTC_WRAPPER == 'sccache' }}
+        continue-on-error: true
         shell: bash
         run: |
-          # This job's verified archives, for the next job to check and copy.
-          home="${CARGO_HOME:-$HOME/.cargo}"
-          cp -rn "$home/registry/cache/." /cache/cargo/registry/cache/ 2>/dev/null || true
-          rmdir "$CLAIM"
+          stats=$(sccache --show-stats 2>&1) || true
+          {
+            echo '### sccache'
+            echo '```'
+            echo "$stats"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$stats" | grep -E 'Cache (hits|misses|errors)|Compile requests executed' || true
 
   css:
     if: ${{ inputs.css-script != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
