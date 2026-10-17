@@ -199,7 +199,9 @@ jobs:
       # than this checkout, so the checkout is dated to the claim: every build in the
       # slot before it is older, so this repository's crates rebuild once and its
       # dependencies come from the cache. Anything unused for a week is removed. With
-      # no volume, or every slot taken, the GitHub cache is used instead.
+      # no volume, every slot taken, or a write to the volume failing (a full disk,
+      # which the writable check passes while the directories exist), the GitHub
+      # cache is used instead.
       - name: Cargo cache volume
         id: cache-volume
         shell: bash
@@ -207,6 +209,13 @@ jobs:
           CONTAINER: ${{ inputs.container }}
         run: |
           github_cache() { echo "$1: using the GitHub cache"; exit 0; }
+          # A write on the volume failed: give back the slot, if one was claimed, and
+          # fall back rather than fail the job.
+          volume_failed() {
+            echo "::warning::$1 on /cache failed (full?); using the GitHub cache"
+            [ -z "${slot:-}" ] || rmdir "$slots/$slot.claim" 2>/dev/null || true
+            exit 0
+          }
           [ -d /cache ] || github_cache "no /cache volume"
           mkdir -p /cache/cargo/registry /cache/cargo/git /cache/target 2>/dev/null \
             && touch /cache/cargo/.package-cache /cache/cargo/.package-cache-mutate 2>/dev/null \
@@ -214,7 +223,7 @@ jobs:
             || github_cache "/cache is not writable"
           key=$( { rustc -vV; cat /etc/os-release 2>/dev/null || true; echo "$CONTAINER"; } | sha256sum | cut -c1-12)
           slots="/cache/target/$GITHUB_REPOSITORY/$key"
-          mkdir -p "$slots"
+          mkdir -p "$slots" || volume_failed "creating $slots"
           # Key and slot dirs unused for a week, in any repository, unless claimed.
           find /cache/target -mindepth 3 -maxdepth 4 -type d ! -name '*.claim' -mtime +7 -print0 \
             2>/dev/null | while IFS= read -r -d '' d; do
@@ -226,17 +235,16 @@ jobs:
             # job's mv wins, so two can't both take it over.
             if [ -n "$(find "$slots/$n.claim" -maxdepth 0 -mmin +360 2>/dev/null)" ] \
               && mv "$slots/$n.claim" "$slots/$n.stale.$$" 2>/dev/null; then
-              rmdir "$slots/$n.stale.$$"
+              rmdir "$slots/$n.stale.$$" 2>/dev/null || true
             fi
             if mkdir "$slots/$n.claim" 2>/dev/null; then slot=$n; break; fi
           done
           [ -n "$slot" ] || github_cache "every cache slot for $GITHUB_REPOSITORY is in use"
-          echo "claim=$slots/$slot.claim" >> "$GITHUB_OUTPUT"
           target="$slots/$slot"
-          mkdir -p "$target" && touch "$slots" "$target"
+          { mkdir -p "$target" && touch "$slots" "$target"; } || volume_failed "preparing $target"
           if [ "$(du -sk "$target" | cut -f1)" -gt $((20 * 1024 * 1024)) ]; then
             echo "$target passed 20 GiB: starting it over"
-            rm -rf "$target" && mkdir -p "$target"
+            { rm -rf "$target" && mkdir -p "$target"; } || volume_failed "starting $target over"
           fi
           home="${CARGO_HOME:-$HOME/.cargo}"
           # Shared: the index and git databases (git checks its own objects). Not
@@ -253,7 +261,11 @@ jobs:
           # under a cargo home of the job's own, below). The slot's
           # release adds this job's archives back for the next.
           mkdir -p "$home/registry/cache" "$home/git" /cache/cargo/registry/index \
-            /cache/cargo/registry/cache /cache/cargo/git/db
+            /cache/cargo/registry/cache /cache/cargo/git/db \
+            || volume_failed "creating the shared cargo directories"
+          # Only now does the job build in the slot, and "Release the cache slot"
+          # gives it back. Before here, a failed write gave it back itself.
+          echo "claim=$slots/$slot.claim" >> "$GITHUB_OUTPUT"
           for f in registry/index git/db .package-cache .package-cache-mutate; do
             rm -rf "${home:?}/${f:?}"
             ln -s "/cache/cargo/$f" "$home/$f"
