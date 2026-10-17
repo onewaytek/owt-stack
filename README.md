@@ -2559,6 +2559,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - `owt_accounts::Refused` has a new variant, `NoPasswordSignIn` (`store::set_password`
   on an account whose password sign-in is off). `Refused` is not `#[non_exhaustive]`:
   an exhaustive `match` on it adds an arm.
+- `owt_accounts::social::Connections` has a lifetime, `Connections<'a>`, for the words
+  it draws with: a field or return type naming it becomes `Connections<'static>`.
+- Move the npm stylesheet package with
+  `npm install -D github:onewaytek/owt-stack#v0.6.0`, not by editing the tag in
+  `package.json`: a plain `npm install` keeps the old commit in `package-lock.json`.
 - **Re-applying the OpenShift template:** pass `-p POSTGRES_MAJOR=<the major the
   cluster runs>`, and keep compose and CI's `postgres-major` on it. The default, 18,
   upgrades an older cluster in place (or is refused before CNPG 1.26). Moving to a
