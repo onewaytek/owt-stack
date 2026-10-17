@@ -710,6 +710,332 @@ async fn an_identity_arrives_by_its_subject_or_creates_an_account() {
     db.drop().await;
 }
 
+/// An account an app reaches by a key and subject of its own: found and created with
+/// no provider, apart from every provider's subjects, and opened by no password.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one account's ways in, and out")]
+async fn a_local_identity_reaches_an_account_no_password_opens() {
+    use identities::Arrival;
+    use owt_accounts::Refused;
+    let db = db!();
+    // Found only: nothing yet.
+    let arrival = identities::arrive_as(&db.pool, "kiosk", "desk-1", None)
+        .await
+        .unwrap();
+    assert_eq!(arrival, Arrival::Unknown);
+
+    // Created under the name given (a number after it when taken), with no email.
+    store::create(&db.pool, new("front-desk", "", None))
+        .await
+        .unwrap();
+    let arrival = identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("Front-Desk"))
+        .await
+        .unwrap();
+    let Arrival::Created(desk) = arrival else {
+        panic!("{arrival:?}")
+    };
+    assert_eq!(
+        (desk.username.as_str(), desk.email.as_str()),
+        ("front-desk2", "")
+    );
+    let again = identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("front-desk"))
+        .await
+        .unwrap();
+    assert_eq!(again, Arrival::Known(desk.clone()));
+
+    // The subject is the key's alone: under another key, or at a provider whose key
+    // is the same word, it is someone else.
+    let other = identities::arrive_as(&db.pool, "system", "desk-1", Some("jobs"))
+        .await
+        .unwrap();
+    assert_ne!(other.account().map(|a| a.id), Some(desk.id));
+    let local = identities::arrive_as(&db.pool, "google", "g1", Some("local"))
+        .await
+        .unwrap();
+    let open = identities::Welcome {
+        create: true,
+        record_email: false,
+    };
+    let google = oauth::google();
+    let stranger = identities::arrive(&db.pool, &google, &identity("g1", None, true), open)
+        .await
+        .unwrap();
+    assert!(matches!(stranger, Arrival::Created(_)), "{stranger:?}");
+    assert_ne!(stranger.account(), local.account());
+    // And no provider's list or check sees one.
+    assert_eq!(identities::list(&db.pool, desk.id).await.unwrap(), []);
+    assert_eq!(
+        identities::unconfigured(&db.pool, &[&google])
+            .await
+            .unwrap(),
+        []
+    );
+
+    // No password opens it, by name or email, and none can be set.
+    assert!(!store::has_password(&db.pool, desk.id).await.unwrap());
+    let err = store::set_password(&db.pool, &desk, "a good long passphrase")
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&Refused::NoPasswordSignIn));
+    store::set_email(&db.pool, desk.id, "desk@example.com")
+        .await
+        .unwrap();
+    assert!(
+        store::by_email(&db.pool, "desk@example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Written around the library, the hash is refused too.
+    let err = sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+        .bind(desk.id)
+        .bind(
+            owt_auth::password::hash("a good long passphrase")
+                .await
+                .unwrap(),
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap_err();
+    assert!(
+        err.as_database_error()
+            .is_some_and(sqlx::error::DatabaseError::is_check_violation),
+        "{err}"
+    );
+
+    // Turned on, a password can be set and opens it; turned off, it is gone, the
+    // sessions with it.
+    store::set_password_sign_in(&db.pool, desk.id, true)
+        .await
+        .unwrap();
+    assert!(
+        store::set_password(&db.pool, &desk, "a good long passphrase")
+            .await
+            .unwrap()
+    );
+    for login in ["front-desk2", "desk@example.com"] {
+        assert!(
+            store::authenticate(&db.pool, login, "a good long passphrase")
+                .await
+                .unwrap()
+                .is_some(),
+            "{login}"
+        );
+    }
+    // A link handed out while passwords opened it (a lost-password one, say).
+    let old_link = links::mint(&db.pool, desk.id, Duration::from_secs(900), "lost")
+        .await
+        .unwrap();
+    let before = store::by_id(&db.pool, desk.id).await.unwrap().unwrap();
+    store::set_password_sign_in(&db.pool, desk.id, false)
+        .await
+        .unwrap();
+    let after = store::by_id(&db.pool, desk.id).await.unwrap().unwrap();
+    assert_eq!(after.session_epoch, before.session_epoch + 1);
+    let err = links::redeem(&db.pool, &old_link.token, "203.0.113.9")
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&Refused::Link));
+    // One an operator mints after still opens it, and turning it off again voids
+    // nothing and moves nothing.
+    let new_link = links::mint(&db.pool, desk.id, Duration::from_secs(900), "kiosk")
+        .await
+        .unwrap();
+    assert!(!store::has_password(&db.pool, desk.id).await.unwrap());
+    for login in ["front-desk2", "desk@example.com"] {
+        assert!(
+            store::authenticate(&db.pool, login, "a good long passphrase")
+                .await
+                .unwrap()
+                .is_none(),
+            "{login}"
+        );
+    }
+    store::set_password_sign_in(&db.pool, desk.id, false)
+        .await
+        .unwrap();
+    let still = store::by_id(&db.pool, desk.id).await.unwrap().unwrap();
+    assert_eq!(still.session_epoch, after.session_epoch);
+    let opened = links::redeem(&db.pool, &new_link.token, "203.0.113.9")
+        .await
+        .unwrap();
+    assert_eq!(opened.id, desk.id);
+    // The local identity still reaches it.
+    let back = identities::arrive_as(&db.pool, "kiosk", "desk-1", None)
+        .await
+        .unwrap();
+    assert_eq!(back.account().map(|a| a.id), Some(desk.id));
+
+    // Nobody, and a name the rules refuse.
+    for (key, subject) in [("", "desk-1"), ("kiosk", "")] {
+        let err = identities::arrive_as(&db.pool, key, subject, Some("desk"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.refused(), Some(&Refused::NoSubject));
+    }
+    let err = identities::arrive_as(&db.pool, "kiosk", "desk-2", Some("front desk"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&Refused::Username));
+
+    // A deactivated account's local identity signs nobody in.
+    store::set_active(&db.pool, desk.id, false).await.unwrap();
+    let arrival = identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("front-desk"))
+        .await
+        .unwrap();
+    assert_eq!(arrival, Arrival::Unknown);
+    db.drop().await;
+}
+
+/// Two first arrivals with one local identity at once make one account.
+#[tokio::test]
+async fn racing_local_arrivals_make_one_account() {
+    let db = db!();
+    let arrive = || identities::arrive_as(&db.pool, "kiosk", "desk-9", Some("desk"));
+    let (a, b) = tokio::join!(arrive(), arrive());
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let (Some(a), Some(b)) = (a.account(), b.account()) else {
+        panic!("{a:?} {b:?}")
+    };
+    assert_eq!(a.id, b.id);
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(accounts, 1);
+    db.drop().await;
+}
+
+/// A local identity is a way in: a provider linked beside it can be removed. Retired,
+/// the pair reaches nothing, and what it opened is closed.
+#[tokio::test]
+async fn a_local_identity_is_a_way_in_until_it_is_forgotten() {
+    let db = db!();
+    let arrival = identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("desk"))
+        .await
+        .unwrap();
+    let desk = arrival.account().unwrap().clone();
+    let google = identities::link(
+        &db.pool,
+        desk.id,
+        &oauth::google(),
+        &identity("g1", None, true),
+    )
+    .await
+    .unwrap();
+    assert!(
+        identities::unlink(&db.pool, desk.id, google.id)
+            .await
+            .unwrap()
+    );
+
+    let link = links::mint(&db.pool, desk.id, Duration::from_secs(900), "setup")
+        .await
+        .unwrap();
+    assert_eq!(
+        identities::forget_as(&db.pool, "kiosk", "desk-1")
+            .await
+            .unwrap(),
+        Some(desk.id)
+    );
+    assert_eq!(
+        identities::forget_as(&db.pool, "kiosk", "desk-1")
+            .await
+            .unwrap(),
+        None
+    );
+    let after = store::by_id(&db.pool, desk.id).await.unwrap().unwrap();
+    assert_eq!(after.session_epoch, desk.session_epoch + 1);
+    let err = links::redeem(&db.pool, &link.token, "203.0.113.9")
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::Link));
+    let arrival = identities::arrive_as(&db.pool, "kiosk", "desk-1", None)
+        .await
+        .unwrap();
+    assert_eq!(arrival, identities::Arrival::Unknown);
+    // Enrolled again, it is a new account: nothing of the old one carries over.
+    let again = identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("desk"))
+        .await
+        .unwrap();
+    assert_ne!(again.account().map(|a| a.id), Some(desk.id));
+    db.drop().await;
+}
+
+/// A password sign-in under way when password sign-in is turned off does not stand.
+#[tokio::test]
+async fn a_sign_in_in_flight_does_not_outlive_password_sign_in() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    // Turned off in a transaction not yet committed: the sign-in reads the row as it
+    // was (on, with the hash), checks the password, and its last statement waits on
+    // the row's lock.
+    let mut off = db.pool.begin().await.unwrap();
+    let off_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *off)
+        .await
+        .unwrap();
+    store::set_password_sign_in(&mut *off, ada.id, false)
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let signing_in =
+        tokio::spawn(
+            async move { store::authenticate(&pool, "ada", "correct horse battery").await },
+        );
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                            WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(off_pid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting {
+            break;
+        }
+        assert!(
+            !signing_in.is_finished(),
+            "the sign-in never reached the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    off.commit().await.unwrap();
+    assert_eq!(signing_in.await.unwrap().unwrap(), None);
+    db.drop().await;
+}
+
+/// Staff cannot give a password to an account that signs in without one.
+#[tokio::test]
+async fn the_admin_sets_no_password_where_password_sign_in_is_off() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(admin_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let arrival = identities::arrive_as(&db.pool, "system", "jobs", Some("jobs"))
+        .await
+        .unwrap();
+    let jobs = arrival.account().unwrap();
+    let r = client
+        .post_form(&format!("/staff/accounts/{}/password", jobs.id), &[])
+        .await;
+    assert_eq!(r.status, 409);
+    assert!(
+        r.text().contains("does not sign in with a password"),
+        "{}",
+        r.text()
+    );
+    assert!(!store::has_password(&db.pool, jobs.id).await.unwrap());
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn the_last_way_in_cannot_be_unlinked() {
     let db = db!();
@@ -3410,6 +3736,15 @@ async fn the_schema_refuses_rows_the_library_would_misread() {
         "INSERT INTO account_identities (account_id, provider, subject) VALUES ($1, 'google', '')",
     )
     .await;
+    refused(
+        "INSERT INTO account_local_identities (account_id, key, subject) VALUES ($1, 'kiosk', '')",
+    )
+    .await;
+    refused(
+        "UPDATE accounts SET password_sign_in = false, password_hash = '$argon2id$v=19$x'
+         WHERE id = $1",
+    )
+    .await;
     // And what the library writes, it takes.
     links::mint(&db.pool, ada.id, links::MAX_TTL, "longest")
         .await
@@ -3494,13 +3829,16 @@ async fn existing_rows_come_through_the_constraints_migration() {
     .await
     .unwrap();
 
-    // As sqlx runs a migration: in a transaction.
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::raw_sql(sqlx::AssertSqlSafe(ALL[2].sql))
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    // As sqlx runs each migration: in a transaction. The later ones too, which the
+    // library reads.
+    for migration in &ALL[2..] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(migration.sql))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
     let done = complete(&pool).await.unwrap();
     let renamed = |id, from: &str, to: &str| Renamed {
         id,
@@ -3601,6 +3939,42 @@ async fn existing_rows_come_through_the_constraints_migration() {
     drop_schema.await;
 }
 
+/// A database at 0004 comes through 0005: every account keeps password sign-in, and
+/// `complete` validates the constraint it adds.
+#[tokio::test]
+async fn existing_accounts_keep_password_sign_in_through_the_local_migration() {
+    use owt_accounts::migrations::{ALL, complete};
+    let Some((pool, drop_schema)) = schema_after(&ALL[..4]).await else {
+        return;
+    };
+    complete(&pool).await.unwrap();
+    let ada = store::create(&pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(ALL[4].sql))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let done = complete(&pool).await.unwrap();
+    assert!(done.validated, "{done:?}");
+    let opened = store::authenticate(&pool, "ada", "correct horse battery")
+        .await
+        .unwrap();
+    assert_eq!(opened.map(|a| a.id), Some(ada.id));
+    let unvalidated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+         WHERE NOT convalidated AND connamespace = current_schema()::regnamespace",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unvalidated, 0);
+    pool.close().await;
+    drop_schema.await;
+}
+
 /// A schema of its own with these migrations applied, as a database that stopped at
 /// them; and the future that drops it.
 async fn schema_after(
@@ -3697,6 +4071,42 @@ async fn every_name_the_migrations_take_is_checked() {
     };
     assert_eq!(held("table"), relations);
     assert_eq!(held("function"), functions);
+    db.drop().await;
+}
+
+/// A column or constraint a pending migration adds to `accounts`, which the app
+/// added first under the same name, is named too.
+#[tokio::test]
+async fn a_column_the_migrations_add_is_named_when_held() {
+    let db = db!();
+    // As a database that stopped before 0005, whose app then added a column of the
+    // name 0005 takes, and a constraint.
+    sqlx::raw_sql(
+        "DROP TABLE account_local_identities;
+         ALTER TABLE accounts DROP COLUMN password_sign_in;
+         DELETE FROM _sqlx_migrations WHERE version = 5;
+         ALTER TABLE accounts ADD COLUMN password_sign_in text,
+             ADD CONSTRAINT accounts_password_sign_in_hash CHECK (true);",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let found = owt_accounts::migrations::conflicts(&db.pool).await.unwrap();
+    let named: Vec<(&str, &str, &str)> = found
+        .iter()
+        .map(|c| (c.migration, c.name, c.held_by))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("owt_accounts_local", "accounts.password_sign_in", "column"),
+            (
+                "owt_accounts_local",
+                "accounts.accounts_password_sign_in_hash",
+                "constraint"
+            ),
+        ]
+    );
     db.drop().await;
 }
 

@@ -52,6 +52,10 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_policies",
         sql: include_str!("../migrations/0004_policies.sql"),
     },
+    Migration {
+        name: "owt_accounts_local",
+        sql: include_str!("../migrations/0005_local_identities.sql"),
+    },
 ];
 
 /// What [`complete`] changed, for the operator to read (it is logged too). An owner
@@ -89,12 +93,14 @@ pub struct Renamed {
     pub to: String,
 }
 
-/// The constraints `0003` adds `NOT VALID`, by table, validated once the rows hold them.
+/// The constraints `0003` and `0005` add `NOT VALID`, by table, validated once the rows
+/// hold them.
 const DEFERRED: &[(&str, &str)] = &[
     ("accounts", "accounts_password_hash_form"),
     ("accounts", "accounts_username_nfkc"),
     ("accounts", "accounts_email_form"),
     ("accounts", "accounts_session_epoch_check"),
+    ("accounts", "accounts_password_sign_in_hash"),
     ("account_identities", "account_identities_named"),
     ("sign_in_links", "sign_in_links_lifetime"),
     ("sign_in_links", "sign_in_links_digest"),
@@ -118,10 +124,10 @@ const DEFERRED: &[(&str, &str)] = &[
 ///   carries its id, so only new names are held to the rule.
 ///
 /// Then identities with no subject are deleted, sign-in links are cut to 30 days,
-/// and the constraints `0003` added are validated (which locks no writer out). Call
-/// it at every start: once done it reads one index and the catalog. An account it
-/// cannot complete is logged and left for the next call; it never fails the start
-/// over one row.
+/// and the constraints `0003` and `0005` added are validated (which locks no writer
+/// out). Call it at every start: once done it reads one index and the catalog. An
+/// account it cannot complete is logged and left for the next call; it never fails
+/// the start over one row.
 ///
 /// # Errors
 ///
@@ -375,6 +381,7 @@ const SHIPPED_SHA256: &[&str] = &[
     "0e6d42a67ddabfb50f56650fe85ff0bc810c4b3230a1115706db467ea27b2338",
     "4e910454cfdd01ef4559772fd8b4140f39d887383ebb2de06c920924161152e0",
     "629cca392e80505f93a71a9eb9d13683ef82f31790d682363d346ebfb2f32f52",
+    "2952542fa9af6f8c1c7ee21987676fd1ed42cb0d18c752b485d4f315f4eccb18",
 ];
 
 /// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;
@@ -477,6 +484,14 @@ const RELATIONS: &[(&str, &[&str])] = &[
             "policy_acceptance_events_account",
         ],
     ),
+    (
+        "owt_accounts_local",
+        &[
+            "account_local_identities",
+            "account_local_identities_pkey",
+            "account_local_identities_account",
+        ],
+    ),
 ];
 
 /// The functions (of no arguments) each of [`ALL`] creates, by migration.
@@ -485,6 +500,35 @@ const FUNCTIONS: &[(&str, &[&str])] = &[(
     &["policy_versions_immutable", "policy_versions_keep_current"],
 )];
 
+/// The columns each of [`ALL`] adds to a table an earlier one created, as
+/// `table.column`, by migration.
+const COLUMNS: &[(&str, &[&str])] = &[
+    ("owt_accounts_constraints", &["accounts.username_skeleton"]),
+    ("owt_accounts_local", &["accounts.password_sign_in"]),
+];
+
+/// The constraints each of [`ALL`] adds to a table an earlier one created, as
+/// `table.constraint`, by migration.
+const CONSTRAINTS: &[(&str, &[&str])] = &[
+    (
+        "owt_accounts_constraints",
+        &[
+            "accounts.accounts_username_skeleton_form",
+            "accounts.accounts_password_hash_form",
+            "accounts.accounts_username_nfkc",
+            "accounts.accounts_email_form",
+            "accounts.accounts_session_epoch_check",
+            "account_identities.account_identities_named",
+            "sign_in_links.sign_in_links_lifetime",
+            "sign_in_links.sign_in_links_digest",
+        ],
+    ),
+    (
+        "owt_accounts_local",
+        &["accounts.accounts_password_sign_in_hash"],
+    ),
+];
+
 /// A name one of [`ALL`] takes that something of the app's already holds, from
 /// [`conflicts`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -492,12 +536,12 @@ const FUNCTIONS: &[(&str, &[&str])] = &[(
 pub struct Conflict {
     /// The migration that takes the name ([`Migration::name`]).
     pub migration: &'static str,
-    /// The name.
+    /// The name; a column or constraint's as `table.name`.
     pub name: &'static str,
     /// The schema it is held in: the one the migrations create their objects in.
     pub schema: String,
     /// What holds it now: `table`, `index`, `sequence`, `view`, `materialized view`,
-    /// `foreign table`, `type` or `function`.
+    /// `foreign table`, `type`, `function`, `column` or `constraint`.
     pub held_by: &'static str,
 }
 
@@ -522,8 +566,10 @@ impl std::fmt::Display for Conflict {
 /// A migration sqlx's ledger (`_sqlx_migrations`, found on the `search_path` as sqlx
 /// finds it) records as applied, by its checksum, is installed, and what it created
 /// is the library's own; the names of every other migration are checked against the
-/// tables, indexes, sequences, views, types and functions there. A held table or
-/// index name fails that migration at `CREATE`; a held name Postgres would have
+/// tables, indexes, sequences, views, types and functions there, and the columns and
+/// constraints it adds to an existing table (an `accounts.password_sign_in` of the
+/// app's own) against that table's. A held table, index, column or constraint name
+/// fails that migration; a held name Postgres would have
 /// picked itself (a key's index, an identity's sequence) is taken silently with a
 /// suffix instead, so the library no longer recognizes the key. Call it when the
 /// migrations fail, to say why, or from a test against a copy of the app's schema
@@ -571,13 +617,18 @@ pub async fn conflicts(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Conflict>> {
         };
     let relations = names(RELATIONS);
     let functions = names(FUNCTIONS);
-    if relations.is_empty() && functions.is_empty() {
+    let columns = names(COLUMNS);
+    let constraints = names(CONSTRAINTS);
+    if [&relations, &functions, &columns, &constraints]
+        .iter()
+        .all(|n| n.is_empty())
+    {
         return Ok(Vec::new());
     }
 
     // What holds each name in the current schema: a relation (by its kind; a
-    // composite type is one too), another type (`T`), or a function of no arguments
-    // (`F`).
+    // composite type is one too), another type (`T`), a function of no arguments
+    // (`F`), or a column (`C`) or constraint (`K`) of the table named before the dot.
     let held: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT current_schema()::text, relname::text, relkind::text FROM pg_class
          WHERE relnamespace = current_schema()::regnamespace AND relname = ANY($1)
@@ -588,17 +639,37 @@ pub async fn conflicts(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Conflict>> {
          UNION ALL
          SELECT current_schema()::text, proname::text, 'F' FROM pg_proc
          WHERE pronamespace = current_schema()::regnamespace AND pronargs = 0
-           AND proname = ANY($2)",
+           AND proname = ANY($2)
+         UNION ALL
+         SELECT current_schema()::text, m.name, 'C' FROM unnest($3::text[]) AS m(name)
+         JOIN pg_attribute a
+           ON a.attrelid = to_regclass(quote_ident(current_schema()) || '.'
+                                       || quote_ident(split_part(m.name, '.', 1)))
+          AND a.attname = split_part(m.name, '.', 2) AND a.attnum > 0 AND NOT a.attisdropped
+         UNION ALL
+         SELECT current_schema()::text, m.name, 'K' FROM unnest($4::text[]) AS m(name)
+         JOIN pg_constraint k
+           ON k.conrelid = to_regclass(quote_ident(current_schema()) || '.'
+                                       || quote_ident(split_part(m.name, '.', 1)))
+          AND k.conname = split_part(m.name, '.', 2)",
     )
     .bind(relations.iter().map(|(_, n)| *n).collect::<Vec<_>>())
     .bind(functions.iter().map(|(_, n)| *n).collect::<Vec<_>>())
+    .bind(columns.iter().map(|(_, n)| *n).collect::<Vec<_>>())
+    .bind(constraints.iter().map(|(_, n)| *n).collect::<Vec<_>>())
     .fetch_all(pool)
     .await?;
 
+    let every = || {
+        relations
+            .iter()
+            .chain(&functions)
+            .chain(&columns)
+            .chain(&constraints)
+    };
     let mut found = Vec::new();
     for (schema, name, kind) in held {
-        let Some(&(migration, name)) = relations.iter().chain(&functions).find(|(_, n)| *n == name)
-        else {
+        let Some(&(migration, name)) = every().find(|(_, n)| *n == name) else {
             continue;
         };
         found.push(Conflict {
@@ -613,17 +684,14 @@ pub async fn conflicts(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Conflict>> {
                 "m" => "materialized view",
                 "f" => "foreign table",
                 "F" => "function",
+                "C" => "column",
+                "K" => "constraint",
                 _ => "type",
             },
         });
     }
     // In the order the migrations take the names.
-    found.sort_by_key(|c| {
-        relations
-            .iter()
-            .chain(&functions)
-            .position(|(_, n)| *n == c.name)
-    });
+    found.sort_by_key(|c| every().position(|(_, n)| *n == c.name));
     Ok(found)
 }
 
@@ -669,6 +737,8 @@ mod tests {
         std::fs::write(&constraints, ALL[2].sql).unwrap();
         let policies = dir.join("0004_owt_accounts_policies.sql");
         std::fs::write(&policies, ALL[3].sql).unwrap();
+        let local = dir.join("0005_owt_accounts_local.sql");
+        std::fs::write(&local, ALL[4].sql).unwrap();
         assert_installed(&dir);
         std::fs::write(&file, format!("{}\n-- edited", ALL[0].sql)).unwrap();
         let err = std::panic::catch_unwind(|| assert_installed(&dir)).unwrap_err();
@@ -684,6 +754,7 @@ mod tests {
         std::fs::remove_file(&roles).unwrap();
         std::fs::remove_file(&constraints).unwrap();
         std::fs::remove_file(&policies).unwrap();
+        std::fs::remove_file(&local).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }
 }

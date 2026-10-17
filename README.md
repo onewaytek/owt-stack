@@ -8,7 +8,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
-| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; sign-in with a provider (routes, configuration, buttons, connections) |
+| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -625,7 +625,7 @@ itself (an `owt-auth` dependency with default features does; see above).
 **Tables:** write each of `owt_accounts::migrations::ALL`, in order, to the app's
 `migrations/`. A new app writes them first (`0001_owt_accounts.sql`,
 `0002_owt_accounts_roles.sql`, `0003_owt_accounts_constraints.sql`,
-`0004_owt_accounts_policies.sql`), since its
+`0004_owt_accounts_policies.sql`, `0005_owt_accounts_local.sql`), since its
 tables reference `accounts(id)`. An app that has migrations of its own gives a newly
 released entry its next unused version (`0007_owt_accounts_roles.sql` after its
 `0006_…`), never a number already applied: sqlx refuses a file whose version it ran
@@ -638,8 +638,8 @@ checksum differing from the applied one): a later release appends a new entry to
 `ALL`, and a test here pins each file's SHA-256. A migration moves the rows
 already there along with the schema, so a database that has run the library for years
 ends in the state a new one starts in. The constraints hold what the library assumes
-(names in stored form, Argon2 hashes or none, links of 30 days at most, non-empty
-subjects), so a row written around it (an import, a console) cannot be one it would
+(names in stored form, Argon2 hashes or none, no hash where password sign-in is off,
+links of 30 days at most, non-empty subjects), so a row written around it (an import, a console) cannot be one it would
 misread. After the migrations run, at every start and before serving, the app awaits
 `owt_accounts::migrations::complete(&pool)`: it moves rows made before a migration
 to the stored form (in Rust, as sign-in normalizes) and validates the constraints
@@ -659,17 +659,18 @@ for r in &done.renamed {
 **Names the migrations take**, in the schema they run in (the first on the
 `search_path`, usually `public`):
 
-| Migration | Tables | Indexes and sequences | Functions |
-|---|---|---|---|
-| `owt_accounts` | `accounts`, `account_identities`, `sign_in_links` | `accounts_pkey`, `accounts_id_seq`, `accounts_username_key`, `accounts_email_key`, `account_identities_pkey`, `account_identities_id_seq`, `account_identities_provider_subject_key`, `account_identities_account`, `sign_in_links_pkey`, `sign_in_links_account` | |
-| `owt_accounts_roles` | `account_roles` | `account_roles_pkey`, `account_roles_role` | |
-| `owt_accounts_constraints` | | `accounts_username_skeleton_key` | |
-| `owt_accounts_policies` | `policy_versions`, `policy_acceptances`, `policy_acceptance_events` | `policy_versions_pkey`, `policy_versions_id_seq`, `policy_versions_kind_version_key`, `policy_acceptances_pkey`, `policy_acceptances_version`, `policy_acceptance_events_pkey`, `policy_acceptance_events_id_seq`, `policy_acceptance_events_account` | `policy_versions_immutable()`, `policy_versions_keep_current()` |
+| Migration | Tables | Indexes and sequences | Functions | Added to an earlier table |
+|---|---|---|---|---|
+| `owt_accounts` | `accounts`, `account_identities`, `sign_in_links` | `accounts_pkey`, `accounts_id_seq`, `accounts_username_key`, `accounts_email_key`, `account_identities_pkey`, `account_identities_id_seq`, `account_identities_provider_subject_key`, `account_identities_account`, `sign_in_links_pkey`, `sign_in_links_account` | | |
+| `owt_accounts_roles` | `account_roles` | `account_roles_pkey`, `account_roles_role` | | |
+| `owt_accounts_constraints` | | `accounts_username_skeleton_key` | | `accounts.username_skeleton`; constraints `accounts_username_skeleton_form`, `accounts_password_hash_form`, `accounts_username_nfkc`, `accounts_email_form`, `accounts_session_epoch_check` on `accounts`, `account_identities_named` on `account_identities`, `sign_in_links_lifetime` and `sign_in_links_digest` on `sign_in_links` |
+| `owt_accounts_policies` | `policy_versions`, `policy_acceptances`, `policy_acceptance_events` | `policy_versions_pkey`, `policy_versions_id_seq`, `policy_versions_kind_version_key`, `policy_acceptances_pkey`, `policy_acceptances_version`, `policy_acceptance_events_pkey`, `policy_acceptance_events_id_seq`, `policy_acceptance_events_account` | `policy_versions_immutable()`, `policy_versions_keep_current()` | |
+| `owt_accounts_local` | `account_local_identities` | `account_local_identities_pkey`, `account_local_identities_account` | | `accounts.password_sign_in`; constraint `accounts_password_sign_in_hash` on `accounts` |
 
 Each table is also a type of its name, and its triggers and constraints are its own.
 An app that already has any of these names (a table, view, index, sequence, type or
-function) renames its own first, in a migration of its own placed before
-owt-accounts' files. A taken table or index name fails the migration at `CREATE`; a
+function, or a column or constraint of that name on the table named) renames its own
+first, in a migration of its own placed before owt-accounts' files. A taken table or index name fails the migration at `CREATE`; a
 taken key index or sequence name is worse: Postgres gives the library's a suffix
 silently, and the library no longer recognizes a taken username. Renaming a table
 keeps the names of its indexes and sequences, so rename those
@@ -712,6 +713,48 @@ is the namespace its subjects are trusted in, so two configurations naming one i
 share people. `identities::list` returns `Linked::provider` as stored, the issuer's
 URL for an OIDC provider and the id (`google`) for a preset; match it against
 `Provider::key()`, not `Provider::id`.
+
+**Local and system accounts have no provider and no password.** An app that vouches
+for someone itself (its own check: a kiosk's code, a device it enrolled) or keeps an
+account its jobs act as reaches it with `identities::arrive_as(&pool, key, subject,
+create)`: `key` is a namespace of the app's own and `subject` an id in it. These
+local identities are stored apart from providers' identities, so no provider's
+subject ever matches one (a key of `google` is not Google's), and `identities::list`,
+`unconfigured` and the connections page never show one. Given a username, an unknown
+pair creates an account under it (a number after it when taken) with no email and
+**password sign-in off**; given `None`, it finds only. With password sign-in off,
+`store::authenticate` never finds the account, by username or email, `store::by_email`
+does not either (so a reset by email cannot reach it), and `store::set_password`
+refuses it with `Refused::NoPasswordSignIn` (the admin's generated password too).
+`store::set_password_sign_in(&pool, id, false)` turns it off for any account,
+clearing its password and signing it out everywhere (its sessions end and its unused
+sign-in links are void); turning it back on sets no password. A sign-in link an
+operator mints after that still opens such an account. A local identity is a way in,
+so `identities::unlink` lets a provider beside one go. `identities::forget_as(&pool,
+key, subject)` retires one (a device lost or re-enrolled): the pair reaches nothing
+after, and the account it reached is signed out everywhere, links voided, but kept
+(deactivate it too to retire it whole). `arrive_as_in` works in the app's
+transaction, as `arrive_in` does.
+
+```rust,no_run
+# async fn demo(
+#     pool: sqlx::PgPool, session: owt_web::session::Session<owt_accounts::session::Data>,
+#     device: &str, id: i64,
+# ) -> anyhow::Result<()> {
+use owt_accounts::{identities, session, store};
+// The app's own check passed for this device: its account, made at first use.
+let arrival = identities::arrive_as(&pool, "kiosk", device, Some("kiosk")).await?;
+if let Some(account) = arrival.account() {
+    session::sign_in(&session, account);
+}
+// The account the app's jobs act as, found or made at start.
+let jobs = identities::arrive_as(&pool, "system", "jobs", Some("jobs")).await?;
+// An existing account that no password opens any more.
+store::set_password_sign_in(&pool, id, false).await?;
+// The device was lost: its pair reaches nothing now, and its sessions are over.
+let _retired: Option<i64> = identities::forget_as(&pool, "kiosk", device).await?;
+# let _ = jobs; Ok(()) }
+```
 
 **Upgrading from 0.4 (roles and admin):** install `ALL[1]` (roles) as the app's next
 migration (above). `Account` gains `roles`, read by `store::COLUMNS`, now public; a
@@ -778,12 +821,12 @@ every name made after.
   throttle with the account's id once the login resolves.
 - Everything that revokes an account's sessions moves `accounts.session_epoch`
   (`sign_out_everywhere`, `set_password` and `change_password`, deactivating,
-  revoking staff), and nothing else does. An app that keeps something per account
+  revoking staff, turning password sign-in off), and nothing else does. An app that keeps something per account
   that must go with the sessions (a provider's tokens, sealed) puts a trigger on
   that column in a migration of its own, so it goes in the same transaction
   whichever path revoked, the staff pages and a console included. The `WHEN` clause
-  matters: `set_active` and `set_staff` write the column even when it does not
-  change.
+  matters: `set_active`, `set_staff` and `set_password_sign_in` write the column
+  even when it does not change.
 
 ```sql
 -- migrations/0009_provider_tokens.sql (the app's next unused version)
@@ -953,8 +996,9 @@ everywhere; remove a sign-in connection). Lists show `admin::PER_PAGE` accounts 
 
 - **Who:** only `Staff`, and each change re-checks inside its transaction that its
   author is still active staff (locking both rows, so two staff removing each other at
-  once cannot leave none). It refuses your own staff access, deactivating yourself and
-  unlinking an account's last way in.
+  once cannot leave none). It refuses your own staff access, deactivating yourself,
+  unlinking an account's last way in and a password for an account whose password
+  sign-in is off.
 - **From where:** the routes refuse a cross-origin `POST` themselves, with
   `owt_web::csrf::CrossOrigin`, whatever the app layers: `SameSite=Lax` alone lets a
   sibling subdomain post.
@@ -2446,6 +2490,17 @@ The router example under "Wiring an app" composes the layers; beyond it:
   empty until the app wires `policies::Policies` ("Site policies"). It takes the
   `policy_*` names listed under "Names the migrations take": an app with a table,
   index or function of one of them renames its own first.
+- Install `owt_accounts::migrations::ALL[4]` (`owt_accounts_local`) as the app's next
+  unused migration version after that, whether or not the app uses local accounts,
+  and keep awaiting `migrations::complete` before serving (it validates the
+  constraint this one adds). It takes the table `account_local_identities` (with its
+  `_pkey` and `_account` indexes), the column `accounts.password_sign_in` (every
+  existing account keeps password sign-in) and the constraint
+  `accounts_password_sign_in_hash`: an app with one of those names renames its own
+  first (`migrations::conflicts` names it).
+- `owt_accounts::Refused` has a new variant, `NoPasswordSignIn` (`store::set_password`
+  on an account whose password sign-in is off). `Refused` is not `#[non_exhaustive]`:
+  an exhaustive `match` on it adds an arm.
 - **Re-applying the OpenShift template:** pass `-p POSTGRES_MAJOR=<the major the
   cluster runs>`, and keep compose and CI's `postgres-major` on it. The default, 18,
   upgrades an older cluster in place (or is refused before CNPG 1.26). Moving to a
