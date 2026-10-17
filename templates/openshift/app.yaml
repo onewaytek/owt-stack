@@ -66,6 +66,12 @@ parameters:
       NetworkPolicy are named after it. Changed only to move the app onto a cluster
       imported at a new major (the README's "Upgrading Postgres").
     value: db
+  - name: DB_INSTANCES
+    description: >-
+      Postgres instances. With one, each offline backup stops Postgres for a few
+      seconds; with two, CNPG snapshots the standby and the primary keeps serving,
+      at twice the volume group's space.
+    value: "1"
   - name: DB_SIZE
     value: 2Gi
   - name: STORAGE_CLASS
@@ -106,6 +112,12 @@ parameters:
       the backup's start to its end is not in the snapshot), which these clusters
       do not have, so the default is offline.
     value: "false"
+  - name: PRUNE_IMAGE
+    description: >-
+      The backup prune's image: bash, oc and python3. The default comes from the
+      internal image registry; a cluster without one passes another image the
+      namespace can pull, or pruning never runs and snapshots fill the volume group.
+    value: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
   - name: CNPG_NAMESPACE
     description: >-
       The namespace the CloudNativePG operator runs in (openshift-operators when
@@ -265,9 +277,10 @@ objects:
       namespace: ${NAMESPACE}
       labels: {app: "${NAME}"}
     spec:
-      # One instance on a single-node cluster: a standby on the same node buys
-      # availability during drains, not durability.
-      instances: 1
+      # One instance by default, on a single-node cluster: a standby on the same
+      # node buys no durability, and doesn't help a drain (it goes down with the
+      # node). What it buys is the offline backups stopping it, not the primary.
+      instances: ${{DB_INSTANCES}}
       # CNPG's image, not docker.io/postgres: the stock image needs a passwd entry
       # for its UID, and restricted-v2 assigns an arbitrary one. Changing the major
       # here upgrades the running cluster (see POSTGRES_MAJOR).
@@ -291,7 +304,8 @@ objects:
           className: ${SNAPSHOT_CLASS}
           # Offline (cold) by default: with no WAL archive, an online snapshot lacks
           # the WAL needed to make it consistent, and restores from it fail. On one
-          # instance this stops Postgres for the snapshot's few seconds, nightly.
+          # instance this stops Postgres for the snapshot's few seconds, nightly and
+          # once at first apply (see DB_INSTANCES).
           online: ${{BACKUP_ONLINE}}
           # Deleting a Backup takes its VolumeSnapshot with it, so the prune below
           # reclaims disk instead of merely forgetting.
@@ -374,7 +388,7 @@ objects:
               restartPolicy: Never
               containers:
                 - name: prune
-                  image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+                  image: ${PRUNE_IMAGE}
                   resources:
                     requests: {cpu: 50m, memory: 128Mi}
                     limits: {cpu: 200m, memory: 256Mi}

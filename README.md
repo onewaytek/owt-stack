@@ -2166,11 +2166,24 @@ jobs:
   run fails at "Move rc to the candidate" rather than publish a merge nobody checked.
   Either way the PR is left out of `rc` until it is pushed again, unless
   `requeue-rc.yml` re-runs it. It looks for open PRs whose head isn't in `rc` and
-  whose latest run was cancelled or failed at that step, and re-runs the oldest one,
-  one at a time and only while no run is waiting (a re-run is itself a new arrival in
-  the group). A run that failed its checks is left alone, and so is one already on
+  whose latest promoting run was cancelled or failed at that step, and re-runs the
+  oldest one, one at a time and only while no run is waiting (a re-run is itself a new
+  arrival in the group). A run that succeeded without running "Merge into rc" (an
+  `edited` or `labeled` trigger whose candidate job was skipped) doesn't count, so it
+  can't hide a lost promotion of the same head. A cancelled run always counts, since
+  one cancelled before its candidate job ran can't be told from one that would have
+  skipped it: a non-promoting one is re-run, succeeds having merged nothing, and the
+  next pass looks beneath it. A run that timed out, failed to start or awaits
+  approval is left for a person. Keeping the workflow's
+  `pull_request` types to the default (`opened`, `synchronize`, `reopened`) avoids
+  those wasted re-runs.
+  A run that failed its checks is left alone, and so is one already on
   its fifth attempt (`max-attempts`). Run it after each promotion, so one hands on to
-  the next, and on a schedule, for when none follows. It sees waiting *runs*, not
+  the next, and on a schedule, for when none follows. The scheduled one sits outside
+  the group, so both can pick the same run: GitHub refuses the second re-run as
+  already running, which is logged and passes. Any other refusal of a run (one over a
+  month old, say) is a warning, and the next PR is tried; a refusal for want of
+  `actions: write` fails the job once every PR is walked. It sees waiting *runs*, not
   waiting jobs, so put the `promote-rc` concurrency group on the workflow, as below:
   on a job, a re-run can cancel that job while it waits (a later requeue picks it up).
 
@@ -2311,10 +2324,45 @@ so a quiet SSE stream sends `sse::HEARTBEAT` more often than that.
 (`BACKUP_SCHEDULE`, CNPG's six-field cron, seconds first) and once at first apply.
 They are offline by default (`BACKUP_ONLINE=false`): Postgres stops for the seconds an
 LVM snapshot takes, because an online snapshot is only consistent with a WAL archive,
-which these clusters don't have. A CronJob (`PRUNE_SCHEDULE`, after the backup) prunes
+which these clusters don't have. With one instance (`DB_INSTANCES=1`, the default)
+the app sees that pause: requests needing the database fail for a few seconds each
+night, and once at the first apply, when the immediate backup overlaps the rollout
+that same apply starts (apply outside busy hours, or expect a few errors then). The
+choices: accept the pause; run two instances (`-p DB_INSTANCES=2`: CNPG snapshots the
+standby and the primary keeps serving, for twice the space in the volume group, and
+no help with a drain: on a single node the standby goes down with the primary); or
+take online backups (`BACKUP_ONLINE=true`), only once the cluster has a WAL archive
+(below), since an online snapshot without one doesn't restore.
+
+**Draining the node** waits on CNPG's PodDisruptionBudgets whatever `DB_INSTANCES`
+is: a single instance can't switch over, and on a single node neither can two. For
+planned node maintenance, accept the downtime: before the drain, put the Cluster in
+a maintenance window, which keeps its local volume for when the node returns and
+lifts the budget, and take it out afterwards (`inProgress: false`):
+
+```sh
+oc patch cluster.postgresql.cnpg.io myapp-db --type merge \
+  -p '{"spec": {"nodeMaintenanceWindow": {"inProgress": true, "reusePVC": true}}}'
+```
+
+A CronJob (`PRUNE_SCHEDULE`, after the backup) prunes
 snapshots older than `BACKUP_KEEP_DAYS` (14) but always keeps the newest
 `BACKUP_KEEP_AT_LEAST` (3) completed ones, so backups that silently stop are not all
-aged out on schedule; a prune that fails fails its Job.
+aged out on schedule; a prune that fails fails its Job. **Its image comes from the
+internal image registry** (`PRUNE_IMAGE`, the cluster's own `openshift/cli`). On a
+cluster with that registry removed the image never pulls, nothing is pruned, and the
+snapshots fill the volume group until the database stops. Check before relying on it
+that the registry runs and holds the image:
+
+```sh
+oc get pods -n openshift-image-registry -l docker-registry=default  # one Running
+oc get istag cli:latest -n openshift
+```
+
+and, after the first night, that a prune succeeded
+(`oc get cronjob myapp-backup-prune -o jsonpath='{.status.lastSuccessfulTime}'` prints
+a time). A cluster without the registry passes `-p PRUNE_IMAGE=<image>`: any image the
+namespace can pull that has `bash`, `oc` and `python3`.
 
 These snapshots live in the same volume group, on the same node: they undo a bad
 migration or a dropped table, not the loss of the disk. Off-node copies need object
@@ -2359,7 +2407,15 @@ qualifies. A cluster moved to other tags (`18-minimal-trixie`) upgrades only wit
 their flavour.
 
 1. Take a backup and wait for it. Like the nightly ones, it is pruned after
-   `BACKUP_KEEP_DAYS`:
+   `BACKUP_KEEP_DAYS`. A Backup needs the Cluster's `backup.volumeSnapshot` stanza,
+   which an apply of this template puts there. A cluster that predates it
+   (`oc get cluster.postgresql.cnpg.io myapp-db -o jsonpath='{.spec.backup}'` prints
+   nothing) gets it only from an apply at its *current* major, since an apply at the
+   new one starts the upgrade at once. So in that order: apply the template rendered
+   with `-p POSTGRES_MAJOR=<current>`; take the Backup below and see it `completed`
+   (without the stanza it fails, and `oc wait` waits out its timeout); only then go
+   on to step 2. That first apply also starts the nightly schedule and its immediate
+   backup, which pauses a single instance for a few seconds ("Backups come with it").
 
    ```sh
    oc create -f - <<EOF
@@ -2569,6 +2625,13 @@ The router example under "Wiring an app" composes the layers; beyond it:
   upgrades an older cluster in place (or is refused before CNPG 1.26). Moving to a
   new major is its own step: "Upgrading Postgres" under "Commands, CI, releases and
   deployment". The new `DB_SUFFIX` parameter leaves the default render as it was.
+- **An app moving from a template that took no backups** (a hand-written one, or
+  none) applies this one, at its current major, and confirms the first backup
+  completed (`oc get backups.postgresql.cnpg.io` shows the immediate one `completed`)
+  before deploying a migration it can't undo. That apply's backup pauses a single
+  instance for a few seconds during its rollout, and its prune needs the internal
+  image registry ("Backups come with it", under "Commands, CI, releases and
+  deployment").
 - The OpenShift template's Deployment reads `myapp-env` whole and `REDIS_URL` from
   `myapp-redis`'s `url`, each only if it exists, so the next apply rolls the pods once
   and changes nothing else. An app whose environment was patched onto the Deployment
