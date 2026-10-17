@@ -20,8 +20,9 @@ name: Requeue rc promotions
 # its checks is not re-run; nor is one already on its `max-attempts`th attempt. Call
 # it from the candidate workflow after publishing, so each promotion hands on to the
 # next lost one, and from a schedule, for when no promotion follows. The scheduled
-# one runs outside the concurrency group, so both can pick the same run; GitHub
-# refuses the second re-run as already running, and that is logged, not failed. Any
+# one runs outside the concurrency group, so both can pick the same run; the run is
+# read again before it is re-run and once more if GitHub refuses the re-run, and a run
+# that is going again is logged, not failed, whatever GitHub's refusal says. Any
 # other refusal of one run is a warning and the next PR is tried, so a run GitHub
 # won't re-run (one over a month old) can't starve the rest; a refusal for want of
 # `actions: write` fails the job once every PR is walked:
@@ -166,6 +167,22 @@ jobs:
                 continue;
               }
 
+              // The scheduled requeue runs outside the promote-rc group, so it can pick
+              // the run the in-group one has just re-run. The run's own status says so,
+              // whatever wording GitHub refuses a second re-run with: one that is not
+              // completed is going again, which is what was wanted. It is read before
+              // the re-run and, since the other requeue can get in between, again on a
+              // refusal.
+              const goingAgain = async () => {
+                const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id });
+                return data.status === "completed" ? "" : data.status;
+              };
+              const status = await goingAgain();
+              if (status) {
+                core.info(`#${pr.number}: run ${run.id} is ${status} again; another requeue got there first`);
+                return;
+              }
+
               core.notice(`#${pr.number}: run ${run.id} (${run.conclusion}) never promoted ${head}; re-running it`);
               try {
                 await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
@@ -174,11 +191,16 @@ jobs:
                 // GitHub's own message: the error's `message` also carries the endpoint's
                 // documentation link, which names re-runs whatever the refusal was.
                 const why = e.response?.data?.message ?? "";
-                // The scheduled requeue runs outside the promote-rc group, so it can pick
-                // the run the in-group one just re-ran, and GitHub refuses the second
-                // re-run. The run is going again, which is what was wanted.
-                if (/already running/i.test(why)) {
-                  core.info(`#${pr.number}: run ${run.id} is already running; another requeue got there first`);
+                // The status decides; GitHub's "already running" is a second net, for
+                // when the run cannot be read again.
+                let now = "";
+                try {
+                  now = await goingAgain();
+                } catch (read) {
+                  core.warning(`#${pr.number}: run ${run.id} could not be read again (${read.message})`);
+                }
+                if (now || /already running/i.test(why)) {
+                  core.info(`#${pr.number}: run ${run.id} is ${now || "already running"}; another requeue got there first`);
                   return;
                 }
                 // Any other refusal is about this run (one created over a month ago, say)
