@@ -2170,16 +2170,20 @@ jobs:
   oldest one, one at a time and only while no run is waiting (a re-run is itself a new
   arrival in the group). A run that succeeded without running "Merge into rc" (an
   `edited` or `labeled` trigger whose candidate job was skipped) doesn't count, so it
-  can't hide a lost promotion of the same head. One that was cancelled before any of
-  its jobs started can't be told apart, so it is re-run; it then succeeds having
-  merged nothing, and the next pass looks beneath it. Keeping the workflow's
+  can't hide a lost promotion of the same head. A cancelled run always counts, since
+  one cancelled before its candidate job ran can't be told from one that would have
+  skipped it: a non-promoting one is re-run, succeeds having merged nothing, and the
+  next pass looks beneath it. A run that timed out, failed to start or awaits
+  approval is left for a person. Keeping the workflow's
   `pull_request` types to the default (`opened`, `synchronize`, `reopened`) avoids
   those wasted re-runs.
   A run that failed its checks is left alone, and so is one already on
   its fifth attempt (`max-attempts`). Run it after each promotion, so one hands on to
   the next, and on a schedule, for when none follows. The scheduled one sits outside
-  the group, so both can pick the same run: GitHub refuses the second re-run, which is
-  logged and passes. It sees waiting *runs*, not
+  the group, so both can pick the same run: GitHub refuses the second re-run as
+  already running, which is logged and passes. Any other refusal of a run (one over a
+  month old, say) is a warning, and the next PR is tried; a refusal for want of
+  `actions: write` fails the job once every PR is walked. It sees waiting *runs*, not
   waiting jobs, so put the `promote-rc` concurrency group on the workflow, as below:
   on a job, a re-run can cancel that job while it waits (a later requeue picks it up).
 
@@ -2325,9 +2329,21 @@ the app sees that pause: requests needing the database fail for a few seconds ea
 night, and once at the first apply, when the immediate backup overlaps the rollout
 that same apply starts (apply outside busy hours, or expect a few errors then). The
 choices: accept the pause; run two instances (`-p DB_INSTANCES=2`: CNPG snapshots the
-standby and the primary keeps serving, for twice the space in the volume group); or
+standby and the primary keeps serving, for twice the space in the volume group, and
+no help with a drain: on a single node the standby goes down with the primary); or
 take online backups (`BACKUP_ONLINE=true`), only once the cluster has a WAL archive
 (below), since an online snapshot without one doesn't restore.
+
+**Draining the node** waits on CNPG's PodDisruptionBudgets whatever `DB_INSTANCES`
+is: a single instance can't switch over, and on a single node neither can two. For
+planned node maintenance, accept the downtime: before the drain, put the Cluster in
+a maintenance window, which keeps its local volume for when the node returns and
+lifts the budget, and take it out afterwards (`inProgress: false`):
+
+```sh
+oc patch cluster.postgresql.cnpg.io myapp-db --type merge \
+  -p '{"spec": {"nodeMaintenanceWindow": {"inProgress": true, "reusePVC": true}}}'
+```
 
 A CronJob (`PRUNE_SCHEDULE`, after the backup) prunes
 snapshots older than `BACKUP_KEEP_DAYS` (14) but always keeps the newest

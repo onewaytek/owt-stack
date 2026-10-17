@@ -278,8 +278,8 @@ objects:
       labels: {app: "${NAME}"}
     spec:
       # One instance by default, on a single-node cluster: a standby on the same
-      # node buys availability (drains, and the offline backups, which then stop the
-      # standby instead of the primary), not durability.
+      # node buys no durability, and doesn't help a drain (it goes down with the
+      # node). What it buys is the offline backups stopping it, not the primary.
       instances: ${{DB_INSTANCES}}
       # CNPG's image, not docker.io/postgres: the stock image needs a passwd entry
       # for its UID, and restricted-v2 assigns an arbitrary one. Changing the major

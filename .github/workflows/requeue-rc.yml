@@ -21,7 +21,10 @@ name: Requeue rc promotions
 # it from the candidate workflow after publishing, so each promotion hands on to the
 # next lost one, and from a schedule, for when no promotion follows. The scheduled
 # one runs outside the concurrency group, so both can pick the same run; GitHub
-# refuses the second re-run, and that refusal is logged, not failed:
+# refuses the second re-run as already running, and that is logged, not failed. Any
+# other refusal of one run is a warning and the next PR is tried, so a run GitHub
+# won't re-run (one over a month old) can't starve the rest; a refusal for want of
+# `actions: write` fails the job once every PR is walked:
 #
 #   # pr.yml, beside the candidate flow
 #   requeue:
@@ -85,6 +88,8 @@ jobs:
             // promote-rc.yml's step that makes the candidate: a run that ran it set
             // out to promote (keep that name too).
             const mergeStep = "Merge into rc";
+            // A refusal of a re-run for want of permission, reported once the PRs are walked.
+            let denied = "";
 
             for (const status of ["requested", "queued", "pending", "waiting"]) {
               const { data } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id, status, per_page: 1 });
@@ -127,10 +132,18 @@ jobs:
                 // Still going: it may yet promote, so leave the PR to it.
                 if (r.status !== "completed") break;
                 // Cancelled, waiting or running: a candidate it would have made was never
-                // published. (One cancelled before any job ran can't be told from a
-                // non-promoting run; its re-run merges nothing and succeeds, and the
-                // next pass looks beneath it.)
+                // published. A run cancelled before its candidate job ran can't be told
+                // from one that would have skipped it (a job behind a cancelled one is
+                // reported skipped too), so every cancelled run counts as lost; a
+                // non-promoting one re-runs, merges nothing and succeeds, and the next
+                // pass looks beneath it.
                 if (r.conclusion === "cancelled") { run = r; lost = true; break; }
+                if (!["success", "neutral", "skipped", "failure"].includes(r.conclusion)) {
+                  // timed_out, startup_failure, action_required: not a lost race, and a
+                  // re-run would not settle them. Left for a person, like a failed check.
+                  core.info(`#${pr.number}: run ${r.id} ended ${r.conclusion}; leaving it`);
+                  break;
+                }
                 const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
                   owner, repo, run_id: r.id, attempt_number: r.run_attempt, per_page: 100,
                 });
@@ -157,15 +170,29 @@ jobs:
               try {
                 await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
               } catch (e) {
+                if (![403, 409, 422].includes(e.status)) throw e;
+                // GitHub's own message: the error's `message` also carries the endpoint's
+                // documentation link, which names re-runs whatever the refusal was.
+                const why = e.response?.data?.message ?? "";
                 // The scheduled requeue runs outside the promote-rc group, so it can pick
                 // the run the in-group one just re-ran, and GitHub refuses the second
                 // re-run. The run is going again, which is what was wanted.
-                if ([403, 409, 422].includes(e.status) && /already|rerun|re-run/i.test(e.message ?? "")) {
-                  core.info(`#${pr.number}: run ${run.id} was not re-run (${e.status}: ${e.message}); another requeue got there first`);
+                if (/already running/i.test(why)) {
+                  core.info(`#${pr.number}: run ${run.id} is already running; another requeue got there first`);
                   return;
                 }
-                throw e;
+                // Any other refusal is about this run (one created over a month ago, say)
+                // or about this job's token. Either way try the next PR, so one refused
+                // run cannot starve the rest; a token without `actions: write` fails the
+                // job once the PRs are walked.
+                if (e.status === 403 && /not accessible|permission|must have/i.test(why)) denied = why;
+                core.warning(`#${pr.number}: run ${run.id} was not re-run (${e.status}: ${why || e.message})`);
+                continue;
               }
+              return;
+            }
+            if (denied) {
+              core.setFailed(`re-runs were refused for want of permission (${denied}): the calling job needs \`actions: write\``);
               return;
             }
             core.info("no lost promotion");
