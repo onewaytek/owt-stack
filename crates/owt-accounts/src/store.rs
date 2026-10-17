@@ -323,9 +323,10 @@ pub async fn by_id_in_epoch(
 /// `username`). A row with two columns of one name fails the load like a database
 /// error, so an extra `roles` or `is_staff` can never stand in for the account's.
 /// A query that finds no row reads as `NULL` in each column, so a field it may miss
-/// is an `Option`; a column that fails to decode fails the load too. A query that
-/// finds several rows gives one of them, which one unsaid without an `ORDER BY`: join
-/// on a key, or end it with `LIMIT 1`.
+/// is an `Option`; a column that fails to decode fails the load too. It yields at
+/// most one row: several fail the load as well, rather than pass one of them off as
+/// the viewer's. So join on a key or end it with `LIMIT 1`, and never name `accounts`
+/// in its own `FROM`: that reads the whole table, not the viewer's row.
 ///
 /// `QUERY` is SQL pasted into the statement as it is, so it is a constant of the app's
 /// code: never built from anything a visitor sends. It binds no parameters of its own
@@ -347,18 +348,29 @@ pub async fn by_id_in_epoch_with<X: Extra>(
     // The account's columns are computed in a lateral of their own, which sees only
     // `accounts`: an extra column named `id` does not make them ambiguous. The newline
     // before each `)` keeps a `--` comment ending QUERY from swallowing it.
-    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+    // LIMIT 2: enough to tell one row from several.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT account.*, extra.* FROM accounts
          CROSS JOIN LATERAL (SELECT {COLUMNS}\n) account
          LEFT JOIN LATERAL ({}\n) extra ON true
-         WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2",
+         WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2
+         LIMIT 2",
         X::QUERY
     )))
     .bind(id)
     .bind(epoch)
-    .fetch_optional(db)
+    .fetch_all(db)
     .await?;
-    let Some(row) = row else {
+    if rows.len() > 1 {
+        return Err(sqlx::Error::Decode(
+            format!(
+                "the Extra::QUERY of {} yields several rows for one account",
+                std::any::type_name::<X>()
+            )
+            .into(),
+        ));
+    }
+    let Some(row) = rows.into_iter().next() else {
         return Ok(None);
     };
     // Decoding by name reads the last column of a name: refuse any name twice, so

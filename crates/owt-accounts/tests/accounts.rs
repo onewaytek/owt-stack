@@ -486,6 +486,18 @@ impl store::Extra for Mistyped {
     const QUERY: &'static str = "SELECT accounts.beta";
 }
 
+/// An extra that names `accounts` in its own `FROM`: every account's row, not the
+/// viewer's.
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct WholeTable {
+    #[allow(dead_code)]
+    who: String,
+}
+
+impl store::Extra for WholeTable {
+    const QUERY: &'static str = "SELECT accounts.beta, accounts.username AS who FROM accounts";
+}
+
 fn app_with<X: store::Extra + Clone>(db: &Db, sessions: &Sessions<Data>) -> Router {
     async fn whoami(Maybe(me): Maybe) -> String {
         me.map_or_else(|| "anonymous".to_owned(), |a| a.username)
@@ -547,6 +559,12 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
     store::by_id_in_epoch_with::<Mistyped>(&db.pool, ada.id, epoch)
         .await
         .unwrap_err();
+    // With a second account, the whole table is two rows: refused, not the first.
+    store::create(&db.pool, new("bob", "", None)).await.unwrap();
+    let err = store::by_id_in_epoch_with::<WholeTable>(&db.pool, ada.id, epoch)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("several rows"), "{err}");
 
     let sessions = sessions();
     let sealed = cookie_for(&sessions, &ada);
@@ -554,6 +572,7 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
         app_with::<Sneaky>(&db, &sessions),
         app_with::<Everything>(&db, &sessions),
         app_with::<Mistyped>(&db, &sessions),
+        app_with::<WholeTable>(&db, &sessions),
     ] {
         let client = owt_test::Client::new(app);
         client.set_cookie("s", &sealed);

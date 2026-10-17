@@ -911,9 +911,11 @@ no parameters. Its columns are named apart from the account's (`id`, `username`,
 (`SELECT p.*` of a table with an `id`, an extra `roles`) is refused, never read in
 place of the account's. That refusal, and a column that fails to decode, fail the
 load as a database outage would, on every walled page, so an app sees it at once. A
-viewer with no joined row reads `NULL` in each column (make the field an `Option`);
-several rows give one of them, which one unsaid without an `ORDER BY`, so join on a
-key or end with `LIMIT 1`. `store::by_id_in_epoch_with` is the same query outside the
+viewer with no joined row reads `NULL` in each column (make the field an `Option`).
+`QUERY` yields at most one row: several fail the load too, rather than pass one off
+as the viewer's. Join on a key or end with `LIMIT 1`, and never name `accounts` in
+its own `FROM` (that reads the whole table, not the viewer's row).
+`store::by_id_in_epoch_with` is the same query outside the
 layer (a stream re-checking its viewer).
 
 ```rust,no_run
