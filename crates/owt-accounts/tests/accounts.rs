@@ -1963,6 +1963,207 @@ async fn a_username_is_text_on_every_admin_page() {
     db.drop().await;
 }
 
+/// An app's own markup for the admin, from the view models: a design system with
+/// none of the `owt-*` classes.
+mod plain {
+    use askama::Template;
+    use axum::http::request::Parts;
+    use owt_accounts::admin::{AccountView, Body, ListView, NewView, Views};
+
+    #[derive(Template)]
+    #[template(
+        source = r#"<ul class="pf-list" data-total="{{ v.total }}" data-filter="{{ v.filter }}">
+{% for r in v.rows %}<li><a href="{{ r.href }}">{{ r.username }}</a>{% for b in r.badges %} [{{ b.text }}]{% endfor %}</li>
+{% endfor %}</ul>{% for i in v.pagination.items() %}<a class="pf-page" href="{{ i.href }}">{{ i.label }}</a>{% endfor %}
+<a href="{{ v.new_account }}">add</a>"#,
+        ext = "html"
+    )]
+    struct List<'a, 'b> {
+        v: &'a ListView<'b>,
+    }
+
+    #[derive(Template)]
+    #[template(
+        source = r#"<form class="pf-form" action="{{ v.action }}" method="post">{% if let Some(e) = v.error %}<p class="pf-error">{{ e }}</p>{% endif %}<input name="username" value="{{ v.username }}"></form>"#,
+        ext = "html"
+    )]
+    struct New<'a, 'b> {
+        v: &'a NewView<'b>,
+    }
+
+    #[derive(Template)]
+    #[template(
+        source = r#"<h1 class="pf-title">{{ v.account.username }}</h1>{% if let Some(n) = v.notice %}<p class="pf-notice" data-error="{{ n.is_error() }}">{{ n.text }}</p>{% endif %}{% if let Some(s) = v.secret %}<output class="pf-secret">{{ s.value }}</output>{% endif %}
+<form action="{{ v.save }}" method="post"></form><form action="{{ v.set_password }}" method="post"></form>{% if let Some(l) = v.issue_link %}<form action="{{ l }}" method="post">{{ v.link_lifetime }}</form>{% endif %}<form action="{{ v.sign_out }}" method="post"></form>
+{% for c in v.connections %}<form action="{{ c.unlink }}" method="post">{{ c.provider }}</form>{% endfor %}"#,
+        ext = "html"
+    )]
+    struct Account<'a, 'b> {
+        v: &'a AccountView<'b>,
+    }
+
+    pub struct Plain;
+
+    impl Views for Plain {
+        fn list(&self, _: &Parts, view: &ListView<'_>) -> owt_web::Result<Body> {
+            Body::render(&List { v: view })
+        }
+        fn new_account(&self, _: &Parts, view: &NewView<'_>) -> owt_web::Result<Body> {
+            Body::render(&New { v: view })
+        }
+        fn account(&self, _: &Parts, view: &AccountView<'_>) -> owt_web::Result<Body> {
+            Body::render(&Account { v: view })
+        }
+    }
+}
+
+/// The test app with the admin drawn by [`plain::Plain`].
+fn plain_app(db: &Db, sessions: &Sessions<Data>) -> Router {
+    let admin = admin(db)
+        .views(plain::Plain)
+        .sign_in_links(Duration::from_secs(3_600), |token| {
+            format!("https://app.example/login/link/{token}")
+        });
+    app(db, sessions, admin.routes())
+}
+
+/// An app draws every admin page from the view models with its own templates.
+#[tokio::test]
+async fn an_app_draws_the_admin_with_its_own_templates() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(plain_app(&db, &sessions));
+    let ada = store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    owt_accounts::roles::grant(&db.pool, ada.id, &EDITOR, None)
+        .await
+        .unwrap();
+    let linked = identities::link(
+        &db.pool,
+        ada.id,
+        &owt_auth::oauth::google(),
+        &identity("g1", None, false),
+    )
+    .await
+    .unwrap();
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+
+    let r = client.get("/staff/accounts?role=editor").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(r.header("x-frame-options"), Some("DENY"));
+    let html = r.text();
+    assert!(!html.contains("owt-"), "{html}");
+    assert!(
+        html.contains(r#"data-total="1" data-filter="editor""#)
+            && html.contains(&format!(
+                r#"<a href="/staff/accounts/{}">ada</a> [Editor]"#,
+                ada.id
+            ))
+            && html.contains(r#"<a href="/staff/accounts/new">add</a>"#),
+        "{html}"
+    );
+
+    let html = client.get("/staff/accounts/new").await.text();
+    assert!(
+        html.contains(r#"<form class="pf-form" action="/staff/accounts" method="post">"#),
+        "{html}"
+    );
+    let r = client
+        .post_form("/staff/accounts", &[("username", "ada"), ("email", "")])
+        .await;
+    assert_eq!(r.status, 422);
+    let html = r.text();
+    assert!(
+        html.contains(r#"<p class="pf-error">There is already an account named"#)
+            && html.contains(r#"value="ada""#)
+            && !html.contains("owt-"),
+        "{html}"
+    );
+
+    let at = format!("/staff/accounts/{}", ada.id);
+    let html = client.get(&at).await.text();
+    for action in [
+        at.clone(),
+        format!("{at}/password"),
+        format!("{at}/link"),
+        format!("{at}/sign-out"),
+        format!("{at}/identities/{}/unlink", linked.id),
+    ] {
+        assert!(
+            html.contains(&format!(r#"action="{action}""#)),
+            "{action}: {html}"
+        );
+    }
+    assert!(html.contains(">1 hour</form>"), "{html}");
+
+    let r = client.post_form(&format!("{at}/password"), &[]).await;
+    assert_eq!(r.status, 200);
+    let html = r.text();
+    let password = html
+        .split(r#"<output class="pf-secret">"#)
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .expect("the password, once");
+    assert!(
+        store::authenticate(&db.pool, "ada", password)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    db.drop().await;
+}
+
+/// The app's markup is not what guards: under its own templates the admin is still
+/// for staff alone, a staff member's own access cannot be posted away, and another
+/// site cannot post at all.
+#[tokio::test]
+async fn the_admin_checks_hold_under_an_apps_templates() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(plain_app(&db, &sessions));
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    assert_eq!(client.get("/staff/accounts").await.status, 403);
+
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let at = format!("/staff/accounts/{}", ada.id);
+    let mine = format!("/staff/accounts/{}", boss.id);
+    let r = client
+        .post_form(&mine, &[("email", ""), ("active", "on")])
+        .await;
+    assert_eq!(r.status, 403);
+    assert!(r.text().contains(r#"data-error="true""#));
+    let r = client
+        .send(
+            axum::http::Request::post(format!("{at}/sign-out"))
+                .header("sec-fetch-site", "same-site")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, 403);
+    assert!(
+        store::by_id(&db.pool, boss.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_staff
+    );
+    db.drop().await;
+}
+
 /// The list pages past fifty accounts and keeps its search and filter on each page.
 #[tokio::test]
 async fn the_list_pages_and_keeps_its_filter() {

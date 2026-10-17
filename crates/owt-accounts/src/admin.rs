@@ -24,10 +24,14 @@
 //! it changed.
 //!
 //! The app supplies its layout through a [`Chrome`] function: the admin renders the
-//! page's body (only `owt-*` classes, from `tailwind/owt.css`) and the app wraps it,
-//! as it would any page. Only [`Staff`] reach the routes, and the routes refuse a
-//! cross-origin `POST` themselves ([`CrossOrigin`]), whether or not the app layers it
-//! too: a sibling subdomain is same-site, so `SameSite=Lax` alone would let it post.
+//! page's body and the app wraps it, as it would any page. The body comes from
+//! [`Views`]: by default [`Tailwind`], which uses only `owt-*` classes (from
+//! `tailwind/owt.css`); an app with another design system implements [`Views`] and
+//! renders each page's view model ([`ListView`], [`NewView`], [`AccountView`]) with
+//! its own templates. Either way the routes, the checks and the log stay here: only
+//! [`Staff`] reach the routes, and the routes refuse a cross-origin `POST` themselves
+//! ([`CrossOrigin`]), whether or not the app layers it too: a sibling subdomain is
+//! same-site, so `SameSite=Lax` alone would let it post.
 
 use std::fmt;
 use std::future::Future;
@@ -71,6 +75,21 @@ impl fmt::Display for Body {
 }
 impl HtmlSafe for Body {}
 
+impl Body {
+    /// `template`, rendered: what a [`Views`] method answers. Askama escapes what the
+    /// template prints, so the body is safe to embed as it is.
+    ///
+    /// # Errors
+    ///
+    /// When the template does not render.
+    pub fn render(template: &impl Template) -> owt_web::Result<Self> {
+        template
+            .render()
+            .map(Self)
+            .map_err(|e| owt_web::Error::Internal(e.into()))
+    }
+}
+
 /// What the app's [`Chrome`] wraps: an admin page.
 #[non_exhaustive]
 pub struct Page<'a> {
@@ -105,6 +124,285 @@ where
     }
 }
 
+/// How the admin draws each page's body from its view model. Every method has the
+/// [`Tailwind`] body as its default, so an app overrides the pages it draws itself
+/// (all of them, for a design system of its own).
+///
+/// A view model carries what the page shows and the URLs its links and forms use;
+/// the field names each form posts are on its view model. The routes check what is
+/// posted whatever the markup: a page that offers less (no "Staff" box on your own
+/// account) is a choice of the app's, and one that offers more is refused.
+pub trait Views: Send + Sync + 'static {
+    /// The list of accounts.
+    ///
+    /// # Errors
+    ///
+    /// When the app's template does not render.
+    fn list(&self, request: &Parts, view: &ListView<'_>) -> owt_web::Result<Body> {
+        let _ = request;
+        Body::render(&ListHtml { v: view })
+    }
+
+    /// The form for a new account, empty or with what was posted and why it was
+    /// refused.
+    ///
+    /// # Errors
+    ///
+    /// When the app's template does not render.
+    fn new_account(&self, request: &Parts, view: &NewView<'_>) -> owt_web::Result<Body> {
+        let _ = request;
+        Body::render(&NewHtml {
+            v: view,
+            username: Field::text("username", "Username")
+                .value(view.username)
+                .hint("One word, no “@”. It does not change later.")
+                .required()
+                .autofocus(),
+            email: Field::email("email", "Email")
+                .value(view.email)
+                .hint("Optional. It signs in with the password, as the username does; a provider sign-in never matches it."),
+        })
+    }
+
+    /// An account's page.
+    ///
+    /// # Errors
+    ///
+    /// When the app's template does not render.
+    fn account(&self, request: &Parts, view: &AccountView<'_>) -> owt_web::Result<Body> {
+        let _ = request;
+        Body::render(&AccountHtml {
+            v: view,
+            email: Field::email("email", "Email")
+                .value(&view.email)
+                .error(view.email_error.as_deref())
+                .hint("It signs in with the password, as the username does; a provider sign-in never matches it."),
+        })
+    }
+}
+
+/// The admin's own pages, in `owt-*` classes from `tailwind/owt.css`: what an
+/// [`Admin`] draws unless given other [`Views`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tailwind;
+
+impl Views for Tailwind {}
+
+/// The list of accounts, at the admin's base. Its search form `GET`s [`ListView::url`]
+/// with `q` (the term) and `role` (a filter's value); its pages are
+/// [`ListView::pagination`]'s links, which keep both.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ListView<'a> {
+    /// The list's URL: where the search form goes.
+    pub url: String,
+    /// The new-account form's URL.
+    pub new_account: String,
+    /// The search term, trimmed.
+    pub q: &'a str,
+    /// What the search box finds: `Username or email`, or with the app's own
+    /// ([`Admin::search`]) `Username, email or nickname`.
+    pub placeholder: String,
+    /// A failure to report: the app's search failed.
+    pub notice: Option<Notice>,
+    /// The filter in force: a value of [`ListView::filters`], or empty for everyone.
+    pub filter: &'a str,
+    /// The filters, as `(value, label)`: staff, each of the app's roles, deactivated.
+    pub filters: Vec<(String, String)>,
+    /// How many accounts match, on every page.
+    pub total: i64,
+    /// This page's accounts, by username.
+    pub rows: Vec<Row>,
+    /// The page links: `items()` for the app's own markup (it displays as `owt-*`).
+    pub pagination: Pagination<'a>,
+}
+
+/// An account in the list.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Row {
+    /// The account's id.
+    pub id: i64,
+    /// Its page's URL.
+    pub href: String,
+    /// Its username.
+    pub username: String,
+    /// Its email, or empty.
+    pub email: String,
+    /// What it is, in words: deactivated, staff, each role; `User` when none.
+    pub badges: Vec<Badge>,
+    /// The day it last signed in (`YYYY-MM-DD`), or empty for never.
+    pub last_sign_in: String,
+}
+
+/// A word beside an account in the list.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Badge {
+    /// The word: `Staff`, a role's label.
+    pub text: String,
+    /// Drawn quieter: `Deactivated`, `User`, a role the app does not declare.
+    pub quiet: bool,
+}
+
+/// The new-account form. It `POST`s [`NewView::action`] with `username`, `email`,
+/// `staff` (a checkbox, present when ticked) and a `role` for each role ticked (its
+/// [`RoleChoice::name`]). There is no password: the account's page gives a way in.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct NewView<'a> {
+    /// Where the form posts.
+    pub action: String,
+    /// The list's URL.
+    pub list: String,
+    /// Why the last attempt was refused (a taken username, say).
+    pub error: Option<String>,
+    /// The username, as posted.
+    pub username: &'a str,
+    /// The email, as posted.
+    pub email: &'a str,
+    /// Whether staff is ticked.
+    pub staff: bool,
+    /// The app's roles, ticked as posted.
+    pub roles: Vec<RoleChoice>,
+}
+
+/// An account's page. Its forms `POST` no fields except these:
+///
+/// - [`AccountView::save`]: `email`, `active` and `staff` (checkboxes, present when
+///   ticked), and a `role` for each role ticked, declared or
+///   [undeclared](AccountView::undeclared) (unticking an undeclared one revokes it).
+///   On your own account ([`AccountView::myself`]) send `active` and `staff` ticked:
+///   taking either away is refused.
+/// - [`AccountView::set_password`] and [`AccountView::issue_link`] answer this page
+///   with the [`AccountView::secret`].
+/// - [`AccountView::sign_out`] and each [`Connection::unlink`] redirect back here.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AccountView<'a> {
+    /// The account. Its username is the page's title.
+    pub account: &'a Account,
+    /// Whether it is the staff member's own.
+    pub myself: bool,
+    /// The outcome of the last change.
+    pub notice: Option<Notice>,
+    /// A password or sign-in link to show this once: nothing can show it again.
+    pub secret: Option<Secret>,
+    /// The email for the form: the account's, or what was posted when it was refused.
+    pub email: String,
+    /// Why the posted email was refused.
+    pub email_error: Option<String>,
+    /// The app's roles, ticked where the account holds them.
+    pub roles: Vec<RoleChoice>,
+    /// Roles the account holds that the app does not declare: shown ticked, so staff
+    /// can revoke them; never granted here.
+    pub undeclared: Vec<String>,
+    /// Whether it has a password.
+    pub has_password: bool,
+    /// The day it was created (`YYYY-MM-DD`).
+    pub joined: String,
+    /// When it last signed in (`YYYY-MM-DD HH:MM`), or `never`.
+    pub last_sign_in: String,
+    /// Its linked provider identities.
+    pub connections: Vec<Connection>,
+    /// The app's own page about it, as `(label, href)` ([`Admin::more`]).
+    pub more: Option<(&'static str, String)>,
+    /// The list's URL.
+    pub list: String,
+    /// Where the account's form posts.
+    pub save: String,
+    /// Where "set a generated password" posts.
+    pub set_password: String,
+    /// Where "issue a sign-in link" posts, when the admin offers them
+    /// ([`Admin::sign_in_links`]).
+    pub issue_link: Option<String>,
+    /// How long an issued link lasts, in words (`24 hours`); empty without links.
+    pub link_lifetime: String,
+    /// Where "sign out everywhere" posts.
+    pub sign_out: String,
+}
+
+/// A provider identity linked to an account.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Connection {
+    /// Its id.
+    pub id: i64,
+    /// The provider (`google`).
+    pub provider: String,
+    /// Who it is there, as the provider showed it.
+    pub label: String,
+    /// Where "remove" posts: it signs the account out everywhere, and is refused for
+    /// the account's last way in.
+    pub unlink: String,
+}
+
+/// A role as a checkbox, posted as `role` with [`RoleChoice::name`] as its value.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct RoleChoice {
+    /// The role's name: the value posted.
+    pub name: String,
+    /// Its label.
+    pub label: String,
+    /// What it allows.
+    pub description: String,
+    /// Whether staff hold it anyway.
+    pub staff: bool,
+    /// Whether it is ticked.
+    pub checked: bool,
+}
+
+/// How a [`Notice`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// It worked.
+    Success,
+    /// It was refused, or failed.
+    Error,
+}
+
+/// A one-line outcome above the page.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Notice {
+    /// Success or error.
+    pub level: Level,
+    /// The sentence.
+    pub text: String,
+}
+
+/// A password or link, shown once.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Secret {
+    /// What it is and whose, as a sentence.
+    pub what: String,
+    /// The password or the link.
+    pub value: String,
+}
+
+#[derive(Template)]
+#[template(path = "admin/list.html")]
+struct ListHtml<'a, 'b> {
+    v: &'a ListView<'b>,
+}
+
+#[derive(Template)]
+#[template(path = "admin/new.html")]
+struct NewHtml<'a, 'b> {
+    v: &'a NewView<'b>,
+    username: Field<'a>,
+    email: Field<'a>,
+}
+
+#[derive(Template)]
+#[template(path = "admin/detail.html")]
+struct AccountHtml<'a, 'b> {
+    v: &'a AccountView<'b>,
+    email: Field<'a>,
+}
+
 type LinkUrl = Box<dyn Fn(&str) -> String + Send + Sync>;
 type MoreHref = Box<dyn Fn(&Account) -> String + Send + Sync>;
 type Search = Box<
@@ -117,6 +415,7 @@ pub struct Admin {
     base: String,
     roles: Vec<Role>,
     chrome: Box<dyn Chrome>,
+    views: Box<dyn Views>,
     links: Option<(Duration, LinkUrl)>,
     more: Option<(&'static str, MoreHref)>,
     search: Option<(&'static str, Search)>,
@@ -149,6 +448,7 @@ impl Admin {
             base,
             roles: Vec::new(),
             chrome: Box::new(chrome),
+            views: Box::new(Tailwind),
             links: None,
             more: None,
             search: None,
@@ -159,6 +459,14 @@ impl Admin {
     #[must_use]
     pub fn roles(mut self, roles: &[Role]) -> Self {
         self.roles = roles.to_vec();
+        self
+    }
+
+    /// Draw the pages' bodies with `views` (the app's own templates) rather than
+    /// [`Tailwind`].
+    #[must_use]
+    pub fn views(mut self, views: impl Views) -> Self {
+        self.views = Box::new(views);
         self
     }
 
@@ -228,18 +536,21 @@ impl Admin {
         Router::new().nest(&base, pages)
     }
 
-    fn render(&self, request: &Parts, me: &Account, title: &str, body: &impl Template) -> Response {
-        let page = body
-            .render()
-            .map_err(|e| owt_web::Error::Internal(e.into()))
-            .and_then(|html| {
-                self.chrome.page(Page {
-                    request,
-                    me,
-                    title,
-                    body: Body(html),
-                })
-            });
+    fn render(
+        &self,
+        request: &Parts,
+        me: &Account,
+        title: &str,
+        body: owt_web::Result<Body>,
+    ) -> Response {
+        let page = body.and_then(|body| {
+            self.chrome.page(Page {
+                request,
+                me,
+                title,
+                body,
+            })
+        });
         match page {
             Ok(response) => (CachePolicy::no_store(), response).into_response(),
             Err(e) => e.into_response(),
@@ -270,26 +581,25 @@ impl<S: Send + Sync> FromRequestParts<S> for Req {
     }
 }
 
-/// A one-line outcome above the page.
-#[derive(Clone, Debug)]
-struct Notice {
-    level: &'static str,
-    text: String,
-}
-
 impl Notice {
     fn success(text: impl Into<String>) -> Self {
         Self {
-            level: "success",
+            level: Level::Success,
             text: text.into(),
         }
     }
 
     fn error(text: impl Into<String>) -> Self {
         Self {
-            level: "error",
+            level: Level::Error,
             text: text.into(),
         }
+    }
+
+    /// Whether it reports a refusal or failure.
+    #[must_use]
+    pub fn is_error(&self) -> bool {
+        self.level == Level::Error
     }
 
     /// The notice a redirect named; unknown names show nothing.
@@ -307,28 +617,11 @@ impl Notice {
     }
 }
 
-/// A password or link, shown once.
-#[derive(Clone, Debug)]
-struct Secret {
-    what: String,
-    value: String,
-}
-
-/// A role as a checkbox.
-#[derive(Clone, Debug)]
-struct RoleBox {
-    name: String,
-    label: String,
-    description: String,
-    staff: bool,
-    checked: bool,
-}
-
 /// The declared roles, ticked where `ticked` names them.
-fn boxes(roles: &[Role], ticked: &[String]) -> Vec<RoleBox> {
+fn boxes(roles: &[Role], ticked: &[String]) -> Vec<RoleChoice> {
     roles
         .iter()
-        .map(|r| RoleBox {
+        .map(|r| RoleChoice {
             name: r.name.to_owned(),
             label: r.label.to_owned(),
             description: r.description.to_owned(),
@@ -344,35 +637,6 @@ fn boxes(roles: &[Role], ticked: &[String]) -> Vec<RoleBox> {
 fn undeclared<'a>(roles: &'a [Role], held: &'a [String]) -> impl Iterator<Item = &'a String> {
     held.iter()
         .filter(|h| !roles.iter().any(|r| r.name == h.as_str()))
-}
-
-/// A word beside an account in the list.
-#[derive(Clone, Debug)]
-struct Badge {
-    text: String,
-    quiet: bool,
-}
-
-struct Row {
-    id: i64,
-    username: String,
-    email: String,
-    badges: Vec<Badge>,
-    last_sign_in: String,
-}
-
-#[derive(Template)]
-#[template(path = "admin/list.html")]
-struct ListPage<'a> {
-    base: &'a str,
-    q: &'a str,
-    placeholder: String,
-    notice: Option<Notice>,
-    role: &'a str,
-    filters: Vec<(String, String)>,
-    total: i64,
-    rows: Vec<Row>,
-    pagination: Pagination<'a>,
 }
 
 #[derive(Deserialize)]
@@ -470,6 +734,7 @@ async fn list(
         .into_iter()
         .map(|(a, last_sign_in)| Row {
             badges: badges(&admin.roles, &a),
+            href: format!("{}/{}", admin.base, a.id),
             id: a.id,
             username: a.username,
             email: a.email,
@@ -484,21 +749,23 @@ async fn list(
             .map(|r| (r.name.to_owned(), r.label.to_owned())),
     );
     filters.push(("inactive".to_owned(), "Deactivated".to_owned()));
-    let page = ListPage {
-        base: &admin.base,
+    let view = ListView {
+        url: admin.base.clone(),
+        new_account: format!("{}/new", admin.base),
         q: query.q.trim(),
         placeholder: admin.search.as_ref().map_or_else(
             || "Username or email".to_owned(),
             |(what, _)| format!("Username, email or {what}"),
         ),
         notice,
-        role: filter,
+        filter,
         filters,
         total,
         rows,
         pagination: Pagination::new(pager, &info),
     };
-    Ok(admin.render(&parts, &me, "Accounts", &page))
+    let body = admin.views.list(&parts, &view);
+    Ok(admin.render(&parts, &me, "Accounts", body))
 }
 
 /// The accounts the app's own search matches for `term`: none when it has none, the
@@ -578,37 +845,29 @@ impl Posted {
     }
 }
 
-#[derive(Template)]
-#[template(path = "admin/new.html")]
-struct NewPage<'a> {
-    base: &'a str,
+/// The new-account form, with what was posted and why it was refused.
+fn new_page(
+    admin: &Admin,
+    parts: &Parts,
+    me: &Account,
+    form: &Posted,
     error: Option<String>,
-    username: Field<'a>,
-    email: Field<'a>,
-    staff: bool,
-    roles: Vec<RoleBox>,
-}
-
-fn new_page<'a>(admin: &'a Admin, form: &'a Posted, error: Option<String>) -> NewPage<'a> {
-    NewPage {
-        base: &admin.base,
+) -> Response {
+    let view = NewView {
+        action: admin.base.clone(),
+        list: admin.base.clone(),
         error,
-        username: Field::text("username", "Username")
-            .value(form.value("username"))
-            .hint("One word, no “@”. It does not change later.")
-            .required()
-            .autofocus(),
-        email: Field::email("email", "Email")
-            .value(form.value("email"))
-            .hint("Optional. It signs in with the password, as the username does; a provider sign-in never matches it."),
+        username: form.value("username"),
+        email: form.value("email"),
         staff: form.ticked("staff"),
         roles: boxes(&admin.roles, &form.roles()),
-    }
+    };
+    let body = admin.views.new_account(parts, &view);
+    admin.render(parts, me, "New account", body)
 }
 
 async fn new_form(State(admin): Shared, Staff(me): Staff, Req(parts): Req) -> Response {
-    let empty = Posted(Vec::new());
-    admin.render(&parts, &me, "New account", &new_page(&admin, &empty, None))
+    new_page(&admin, &parts, &me, &Posted(Vec::new()), None)
 }
 
 /// Lock the acting member of staff's row and `target`'s, in id order (two staff
@@ -658,8 +917,7 @@ async fn create(
     let account = match made {
         Ok(account) => account,
         Err(crate::Error::Refused(r)) => {
-            let page = new_page(&admin, &form, Some(r.to_string()));
-            let mut response = admin.render(&parts, &me, "New account", &page);
+            let mut response = new_page(&admin, &parts, &me, &form, Some(r.to_string()));
             *response.status_mut() = StatusCode::UNPROCESSABLE_ENTITY;
             return Ok(response);
         }
@@ -678,32 +936,6 @@ async fn create(
     tx.commit().await?;
     tracing::info!(by = me.id, account = account.id, staff = account.is_staff, roles = ?granted, "admin created an account");
     Ok(admin.redirect(account.id, "created"))
-}
-
-/// A linked identity, for the page.
-struct IdentityRow {
-    id: i64,
-    provider: String,
-    label: String,
-}
-
-#[derive(Template)]
-#[template(path = "admin/detail.html")]
-struct DetailPage<'a> {
-    base: &'a str,
-    account: &'a Account,
-    myself: bool,
-    notice: Option<Notice>,
-    secret: Option<Secret>,
-    email: Field<'a>,
-    roles: Vec<RoleBox>,
-    undeclared: Vec<String>,
-    has_password: bool,
-    joined: String,
-    last_sign_in: String,
-    identities: Vec<IdentityRow>,
-    links_for: String,
-    more: Option<(&'static str, String)>,
 }
 
 /// The account, active or not, with its dates as text.
@@ -758,16 +990,17 @@ async fn show(
 ) -> owt_web::Result<Response> {
     let (account, joined, last_sign_in) = load(&admin.pool, id).await?;
     let has_password = store::has_password(&admin.pool, id).await?;
-    let identities = identities::list(&admin.pool, id)
+    let connections = identities::list(&admin.pool, id)
         .await?
         .into_iter()
-        .map(|l| IdentityRow {
+        .map(|l| Connection {
+            unlink: format!("{}/{id}/identities/{}/unlink", admin.base, l.id),
             id: l.id,
             label: l.label().to_owned(),
             provider: l.provider,
         })
         .collect();
-    let links_for = admin
+    let link_lifetime = admin
         .links
         .as_ref()
         .map_or_else(String::new, |(ttl, _)| human(ttl.min(&links::MAX_TTL)));
@@ -775,32 +1008,34 @@ async fn show(
         .more
         .as_ref()
         .map(|(label, href)| (*label, href(&account)));
-    let error = notice
+    let email_error = notice
         .as_ref()
-        .filter(|n| n.level == "error" && email_value.is_some())
+        .filter(|n| n.is_error() && email_value.is_some())
         .map(|n| n.text.clone());
-    let email_shown = email_value.unwrap_or(&account.email).to_owned();
-    let body = DetailPage {
-        base: &admin.base,
+    let at = format!("{}/{id}", admin.base);
+    let view = AccountView {
         account: &account,
         myself: account.id == me.id,
         notice,
         secret,
-        email: Field::email("email", "Email")
-            .value(&email_shown)
-            .error(error.as_deref())
-            .hint("It signs in with the password, as the username does; a provider sign-in never matches it."),
+        email: email_value.unwrap_or(&account.email).to_owned(),
+        email_error,
         roles: boxes(&admin.roles, &account.roles),
         undeclared: undeclared(&admin.roles, &account.roles).cloned().collect(),
         has_password,
         joined,
         last_sign_in,
-        identities,
-        links_for,
+        connections,
         more,
+        list: admin.base.clone(),
+        save: at.clone(),
+        set_password: format!("{at}/password"),
+        issue_link: admin.links.as_ref().map(|_| format!("{at}/link")),
+        link_lifetime,
+        sign_out: format!("{at}/sign-out"),
     };
-    let response = admin.render(parts, me, &account.username, &body);
-    Ok(response)
+    let body = admin.views.account(parts, &view);
+    Ok(admin.render(parts, me, &account.username, body))
 }
 
 /// A lifetime in words: `15 minutes`, `24 hours`, `7 days`.

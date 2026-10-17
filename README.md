@@ -1021,9 +1021,48 @@ let _app: axum::Router = axum::Router::new()
 # }
 ```
 
-Its markup carries only `owt-*` classes from `tailwind/owt.css` (buttons, tables,
-badges, checkboxes), so it takes the app's tokens with no CSS of the app's. A test
-here fails if a template names a class the stylesheet lacks.
+Its markup (`admin::Tailwind`, the default) carries only `owt-*` classes from
+`tailwind/owt.css` (buttons, tables, badges, checkboxes), so it takes the app's tokens
+with no CSS of the app's. A test here fails if a template names a class the stylesheet
+lacks.
+
+An app with another design system draws the pages itself: it implements
+`admin::Views` and passes it to `Admin::views`. Each method gets a page's view model
+(`ListView`, `NewView`, `AccountView`: what the page shows, the URLs its links and
+forms use, and on each type's docs the fields its forms post) and answers the body,
+which the app's `Chrome` then wraps as before. A method left out draws the `owt-*`
+page. The routes, the staff check, the cross-origin refusal, the locking, the
+refusals and the log stay in the admin whatever the markup: a page that leaves out
+the "Staff" box on your own account is the app's choice, and a post that takes it
+away is still refused.
+
+```rust,no_run
+use askama::Template;
+use axum::http::request::Parts;
+use owt_accounts::admin::{Body, ListView, Views};
+
+#[derive(Template)]
+#[template(source = r#"<table class="pf-table">
+{% for r in v.rows %}<tr><td><a href="{{ r.href }}">{{ r.username }}</a></td>
+<td>{% for b in r.badges %}<span class="pf-label">{{ b.text }}</span>{% endfor %}</td></tr>
+{% endfor %}</table>
+{% for i in v.pagination.items() %}<a href="{{ i.href }}">{{ i.label }}</a>{% endfor %}"#, ext = "html")]
+struct AccountList<'a, 'b> { v: &'a ListView<'b> }
+
+struct MyViews;
+
+impl Views for MyViews {
+    // The request's extensions hold the locale, nonce and session, as for `Chrome`.
+    fn list(&self, _request: &Parts, view: &ListView<'_>) -> owt_web::Result<Body> {
+        Body::render(&AccountList { v: view })
+    }
+    // `new_account` and `account` likewise, from `NewView` and `AccountView`.
+}
+# fn demo(pool: sqlx::PgPool, chrome: fn(owt_accounts::admin::Page<'_>) -> owt_web::Result<axum::response::Response>) {
+let admin = owt_accounts::admin::Admin::new(pool, "/staff/accounts", chrome).views(MyViews);
+# let _: axum::Router = admin.routes();
+# }
+```
 
 #### Site policies
 
