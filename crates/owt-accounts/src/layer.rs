@@ -313,7 +313,7 @@ impl<S: Send + Sync, X: Clone + Send + Sync + 'static> FromRequestParts<S> for S
     }
 }
 
-/// A signed-in member of staff.Anyone else signed in gets a 403; an anonymous
+/// A signed-in member of staff. Anyone else signed in gets a 403; an anonymous
 /// visitor goes to the sign-in page.
 #[derive(Clone, Debug)]
 pub struct Staff(pub Account);
