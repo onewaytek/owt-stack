@@ -232,7 +232,8 @@ impl<S: Send + Sync> FromRequestParts<S> for Maybe {
 }
 
 /// The signed-in account and what [`Accounts::load_with`] read with it, if any: none
-/// also when the layer is [`Accounts::load`], or `load_with` of another type.
+/// also when the layer is [`Accounts::load`], or `load_with` of another type, which
+/// logs a warning (the app installed the wrong layer).
 #[derive(Clone, Debug)]
 pub struct MaybeWith<X>(pub Option<(Account, X)>);
 
@@ -240,8 +241,16 @@ impl<X: Clone + Send + Sync + 'static> MaybeWith<X> {
     /// What the request's extensions hold, as [`Maybe::of`].
     #[must_use]
     pub fn of(extensions: &axum::http::Extensions) -> Self {
+        let account = Maybe::of(extensions).0;
         let extra = extensions.get::<LoadedExtra<X>>().map(|e| e.0.clone());
-        Self(Maybe::of(extensions).0.zip(extra))
+        if account.is_some() && extra.is_none() {
+            tracing::warn!(
+                "MaybeWith<{}> needs the layer Accounts::load_with of that type; \
+                 the signed-in viewer reads as anonymous",
+                std::any::type_name::<X>()
+            );
+        }
+        Self(account.zip(extra))
     }
 }
 

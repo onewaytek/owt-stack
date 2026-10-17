@@ -312,24 +312,28 @@ pub async fn by_id_in_epoch(
 /// or a join on `accounts.id`):
 ///
 /// ```sql
-/// SELECT COLUMNS, extra.* FROM accounts LEFT JOIN LATERAL (QUERY) extra ON true
+/// SELECT account.*, extra.* FROM accounts
+/// CROSS JOIN LATERAL (SELECT COLUMNS) account
+/// LEFT JOIN LATERAL (QUERY) extra ON true
 /// WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2
 /// ```
 ///
 /// The type is decoded from the same row as the [`Account`], by column name, so the
 /// query names its columns apart from [`COLUMNS`]' (`AS display_name`, not
-/// `username`). A query that finds no row reads as `NULL` in each column, so a field
-/// it may miss is an `Option`; a column that fails to decode fails the load like a
-/// database error. A query that finds several rows gives the first: end it with
-/// `LIMIT 1` unless the join is on a key.
+/// `username`). A row with two columns of one name fails the load like a database
+/// error, so an extra `roles` or `is_staff` can never stand in for the account's.
+/// A query that finds no row reads as `NULL` in each column, so a field it may miss
+/// is an `Option`; a column that fails to decode fails the load too. A query that
+/// finds several rows gives one of them, which one unsaid without an `ORDER BY`: join
+/// on a key, or end it with `LIMIT 1`.
 ///
 /// `QUERY` is SQL pasted into the statement as it is, so it is a constant of the app's
 /// code: never built from anything a visitor sends. It binds no parameters of its own
 /// (`$1` and `$2` are the library's); it reads the account through `accounts`.
 pub trait Extra: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Sync + 'static {
     /// The `SELECT`, as above: `"SELECT p.display_name FROM profiles p WHERE
-    /// p.account_id = accounts.id"`, or `"SELECT accounts.beta AS beta"` for a column
-    /// of the app's own on `accounts`.
+    /// p.account_id = accounts.id"`, or `"SELECT accounts.beta"` for a column of the
+    /// app's own on `accounts`.
     const QUERY: &'static str;
 }
 
@@ -339,9 +343,14 @@ pub async fn by_id_in_epoch_with<X: Extra>(
     id: i64,
     epoch: i32,
 ) -> sqlx::Result<Option<(Account, X)>> {
-    use sqlx::FromRow;
+    use sqlx::{Column, FromRow, Row};
+    // The account's columns are computed in a lateral of their own, which sees only
+    // `accounts`: an extra column named `id` does not make them ambiguous. The newline
+    // before each `)` keeps a `--` comment ending QUERY from swallowing it.
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS}, extra.* FROM accounts LEFT JOIN LATERAL ({}) extra ON true
+        "SELECT account.*, extra.* FROM accounts
+         CROSS JOIN LATERAL (SELECT {COLUMNS}\n) account
+         LEFT JOIN LATERAL ({}\n) extra ON true
          WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2",
         X::QUERY
     )))
@@ -349,8 +358,23 @@ pub async fn by_id_in_epoch_with<X: Extra>(
     .bind(epoch)
     .fetch_optional(db)
     .await?;
-    row.map(|row| Ok((Account::from_row(&row)?, X::from_row(&row)?)))
-        .transpose()
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    // Decoding by name reads the last column of a name: refuse any name twice, so
+    // the extra cannot replace what the account says (its roles, its staff flag).
+    let mut names = std::collections::HashSet::new();
+    if let Some(twice) = row.columns().iter().find(|c| !names.insert(c.name())) {
+        return Err(sqlx::Error::Decode(
+            format!(
+                "the Extra::QUERY of {} names a column {:?}, which the row already has",
+                std::any::type_name::<X>(),
+                twice.name()
+            )
+            .into(),
+        ));
+    }
+    Ok(Some((Account::from_row(&row)?, X::from_row(&row)?)))
 }
 
 /// The account with this username, active or not: a deactivated account is found

@@ -906,10 +906,15 @@ epoch, so it costs no second round trip and a revoked session reads nothing. A
 handler names `SignedWith<Viewer>` (walled as `Signed`) or `MaybeWith<Viewer>`;
 `Maybe`, `Signed`, `Staff` and `roles::Holds` work as before. `QUERY` is SQL pasted
 as it is, so it is a constant in the app's code, never built from a request; it binds
-no parameters. Its columns are named apart from `store::COLUMNS`'; a viewer with no
-joined row reads `NULL` in each (make the field an `Option`); a column that fails to
-decode fails the load as a database outage would. `store::by_id_in_epoch_with` is the
-same query outside the layer (a stream re-checking its viewer).
+no parameters. Its columns are named apart from the account's (`id`, `username`,
+`email`, `is_staff`, `is_active`, `session_epoch`, `roles`): a row with a name twice
+(`SELECT p.*` of a table with an `id`, an extra `roles`) is refused, never read in
+place of the account's. That refusal, and a column that fails to decode, fail the
+load as a database outage would, on every walled page, so an app sees it at once. A
+viewer with no joined row reads `NULL` in each column (make the field an `Option`);
+several rows give one of them, which one unsaid without an `ORDER BY`, so join on a
+key or end with `LIMIT 1`. `store::by_id_in_epoch_with` is the same query outside the
+layer (a stream re-checking its viewer).
 
 ```rust,no_run
 use axum::{Router, middleware::from_fn_with_state, routing::get};
@@ -922,8 +927,8 @@ struct Viewer {
 }
 
 impl store::Extra for Viewer {
-    const QUERY: &'static str = "SELECT p.display_name, accounts.beta
-        FROM (SELECT 1) one LEFT JOIN profiles p ON p.account_id = accounts.id";
+    const QUERY: &'static str = "SELECT accounts.beta, (SELECT p.display_name
+        FROM profiles p WHERE p.account_id = accounts.id) AS display_name";
 }
 
 async fn home(SignedWith(me, viewer): SignedWith<Viewer>) -> String {
