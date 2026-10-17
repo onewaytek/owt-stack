@@ -94,15 +94,17 @@ on:
         description: >-
           The Redis that sccache reads and writes compiled objects through
           (SCCACHE_REDIS_ENDPOINT), reachable from the runners; empty for no sccache.
-          It is used only when the sccache-redis-password secret is given too.
+          It is used only when the SCCACHE_REDIS_PASSWORD secret is given too.
         type: string
         default: redis://sccache-redis.sccache.svc:6379
     secrets:
-      sccache-redis-password:
+      # Named as the organization secret, because `secrets: inherit` passes a
+      # caller's secrets under their own names.
+      SCCACHE_REDIS_PASSWORD:
         description: >-
           The password of that Redis. An app passes `secrets: inherit`, so the
-          organization secret SCCACHE_REDIS_PASSWORD reaches it; without it the job
-          compiles without sccache.
+          organization secret of this name reaches it; without it the job compiles
+          without sccache.
         required: false
 
 # The jobs read the repository and nothing else.
@@ -214,16 +216,29 @@ jobs:
       # evicted) and holds only objects whose key names their inputs, so a poisoned
       # entry would need a write to the Redis, which the password guards; every
       # repository on the scale set shares that trust, as it shared the volume's.
+      # A step's `if` cannot read secrets, so this step decides for the two after it.
+      - name: Is sccache configured
+        id: sccache
+        env:
+          PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+          ENDPOINT: ${{ inputs.sccache-redis }}
+        shell: bash
+        run: |
+          if [ -n "$ENDPOINT" ] && [ -n "$PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No sccache-redis endpoint or no SCCACHE_REDIS_PASSWORD secret: compiling without sccache"
+          fi
       - name: Install sccache
-        if: ${{ inputs.sccache-redis != '' && secrets.sccache-redis-password != '' }}
+        if: ${{ steps.sccache.outputs.enabled == 'true' }}
         uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: sccache@0.18.0
           fallback: none
       - name: Compile through sccache
-        if: ${{ inputs.sccache-redis != '' && secrets.sccache-redis-password != '' }}
+        if: ${{ steps.sccache.outputs.enabled == 'true' }}
         env:
-          SCCACHE_REDIS_PASSWORD: ${{ secrets.sccache-redis-password }}
+          SCCACHE_REDIS_PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
           ENDPOINT: ${{ inputs.sccache-redis }}
         shell: bash
         run: |

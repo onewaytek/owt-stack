@@ -2070,8 +2070,8 @@ The cargo registry comes from GitHub's cache. Compiled dependencies come from
 [sccache](https://github.com/mozilla/sccache) through one Redis shared by every job on
 the runners and by developers' machines, so a crate compiled once at a toolchain is a
 hit for everyone after it; the job's own crates compile each run. It is on whenever the
-`sccache-redis-password` secret reaches the workflow (`secrets: inherit` below passes
-the organization secret `SCCACHE_REDIS_PASSWORD`) and `sccache-redis` names the Redis
+`SCCACHE_REDIS_PASSWORD` secret reaches the workflow (`secrets: inherit` below passes
+an organization or repository secret of that name) and `sccache-redis` names the Redis
 (default `redis://sccache-redis.sccache.svc:6379`, a Service in the cluster the
 runners run in). Without the secret the job compiles without a cache, so a fork or a
 repository the secret was not shared with still passes. The job summary shows sccache's
