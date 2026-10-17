@@ -2066,11 +2066,27 @@ GitHub cache. The job runs in `container` (default
 `mirror.gcr.io/library/rust:1-trixie`), and the services come from the same mirror of
 Docker Hub's official images, out of reach of Docker Hub's anonymous pull limit.
 
-Its Rust build cache is GitHub's, unless the job pod has a writable volume at `/cache`
-(an ARC pod template can mount one). Then the cargo registry is kept there, shared by
-every job, and target dirs are kept per repository, toolchain and image. Each of those
-has four slots, and a job holds one to itself. Anything unused for a week is removed,
-and a slot past 20 GiB starts over.
+The cargo registry comes from GitHub's cache. Compiled dependencies come from
+[sccache](https://github.com/mozilla/sccache) through one Redis shared by every job on
+the runners and by developers' machines, so a crate compiled once at a toolchain is a
+hit for everyone after it; the job's own crates compile each run. It is on whenever the
+`sccache-redis-password` secret reaches the workflow (`secrets: inherit` below passes
+the organization secret `SCCACHE_REDIS_PASSWORD`) and `sccache-redis` names the Redis
+(default `redis://sccache-redis.sccache.svc:6379`, a Service in the cluster the
+runners run in). Without the secret the job compiles without a cache, so a fork or a
+repository the secret was not shared with still passes. The job summary shows sccache's
+hit and miss counts. The Redis is bounded (`maxmemory`, least recently used evicted)
+and entries expire after a month unused. A developer joins the same cache with
+`~/.config/sccache/config`:
+
+```toml
+[cache.redis]
+endpoint = "redis://<host>:<port>"   # the Service's NodePort from the lab network
+password = "<the SCCACHE_REDIS_PASSWORD secret>"
+expiration = 2592000
+```
+
+and `rustc-wrapper = "sccache"` under `[build]` in `~/.cargo/config.toml`.
 
 <!-- x-release-please-start-version -->
 ```yaml
