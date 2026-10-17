@@ -303,6 +303,92 @@ pub async fn by_id_in_epoch(
     .await
 }
 
+/// What an app reads about the signed-in account beside the [`Account`], in the
+/// same query as the session's epoch check: [`by_id_in_epoch_with`], and the layer's
+/// [`load_with`](crate::Accounts::load_with).
+///
+/// [`QUERY`](Self::QUERY) is a `SELECT` run as a `LEFT JOIN LATERAL` beside the
+/// account's row, so it can name the row as `accounts` (the app's own columns on it,
+/// or a join on `accounts.id`):
+///
+/// ```sql
+/// SELECT account.*, extra.* FROM accounts
+/// CROSS JOIN LATERAL (SELECT COLUMNS) account
+/// LEFT JOIN LATERAL (QUERY) extra ON true
+/// WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2
+/// ```
+///
+/// The type is decoded from the same row as the [`Account`], by column name, so the
+/// query names its columns apart from [`COLUMNS`]' (`AS display_name`, not
+/// `username`). A row with two columns of one name fails the load like a database
+/// error, so an extra `roles` or `is_staff` can never stand in for the account's.
+/// A query that finds no row reads as `NULL` in each column, so a field it may miss
+/// is an `Option`; a column that fails to decode fails the load too. It yields at
+/// most one row: several fail the load as well, rather than pass one of them off as
+/// the viewer's. So join on a key or end it with `LIMIT 1`, and never name `accounts`
+/// in its own `FROM`: that reads the whole table, not the viewer's row.
+///
+/// `QUERY` is SQL pasted into the statement as it is, so it is a constant of the app's
+/// code: never built from anything a visitor sends. It binds no parameters of its own
+/// (`$1` and `$2` are the library's); it reads the account through `accounts`.
+pub trait Extra: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Sync + 'static {
+    /// The `SELECT`, as above: `"SELECT p.display_name FROM profiles p WHERE
+    /// p.account_id = accounts.id"`, or `"SELECT accounts.beta"` for a column of the
+    /// app's own on `accounts`.
+    const QUERY: &'static str;
+}
+
+/// [`by_id_in_epoch`], with what `X` reads beside the account in the same query.
+pub async fn by_id_in_epoch_with<X: Extra>(
+    db: impl PgExecutor<'_>,
+    id: i64,
+    epoch: i32,
+) -> sqlx::Result<Option<(Account, X)>> {
+    use sqlx::{Column, FromRow, Row};
+    // The account's columns are computed in a lateral of their own, which sees only
+    // `accounts`: an extra column named `id` does not make them ambiguous. The newline
+    // before each `)` keeps a `--` comment ending QUERY from swallowing it.
+    // LIMIT 2: enough to tell one row from several.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT account.*, extra.* FROM accounts
+         CROSS JOIN LATERAL (SELECT {COLUMNS}\n) account
+         LEFT JOIN LATERAL ({}\n) extra ON true
+         WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2
+         LIMIT 2",
+        X::QUERY
+    )))
+    .bind(id)
+    .bind(epoch)
+    .fetch_all(db)
+    .await?;
+    if rows.len() > 1 {
+        return Err(sqlx::Error::Decode(
+            format!(
+                "the Extra::QUERY of {} yields several rows for one account",
+                std::any::type_name::<X>()
+            )
+            .into(),
+        ));
+    }
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    // Decoding by name reads the last column of a name: refuse any name twice, so
+    // the extra cannot replace what the account says (its roles, its staff flag).
+    let mut names = std::collections::HashSet::new();
+    if let Some(twice) = row.columns().iter().find(|c| !names.insert(c.name())) {
+        return Err(sqlx::Error::Decode(
+            format!(
+                "the Extra::QUERY of {} names a column {:?}, which the row already has",
+                std::any::type_name::<X>(),
+                twice.name()
+            )
+            .into(),
+        ));
+    }
+    Ok(Some((Account::from_row(&row)?, X::from_row(&row)?)))
+}
+
 /// The account with this username, active or not: a deactivated account is found
 /// too, so this is not the account to sign in as. Sign-in goes through
 /// [`authenticate`], which finds active accounts only; code that looks a person up
