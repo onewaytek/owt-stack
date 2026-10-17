@@ -897,6 +897,46 @@ A refusal (`owt_accounts::Refused`) carries the sentence the person reads; a han
 matches `Error::Refused` to re-render the form with it, and the `From` into
 `owt_web::Error` answers 422 with the same text.
 
+**More about the viewer on every request** (a display name, a profile flag): implement
+`store::Extra` for a `sqlx::FromRow` type of the app's and install
+`Accounts::load_with::<session::Data, Viewer>` in place of `Accounts::load`. Its
+`QUERY` is a `SELECT` that names the account's row as `accounts`; the layer runs it as
+a `LEFT JOIN LATERAL` in the one query that loads the account and checks the session's
+epoch, so it costs no second round trip and a revoked session reads nothing. A
+handler names `SignedWith<Viewer>` (walled as `Signed`) or `MaybeWith<Viewer>`;
+`Maybe`, `Signed`, `Staff` and `roles::Holds` work as before. `QUERY` is SQL pasted
+as it is, so it is a constant in the app's code, never built from a request; it binds
+no parameters. Its columns are named apart from `store::COLUMNS`'; a viewer with no
+joined row reads `NULL` in each (make the field an `Option`); a column that fails to
+decode fails the load as a database outage would. `store::by_id_in_epoch_with` is the
+same query outside the layer (a stream re-checking its viewer).
+
+```rust,no_run
+use axum::{Router, middleware::from_fn_with_state, routing::get};
+use owt_accounts::{Accounts, SignedWith, session, store};
+
+#[derive(Clone, sqlx::FromRow)]
+struct Viewer {
+    display_name: Option<String>, // from the app's `profiles`, if the viewer has one
+    beta: bool,                   // the app's own column on `accounts`
+}
+
+impl store::Extra for Viewer {
+    const QUERY: &'static str = "SELECT p.display_name, accounts.beta
+        FROM (SELECT 1) one LEFT JOIN profiles p ON p.account_id = accounts.id";
+}
+
+async fn home(SignedWith(me, viewer): SignedWith<Viewer>) -> String {
+    viewer.display_name.unwrap_or(me.username)
+}
+
+# fn demo(accounts: Accounts) {
+let app: Router = Router::new()
+    .route("/", get(home))
+    .layer(from_fn_with_state(accounts, Accounts::load_with::<session::Data, Viewer>));
+# let _ = app; }
+```
+
 #### Roles
 
 Three tiers, and the third is the app's:

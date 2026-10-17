@@ -41,7 +41,7 @@ pub mod session;
 pub mod social;
 pub mod store;
 
-pub use layer::{Accounts, Maybe, Signed, Staff};
+pub use layer::{Accounts, Maybe, MaybeWith, Signed, SignedWith, Staff};
 pub use store::{Account, New, normalize};
 
 /// Why an account operation did not happen. Each message is written for the person

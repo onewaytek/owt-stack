@@ -9,7 +9,9 @@ use axum::Router;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 use owt_accounts::session::{self, Data};
-use owt_accounts::{Accounts, Maybe, New, Signed, Staff, identities, links, store};
+use owt_accounts::{
+    Accounts, Maybe, MaybeWith, New, Signed, SignedWith, Staff, identities, links, store,
+};
 use owt_auth::oauth;
 use owt_web::session::{Session, Sessions};
 use sqlx::PgPool;
@@ -366,6 +368,140 @@ async fn the_layer_loads_the_account_walls_the_private_pages_and_drops_a_revoked
     let (_, data) = sessions.unseal(&resealed).expect("still a session");
     assert_eq!(session::Signed::signature(&data), None);
     assert_eq!(client.get("/private").await.status, 303);
+    db.drop().await;
+}
+
+/// What a test app reads about the viewer beside the account: a column of its own on
+/// `accounts`, and one from a table of its own that a viewer may have no row in.
+#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+struct Viewer {
+    display_name: Option<String>,
+    beta: bool,
+}
+
+impl store::Extra for Viewer {
+    const QUERY: &'static str = "SELECT p.display_name, accounts.beta
+        FROM (SELECT 1) one LEFT JOIN profiles p ON p.account_id = accounts.id";
+}
+
+async fn add_viewer_tables(db: &Db) {
+    sqlx::raw_sql(
+        "ALTER TABLE accounts ADD COLUMN beta boolean NOT NULL DEFAULT false;
+         CREATE TABLE profiles (
+             id bigserial PRIMARY KEY,
+             account_id bigint NOT NULL UNIQUE REFERENCES accounts (id),
+             display_name text NOT NULL
+         );",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_extra_is_read_with_the_account_in_its_epoch() {
+    let db = db!();
+    add_viewer_tables(&db).await;
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let bob = store::create(&db.pool, new("bob", "", None)).await.unwrap();
+    sqlx::query("INSERT INTO profiles (account_id, display_name) VALUES ($1, 'Ada L.')")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE accounts SET beta = true WHERE id = $1")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let read =
+        |a: &store::Account, epoch| store::by_id_in_epoch_with::<Viewer>(&db.pool, a.id, epoch);
+    let (account, viewer) = read(&ada, ada.session_epoch).await.unwrap().unwrap();
+    assert_eq!(account, ada);
+    let ada_viewer = Viewer {
+        display_name: Some("Ada L.".into()),
+        beta: true,
+    };
+    assert_eq!(viewer, ada_viewer);
+    // No profile row: the account still loads, without a name.
+    let (account, viewer) = read(&bob, bob.session_epoch).await.unwrap().unwrap();
+    assert_eq!(account, bob);
+    assert_eq!(
+        viewer,
+        Viewer {
+            display_name: None,
+            beta: false
+        }
+    );
+    assert_eq!(read(&ada, ada.session_epoch + 1).await.unwrap(), None);
+    store::set_active(&db.pool, bob.id, false).await.unwrap();
+    assert_eq!(read(&bob, bob.session_epoch + 1).await.unwrap(), None);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn the_layer_with_an_extra_hands_it_to_the_handler_and_still_revokes() {
+    async fn named(SignedWith(me, viewer): SignedWith<Viewer>) -> String {
+        viewer.display_name.unwrap_or(me.username)
+    }
+    async fn chrome(MaybeWith(me): MaybeWith<Viewer>) -> String {
+        me.map_or_else(
+            || "anonymous".to_owned(),
+            |(_, v)| format!("beta {}", v.beta),
+        )
+    }
+    let db = db!();
+    add_viewer_tables(&db).await;
+    let sessions = sessions();
+    let accounts = Accounts::new(db.pool.clone(), "/login");
+    let with = Router::new()
+        .route("/named", get(named))
+        .route("/chrome", get(chrome))
+        .route(
+            "/private",
+            get(|Signed(me): Signed| async move { me.username }),
+        )
+        .layer(from_fn_with_state(
+            accounts.clone(),
+            Accounts::load_with::<Data, Viewer>,
+        ))
+        .layer(from_fn_with_state(sessions.clone(), Sessions::layer));
+    let without = Router::new()
+        .route("/named", get(named))
+        .route("/chrome", get(chrome))
+        .layer(from_fn_with_state(accounts, Accounts::load::<Data>))
+        .layer(from_fn_with_state(sessions.clone(), Sessions::layer));
+    let client = owt_test::Client::new(with);
+    let plain = owt_test::Client::new(without);
+
+    assert_eq!(client.get("/chrome").await.text(), "anonymous");
+    assert_eq!(client.get("/named").await.status, 303);
+
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    sqlx::query("INSERT INTO profiles (account_id, display_name) VALUES ($1, 'Ada L.')")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let sealed = cookie_for(&sessions, &ada);
+    client.set_cookie("s", &sealed);
+    assert_eq!(client.get("/named").await.text(), "Ada L.");
+    assert_eq!(client.get("/chrome").await.text(), "beta false");
+    assert_eq!(client.get("/private").await.text(), "ada");
+
+    // Under the plain layer the extra was never read: a wiring mistake, not a wall.
+    plain.set_cookie("s", &sealed);
+    assert_eq!(plain.get("/named").await.status, 500);
+    assert_eq!(plain.get("/chrome").await.text(), "anonymous");
+
+    store::sign_out_everywhere(&db.pool, ada.id).await.unwrap();
+    assert_eq!(client.get("/chrome").await.text(), "anonymous");
+    let (_, data) = sessions
+        .unseal(&client.cookie("s").expect("the cookie was rewritten"))
+        .expect("still a session");
+    assert_eq!(session::Signed::signature(&data), None);
+    assert_eq!(client.get("/named").await.status, 303);
     db.drop().await;
 }
 

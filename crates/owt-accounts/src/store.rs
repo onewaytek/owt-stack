@@ -303,6 +303,56 @@ pub async fn by_id_in_epoch(
     .await
 }
 
+/// What an app reads about the signed-in account beside the [`Account`], in the
+/// same query as the session's epoch check: [`by_id_in_epoch_with`], and the layer's
+/// [`load_with`](crate::Accounts::load_with).
+///
+/// [`QUERY`](Self::QUERY) is a `SELECT` run as a `LEFT JOIN LATERAL` beside the
+/// account's row, so it can name the row as `accounts` (the app's own columns on it,
+/// or a join on `accounts.id`):
+///
+/// ```sql
+/// SELECT COLUMNS, extra.* FROM accounts LEFT JOIN LATERAL (QUERY) extra ON true
+/// WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2
+/// ```
+///
+/// The type is decoded from the same row as the [`Account`], by column name, so the
+/// query names its columns apart from [`COLUMNS`]' (`AS display_name`, not
+/// `username`). A query that finds no row reads as `NULL` in each column, so a field
+/// it may miss is an `Option`; a column that fails to decode fails the load like a
+/// database error. A query that finds several rows gives the first: end it with
+/// `LIMIT 1` unless the join is on a key.
+///
+/// `QUERY` is SQL pasted into the statement as it is, so it is a constant of the app's
+/// code: never built from anything a visitor sends. It binds no parameters of its own
+/// (`$1` and `$2` are the library's); it reads the account through `accounts`.
+pub trait Extra: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Sync + 'static {
+    /// The `SELECT`, as above: `"SELECT p.display_name FROM profiles p WHERE
+    /// p.account_id = accounts.id"`, or `"SELECT accounts.beta AS beta"` for a column
+    /// of the app's own on `accounts`.
+    const QUERY: &'static str;
+}
+
+/// [`by_id_in_epoch`], with what `X` reads beside the account in the same query.
+pub async fn by_id_in_epoch_with<X: Extra>(
+    db: impl PgExecutor<'_>,
+    id: i64,
+    epoch: i32,
+) -> sqlx::Result<Option<(Account, X)>> {
+    use sqlx::FromRow;
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS}, extra.* FROM accounts LEFT JOIN LATERAL ({}) extra ON true
+         WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2",
+        X::QUERY
+    )))
+    .bind(id)
+    .bind(epoch)
+    .fetch_optional(db)
+    .await?;
+    row.map(|row| Ok((Account::from_row(&row)?, X::from_row(&row)?)))
+        .transpose()
+}
+
 /// The account with this username, active or not: a deactivated account is found
 /// too, so this is not the account to sign in as. Sign-in goes through
 /// [`authenticate`], which finds active accounts only; code that looks a person up

@@ -31,7 +31,7 @@ use owt_web::session::Session;
 use sqlx::PgPool;
 
 use crate::session::Signed as SignedData;
-use crate::store::{self, Account};
+use crate::store::{self, Account, Extra};
 
 /// The layer's state: the pool and where the sign-in page is.
 #[derive(Clone, Debug)]
@@ -56,15 +56,49 @@ impl Accounts {
     /// it).
     pub async fn load<T: SignedData>(
         State(this): State<Self>,
-        mut req: Request,
+        req: Request,
         next: Next,
     ) -> Response {
+        this.load_by::<T, _, _, _>(req, next, |pool, id, epoch| async move {
+            let account = store::by_id_in_epoch(&pool, id, epoch).await?;
+            Ok(account.map(|account| (account, ())))
+        })
+        .await
+    }
+
+    /// [`load`](Self::load), also reading `X` about the account in the same query as
+    /// the epoch check (see [`store::Extra`]), for [`SignedWith`] and [`MaybeWith`].
+    /// [`Maybe`], [`Signed`] and [`Staff`] read the account as under `load`. Install it
+    /// as `Accounts::load_with::<T, X>` in place of `load`.
+    pub async fn load_with<T: SignedData, X: Extra + Clone>(
+        State(this): State<Self>,
+        req: Request,
+        next: Next,
+    ) -> Response {
+        this.load_by::<T, _, _, _>(req, next, |pool, id, epoch| async move {
+            store::by_id_in_epoch_with::<X>(&pool, id, epoch).await
+        })
+        .await
+    }
+
+    /// The middleware, with `read` asking for the session's account (by id, in its
+    /// epoch) and what comes with it.
+    async fn load_by<T, X, F, R>(self, mut req: Request, next: Next, read: R) -> Response
+    where
+        T: SignedData,
+        X: Clone + Send + Sync + 'static,
+        F: Future<Output = sqlx::Result<Option<(Account, X)>>>,
+        R: FnOnce(PgPool, i64, i32) -> F,
+    {
         let session = req.extensions().get::<Session<T>>().cloned();
         let loaded = match session.as_ref().and_then(|s| s.read(SignedData::signature)) {
             None => Loaded::Anonymous,
             Some(signature) => {
-                match store::by_id_in_epoch(&this.pool, signature.account, signature.epoch).await {
-                    Ok(Some(account)) => Loaded::Account(account),
+                match read(self.pool.clone(), signature.account, signature.epoch).await {
+                    Ok(Some((account, extra))) => {
+                        req.extensions_mut().insert(LoadedExtra(extra));
+                        Loaded::Account(account)
+                    }
                     Ok(None) => {
                         // Revoked: the cookie must stop carrying it.
                         if let Some(session) = &session {
@@ -80,8 +114,8 @@ impl Accounts {
             }
         };
         req.extensions_mut().insert(loaded);
-        req.extensions_mut().insert(SignInAt(this.sign_in.clone()));
-        let htmx = HtmxWall::of(&req, &this.sign_in);
+        req.extensions_mut().insert(SignInAt(self.sign_in.clone()));
+        let htmx = HtmxWall::of(&req, &self.sign_in);
         let mut response = next.run(req).await;
         if let Some(htmx) = htmx {
             htmx.replace_wall(&mut response);
@@ -163,6 +197,11 @@ enum Loaded {
     Unknown,
 }
 
+/// What the layer read beside the account, kept beside [`Loaded::Account`]: `()` under
+/// [`Accounts::load`], the app's type under [`Accounts::load_with`].
+#[derive(Clone, Debug)]
+struct LoadedExtra<X>(X);
+
 /// Where the sign-in page is, for the extractors' redirect.
 #[derive(Clone, Debug)]
 struct SignInAt(String);
@@ -185,6 +224,28 @@ impl Maybe {
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for Maybe {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self::of(&parts.extensions))
+    }
+}
+
+/// The signed-in account and what [`Accounts::load_with`] read with it, if any: none
+/// also when the layer is [`Accounts::load`], or `load_with` of another type.
+#[derive(Clone, Debug)]
+pub struct MaybeWith<X>(pub Option<(Account, X)>);
+
+impl<X: Clone + Send + Sync + 'static> MaybeWith<X> {
+    /// What the request's extensions hold, as [`Maybe::of`].
+    #[must_use]
+    pub fn of(extensions: &axum::http::Extensions) -> Self {
+        let extra = extensions.get::<LoadedExtra<X>>().map(|e| e.0.clone());
+        Self(Maybe::of(extensions).0.zip(extra))
+    }
+}
+
+impl<S: Send + Sync, X: Clone + Send + Sync + 'static> FromRequestParts<S> for MaybeWith<X> {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
@@ -229,7 +290,30 @@ impl<S: Send + Sync> FromRequestParts<S> for Signed {
     }
 }
 
-/// A signed-in member of staff. Anyone else signed in gets a 403; an anonymous
+/// A signed-in account and what [`Accounts::load_with`] read with it, walled as
+/// [`Signed`] is. Signed in under a layer that read no `X` ([`Accounts::load`], or
+/// `load_with` of another type), it answers 500: the app installed the wrong layer.
+#[derive(Clone, Debug)]
+pub struct SignedWith<X>(pub Account, pub X);
+
+impl<S: Send + Sync, X: Clone + Send + Sync + 'static> FromRequestParts<S> for SignedWith<X> {
+    type Rejection = Error;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        let Some(account) = Maybe::of(&parts.extensions).0 else {
+            return Err(wall(parts));
+        };
+        match parts.extensions.get::<LoadedExtra<X>>() {
+            Some(extra) => Ok(Self(account, extra.0.clone())),
+            None => Err(Error::Internal(anyhow::anyhow!(
+                "SignedWith<{}> needs the layer Accounts::load_with of that type",
+                std::any::type_name::<X>()
+            ))),
+        }
+    }
+}
+
+/// A signed-in member of staff.Anyone else signed in gets a 403; an anonymous
 /// visitor goes to the sign-in page.
 #[derive(Clone, Debug)]
 pub struct Staff(pub Account);
