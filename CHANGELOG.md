@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.6.0](https://github.com/onewaytek/owt-stack/compare/v0.5.0...v0.6.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** install owt_accounts::migrations::ALL[4] (owt_accounts_local, 0005_local_identities.sql) as the app's next unused migration version, and await owt_accounts::migrations::complete before serving as before (it validates the constraint 0005 adds); assert_installed expects every entry. It takes the table account_local_identities, the column accounts.password_sign_in and the constraint accounts_password_sign_in_hash. Refused has a new variant, NoPasswordSignIn: an exhaustive match on it needs an arm.
+* Leases::new returns anyhow::Result<Leases>: add ?. Cache::connect and Leases::new refuse a prefix with characters other than ASCII letters, digits, _, . and -. An app whose prefix has a : or a space renames it. Its cache starts cold, and during that rollout a leased job may run on an old and a new replica at once.
+* **auth:** oauth::Provider's scope is a Cow<'static, str>: scope: "openid email" becomes scope: "openid email".into(), and a configured scope is passed as a String (scope: configured.into()) instead of a leaked &'static str. oauth::Error is #[non_exhaustive]: a match on it adds a _ arm.
+* **accounts:** install owt_accounts::migrations::ALL[3] (owt_accounts_policies, 0004_policies.sql) as the app's next unused migration version, whether or not the app uses site policies: assert_installed expects every entry. Its tables stay empty until the app wires policies::Policies.
+* Pagination has a public words field. A Pagination written as a struct literal adds words: owt_web::ui::PagerWords::ENGLISH; one made with Pagination::new needs no change.
+
+### Features
+
+* **accounts:** a public username rule for sign-up forms ([#67](https://github.com/onewaytek/owt-stack/issues/67)) ([db53560](https://github.com/onewaytek/owt-stack/commit/db53560d2d2dc8fddc1d3887a802766dd5024788))
+* **accounts:** an app draws the admin with its own templates ([#94](https://github.com/onewaytek/owt-stack/issues/94)) ([5c62816](https://github.com/onewaytek/owt-stack/commit/5c62816f880f3e7d4bb7faf813746ff227d011b3)), closes [#77](https://github.com/onewaytek/owt-stack/issues/77)
+* **accounts:** local and system accounts, reached by an app's own key with no password ([#95](https://github.com/onewaytek/owt-stack/issues/95)) ([36b2ba6](https://github.com/onewaytek/owt-stack/commit/36b2ba660c237baa031c0e5869b15061719b46c1))
+* **accounts:** name the tables the migrations take, and migrations::conflicts ([#85](https://github.com/onewaytek/owt-stack/issues/85)) ([03d0b63](https://github.com/onewaytek/owt-stack/commit/03d0b639ae6f20109b036009dfd4836abd8c6a32)), closes [#69](https://github.com/onewaytek/owt-stack/issues/69)
+* **accounts:** read an app's extra about the viewer in the load query ([#93](https://github.com/onewaytek/owt-stack/issues/93)) ([e34c98c](https://github.com/onewaytek/owt-stack/commit/e34c98c8e80ded65d5aa9d5f67b43293962cefe8)), closes [#78](https://github.com/onewaytek/owt-stack/issues/78)
+* **accounts:** run the app's code at each provider sign-in (SocialSignIn::on_arrival) ([#50](https://github.com/onewaytek/owt-stack/issues/50)) ([a335da6](https://github.com/onewaytek/owt-stack/commit/a335da64ff1459a9e97ab1b3427ebcdadd1ed1f0))
+* **accounts:** the admin also searches the app's own columns ([#89](https://github.com/onewaytek/owt-stack/issues/89)) ([247c34a](https://github.com/onewaytek/owt-stack/commit/247c34a147ecbbf302c913893f35c122fb9286d2)), closes [#52](https://github.com/onewaytek/owt-stack/issues/52)
+* **accounts:** the admin shows password sign-in off and an account's local identities ([#97](https://github.com/onewaytek/owt-stack/issues/97)) ([f47d5d4](https://github.com/onewaytek/owt-stack/commit/f47d5d43b937a6bd458d9a24cc7c6c1e80323ca8)), closes [#96](https://github.com/onewaytek/owt-stack/issues/96)
+* **accounts:** the provider's tokens at each sign-in and connect, and arrive_in ([#92](https://github.com/onewaytek/owt-stack/issues/92)) ([541b62e](https://github.com/onewaytek/owt-stack/commit/541b62ee54a013840b34ccb139451fb3f77b1eef)), closes [#60](https://github.com/onewaytek/owt-stack/issues/60)
+* **accounts:** track which version of each site policy an account accepted ([#56](https://github.com/onewaytek/owt-stack/issues/56)) ([a982a8a](https://github.com/onewaytek/owt-stack/commit/a982a8a7bc2e4a77dda3ff5a026b254da0d94585))
+* **auth:** an owned oauth::Provider scope, and a non-exhaustive oauth::Error ([#80](https://github.com/onewaytek/owt-stack/issues/80)) ([97eb1d5](https://github.com/onewaytek/owt-stack/commit/97eb1d53274b3b352cb64a1fa82067ddca220737))
+* **auth:** hand back the token set from a sign-in, refresh it, and get an app's own token ([#48](https://github.com/onewaytek/owt-stack/issues/48)) ([02bf671](https://github.com/onewaytek/owt-stack/commit/02bf671c98474ee712d1bdea90d188ac1f954480))
+* **auth:** put owt_auth::jwt behind a default jwt feature ([#90](https://github.com/onewaytek/owt-stack/issues/90)) ([87883bd](https://github.com/onewaytek/owt-stack/commit/87883bd6177e7db2db6344eb6534b2988e56e3cf)), closes [#70](https://github.com/onewaytek/owt-stack/issues/70)
+* **ci:** cache sqlx-cli, mirror the job image, requeue lost rc promotions ([#64](https://github.com/onewaytek/owt-stack/issues/64)) ([8fe2e77](https://github.com/onewaytek/owt-stack/commit/8fe2e77789c1978032636ffb3ca29edf4ae62ea1)), closes [#61](https://github.com/onewaytek/owt-stack/issues/61) [#62](https://github.com/onewaytek/owt-stack/issues/62)
+* **runtime:** jobs that run at schedule boundaries (Every::aligned) ([#91](https://github.com/onewaytek/owt-stack/issues/91)) ([91df731](https://github.com/onewaytek/owt-stack/commit/91df731793e7f2e7785905ac054aff44bd1a0943)), closes [#76](https://github.com/onewaytek/owt-stack/issues/76)
+* **templates:** app environment from a Secret, an optional Redis, and a CronJob template ([#86](https://github.com/onewaytek/owt-stack/issues/86)) ([a63eaaf](https://github.com/onewaytek/owt-stack/commit/a63eaaf9fb428ce4237cb7d19cc4ff1d604e9c27)), closes [#74](https://github.com/onewaytek/owt-stack/issues/74)
+* **templates:** pin an existing cluster's Postgres major and document a major upgrade ([#83](https://github.com/onewaytek/owt-stack/issues/83)) ([9bc0fc4](https://github.com/onewaytek/owt-stack/commit/9bc0fc4e84e00a54d0faf97881d4abc7aa1f83af)), closes [#75](https://github.com/onewaytek/owt-stack/issues/75)
+* the words owt's components write, in the page's language ([#57](https://github.com/onewaytek/owt-stack/issues/57)) ([07db751](https://github.com/onewaytek/owt-stack/commit/07db7511bf26fd1cd0017db14cb0e8f17c265772))
+* **web:** Csp::allow_style_attributes for style="…" attributes ([#82](https://github.com/onewaytek/owt-stack/issues/82)) ([b5a7722](https://github.com/onewaytek/owt-stack/commit/b5a772295f8b5639a2e47d8bb943634bc646364f)), closes [#71](https://github.com/onewaytek/owt-stack/issues/71)
+* **web:** Limits is a layer, so a route can have its own bounds ([#84](https://github.com/onewaytek/owt-stack/issues/84)) ([82c2a73](https://github.com/onewaytek/owt-stack/commit/82c2a73a97ee814d04606af650de1e2de063b691)), closes [#73](https://github.com/onewaytek/owt-stack/issues/73)
+* **web:** try_trust refuses a bad trusted origin with an error naming it ([#66](https://github.com/onewaytek/owt-stack/issues/66)) ([9c3b892](https://github.com/onewaytek/owt-stack/commit/9c3b892ea224e37cdc9fbdb187fbdf57babb12d2)), closes [#53](https://github.com/onewaytek/owt-stack/issues/53)
+
+
+### Bug Fixes
+
+* **accounts:** a database failure in the provider callback still uses up the pending sign-in ([#88](https://github.com/onewaytek/owt-stack/issues/88)) ([7b57d76](https://github.com/onewaytek/owt-stack/commit/7b57d76ea0163210c38a130125f6058e5da781e2)), closes [#59](https://github.com/onewaytek/owt-stack/issues/59)
+* **accounts:** the sign-in wall answers htmx with HX-Redirect ([#87](https://github.com/onewaytek/owt-stack/issues/87)) ([f229270](https://github.com/onewaytek/owt-stack/commit/f22927043e23cbe5589fa7151ba48fad416cea31)), closes [#72](https://github.com/onewaytek/owt-stack/issues/72)
+* one prefix rule for the cache, leases and bus; owt-accounts optional in owt-change ([#81](https://github.com/onewaytek/owt-stack/issues/81)) ([5910c40](https://github.com/onewaytek/owt-stack/commit/5910c4043076bb638137da0ee549cc4ea113ace2))
+
 ## [0.5.0](https://github.com/onewaytek/owt-stack/compare/v0.4.4...v0.5.0) (2026-10-16)
 
 
