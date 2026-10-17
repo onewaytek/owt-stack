@@ -1036,17 +1036,33 @@ refusals and the log stay in the admin whatever the markup: a page that leaves o
 the "Staff" box on your own account is the app's choice, and a post that takes it
 away is still refused.
 
+The body is embedded as it is, so render the view models only through a template
+Askama escapes HTML in: a file ending `.html`, or a `source` with `ext = "html"`.
+Usernames, emails and provider labels are their owners' text; a `.txt` or `.md`
+template, `escape = "none"` or a `|safe` prints them as markup on a staff page. If
+the app's account page fails while showing a new password or sign-in link (already
+made, and shown once), the admin logs the error and shows it on the `owt-*` page
+instead.
+
 ```rust,no_run
 use askama::Template;
 use axum::http::request::Parts;
 use owt_accounts::admin::{Body, ListView, Views};
+use owt_web::ui::Kind; // what each pager item is, for the `match` below
 
 #[derive(Template)]
 #[template(source = r#"<table class="pf-table">
 {% for r in v.rows %}<tr><td><a href="{{ r.href }}">{{ r.username }}</a></td>
 <td>{% for b in r.badges %}<span class="pf-label">{{ b.text }}</span>{% endfor %}</td></tr>
 {% endfor %}</table>
-{% for i in v.pagination.items() %}<a href="{{ i.href }}">{{ i.label }}</a>{% endfor %}"#, ext = "html")]
+{% if v.pagination.pager.is_paginated() %}<nav class="pf-pagination" aria-label="Pages">
+{% for i in v.pagination.items() %}{% match i.kind %}
+{% when Kind::Previous %}<a href="{{ i.href }}" rel="prev">Previous</a>
+{% when Kind::Next %}<a href="{{ i.href }}" rel="next">Next</a>
+{% when Kind::Current %}<span aria-current="page">{{ i.label }}</span>
+{% when Kind::Gap %}<span aria-hidden="true">…</span>
+{% when _ %}<a href="{{ i.href }}">{{ i.label }}</a>
+{% endmatch %}{% endfor %}</nav>{% endif %}"#, ext = "html")]
 struct AccountList<'a, 'b> { v: &'a ListView<'b> }
 
 struct MyViews;

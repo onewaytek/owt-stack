@@ -76,8 +76,12 @@ impl fmt::Display for Body {
 impl HtmlSafe for Body {}
 
 impl Body {
-    /// `template`, rendered: what a [`Views`] method answers. Askama escapes what the
-    /// template prints, so the body is safe to embed as it is.
+    /// `template`, rendered: what a [`Views`] method answers. The body is embedded
+    /// as it is, never escaped again, so `template` must be one Askama escapes HTML
+    /// in: a file ending `.html` (`path = "admin/list.html"`) or a `source` with
+    /// `ext = "html"`. A `.txt` or `.md` template, or `escape = "none"`, prints the
+    /// view models' text raw, and a username, email or provider label its owner chose
+    /// becomes markup on a staff page. Never `|safe` a view model's text.
     ///
     /// # Errors
     ///
@@ -132,6 +136,10 @@ where
 /// the field names each form posts are on its view model. The routes check what is
 /// posted whatever the markup: a page that offers less (no "Staff" box on your own
 /// account) is a choice of the app's, and one that offers more is refused.
+///
+/// Much of a view model's text is chosen by someone other than staff (usernames,
+/// emails, provider labels): render it only through an HTML-escaping template, as
+/// [`Body::render`] says.
 pub trait Views: Send + Sync + 'static {
     /// The list of accounts.
     ///
@@ -165,6 +173,10 @@ pub trait Views: Send + Sync + 'static {
     }
 
     /// An account's page.
+    ///
+    /// When it fails on a page carrying a [`Secret`] (the answer to setting a password
+    /// or issuing a link, both already made), the error is logged and the
+    /// [`Tailwind`] page shows the secret instead: nothing could show it again.
     ///
     /// # Errors
     ///
@@ -355,6 +367,7 @@ pub struct RoleChoice {
 
 /// How a [`Notice`] reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Level {
     /// It worked.
     Success,
@@ -1034,7 +1047,14 @@ async fn show(
         link_lifetime,
         sign_out: format!("{at}/sign-out"),
     };
-    let body = admin.views.account(parts, &view);
+    let body = match admin.views.account(parts, &view) {
+        // The secret is made and committed: a 500 would lose it.
+        Err(e) if view.secret.is_some() => {
+            tracing::error!(error = ?e, "the app's admin page failed; showing the secret in Tailwind");
+            Tailwind.account(parts, &view)
+        }
+        body => body,
+    };
     Ok(admin.render(parts, me, &account.username, body))
 }
 

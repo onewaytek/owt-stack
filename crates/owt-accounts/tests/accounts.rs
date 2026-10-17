@@ -1969,12 +1969,19 @@ mod plain {
     use askama::Template;
     use axum::http::request::Parts;
     use owt_accounts::admin::{AccountView, Body, ListView, NewView, Views};
+    use owt_web::ui::Kind;
 
     #[derive(Template)]
     #[template(
         source = r#"<ul class="pf-list" data-total="{{ v.total }}" data-filter="{{ v.filter }}">
 {% for r in v.rows %}<li><a href="{{ r.href }}">{{ r.username }}</a>{% for b in r.badges %} [{{ b.text }}]{% endfor %}</li>
-{% endfor %}</ul>{% for i in v.pagination.items() %}<a class="pf-page" href="{{ i.href }}">{{ i.label }}</a>{% endfor %}
+{% endfor %}</ul>{% for i in v.pagination.items() %}{% match i.kind %}
+{% when Kind::Previous %}<a class="pf-prev" href="{{ i.href }}">Previous</a>
+{% when Kind::Next %}<a class="pf-next" href="{{ i.href }}">Next</a>
+{% when Kind::Current %}<b class="pf-current">{{ i.label }}</b>
+{% when Kind::Gap %}…
+{% when Kind::Page %}<a class="pf-page" href="{{ i.href }}">{{ i.label }}</a>
+{% endmatch %}{% endfor %}
 <a href="{{ v.new_account }}">add</a>"#,
         ext = "html"
     )]
@@ -2015,16 +2022,128 @@ mod plain {
             Body::render(&Account { v: view })
         }
     }
+
+    /// An app whose account page always fails.
+    pub struct Broken;
+
+    impl Views for Broken {
+        fn account(&self, _: &Parts, _: &AccountView<'_>) -> owt_web::Result<Body> {
+            Err(owt_web::Error::Internal(anyhow::anyhow!(
+                "the template broke"
+            )))
+        }
+    }
 }
 
-/// The test app with the admin drawn by [`plain::Plain`].
-fn plain_app(db: &Db, sessions: &Sessions<Data>) -> Router {
+/// The test app with the admin drawn by `views`.
+fn plain_app_with(
+    db: &Db,
+    sessions: &Sessions<Data>,
+    views: impl owt_accounts::admin::Views,
+) -> Router {
     let admin = admin(db)
-        .views(plain::Plain)
+        .views(views)
         .sign_in_links(Duration::from_secs(3_600), |token| {
             format!("https://app.example/login/link/{token}")
         });
     app(db, sessions, admin.routes())
+}
+
+/// The test app with the admin drawn by [`plain::Plain`].
+fn plain_app(db: &Db, sessions: &Sessions<Data>) -> Router {
+    plain_app_with(db, sessions, plain::Plain)
+}
+
+/// An app's list pages with the view model's pager: each kind of item drawn its
+/// own way, the filter kept.
+#[tokio::test]
+async fn an_apps_templates_page_the_list() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(plain_app(&db, &sessions));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    sqlx::query(
+        "WITH made AS (
+            INSERT INTO accounts (username, username_skeleton)
+            SELECT 'ed' || lpad(n::text, 3, '0'), 'ed' || lpad(n::text, 3, '0')
+            FROM generate_series(1, 55) n
+            RETURNING id)
+         INSERT INTO account_roles (account_id, role) SELECT id, 'editor' FROM made",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let first = client.get("/staff/accounts?role=editor").await.text();
+    assert!(
+        first.contains(r#"data-total="55""#)
+            && first.contains(r#"<b class="pf-current">1</b>"#)
+            && first.contains(
+                r#"<a class="pf-page" href="/staff/accounts?role=editor&#38;page=2">2</a>"#
+            )
+            && first.contains(
+                r#"<a class="pf-next" href="/staff/accounts?role=editor&#38;page=2">Next</a>"#
+            )
+            && !first.contains("pf-prev")
+            && !first.contains(r#"href="""#),
+        "{first}"
+    );
+    let second = client
+        .get("/staff/accounts?role=editor&page=2")
+        .await
+        .text();
+    assert!(
+        second.contains(r#"<a class="pf-prev" href="/staff/accounts?role=editor">Previous</a>"#)
+            && second.contains(r#"<b class="pf-current">2</b>"#)
+            && second.contains(">ed055</a>")
+            && !second.contains("pf-next"),
+        "{second}"
+    );
+    db.drop().await;
+}
+
+/// A password or link is made before its page is drawn: when the app's page fails,
+/// the admin's own shows it rather than lose it to a 500.
+#[tokio::test]
+async fn a_secret_survives_the_apps_page_failing() {
+    let db = db!();
+    let sessions = sessions();
+    let client = owt_test::Client::new(plain_app_with(&db, &sessions, plain::Broken));
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let at = format!("/staff/accounts/{}", ada.id);
+    assert_eq!(client.get(&at).await.status, 500);
+
+    for action in ["password", "link"] {
+        let r = client.post_form(&format!("{at}/{action}"), &[]).await;
+        assert_eq!(r.status, 200, "{action}");
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+        assert_eq!(r.header("x-frame-options"), Some("DENY"));
+        let value = secret(&r.text());
+        if action == "password" {
+            assert!(
+                store::authenticate(&db.pool, "ada", &value)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        } else {
+            assert!(
+                value.starts_with("https://app.example/login/link/"),
+                "{value}"
+            );
+        }
+    }
+    db.drop().await;
 }
 
 /// An app draws every admin page from the view models with its own templates.
@@ -2105,7 +2224,10 @@ async fn an_app_draws_the_admin_with_its_own_templates() {
 
     let r = client.post_form(&format!("{at}/password"), &[]).await;
     assert_eq!(r.status, 200);
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(r.header("x-frame-options"), Some("DENY"));
     let html = r.text();
+    assert!(!html.contains("owt-"), "{html}");
     let password = html
         .split(r#"<output class="pf-secret">"#)
         .nth(1)
