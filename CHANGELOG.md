@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.1](https://github.com/onewaytek/owt-stack/compare/v0.6.0...v0.6.1) (2026-10-17)
+
+
+### Features
+
+* **templates:** backup instance and prune-image options; fix requeue and CI cache fallback ([#103](https://github.com/onewaytek/owt-stack/issues/103)) ([9df3790](https://github.com/onewaytek/owt-stack/commit/9df3790086082bd5ba0498c0eb2109edcd0d7c4b)), closes [#98](https://github.com/onewaytek/owt-stack/issues/98)
+
+
+### Bug Fixes
+
+* **ci:** requeue-rc reads the run's status instead of GitHub's refusal wording ([#117](https://github.com/onewaytek/owt-stack/issues/117)) ([81b4a27](https://github.com/onewaytek/owt-stack/commit/81b4a27477e55003008ada0013030a38b612aea4))
+
 ## [0.6.0](https://github.com/onewaytek/owt-stack/compare/v0.5.0...v0.6.0) (2026-10-17)
 
 
