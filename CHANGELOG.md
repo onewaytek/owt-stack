@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/onewaytek/owt-stack/compare/v0.6.1...v0.7.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ci:** rust-ci.yml no longer uses a cargo cache volume at /cache; compiled crates come from sccache over a shared Redis. To use it, an app passes `secrets: inherit` on its call of rust-ci.yml and at every level of workflow that calls that one, and makes a secret SCCACHE_REDIS_PASSWORD visible to the repository (a private repository on GitHub Free needs a repository secret, since organization secrets do not reach it). An app on GitHub-hosted runners (RUNS_ON) passes `sccache-redis: ""`. Remove the /cache volume mount from the runner pod template. Without the secret the checks pass uncached.
+
+### Features
+
+* **ci:** compiled dependencies from sccache over a shared Redis, not a cache volume ([#116](https://github.com/onewaytek/owt-stack/issues/116)) ([94ec486](https://github.com/onewaytek/owt-stack/commit/94ec48674f971d0356d0e311b9cf6731fbd3425e))
+
 ## [0.6.1](https://github.com/onewaytek/owt-stack/compare/v0.6.0...v0.6.1) (2026-10-17)
 
 
