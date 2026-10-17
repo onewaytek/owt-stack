@@ -201,21 +201,24 @@ jobs:
           components: rustfmt, clippy
       # The cargo registry and git checkouts come from GitHub's cache, keyed by the
       # lockfile and the toolchain. Nothing of target/ is cached that way: compiled
-      # dependencies come from sccache instead, so a job never inherits another job's
-      # build directory (a shared target dir cannot be checked; an sccache entry is
-      # keyed by the compiler, its flags and the exact inputs, and a miss costs one
-      # compile). The job pod no longer needs a volume at /cache.
+      # crates come from sccache instead, so a job never inherits another job's build
+      # directory (a shared target dir cannot be checked; an sccache entry is keyed by
+      # the compiler, its flags and the exact inputs, and a miss costs one compile).
+      # The job needs no volume.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-targets: "false"
-      # sccache, with one Redis shared by every job on the scale set and by the
-      # developers' machines: a dependency compiled once at a toolchain is a hit for
-      # everyone after. Prebuilt and checksummed, as the gate's tools are. Only with the
-      # secret: a job without it (a fork, a repository that has not been given it)
-      # compiles as before. The Redis itself is bounded (maxmemory, least recently used
-      # evicted) and holds only objects whose key names their inputs, so a poisoned
-      # entry would need a write to the Redis, which the password guards; every
-      # repository on the scale set shares that trust, as it shared the volume's.
+      # sccache, with one Redis shared by every job on the scale set. A Rust entry's key
+      # holds absolute paths (the source, CARGO_MANIFEST_DIR, the working directory)
+      # and the toolchain's own files, so a hit needs the same crate built at the same
+      # paths by the same toolchain: jobs in one image share registry crates, and a
+      # repository's own crates with its earlier runs; a developer machine, whose
+      # paths differ, keeps entries of its own.
+      # Prebuilt and checksummed, as the gate's tools are. Only with the secret: a job
+      # without it compiles without sccache. The Redis is bounded (maxmemory, least
+      # recently used evicted) and holds only objects whose key names their inputs, so
+      # a poisoned entry needs a write to the Redis, which the password guards; every
+      # repository on the scale set shares that trust.
       # A step's `if` cannot read secrets, so this step decides for the two after it.
       - name: Is sccache configured
         id: sccache
@@ -235,24 +238,45 @@ jobs:
         with:
           tool: sccache@0.18.0
           fallback: none
-      - name: Compile through sccache
+      # The server checks the Redis as it starts (it reads and writes a check key), so
+      # an unreachable Redis or a wrong password stops it here, within about ten
+      # seconds; the job then warns and compiles without sccache.
+      #
+      # The password reaches the server and nothing else: it is in a config file only
+      # while the server starts (before any of the app's code has run), and not in the
+      # server's environment, nor in any later step's, where the gate, every build
+      # script and every test could read it. The server lives for the job
+      # (SCCACHE_IDLE_TIMEOUT=0). Should it exit anyway, the next compile starts one
+      # without the config, which caches on local disk, and SCCACHE_IGNORE_SERVER_IO_ERROR
+      # compiles directly when no server answers: either way the build goes on.
+      - name: Start sccache
         if: ${{ steps.sccache.outputs.enabled == 'true' }}
         env:
-          SCCACHE_REDIS_PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+          PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
           ENDPOINT: ${{ inputs.sccache-redis }}
         shell: bash
         run: |
-          {
-            echo "RUSTC_WRAPPER=sccache"
-            echo "SCCACHE_REDIS_ENDPOINT=$ENDPOINT"
-            echo "SCCACHE_REDIS_PASSWORD=$SCCACHE_REDIS_PASSWORD"
+          conf="$RUNNER_TEMP/sccache.toml"
+          # A TOML basic string: backslashes and quotes escaped.
+          pw=${PASSWORD//\\/\\\\}
+          pw=${pw//\"/\\\"}
+          (
+            umask 077
             # A month unused and an entry may go; the Redis evicts sooner if full.
-            echo "SCCACHE_REDIS_EXPIRATION=2592000"
-            # A cache that cannot be reached costs each compile a connection attempt;
-            # say so once rather than fail the gate.
-            echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
-          } >> "$GITHUB_ENV"
-          echo "::add-mask::$SCCACHE_REDIS_PASSWORD"
+            printf '[cache.redis]\nendpoint = "%s"\npassword = "%s"\nexpiration = 2592000\n' \
+              "$ENDPOINT" "$pw" > "$conf"
+          )
+          if env -u PASSWORD SCCACHE_CONF="$conf" SCCACHE_IDLE_TIMEOUT=0 sccache --start-server; then
+            rm -f "$conf"
+            {
+              echo "RUSTC_WRAPPER=sccache"
+              echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
+            } >> "$GITHUB_ENV"
+          else
+            rm -f "$conf"
+            sccache --stop-server > /dev/null 2>&1 || true
+            echo "::warning::sccache could not use the Redis at $ENDPOINT (above): compiling without it"
+          fi
       # Its own step, so a pin the lockfile can't satisfy fails here by name.
       - name: Fetch dependencies
         run: cargo fetch --locked
@@ -267,8 +291,8 @@ jobs:
           tool: just@1.58.0,cargo-audit@0.22.2
           fallback: none
       # sqlx publishes no binaries, so sqlx-cli is built: under a cargo home and a
-      # target of this job's own, from crates.io afresh, never through the shared
-      # index (whose entries name a crate's checksum and download URL). The binary
+      # target of this job's own, from crates.io afresh, with the checkout's
+      # configuration left out, and through sccache when it is on. The binary
       # is kept in the GitHub cache (scoped to the repository and branch, like
       # rust-cache's), keyed by its version and features and by the image it was
       # built in, so it is built once per image rather than every run. It is
@@ -370,17 +394,21 @@ jobs:
         shell: bash
         # Unquoted on purpose: several arguments.
         run: cargo test --locked $TEST_ARGS
+      # Never fails the job. A server that restarted during the job counts only
+      # what it served since.
       - name: sccache statistics
         if: ${{ always() && env.RUSTC_WRAPPER == 'sccache' }}
+        continue-on-error: true
         shell: bash
         run: |
+          stats=$(sccache --show-stats 2>&1) || true
           {
             echo '### sccache'
             echo '```'
-            sccache --show-stats
+            echo "$stats"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          sccache --show-stats | grep -E 'Cache (hits|misses|errors)|Compile requests executed'
+          echo "$stats" | grep -E 'Cache (hits|misses|errors)|Compile requests executed' || true
 
   css:
     if: ${{ inputs.css-script != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}

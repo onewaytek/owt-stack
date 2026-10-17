@@ -2066,18 +2066,25 @@ GitHub cache. The job runs in `container` (default
 `mirror.gcr.io/library/rust:1-trixie`), and the services come from the same mirror of
 Docker Hub's official images, out of reach of Docker Hub's anonymous pull limit.
 
-The cargo registry comes from GitHub's cache. Compiled dependencies come from
+The cargo registry comes from GitHub's cache. Compiled crates come from
 [sccache](https://github.com/mozilla/sccache) through one Redis shared by every job on
-the runners and by developers' machines, so a crate compiled once at a toolchain is a
-hit for everyone after it; the job's own crates compile each run. It is on whenever the
-`SCCACHE_REDIS_PASSWORD` secret reaches the workflow (`secrets: inherit` below passes
-an organization or repository secret of that name) and `sccache-redis` names the Redis
-(default `redis://sccache-redis.sccache.svc:6379`, a Service in the cluster the
-runners run in). Without the secret the job compiles without a cache, so a fork or a
-repository the secret was not shared with still passes. The job summary shows sccache's
-hit and miss counts. The Redis is bounded (`maxmemory`, least recently used evicted)
-and entries expire after a month unused. A developer joins the same cache with
-`~/.config/sccache/config`:
+the runners. sccache keys a Rust compile by its absolute paths and the toolchain's
+files, so a hit needs the same crate built at the same paths by the same toolchain:
+jobs in one image share registry crates across repositories, and a repository's own
+crates hit its earlier runs. It is on when the `SCCACHE_REDIS_PASSWORD` secret reaches
+the workflow (`secrets: inherit` below passes an organization or repository secret of
+that name; an organization secret reaches a private repository only on a paid plan, so
+a private repository on GitHub Free sets it as a repository secret) and
+`sccache-redis` names the Redis (default `redis://sccache-redis.sccache.svc:6379`, a
+Service in the cluster the runners run in). The password goes to the sccache server
+alone, never into the environment of the gate, build scripts or tests. Without the
+secret the job compiles without a cache. If the Redis cannot be used (unreachable, or
+the password is wrong), the job warns after about ten seconds and compiles without it;
+it does not fail. The job summary shows sccache's hit and miss counts. The Redis is
+bounded (`maxmemory`, least recently used evicted) and entries expire after a month
+unused. A developer machine can use the same Redis; its paths differ from the
+runners', so its entries are its own (its registry crates hit across its clean
+rebuilds and worktrees, not CI's). It joins with `~/.config/sccache/config`:
 
 ```toml
 [cache.redis]
@@ -2108,7 +2115,9 @@ jobs:
 The checks run on the `arc-openshift-k8s` scale set unless the repository or
 organization variable `RUNS_ON` names other runners, as JSON (`"ubuntu-latest"`). A
 public repository should: self-hosted runners in the cluster are no place for code
-anyone can propose. Off ARC the services are at their names (`postgres`, `redis`)
+anyone can propose. Off the cluster the Redis's Service name does not resolve, so such
+an app passes `sccache-redis: ""` (otherwise each job spends about ten seconds finding
+that out, warns, and compiles without sccache). Off ARC the services are at their names (`postgres`, `redis`)
 rather than localhost; `DATABASE_URL` and `REDIS_URL` follow, so build on those
 rather than naming a host.
 
@@ -2606,6 +2615,17 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+
+## Upgrading from 0.6
+
+- `rust-ci.yml` compiles through sccache over a shared Redis instead of a cargo cache
+  volume at `/cache`. To use it, pass `secrets: inherit` on the call of `rust-ci.yml`
+  and at every level of workflow that calls the one that calls it, and make a secret
+  `SCCACHE_REDIS_PASSWORD` visible to the repository (an organization secret, or a
+  repository secret for a private repository on GitHub Free). An app on GitHub-hosted
+  runners (`RUNS_ON`) passes `sccache-redis: ""`. The job uses no `/cache` volume:
+  remove its mount from the runner pod template. Without the secret the checks pass,
+  uncached.
 
 ## Upgrading from 0.5
 
