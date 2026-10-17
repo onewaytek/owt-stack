@@ -236,7 +236,7 @@ jobs:
             done
           # A full volume usually still has this repository's slot dirs, so creating
           # them proves nothing, and a build in a claimed slot would fail for space.
-          avail=$(df -Pk /cache | awk 'NR == 2 { print $4 }')
+          avail=$(df -Pk /cache | awk 'NR == 2 { print $4 }') || avail=0
           [ "${avail:-0}" -ge $((5 * 1024 * 1024)) ] \
             || volume_failed "/cache has $((${avail:-0} / 1024)) MiB free, under 5 GiB"
           mkdir -p "$slots" || volume_failed "creating $slots failed"
