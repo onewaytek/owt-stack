@@ -114,6 +114,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # Keep this name: requeue-rc.yml tells a run that set out to promote from one
+      # that skipped promotion by whether this step ran.
       - id: merge
         name: Merge into rc
         env:

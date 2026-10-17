@@ -10,14 +10,18 @@ name: Requeue rc promotions
 #   fails at "Move rc to the candidate", having lost a race, not a check.
 #
 # This finds the open, same-repository, non-draft PRs into `base` whose head is not
-# in rc and whose latest run of `workflow` for that head ended either way, and re-runs
-# the oldest one (the whole run, so the promotion starts from a fresh candidate).
-# One at a time, and only while no run of `workflow` is waiting: a re-run is a new
-# arrival in the concurrency group and would cancel a waiting run, which is the
-# first loss over again. A run that failed its checks is not re-run; nor is one
-# already on its `max-attempts`th attempt. Call it from the candidate workflow after
-# publishing, so each promotion hands on to the next lost one, and from a schedule,
-# for when no promotion follows:
+# in rc and whose latest promoting run of `workflow` for that head ended either way,
+# and re-runs the oldest one (the whole run, so the promotion starts from a fresh
+# candidate). A run that succeeded without running promote-rc.yml's "Merge into rc"
+# step (a trigger such as `edited` that skips the candidate job) is passed over, so it
+# can't hide a lost promotion for the same head. One at a time, and only while no run
+# of `workflow` is waiting: a re-run is a new arrival in the concurrency group and
+# would cancel a waiting run, which is the first loss over again. A run that failed
+# its checks is not re-run; nor is one already on its `max-attempts`th attempt. Call
+# it from the candidate workflow after publishing, so each promotion hands on to the
+# next lost one, and from a schedule, for when no promotion follows. The scheduled
+# one runs outside the concurrency group, so both can pick the same run; GitHub
+# refuses the second re-run, and that refusal is logged, not failed:
 #
 #   # pr.yml, beside the candidate flow
 #   requeue:
@@ -78,6 +82,9 @@ jobs:
             const maxAttempts = Number(process.env.MAX_ATTEMPTS);
             // The step publish-rc.yml fails at when rc moved under the candidate.
             const raceStep = "Move rc to the candidate";
+            // promote-rc.yml's step that makes the candidate: a run that ran it set
+            // out to promote (keep that name too).
+            const mergeStep = "Merge into rc";
 
             for (const status of ["requested", "queued", "pending", "waiting"]) {
               const { data } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id, status, per_page: 1 });
@@ -108,26 +115,57 @@ jobs:
               if (cmp.status === "ahead" || cmp.status === "identical") continue;
 
               const { data: runs } = await github.rest.actions.listWorkflowRuns({
-                owner, repo, workflow_id, head_sha: head, event: "pull_request", per_page: 1,
+                owner, repo, workflow_id, head_sha: head, event: "pull_request", per_page: 20,
               });
-              const run = runs.workflow_runs[0];
-              if (!run || run.status !== "completed") continue;
+              // The newest run that set out to promote this head decides. One that
+              // succeeded without merging (an `edited` or `labeled` trigger whose
+              // candidate job was skipped) is passed over, so it cannot hide a lost
+              // promotion beneath it.
+              let run;
+              let lost = false;
+              for (const r of runs.workflow_runs) {
+                // Still going: it may yet promote, so leave the PR to it.
+                if (r.status !== "completed") break;
+                // Cancelled, waiting or running: a candidate it would have made was never
+                // published. (One cancelled before any job ran can't be told from a
+                // non-promoting run; its re-run merges nothing and succeeds, and the
+                // next pass looks beneath it.)
+                if (r.conclusion === "cancelled") { run = r; lost = true; break; }
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+                  owner, repo, run_id: r.id, attempt_number: r.run_attempt, per_page: 100,
+                });
+                const steps = jobs.flatMap((j) => j.steps ?? []);
+                if (r.conclusion === "failure") {
+                  // Lost the race at publishing, or failed a check (which is not re-run).
+                  run = r;
+                  lost = steps.some((s) => s.name === raceStep && s.conclusion === "failure");
+                  break;
+                }
+                // Succeeded: a promotion if it merged; otherwise look further back.
+                if (steps.some((s) => s.name === mergeStep && s.conclusion && s.conclusion !== "skipped")) {
+                  run = r;
+                  break;
+                }
+              }
+              if (!run || !lost) continue;
               if (run.run_attempt >= maxAttempts) {
                 core.info(`#${pr.number}: run ${run.id} is on attempt ${run.run_attempt}; leaving it`);
                 continue;
               }
 
-              let lost = run.conclusion === "cancelled";
-              if (!lost && run.conclusion === "failure") {
-                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
-                  owner, repo, run_id: run.id, attempt_number: run.run_attempt, per_page: 100,
-                });
-                lost = jobs.some((j) => (j.steps ?? []).some((s) => s.name === raceStep && s.conclusion === "failure"));
-              }
-              if (!lost) continue;
-
               core.notice(`#${pr.number}: run ${run.id} (${run.conclusion}) never promoted ${head}; re-running it`);
-              await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+              try {
+                await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+              } catch (e) {
+                // The scheduled requeue runs outside the promote-rc group, so it can pick
+                // the run the in-group one just re-ran, and GitHub refuses the second
+                // re-run. The run is going again, which is what was wanted.
+                if ([403, 409, 422].includes(e.status) && /already|rerun|re-run/i.test(e.message ?? "")) {
+                  core.info(`#${pr.number}: run ${run.id} was not re-run (${e.status}: ${e.message}); another requeue got there first`);
+                  return;
+                }
+                throw e;
+              }
               return;
             }
             core.info("no lost promotion");
