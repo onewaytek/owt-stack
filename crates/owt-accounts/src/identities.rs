@@ -9,6 +9,10 @@
 //! to someone else, so an unlinked identity whose verified email matches an account
 //! is still a stranger to it. The only way to add a provider to an existing account
 //! is [`link`], from a session already signed in to that account.
+//!
+//! An app that vouches for a person itself (its own check, a device it enrolled, a
+//! system account its jobs act as) reaches the account with [`arrive_as`], by a key
+//! and subject of its own, with no provider.
 
 use owt_auth::oauth::{Identity, Provider};
 use serde_json::Value;
@@ -115,7 +119,8 @@ pub async fn link(
 }
 
 /// Unlink identity `id` from `account_id`. Refused when it is the account's only
-/// way in (no password, no other identity); `false` when no such link exists.
+/// way in (no password, no other identity, no local identity); `false` when no such
+/// link exists.
 ///
 /// Two unlinks at once are serialized on the account's row, and each counts the
 /// identities only once it holds it: counted in the statement that waited, the
@@ -146,7 +151,8 @@ pub(crate) async fn unlink_in(
     // A statement after the lock reads what committed before it was granted.
     let (theirs, count) = sqlx::query_as::<_, (bool, i64)>(
         "SELECT EXISTS (SELECT 1 FROM account_identities WHERE id = $2 AND account_id = $1),
-                (SELECT count(*) FROM account_identities WHERE account_id = $1)",
+                (SELECT count(*) FROM account_identities WHERE account_id = $1)
+                + (SELECT count(*) FROM account_local_identities WHERE account_id = $1)",
     )
     .bind(account_id)
     .bind(id)
@@ -186,7 +192,8 @@ pub struct Welcome {
 pub enum Arrival {
     /// The identity was linked already.
     Known(Account),
-    /// An account was created for it, with a username made from the identity.
+    /// An account was created for it, with a username made from the identity (or,
+    /// by [`arrive_as`], from the name the app gave).
     Created(Account),
     /// Nothing matched and the policy creates nothing.
     Unknown,
@@ -365,6 +372,126 @@ pub async fn arrive_in(
     };
     tx.commit().await?;
     Ok(arrival)
+}
+
+/// The first key of the advisory lock [`arrive_as`] takes per local identity.
+const LOCAL_ARRIVAL_LOCK: i32 = 0x6f77_7402;
+
+/// Resolve the account an app knows as `subject` under `key`, a namespace of the
+/// app's own (`kiosk`, `system`): for a person or a process the app vouches for
+/// itself, with no provider. Local identities are kept apart from providers' (no
+/// provider's subject matches one, and [`list`], [`unconfigured`] and the
+/// connections page never show one).
+///
+/// Linked already: [`Arrival::Known`] (a deactivated account is
+/// [`Arrival::Unknown`]). Not linked: with `create` (a username, given a number
+/// after it when taken), [`Arrival::Created`], an account with no email whose
+/// password sign-in is off ([`store::set_password_sign_in`]): no password opens it
+/// and [`store::authenticate`] never finds it by name, so this pair is its only way
+/// in besides a sign-in link. Without `create`, [`Arrival::Unknown`].
+/// [`Refused::NoSubject`] when `key` or `subject` is empty, [`Refused::Username`]
+/// when `create` breaks the username rule.
+///
+/// As [`arrive`], one transaction under a lock on the pair, so two at once resolve
+/// to one account.
+pub async fn arrive_as(
+    pool: &PgPool,
+    key: &str,
+    subject: &str,
+    create: Option<&str>,
+) -> Result<Arrival> {
+    arrive_as_in(&mut *pool.acquire().await?, key, subject, create).await
+}
+
+/// [`arrive_as`] on `conn`, as [`arrive_in`] is [`arrive`]: in a savepoint inside
+/// the caller's transaction, holding the lock on the pair until it ends.
+pub async fn arrive_as_in(
+    conn: &mut sqlx::PgConnection,
+    key: &str,
+    subject: &str,
+    create: Option<&str>,
+) -> Result<Arrival> {
+    if key.is_empty() || subject.is_empty() {
+        return Err(Refused::NoSubject.into());
+    }
+    if let Some(refused) = create.and_then(store::username_problem) {
+        return Err(refused.into());
+    }
+    let mut tx = sqlx::Connection::begin(conn).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(LOCAL_ARRIVAL_LOCK)
+        .bind(format!("{key}\n{subject}"))
+        .execute(&mut *tx)
+        .await?;
+    let linked: Option<i64> = sqlx::query_scalar(
+        "UPDATE account_local_identities SET last_sign_in = now()
+         WHERE key = $1 AND subject = $2 RETURNING account_id",
+    )
+    .bind(key)
+    .bind(subject)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let arrival = match (linked, create) {
+        (Some(id), _) => store::by_id(&mut *tx, id)
+            .await?
+            .map_or(Arrival::Unknown, Arrival::Known),
+        (None, Some(username)) => {
+            let account = create_for(&mut tx, &store::normalize(username), "").await?;
+            sqlx::query("UPDATE accounts SET password_sign_in = false WHERE id = $1")
+                .bind(account.id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO account_local_identities (account_id, key, subject)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(account.id)
+            .bind(key)
+            .bind(subject)
+            .execute(&mut *tx)
+            .await?;
+            Arrival::Created(account)
+        }
+        (None, None) => Arrival::Unknown,
+    };
+    tx.commit().await?;
+    Ok(arrival)
+}
+
+/// Retire the local identity `subject` under `key` (a device lost or re-enrolled):
+/// the pair reaches nothing from now on, and the account it reached is signed out
+/// everywhere (every session ends and its unused sign-in links are void), so no
+/// session the pair opened outlives it. The account's id, or `None` when the pair
+/// was not linked. Nothing else is touched: the account stays, active, and may be
+/// left with no way in but a link an operator mints, which is what retiring a
+/// system account's only identity means. Deactivate it as well to retire it whole.
+pub async fn forget_as(
+    db: impl PgExecutor<'_>,
+    key: &str,
+    subject: &str,
+) -> sqlx::Result<Option<i64>> {
+    // The account's row is locked first, as unlink locks it before counting the ways
+    // in: an unlink waiting on it then counts without this pair, and one holding it
+    // has counted with it and finishes before this deletes.
+    sqlx::query_scalar(
+        "WITH owner AS (
+            SELECT a.id FROM accounts a
+            JOIN account_local_identities l ON l.account_id = a.id
+            WHERE l.key = $1 AND l.subject = $2 FOR UPDATE OF a),
+         gone AS (
+            DELETE FROM account_local_identities
+            WHERE key = $1 AND subject = $2 AND account_id IN (SELECT id FROM owner)
+            RETURNING account_id),
+         voided AS (
+            UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
+            WHERE account_id IN (SELECT account_id FROM gone) AND used_at IS NULL)
+         UPDATE accounts SET session_epoch = session_epoch + 1
+         WHERE id IN (SELECT account_id FROM gone) RETURNING id",
+    )
+    .bind(key)
+    .bind(subject)
+    .fetch_optional(db)
+    .await
 }
 
 /// A username from what the provider says: the display name, else the email's

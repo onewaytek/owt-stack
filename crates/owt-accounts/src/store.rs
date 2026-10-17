@@ -217,6 +217,7 @@ pub async fn create_in(conn: &mut sqlx::PgConnection, new: New<'_>) -> Result<Ac
 }
 
 /// The active account `login` (a username or an email) and `password` open, if any.
+/// An account [`set_password_sign_in`] turned off is never found, by either name.
 ///
 /// A login that matches no account, or an account with no password, still costs a
 /// full Argon2 check, so the time taken does not say which accounts exist. A hash in
@@ -236,7 +237,8 @@ pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<
     // At most one row: no username has an `@`, every email does, and each is unique.
     let row = sqlx::query_as::<_, (i64, String)>(
         "SELECT id, password_hash FROM accounts
-         WHERE is_active AND (username = $1 OR (email <> '' AND lower(email) = $1))",
+         WHERE is_active AND password_sign_in
+           AND (username = $1 OR (email <> '' AND lower(email) = $1))",
     )
     .bind(&login)
     .fetch_optional(pool)
@@ -269,7 +271,8 @@ pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<
     }
     Ok(sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
         "UPDATE accounts SET last_sign_in = now()
-         WHERE id = $1 AND is_active AND password_hash = $2 RETURNING {COLUMNS}"
+         WHERE id = $1 AND is_active AND password_sign_in AND password_hash = $2
+         RETURNING {COLUMNS}"
     )))
     .bind(id)
     .bind(&current)
@@ -391,8 +394,9 @@ pub async fn by_id_in_epoch_with<X: Extra>(
 
 /// The account with this username, active or not: a deactivated account is found
 /// too, so this is not the account to sign in as. Sign-in goes through
-/// [`authenticate`], which finds active accounts only; code that looks a person up
-/// by name to act as them checks [`Account::is_active`] first.
+/// [`authenticate`], which finds active accounts only (and none that
+/// [`set_password_sign_in`] turned off); code that looks a person up by name to act
+/// as them checks [`Account::is_active`] first.
 pub async fn by_username(db: impl PgExecutor<'_>, username: &str) -> sqlx::Result<Option<Account>> {
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM accounts WHERE username = $1"
@@ -402,14 +406,17 @@ pub async fn by_username(db: impl PgExecutor<'_>, username: &str) -> sqlx::Resul
     .await
 }
 
-/// The active account with this email, if the email is set.
+/// The active account with this email, if the email is set and is a sign-in name: an
+/// account [`set_password_sign_in`] turned off is not found by it, so a reset by email
+/// cannot reach one.
 pub async fn by_email(db: impl PgExecutor<'_>, email: &str) -> sqlx::Result<Option<Account>> {
     let email = normalize(email);
     if email.is_empty() {
         return Ok(None);
     }
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM accounts WHERE email <> '' AND lower(email) = $1 AND is_active"
+        "SELECT {COLUMNS} FROM accounts
+         WHERE email <> '' AND lower(email) = $1 AND is_active AND password_sign_in"
     )))
     .bind(email)
     .fetch_optional(db)
@@ -438,8 +445,9 @@ pub async fn has_password(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<bool
 }
 
 /// SQL true when the row has a password: the table holds an Argon2id hash or
-/// nothing, so a stored hash is one that can open the account.
-pub(crate) const USABLE_PASSWORD: &str = "password_hash <> ''";
+/// nothing, so a stored hash is one that can open the account, unless password
+/// sign-in is off.
+pub(crate) const USABLE_PASSWORD: &str = "password_sign_in AND password_hash <> ''";
 
 /// The signed-in person's own change: `current` must open `account` first, so a
 /// session someone else is holding cannot also take the password (and sign its owner
@@ -470,9 +478,10 @@ pub async fn change_password(
 
 /// Replace `account`'s password, sign it out everywhere and void its unused sign-in
 /// links. `false` when the row is gone. For staff, or a reset by link; the account's
-/// own change is [`change_password`]. Refuses a password that breaks a rule, the similarity rule included: the
-/// account is passed, not its id, so its username and email are there to check
-/// against.
+/// own change is [`change_password`]. Refuses a password that breaks a rule, the
+/// similarity rule included (the account is passed, not its id, so its username and
+/// email are there to check against), and [`Refused::NoPasswordSignIn`] when
+/// [`set_password_sign_in`] turned password sign-in off for the account.
 pub async fn set_password(
     db: impl PgExecutor<'_>,
     account: &Account,
@@ -495,22 +504,65 @@ async fn replace_password(
     let hash = owt_auth::password::hash(password)
         .await
         .map_err(Error::Hash)?;
-    let done = sqlx::query(
+    // The row's flag, read under its lock: whether it took the password.
+    let allowed = sqlx::query_scalar::<_, bool>(
         "WITH target AS (
-            SELECT id FROM accounts
+            SELECT id, password_sign_in FROM accounts
             WHERE id = $2 AND ($3::text IS NULL OR password_hash = $3) FOR UPDATE),
          voided AS (
             UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
-            WHERE account_id IN (SELECT id FROM target) AND used_at IS NULL)
-         UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1
-         WHERE id IN (SELECT id FROM target)",
+            WHERE account_id IN (SELECT id FROM target WHERE password_sign_in)
+              AND used_at IS NULL),
+         updated AS (
+            UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1
+            WHERE id IN (SELECT id FROM target WHERE password_sign_in))
+         SELECT password_sign_in FROM target",
     )
     .bind(&hash)
     .bind(account.id)
     .bind(expected)
+    .fetch_optional(db)
+    .await?;
+    match allowed {
+        Some(false) => Err(Refused::NoPasswordSignIn.into()),
+        found => Ok(found.is_some()),
+    }
+}
+
+/// Turn password sign-in on or off for the account: off, no password opens it
+/// ([`authenticate`] and [`by_email`] never find it, and [`set_password`] refuses
+/// it), so it is reached only by a provider identity, a local identity
+/// ([`identities::arrive_as`](crate::identities::arrive_as)) or a sign-in link.
+/// Turning it off clears the password and signs the account out everywhere: every
+/// session ends and its unused sign-in links are void, so nothing handed out for the
+/// way in it closes outlives it (an operator may mint a new link after). Turning it
+/// off again, or back on, changes nothing else, and sets no password.
+pub async fn set_password_sign_in(
+    db: impl PgExecutor<'_>,
+    id: i64,
+    allowed: bool,
+) -> sqlx::Result<()> {
+    // `turned_off` is read under the row's lock, so it is the latest committed flag
+    // (not this statement's snapshot): when two changes race, whichever turns it off
+    // both moves the epoch and voids the links.
+    sqlx::query(
+        "WITH target AS (
+            SELECT id, password_sign_in AND NOT $2 AS turned_off FROM accounts
+            WHERE id = $1 FOR UPDATE),
+         voided AS (
+            UPDATE sign_in_links SET used_at = now(), used_from = 'voided'
+            WHERE account_id IN (SELECT id FROM target WHERE turned_off)
+              AND used_at IS NULL)
+         UPDATE accounts SET session_epoch = session_epoch + target.turned_off::int,
+                password_hash = CASE WHEN $2 THEN password_hash ELSE '' END,
+                password_sign_in = $2
+         FROM target WHERE accounts.id = target.id",
+    )
+    .bind(id)
+    .bind(allowed)
     .execute(db)
     .await?;
-    Ok(done.rows_affected() == 1)
+    Ok(())
 }
 
 /// Sign the account out everywhere: every session it has, on any device, ends at

@@ -12,7 +12,8 @@
 //! - [`session`]: what the cookie carries, signing in and out, the validator.
 //! - [`layer`]: the middleware that loads the signed-in account once per request,
 //!   and the extractors ([`Signed`], [`Staff`], [`Maybe`]) a handler names.
-//! - [`identities`]: provider identities (OAuth) linked to accounts.
+//! - [`identities`]: provider identities (OAuth) linked to accounts, and the app's
+//!   own local ones.
 //! - [`links`]: one-time sign-in links.
 //! - [`roles`]: user, staff, and the roles an app declares; the [`roles::Holds`]
 //!   extractor.
@@ -79,6 +80,10 @@ pub enum Refused {
     /// The current password, asked for before a change, is not the account's.
     #[error("That is not your current password.")]
     CurrentPassword,
+    /// The account does not sign in with a password (see
+    /// [`store::set_password_sign_in`]), so none can be set on it.
+    #[error("This account does not sign in with a password.")]
+    NoPasswordSignIn,
     /// Unlinking would leave the account with no way to sign in.
     #[error("Your account has no password, so its only connection cannot be removed.")]
     LastWayIn,

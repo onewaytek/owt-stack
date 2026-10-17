@@ -1220,7 +1220,16 @@ async fn reset_password(
     lock(&mut tx, &me, id).await?;
     let (account, ..) = load(&mut *tx, id).await?;
     let password = generated_password(&account);
-    store::set_password(&mut *tx, &account, &password).await?;
+    match store::set_password(&mut *tx, &account, &password).await {
+        Err(e) if e.refused() == Some(&Refused::NoPasswordSignIn) => {
+            drop(tx);
+            let notice = Notice::error(Refused::NoPasswordSignIn.to_string());
+            let mut response = show(&admin, &parts, &me, id, Some(notice), None, None).await?;
+            *response.status_mut() = StatusCode::CONFLICT;
+            return Ok(response);
+        }
+        done => done?,
+    };
     tx.commit().await?;
     tracing::info!(by = me.id, account = id, "admin set a generated password");
     let secret = Secret {
