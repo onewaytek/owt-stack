@@ -9,9 +9,13 @@
 //!   given afterwards, once: a generated password or a sign-in link.
 //! - **Change:** email, active, staff, each role; reset to a generated password,
 //!   issue a sign-in link ([`Admin::sign_in_links`]), sign out everywhere, unlink a
-//!   provider identity.
+//!   provider identity, turn password sign-in on or off
+//!   ([`store::set_password_sign_in`]), retire a local identity
+//!   ([`identities::forget_as`]). An account with password sign-in off is badged in
+//!   the list, and its page offers no password.
 //!
-//! What it refuses: taking away your own staff access or deactivating yourself, a
+//! What it refuses: taking away your own staff access, deactivating yourself, turning
+//! your own password sign-in off or retiring your own local identity, a
 //! change by someone who stopped being staff after their request began, unlinking an
 //! account's only way in, and every refusal the [`store`] makes (a taken email, say).
 //! Each change runs in a transaction that first locks the acting member of staff's
@@ -241,8 +245,11 @@ pub struct Row {
     pub username: String,
     /// Its email, or empty.
     pub email: String,
-    /// What it is, in words: deactivated, staff, each role; `User` when none.
+    /// What it is, in words: deactivated, staff, each role, `User` when none of
+    /// those; then `Password sign-in off` when it is.
     pub badges: Vec<Badge>,
+    /// Whether a password may open it ([`store::set_password_sign_in`]).
+    pub password_sign_in: bool,
     /// The day it last signed in (`YYYY-MM-DD`), or empty for never.
     pub last_sign_in: String,
 }
@@ -287,8 +294,14 @@ pub struct NewView<'a> {
 ///   On your own account ([`AccountView::myself`]) send `active` and `staff` ticked:
 ///   taking either away is refused.
 /// - [`AccountView::set_password`] and [`AccountView::issue_link`] answer this page
-///   with the [`AccountView::secret`].
+///   with the [`AccountView::secret`]. Setting a password is refused (409) while
+///   [`AccountView::password_sign_in`] is off: offer it only when on.
+/// - [`AccountView::set_password_sign_in`]: `password_sign_in`, `on` or `off`.
+///   Turning it off removes the password and signs the account out everywhere; it is
+///   refused on your own account.
 /// - [`AccountView::sign_out`] and each [`Connection::unlink`] redirect back here.
+/// - Each [`LocalIdentity::forget`]: its `key` and `subject`. It signs the account
+///   out everywhere, and is refused on your own account.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct AccountView<'a> {
@@ -311,12 +324,17 @@ pub struct AccountView<'a> {
     pub undeclared: Vec<String>,
     /// Whether it has a password.
     pub has_password: bool,
+    /// Whether a password may open it: off for an account reached only through a
+    /// provider, a local identity or a link ([`store::set_password_sign_in`]).
+    pub password_sign_in: bool,
     /// The day it was created (`YYYY-MM-DD`).
     pub joined: String,
     /// When it last signed in (`YYYY-MM-DD HH:MM`), or `never`.
     pub last_sign_in: String,
     /// Its linked provider identities.
     pub connections: Vec<Connection>,
+    /// The identities the app reaches it by ([`identities::arrive_as`]).
+    pub local_identities: Vec<LocalIdentity>,
     /// The app's own page about it, as `(label, href)` ([`Admin::more`]).
     pub more: Option<(&'static str, String)>,
     /// The list's URL.
@@ -325,6 +343,8 @@ pub struct AccountView<'a> {
     pub save: String,
     /// Where "set a generated password" posts.
     pub set_password: String,
+    /// Where turning password sign-in on or off posts.
+    pub set_password_sign_in: String,
     /// Where "issue a sign-in link" posts, when the admin offers them
     /// ([`Admin::sign_in_links`]).
     pub issue_link: Option<String>,
@@ -347,6 +367,23 @@ pub struct Connection {
     /// Where "remove" posts: it signs the account out everywhere, and is refused for
     /// the account's last way in.
     pub unlink: String,
+}
+
+/// An identity the app reaches an account by, `subject` under a `key` of its own
+/// ([`identities::arrive_as`]).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct LocalIdentity {
+    /// The app's namespace (`kiosk`, `system`).
+    pub key: String,
+    /// Who or what it is there (`desk-1`).
+    pub subject: String,
+    /// The day it was first used (`YYYY-MM-DD`).
+    pub created: String,
+    /// When it last reached the account (`YYYY-MM-DD HH:MM`).
+    pub last_sign_in: String,
+    /// Where "retire" posts, with `key` and `subject` ([`identities::forget_as`]).
+    pub forget: String,
 }
 
 /// A role as a checkbox, posted as `role` with [`RoleChoice::name`] as its value.
@@ -540,6 +577,8 @@ impl Admin {
             .route("/{id}/link", post(issue_link))
             .route("/{id}/sign-out", post(sign_out))
             .route("/{id}/identities/{identity}/unlink", post(unlink))
+            .route("/{id}/password-sign-in", post(set_password_sign_in))
+            .route("/{id}/local-identities/forget", post(forget_local))
             .with_state(Arc::new(self))
             .layer(axum::middleware::from_fn_with_state(
                 CrossOrigin::new(),
@@ -625,6 +664,15 @@ impl Notice {
                 Self::success("Sign-in connection removed, and the account signed out everywhere.")
             }
             "last-way-in" => Self::error(Refused::LastWayIn.to_string()),
+            "password-sign-in-on" => Self::success(
+                "Password sign-in is on. The account has no password until one is set.",
+            ),
+            "password-sign-in-off" => Self::success(
+                "Password sign-in is off: its password is gone, and the account signed out everywhere.",
+            ),
+            "forgotten" => {
+                Self::success("Local identity retired, and the account signed out everywhere.")
+            }
             _ => return None,
         })
     }
@@ -710,11 +758,22 @@ async fn list(
         PER_PAGE,
     );
     let offset = i64::try_from(pager.offset(PER_PAGE)).unwrap_or(i64::MAX);
-    let accounts: Vec<(Account, String)> = sqlx::query_as::<
+    let accounts: Vec<(Account, String, bool)> = sqlx::query_as::<
         _,
-        (i64, String, String, bool, bool, i32, Vec<String>, String),
+        (
+            i64,
+            String,
+            String,
+            bool,
+            bool,
+            i32,
+            Vec<String>,
+            String,
+            bool,
+        ),
     >(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS}, coalesce(to_char(last_sign_in, 'YYYY-MM-DD'), '') {FROM}
+        "SELECT {COLUMNS}, coalesce(to_char(last_sign_in, 'YYYY-MM-DD'), ''), password_sign_in
+             {FROM}
              ORDER BY username LIMIT $5 OFFSET $6"
     )))
     .bind(&term)
@@ -727,7 +786,7 @@ async fn list(
     .await?
     .into_iter()
     .map(
-        |(id, username, email, is_staff, is_active, session_epoch, roles, last)| {
+        |(id, username, email, is_staff, is_active, session_epoch, roles, last, pw)| {
             (
                 Account {
                     id,
@@ -739,14 +798,16 @@ async fn list(
                     roles,
                 },
                 last,
+                pw,
             )
         },
     )
     .collect();
     let rows = accounts
         .into_iter()
-        .map(|(a, last_sign_in)| Row {
-            badges: badges(&admin.roles, &a),
+        .map(|(a, last_sign_in, password_sign_in)| Row {
+            badges: badges(&admin.roles, &a, password_sign_in),
+            password_sign_in,
             href: format!("{}/{}", admin.base, a.id),
             id: a.id,
             username: a.username,
@@ -754,14 +815,6 @@ async fn list(
             last_sign_in,
         })
         .collect();
-    let mut filters = vec![("staff".to_owned(), "Staff".to_owned())];
-    filters.extend(
-        admin
-            .roles
-            .iter()
-            .map(|r| (r.name.to_owned(), r.label.to_owned())),
-    );
-    filters.push(("inactive".to_owned(), "Deactivated".to_owned()));
     let view = ListView {
         url: admin.base.clone(),
         new_account: format!("{}/new", admin.base),
@@ -772,13 +825,25 @@ async fn list(
         ),
         notice,
         filter,
-        filters,
+        filters: filters(&admin.roles),
         total,
         rows,
         pagination: Pagination::new(pager, &info),
     };
     let body = admin.views.list(&parts, &view);
     Ok(admin.render(&parts, &me, "Accounts", body))
+}
+
+/// The list's filters, as `(value, label)`: staff, each role, deactivated.
+fn filters(roles: &[Role]) -> Vec<(String, String)> {
+    let mut filters = vec![("staff".to_owned(), "Staff".to_owned())];
+    filters.extend(
+        roles
+            .iter()
+            .map(|r| (r.name.to_owned(), r.label.to_owned())),
+    );
+    filters.push(("inactive".to_owned(), "Deactivated".to_owned()));
+    filters
 }
 
 /// The accounts the app's own search matches for `term`: none when it has none, the
@@ -799,7 +864,7 @@ async fn app_matches(admin: &Admin, term: &str) -> (Vec<i64>, Option<Notice>) {
     }
 }
 
-fn badges(roles: &[Role], a: &Account) -> Vec<Badge> {
+fn badges(roles: &[Role], a: &Account, password_sign_in: bool) -> Vec<Badge> {
     let mut out = Vec::new();
     if !a.is_active {
         out.push(Badge {
@@ -828,6 +893,12 @@ fn badges(roles: &[Role], a: &Account) -> Vec<Badge> {
     if out.is_empty() {
         out.push(Badge {
             text: "User".into(),
+            quiet: true,
+        });
+    }
+    if !password_sign_in {
+        out.push(Badge {
+            text: "Password sign-in off".into(),
             quiet: true,
         });
     }
@@ -951,8 +1022,16 @@ async fn create(
     Ok(admin.redirect(account.id, "created"))
 }
 
+/// An account as its page shows it.
+struct Loaded {
+    account: Account,
+    joined: String,
+    last_sign_in: String,
+    password_sign_in: bool,
+}
+
 /// The account, active or not, with its dates as text.
-async fn load(db: impl PgExecutor<'_>, id: i64) -> owt_web::Result<(Account, String, String)> {
+async fn load(db: impl PgExecutor<'_>, id: i64) -> owt_web::Result<Loaded> {
     let row = sqlx::query_as::<
         _,
         (
@@ -965,19 +1044,21 @@ async fn load(db: impl PgExecutor<'_>, id: i64) -> owt_web::Result<(Account, Str
             Vec<String>,
             String,
             String,
+            bool,
         ),
     >(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS}, to_char(created_at, 'YYYY-MM-DD'),
-                    coalesce(to_char(last_sign_in, 'YYYY-MM-DD HH24:MI'), 'never')
+                    coalesce(to_char(last_sign_in, 'YYYY-MM-DD HH24:MI'), 'never'),
+                    password_sign_in
              FROM accounts WHERE id = $1"
     )))
     .bind(id)
     .fetch_optional(db)
     .await?
     .ok_or(owt_web::Error::NotFound)?;
-    let (id, username, email, is_staff, is_active, session_epoch, roles, joined, last) = row;
-    Ok((
-        Account {
+    let (id, username, email, is_staff, is_active, session_epoch, roles, joined, last, pw) = row;
+    Ok(Loaded {
+        account: Account {
             id,
             username,
             email,
@@ -987,8 +1068,25 @@ async fn load(db: impl PgExecutor<'_>, id: i64) -> owt_web::Result<(Account, Str
             roles,
         },
         joined,
-        last,
-    ))
+        last_sign_in: last,
+        password_sign_in: pw,
+    })
+}
+
+/// The account's local identities ([`identities::arrive_as`]), as `(key, subject,
+/// created, last sign-in)`, by key and subject.
+async fn local_identities(
+    db: impl PgExecutor<'_>,
+    id: i64,
+) -> sqlx::Result<Vec<(String, String, String, String)>> {
+    sqlx::query_as(
+        "SELECT key, subject, to_char(created_at, 'YYYY-MM-DD'),
+                to_char(last_sign_in, 'YYYY-MM-DD HH24:MI')
+         FROM account_local_identities WHERE account_id = $1 ORDER BY key, subject",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await
 }
 
 /// The account's page, with an outcome or a secret above it.
@@ -1001,8 +1099,25 @@ async fn show(
     secret: Option<Secret>,
     email_value: Option<&str>,
 ) -> owt_web::Result<Response> {
-    let (account, joined, last_sign_in) = load(&admin.pool, id).await?;
+    let Loaded {
+        account,
+        joined,
+        last_sign_in,
+        password_sign_in,
+    } = load(&admin.pool, id).await?;
     let has_password = store::has_password(&admin.pool, id).await?;
+    let at = format!("{}/{id}", admin.base);
+    let local_identities = local_identities(&admin.pool, id)
+        .await?
+        .into_iter()
+        .map(|(key, subject, created, last_sign_in)| LocalIdentity {
+            key,
+            subject,
+            created,
+            last_sign_in,
+            forget: format!("{at}/local-identities/forget"),
+        })
+        .collect();
     let connections = identities::list(&admin.pool, id)
         .await?
         .into_iter()
@@ -1025,7 +1140,6 @@ async fn show(
         .as_ref()
         .filter(|n| n.is_error() && email_value.is_some())
         .map(|n| n.text.clone());
-    let at = format!("{}/{id}", admin.base);
     let view = AccountView {
         account: &account,
         myself: account.id == me.id,
@@ -1036,13 +1150,16 @@ async fn show(
         roles: boxes(&admin.roles, &account.roles),
         undeclared: undeclared(&admin.roles, &account.roles).cloned().collect(),
         has_password,
+        password_sign_in,
         joined,
         last_sign_in,
         connections,
+        local_identities,
         more,
         list: admin.base.clone(),
         save: at.clone(),
         set_password: format!("{at}/password"),
+        set_password_sign_in: format!("{at}/password-sign-in"),
         issue_link: admin.links.as_ref().map(|_| format!("{at}/link")),
         link_lifetime,
         sign_out: format!("{at}/sign-out"),
@@ -1136,7 +1253,7 @@ async fn save(
     }
     let mut tx = admin.pool.begin().await?;
     lock(&mut tx, &me, id).await?;
-    let (account, ..) = load(&mut *tx, id).await?;
+    let Loaded { account, .. } = load(&mut *tx, id).await?;
     let email_changed = store::normalize(form.value("email")) != account.email;
     if let Err(e) = store::set_email(&mut *tx, id, form.value("email")).await {
         let Some(refused) = e.refused() else {
@@ -1218,18 +1335,22 @@ async fn reset_password(
 ) -> owt_web::Result<Response> {
     let mut tx = admin.pool.begin().await?;
     lock(&mut tx, &me, id).await?;
-    let (account, ..) = load(&mut *tx, id).await?;
+    let Loaded {
+        account,
+        password_sign_in,
+        ..
+    } = load(&mut *tx, id).await?;
+    // Refused before the hash; the row is locked, so the flag holds until commit and
+    // `set_password` (which refuses it too) agrees.
+    if !password_sign_in {
+        drop(tx);
+        let notice = Notice::error(Refused::NoPasswordSignIn.to_string());
+        let mut response = show(&admin, &parts, &me, id, Some(notice), None, None).await?;
+        *response.status_mut() = StatusCode::CONFLICT;
+        return Ok(response);
+    }
     let password = generated_password(&account);
-    match store::set_password(&mut *tx, &account, &password).await {
-        Err(e) if e.refused() == Some(&Refused::NoPasswordSignIn) => {
-            drop(tx);
-            let notice = Notice::error(Refused::NoPasswordSignIn.to_string());
-            let mut response = show(&admin, &parts, &me, id, Some(notice), None, None).await?;
-            *response.status_mut() = StatusCode::CONFLICT;
-            return Ok(response);
-        }
-        done => done?,
-    };
+    store::set_password(&mut *tx, &account, &password).await?;
     tx.commit().await?;
     tracing::info!(by = me.id, account = id, "admin set a generated password");
     let secret = Secret {
@@ -1253,7 +1374,7 @@ async fn issue_link(
     };
     let mut tx = admin.pool.begin().await?;
     lock(&mut tx, &me, id).await?;
-    let (account, ..) = load(&mut *tx, id).await?;
+    let Loaded { account, .. } = load(&mut *tx, id).await?;
     if !account.is_active {
         drop(tx);
         let notice =
@@ -1318,6 +1439,111 @@ async fn unlink(
         Err(e) if e.refused() == Some(&Refused::LastWayIn) => Ok(admin.redirect(id, "last-way-in")),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The account's page answering a change refused on staff's own account: 403.
+async fn not_on_yourself(
+    admin: &Admin,
+    parts: &Parts,
+    me: &Account,
+    what: &str,
+) -> owt_web::Result<Response> {
+    let notice = Notice::error(format!(
+        "You cannot {what} on your own account. Ask another member of staff."
+    ));
+    let mut response = show(admin, parts, me, me.id, Some(notice), None, None).await?;
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    Ok(response)
+}
+
+async fn set_password_sign_in(
+    State(admin): Shared,
+    Staff(me): Staff,
+    Req(parts): Req,
+    Path(id): Path<i64>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> owt_web::Result<Response> {
+    let allowed = match Posted(pairs).value("password_sign_in") {
+        "on" => true,
+        "off" => false,
+        _ => {
+            return Err(owt_web::Error::Unprocessable(
+                "Say on or off for password sign-in.".into(),
+            ));
+        }
+    };
+    // Turning it off removes the password and ends every session, the actor's too.
+    if id == me.id && !allowed {
+        return not_on_yourself(&admin, &parts, &me, "turn password sign-in off").await;
+    }
+    let mut tx = admin.pool.begin().await?;
+    lock(&mut tx, &me, id).await?;
+    let Loaded {
+        password_sign_in: was,
+        ..
+    } = load(&mut *tx, id).await?;
+    store::set_password_sign_in(&mut *tx, id, allowed).await?;
+    tx.commit().await?;
+    tracing::info!(
+        by = me.id,
+        account = id,
+        password_sign_in_was = was,
+        password_sign_in = allowed,
+        "admin set password sign-in"
+    );
+    let notice = if allowed {
+        "password-sign-in-on"
+    } else {
+        "password-sign-in-off"
+    };
+    Ok(admin.redirect(id, notice))
+}
+
+async fn forget_local(
+    State(admin): Shared,
+    Staff(me): Staff,
+    Req(parts): Req,
+    Path(id): Path<i64>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> owt_web::Result<Response> {
+    let form = Posted(pairs);
+    let (key, subject) = (form.value("key"), form.value("subject"));
+    // Retiring one signs the account out everywhere and may leave it no way in.
+    if id == me.id {
+        return not_on_yourself(&admin, &parts, &me, "retire a local identity").await;
+    }
+    let mut tx = admin.pool.begin().await?;
+    lock(&mut tx, &me, id).await?;
+    // Only a pair of this account's, checked before it goes: the URL names the account
+    // staff are looking at. Its row is locked, so the pair cannot move to another.
+    let theirs: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM account_local_identities
+                        WHERE account_id = $1 AND key = $2 AND subject = $3)",
+    )
+    .bind(id)
+    .bind(key)
+    .bind(subject)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !theirs {
+        return Err(owt_web::Error::NotFound);
+    }
+    // The account forget_as signed out must be this one; anything else rolls back.
+    let forgotten = identities::forget_as(&mut *tx, key, subject).await?;
+    if forgotten != Some(id) {
+        return Err(owt_web::Error::Internal(anyhow::anyhow!(
+            "retiring a local identity of account {id} reached {forgotten:?}"
+        )));
+    }
+    tx.commit().await?;
+    tracing::info!(
+        by = me.id,
+        account = id,
+        key,
+        subject,
+        "admin retired a local identity"
+    );
+    Ok(admin.redirect(id, "forgotten"))
 }
 
 #[cfg(test)]

@@ -1039,19 +1039,30 @@ accounts WHERE can_host`, then drops the column.
 username, email or the app's own columns; filter by staff, each role, or deactivated;
 paged), create (username, email, staff, roles; no password), and change (email,
 active, staff, each role; a generated password or a sign-in link, shown once; sign out
-everywhere; remove a sign-in connection). Lists show `admin::PER_PAGE` accounts a page.
+everywhere; remove a sign-in connection; turn password sign-in on or off; retire a
+local identity). Lists show `admin::PER_PAGE` accounts a page.
+
+An account with password sign-in off (a local or system account from
+`identities::arrive_as`, say) carries a "Password sign-in off" badge in the list, and
+its page says so and offers no password, only a button to turn it on. Turning it off
+there removes the password and signs the account out everywhere, as
+`store::set_password_sign_in` does. The page lists the account's local identities
+(key, subject, when added and last used), each with a button that retires it through
+`identities::forget_as`, which signs the account out everywhere too.
 
 - **Who:** only `Staff`, and each change re-checks inside its transaction that its
   author is still active staff (locking both rows, so two staff removing each other at
   once cannot leave none). It refuses your own staff access, deactivating yourself,
-  unlinking an account's last way in and a password for an account whose password
-  sign-in is off.
+  turning your own password sign-in off, retiring your own local identity, unlinking
+  an account's last way in and a password for an account whose password sign-in is
+  off.
 - **From where:** the routes refuse a cross-origin `POST` themselves, with
   `owt_web::csrf::CrossOrigin`, whatever the app layers: `SameSite=Lax` alone lets a
   sibling subdomain post.
 - **What a revocation takes:** a generated password, deactivation and "sign out
   everywhere" end every session and void the account's unused sign-in links (in the
-  same statement); removing a sign-in connection signs the account out everywhere too.
+  same statement); removing a sign-in connection, retiring a local identity and
+  turning password sign-in off sign the account out everywhere too.
   A link is not issued to a deactivated account.
 - **What is kept:** every page is `no-store`; a password or link is shown once; each
   change is logged at `info` with who made it and what changed.
