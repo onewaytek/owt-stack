@@ -634,7 +634,9 @@ impl Policies {
                     CrossOrigin::new(),
                     CrossOrigin::layer,
                 ))
-                .layer(axum::middleware::map_response(crate::admin::never_framed)),
+                .layer(axum::middleware::map_response(
+                    crate::admin::never_cached_or_framed,
+                )),
         )
     }
 

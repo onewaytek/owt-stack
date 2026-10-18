@@ -1359,6 +1359,7 @@ async fn the_admin_shows_and_turns_password_sign_in() {
         )
         .await;
     assert_eq!(r.status, 422);
+    assert_admin_headers(&r);
     let r = client
         .post_form(
             &format!("{at}/password-sign-in"),
@@ -1366,6 +1367,7 @@ async fn the_admin_shows_and_turns_password_sign_in() {
         )
         .await;
     assert_eq!(r.status, 303);
+    assert_admin_headers(&r);
     let html = client.get(r.location().unwrap()).await.text();
     assert!(
         html.contains("Password sign-in is on.")
@@ -1391,6 +1393,7 @@ async fn the_admin_shows_and_turns_password_sign_in() {
         )
         .await;
     assert_eq!(r.status, 303);
+    assert_admin_headers(&r);
     let now = store::by_id(&db.pool, jobs.id).await.unwrap().unwrap();
     assert!(now.session_epoch > jobs.session_epoch);
     assert!(!store::has_password(&db.pool, jobs.id).await.unwrap());
@@ -1407,6 +1410,7 @@ async fn the_admin_shows_and_turns_password_sign_in() {
         .post_form(&mine, &[("password_sign_in", "off")])
         .await;
     assert_eq!(r.status, 403);
+    assert_admin_headers(&r);
     let html = client
         .get(&format!("/staff/accounts/{}", boss.id))
         .await
@@ -1465,6 +1469,7 @@ async fn the_admin_lists_and_retires_local_identities() {
         .post_form(&forget, &[("key", "kiosk"), ("subject", "desk-2")])
         .await;
     assert_eq!(r.status, 404);
+    assert_admin_headers(&r);
     let known = identities::arrive_as(&db.pool, "kiosk", "desk-2", None)
         .await
         .unwrap();
@@ -1474,6 +1479,7 @@ async fn the_admin_lists_and_retires_local_identities() {
         .post_form(&forget, &[("key", "kiosk"), ("subject", "desk-1")])
         .await;
     assert_eq!(r.status, 303);
+    assert_admin_headers(&r);
     let html = client.get(r.location().unwrap()).await.text();
     assert!(
         html.contains("Local identity retired") && !html.contains("Local identities"),
@@ -1491,6 +1497,7 @@ async fn the_admin_lists_and_retires_local_identities() {
         .post_form(&mine, &[("key", "kiosk"), ("subject", "desk-2")])
         .await;
     assert_eq!(r.status, 403);
+    assert_admin_headers(&r);
     db.drop().await;
 }
 
@@ -2061,6 +2068,14 @@ async fn an_admin_page_keeps_the_apps_csp() {
     );
     assert_eq!(r.header("x-frame-options"), Some("DENY"));
     db.drop().await;
+}
+
+/// Every admin response is kept out of caches and out of frames, whatever it
+/// answers: the nest's layers put both headers on it, and a route moved out of the
+/// nest would lose them silently.
+fn assert_admin_headers(r: &owt_test::Response) {
+    assert_eq!(r.header("cache-control"), Some("no-store"), "{}", r.status);
+    assert_eq!(r.header("x-frame-options"), Some("DENY"), "{}", r.status);
 }
 
 /// The value of the one-time secret on an admin page.
