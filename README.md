@@ -2113,9 +2113,11 @@ set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
 
 **Day to day:** copy `templates/justfile` and `templates/compose.yaml` into the app,
 and `templates/dependabot.yml` as `.github/dependabot.yml`, so the app's action and
-workflow pins, crates and npm packages (the stylesheet's `#vX.Y.Z` among them) move
-by weekly `fix(deps)` pull requests, each a patch release once merged, instead of by
-hand at the next adoption. Every app then answers to the same commands:
+workflow pins, crates and npm packages move by weekly `fix(deps)` pull requests, each
+a patch release once merged, instead of by hand at the next adoption (Dependabot
+follows a git dependency pinned to a version tag, the crates' `tag = "vX.Y.Z"` and the
+stylesheet's `#vX.Y.Z`; an app's first weekly pull request shows it). Every app then
+answers to the same commands:
 
 ```sh
 just setup        # npm ci, sqlx-cli and cargo-audit at CI's versions
@@ -2250,6 +2252,9 @@ built.
 on:
   push: {branches: [main, rc]}
   workflow_dispatch:          # promote-rc.yml starts rc releases this way
+# One release at a time per branch, none cancelled: two pushes close together (a
+# merge, then a `chore(release)` commit-back) would otherwise cut the version twice.
+concurrency: {group: "release-${{ github.ref_name }}", cancel-in-progress: false}
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml   # the app's own: it passes the sccache secret on
@@ -2286,8 +2291,24 @@ jobs:
   `.github/workflows` can bypass all of this (a branch's push runs its own workflow
   files): keep that permission to people, never to automation.
 - **Images** are tagged `X.Y.Z`, plus `X.Y` and `latest` (and `X` from 1.0) for a
-  stable release, or `rc` for a prerelease. Rebuild an existing tag by calling
-  `image.yml` from a `workflow_dispatch` with `floating-tags: false`.
+  stable release, or `rc` for a prerelease. Rebuild an existing tag (a base image
+  rebuilt for a fix, a registry that lost it) from a `workflow_dispatch` of the app's
+  own, with `floating-tags` off unless the tag is the newest in its channel, since
+  the floating tags would otherwise move back to it:
+
+  ```yaml
+  # .github/workflows/image.yml
+  on:
+    workflow_dispatch:
+      inputs:
+        version: {description: "The released version (0.2.0, v0.2.0-rc.1)", required: true}
+        floating-tags: {description: "Also move the channel's floating tags", type: boolean, default: false}
+  jobs:
+    image:
+      permissions: {contents: read, packages: write}
+      uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.6.1
+      with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}"}
+  ```
 - **The rc channel** (optional): on each same-repository PR into `main`, once its
   checks pass, merge the PR into `rc` and cut a prerelease. After each stable
   release, merge `main` back into `rc`. A PR's checks run on the PR alone, so two
@@ -2326,7 +2347,14 @@ jobs:
   on a job, a re-run can cancel that job while it waits (a later requeue picks it up).
 
 ```yaml
-# in pr.yml, with concurrency: {group: promote-rc, cancel-in-progress: false}
+# pr.yml
+on:
+  pull_request:
+    # The defaults plus ready_for_review: a draft marked ready is promoted then, not
+    # at its next push. Not `edited` (see "A promotion can be lost" above).
+    types: [opened, synchronize, reopened, ready_for_review]
+concurrency: {group: promote-rc, cancel-in-progress: false}
+jobs:
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
     permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
     uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@v0.6.1  # and "commits / commits"
