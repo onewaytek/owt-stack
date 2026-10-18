@@ -8,17 +8,22 @@
 # app.yaml's policies say who may reach the app; this one says where it may go, and
 # nothing else: a pod that is compromised (a dependency's bug, a request forged
 # through an app's own route) can then open connections to its database, its Redis,
-# the cluster's DNS and port 443 of the internet, and to no other namespace, the
-# cluster API, the node or the internet's other ports. The selected pods lose every
-# other egress the moment this applies, so read the rules against what the app
-# calls before applying it, and apply it in a staging namespace first; a wrong rule
-# looks like a DNS failure. Deleting the policy restores the open egress.
+# the cluster's DNS and port 443 of INTERNET_CIDR, and to nothing else: not the
+# cluster API (node:6443), not another port of any pod, node or host, and not
+# another namespace's pods except on 443 while INTERNET_CIDR is 0.0.0.0/0, which an
+# ipBlock matches pod and node addresses against too (an `except` list of the
+# cluster's own ranges would close that, and the cluster's Routes with it, since the
+# router answers at a node address). The selected pods lose every other egress the
+# moment this applies, so read the rules against what the app calls before applying
+# it, and apply it in a staging namespace first; a wrong rule looks like a DNS
+# failure. Deleting the policy restores the open egress.
 #
 # What the rules cover, and what an app adds in a policy of its own:
 # - DNS: the cluster's resolvers, in DNS_NAMESPACE on DNS_PORT (OpenShift's CoreDNS
 #   answers on 5353; a policy is matched against the pod the Service forwards to).
 # - Postgres: the instances of <NAME>-<DB_SUFFIX>. (The instances get no egress
-#   policy here: the CloudNativePG instance manager talks to the cluster API.)
+#   policy here: the CloudNativePG instance manager calls the cluster API, and
+#   what else an instance needs is the operator's to say, not this template's.)
 # - Redis: the pods redis.yaml makes, if any. Those pods get a policy of their own
 #   there, admitting no egress at all.
 # - The internet, on port 443: a sign-in provider, a tracker for change requests,

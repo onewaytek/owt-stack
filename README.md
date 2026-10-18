@@ -2355,12 +2355,14 @@ per set of pods: the app's, and each task's. `app.yaml`'s policies say who may r
 the app; this one says where it may go, and nothing else. A pod that is compromised
 (a dependency's bug, a request forged through one of the app's own routes) can then
 open connections to the app's database, its Redis, the cluster's DNS and port 443 of
-the internet, and to no other namespace, the cluster API, the node or the internet's
-other ports. `INTERNET_CIDR` bounds the last: `0.0.0.0/0` (the default) is anywhere
-(a sign-in provider, a tracker for change requests, an OTLP collector over the public
-web, and the cluster's own Routes, which the router answers at a node address),
-`0.0.0.0/32` is nowhere, for a task that sends no mail and calls no API. The cluster's
-resolvers are `DNS_NAMESPACE` on `DNS_PORT` (OpenShift's CoreDNS answers on 5353).
+`INTERNET_CIDR`, and to nothing else: not the cluster API, not another port
+anywhere. `INTERNET_CIDR` bounds the last: `0.0.0.0/0` (the default) is anywhere on
+443 (a sign-in provider, a tracker for change requests, an OTLP collector over the
+public web, and the cluster's own Routes, which the router answers at a node address;
+also any pod or node that listens on 443, since an `ipBlock` matches those addresses
+too), `0.0.0.0/32` is nowhere, for a task that sends no mail and calls no API. The
+cluster's resolvers are `DNS_NAMESPACE` on `DNS_PORT` (OpenShift's CoreDNS answers on
+5353).
 Anything else the app calls (a cluster service in another namespace, another port) is
 a further NetworkPolicy of the app's own with the same `podSelector`: policies add up.
 
