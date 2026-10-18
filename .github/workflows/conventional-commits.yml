@@ -6,10 +6,24 @@ name: Conventional Commits
 # which a merge commit keeps. commitlint reads the pull request's commitlint
 # configuration, which is JavaScript and runs: so this job holds no secrets and only
 # a read token, and runs on GitHub-hosted runners, where a fork's code may run.
+#
+# Reusable too: an app whose release.yml derives its version from its commits calls
+# it from its pull-request workflow, so the same rules, commitlint and versions check
+# every app:
+#
+#   jobs:
+#     commits:
+#       permissions: {contents: read, pull-requests: read}
+#       uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # vX.Y.Z
+#
+# The caller's event must be a pull request (the title and the commits are its). An
+# app with a commitlint configuration of its own (commitlint.config.*) is checked by
+# it; one without is checked by the rules below, written for the run.
 
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
+  workflow_call:
 
 permissions: {}
 
@@ -38,10 +52,31 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
+      # The configuration: the repository's own where it has one, else the rules
+      # this repository checks itself by (commitlint.config.mjs here), written
+      # outside the checkout. Dependabot's commits are passed over either way: their
+      # bodies quote release notes whose lines run past the length limit, and their
+      # headers are generated.
       - name: commitlint
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
-        run: >-
-          npx --yes --ignore-scripts -p @commitlint/cli@21.2.3 -p @commitlint/config-conventional@21.2.3
-          commitlint --from "$BASE" --to "$HEAD" --verbose
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE" ] || [ -z "$HEAD" ]; then
+            echo "::error::not a pull request: the caller's event carries no base and head"
+            exit 1
+          fi
+          config=()
+          if ! ls commitlint.config.* .commitlintrc* >/dev/null 2>&1; then
+            cat > "$RUNNER_TEMP/commitlint.config.mjs" <<'JS'
+          export default {
+            extends: ["@commitlint/config-conventional"],
+            ignores: [(message) => message.includes("Signed-off-by: dependabot[bot]")],
+          };
+          JS
+            config=(--config "$RUNNER_TEMP/commitlint.config.mjs")
+          fi
+          npx --yes --ignore-scripts -p @commitlint/cli@21.2.3 -p @commitlint/config-conventional@21.2.3 \
+            commitlint "${config[@]}" --from "$BASE" --to "$HEAD" --verbose

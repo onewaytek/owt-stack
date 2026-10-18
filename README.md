@@ -18,7 +18,8 @@ Outside the crates:
 | Path | What it is |
 |---|---|
 | `.github/workflows/rust-ci.yml` | the reusable check workflow on ARC: the app's `just check`, or built-in fmt, audit, sqlx metadata, clippy and tests; the stylesheet build |
-| `.github/workflows/release-please.yml`, `conventional-commits.yml` | this repository's releases: Conventional Commits checked on every pull request, versions and the changelog by release-please |
+| `.github/workflows/release-please.yml` | this repository's releases: versions and the changelog by release-please |
+| `.github/workflows/conventional-commits.yml` | Conventional Commits checked on every pull request, here and, as a reusable workflow, in an app: the title and every commit, with one commitlint and one configuration |
 | `.github/workflows/release.yml` | reusable releases from conventional commits: stable on `main`, prereleases on `rc`, optional version write-back and changelog |
 | `.github/workflows/image.yml` | reusable image build for a released tag, pushed to ghcr with the channel's floating tags |
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease, or into `rc-candidate` for checking first |
@@ -2319,6 +2320,9 @@ jobs:
 
 ```yaml
 # in pr.yml, with concurrency: {group: promote-rc, cancel-in-progress: false}
+  commits:   # the title and every commit follow Conventional Commits (release.yml reads them)
+    permissions: {contents: read, pull-requests: read}
+    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@v0.6.1
   candidate:
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
