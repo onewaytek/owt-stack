@@ -2026,7 +2026,9 @@ fragment::assert_same_element(&page.text(), "<main id=\"m\"> <p>Hi</p></main>", 
 
 // Golden pages: compared modulo layout, with what changes per run masked.
 // `UPDATE_GOLDEN=1 cargo test` rewrites the snapshots; review the diff.
-let normalize = Normalizer::new().uuids("<uuid>");
+// `asset_versions` drops the `?v=<hash>` on static URLs, so a snapshot recorded with
+// the stylesheet built matches a test job that builds no CSS.
+let normalize = Normalizer::new().uuids("<uuid>").asset_versions();
 # if false { // no snapshots beside the README
 let mut golden = Golden::new("tests/golden/pages");
 golden.take("home", normalize.normalize(&page.text()));
@@ -2054,8 +2056,11 @@ just prepare      # regenerate .sqlx/ after changing a query
 ```
 
 `just check` is the gate before every commit, and CI runs the same command, so the
-two lists of checks can't drift. App-specific recipes go below the template's
-`---- app recipes ----` line. The compose ports and database name come from the
+two lists of checks can't drift. Its `.sqlx` check compares the committed query
+metadata with a live database: the recipe applies the app's migrations to
+`DATABASE_URL` first, so point that at a database of the app's own (`just db`'s, or
+a scratch one on a shared server), never at one another app migrates. App-specific
+recipes go below the template's `---- app recipes ----` line. The compose ports and database name come from the
 app's `.env` (`POSTGRES_PORT`, `POSTGRES_DB`, ...), so two apps' stacks can run side
 by side.
 
@@ -2568,6 +2573,10 @@ the exporter's port to Prometheus alone.
 @import "@onewaytek/owt-stack/tailwind/owt.css";
 @source "../templates";
 ```
+
+Move to a release with `npm install -D github:onewaytek/owt-stack#vX.Y.Z`: editing the
+tag in `package.json` and running `npm install` keeps the old commit in
+`package-lock.json`, and the stylesheet stays at the old release.
 
 ## Decisions
 

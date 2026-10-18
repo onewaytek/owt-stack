@@ -57,9 +57,11 @@ lint:
 doc:
     RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo doc --no-deps --document-private-items
 
-# The committed .sqlx/ matches the queries (skipped for an app without one).
+# The committed .sqlx/ matches the queries (skipped for an app without one). The
+# check needs the schema, so DATABASE_URL is migrated first: give it a database of
+# this app's own (`just db`'s, or a scratch one), never one another app migrates.
 sqlx-check:
-    if [ -d .sqlx ]; then SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
+    if [ -d .sqlx ]; then sqlx migrate run && SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
 
 # No advisories against Cargo.lock (ignored ones are in .cargo/audit.toml, with why).
 audit:

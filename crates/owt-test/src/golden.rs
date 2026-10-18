@@ -72,6 +72,15 @@ impl Normalizer {
         )
     }
 
+    /// Drop the `?v=<hash>` an `owt_web::assets::Assets` URL carries, so a page
+    /// recorded with the stylesheet built compares equal to one rendered where it is
+    /// not (a test job that builds no CSS gets the bare URL): the link reads
+    /// `/static/css/app.css` either way.
+    #[must_use]
+    pub fn asset_versions(self) -> Self {
+        self.mask(r#"\?v=[^"'&<>\s]*"#, "")
+    }
+
     /// `html` with its references canonical, collapsed, masked, one tag per line,
     /// newline-terminated.
     #[must_use]
@@ -232,6 +241,19 @@ mod tests {
         assert_eq!(
             n.normalize(html),
             "<p class=\"a\"> Tom &amp; Jerry</p>\n<a href=\"/s/<uuid>/\">TODAY HH:MM</a>\n"
+        );
+    }
+
+    /// A fingerprinted asset URL and a bare one are one link.
+    #[test]
+    fn asset_versions_are_dropped_whether_present_or_not() {
+        let n = Normalizer::new().asset_versions();
+        let built = r#"<link rel="stylesheet" href="/static/css/app.css?v=3f2a9c0e1b7d4c55"><script src="/static/app.js?v=abc"></script><a href="/items?page=2&v=1">x</a>"#;
+        let bare = r#"<link rel="stylesheet" href="/static/css/app.css"><script src="/static/app.js"></script><a href="/items?page=2&v=1">x</a>"#;
+        assert_eq!(n.normalize(built), n.normalize(bare));
+        assert!(
+            n.normalize(built).contains("page=2&amp;v=1"),
+            "a query's own v= is kept"
         );
     }
 
