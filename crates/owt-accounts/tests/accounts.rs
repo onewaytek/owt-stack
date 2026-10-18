@@ -2043,6 +2043,60 @@ fn admin_app(db: &Db, sessions: &Sessions<Data>) -> Router {
     app(db, sessions, admin.routes())
 }
 
+/// An app's layout may await something per page (a count, the viewer's name): an
+/// `AsyncChrome` is awaited before it wraps the body, and a plain `Chrome` closure
+/// still goes where one is asked for.
+#[tokio::test]
+async fn an_apps_chrome_may_await() {
+    use owt_accounts::admin::{Admin, AsyncChrome, Page};
+    struct Counting(PgPool);
+    impl AsyncChrome for Counting {
+        fn page<'a>(
+            &'a self,
+            page: Page<'a>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = owt_web::Result<axum::response::Response>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                use axum::response::IntoResponse;
+                let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
+                    .fetch_one(&self.0)
+                    .await?;
+                Ok(axum::response::Html(format!(
+                    "<title>{}</title><p>accounts: {accounts}</p><p>at: {}</p>{}",
+                    escaped(page.title),
+                    escaped(&page.request.uri.to_string()),
+                    page.body
+                ))
+                .into_response())
+            })
+        }
+    }
+    let db = db!();
+    let sessions = sessions();
+    let admin = Admin::new(
+        db.pool.clone(),
+        "/staff/accounts",
+        Counting(db.pool.clone()),
+    );
+    let client = owt_test::Client::new(app(&db, &sessions, admin.routes()));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let r = client.get("/staff/accounts").await;
+    assert_eq!(r.status, 200);
+    assert_admin_headers(&r);
+    let html = r.text();
+    assert!(
+        html.contains("<p>accounts: 1</p>") && html.contains("<p>at: /staff/accounts</p>"),
+        "{html}"
+    );
+    db.drop().await;
+}
+
 /// Under the app's enforcing CSP, an admin page keeps the app's whole policy (the
 /// admin adds no policy of its own, which would make the layer skip the app's) and is
 /// never framed.

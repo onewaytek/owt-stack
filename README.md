@@ -1070,9 +1070,40 @@ there removes the password and signs the account out everywhere, as
 
 The app gives it a layout and, optionally, its roles, a sign-in-link route, a link
 to its own page about each account (what the admin does not show: a nickname, what
-they own) and a search of its own columns. `Admin::search` names what it searches
-(the box reads "Username, email or nickname") and gets the trimmed term, never an
-empty one; it answers the ids of the accounts it matches, which the list shows with
+they own) and a search of its own columns. The layout is a `Chrome` (a closure from
+`Page` to a response, as below) or, where it reads something per page before it
+wraps the body (an inbox count, the viewer's display name), an `admin::AsyncChrome`:
+a type whose `page` returns a boxed future borrowing the `Page`, awaited by the admin.
+`policies::AsyncChrome` is the same for the policy pages. Every `Chrome` is an
+`AsyncChrome` too, so a layout that awaits nothing changes nothing.
+
+```rust,no_run
+use std::pin::Pin;
+use axum::response::{Html, IntoResponse, Response};
+use owt_accounts::admin::{AsyncChrome, Page};
+
+struct Shell { pool: sqlx::PgPool }
+
+impl AsyncChrome for Shell {
+    fn page<'a>(&'a self, page: Page<'a>) -> Pin<Box<dyn Future<Output = owt_web::Result<Response>> + Send + 'a>> {
+        Box::pin(async move {
+            let unread: i64 = sqlx::query_scalar("SELECT count(*) FROM inbox WHERE account_id = $1")
+                .bind(page.me.id)
+                .fetch_one(&self.pool)
+                .await?;
+            // The app's Askama layout escapes the title and embeds the body as it is.
+            Ok(Html(format!("<title>{}</title><nav>{unread}</nav>{}", page.title, page.body)).into_response())
+        })
+    }
+}
+# fn demo(pool: sqlx::PgPool) {
+let _admin = owt_accounts::admin::Admin::new(pool.clone(), "/staff/accounts", Shell { pool });
+# }
+```
+
+`Admin::search` names what it searches (the box reads "Username, email or nickname")
+and gets the trimmed term, never an empty one; it answers the ids of the accounts it
+matches, which the list shows with
 the username and email matches, once each, under the same filters, order and pages.
 An id with no account is ignored. Bind the term, never format it into SQL (and in a
 `LIKE` its `%` and `_` are wildcards; `strpos` takes it as text). When it fails, the
