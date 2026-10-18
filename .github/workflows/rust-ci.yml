@@ -4,7 +4,7 @@ name: Rust CI
 #
 #   jobs:
 #     ci:
-#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # vX.Y.Z, the release the app uses
+#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # vX.Y.Z, the app's release
 #       with: {database: myapp, redis: true}
 #       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 #
