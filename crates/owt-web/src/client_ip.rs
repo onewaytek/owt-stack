@@ -12,7 +12,7 @@ use std::net::IpAddr;
 
 use axum::http::HeaderMap;
 
-/// Where the client's address is. A source may be added in a minor release (the
+/// Where the client's address is. A source may be added without a breaking release (the
 /// `Forwarded` header, say), so a `match` on it ends with a `_` arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]

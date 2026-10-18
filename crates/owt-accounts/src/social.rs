@@ -71,7 +71,7 @@ const PRESETS: [(&str, Preset); 3] = [
 
 /// A configuration that cannot be used. Each says which variable to fix, so a
 /// deployment fails at start rather than at someone's first sign-in. A check may be
-/// added in a minor release, so a `match` on it ends with a `_` arm.
+/// added without a breaking release, so a `match` on it ends with a `_` arm.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConfigError {

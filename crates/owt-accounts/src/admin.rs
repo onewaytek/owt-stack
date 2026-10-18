@@ -402,7 +402,7 @@ pub struct RoleChoice {
     pub checked: bool,
 }
 
-/// How a [`Notice`] reads. A level may be added in a minor release, so a `match` on
+/// How a [`Notice`] reads. A level may be added without a breaking release, so a `match` on
 /// it ends with a `_` arm ([`Notice::is_error`] answers for all of them).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]

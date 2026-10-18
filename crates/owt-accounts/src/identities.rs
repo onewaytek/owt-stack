@@ -187,7 +187,7 @@ pub struct Welcome {
     pub record_email: bool,
 }
 
-/// How a provider sign-in resolved. An outcome may be added in a minor release, so a
+/// How a provider sign-in resolved. An outcome may be added without a breaking release, so a
 /// `match` on it ends with a `_` arm; [`Arrival::account`] answers for all of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -242,7 +242,7 @@ pub struct Rekeyed {
     pub conflicts: Vec<String>,
 }
 
-/// Why [`rekey`] refused. A reason may be added in a minor release, so a `match` on
+/// Why [`rekey`] refused. A reason may be added without a breaking release, so a `match` on
 /// it ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

@@ -11,7 +11,7 @@ pub const MIN_CHARS: usize = 8;
 pub const MAX_BYTES: usize = 1024;
 
 /// A rule a password breaks. Its `Display` is the sentence the person reads. A rule
-/// may be added in a minor release, so a `match` on it ends with a `_` arm.
+/// may be added without a breaking release, so a `match` on it ends with a `_` arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Problem {

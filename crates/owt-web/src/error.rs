@@ -18,7 +18,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 /// `Result` with [`Error`] as the default error.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Handler-level error taxonomy. A variant may be added in a minor release, so a
+/// Handler-level error taxonomy. A variant may be added without a breaking release, so a
 /// `match` on it ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

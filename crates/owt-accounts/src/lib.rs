@@ -46,7 +46,7 @@ pub use layer::{Accounts, Maybe, MaybeWith, Signed, SignedWith, Staff};
 pub use store::{Account, New, normalize};
 
 /// Why an account operation did not happen. Each message is written for the person
-/// who filled the form. A refusal may be added in a minor release, so a `match` on
+/// who filled the form. A refusal may be added without a breaking release, so a `match` on
 /// it ends with a `_` arm (its `Display` is the sentence to show for any of them).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -95,7 +95,7 @@ pub enum Refused {
 }
 
 /// What an account operation returns when it fails: a refusal the person can act
-/// on, or a fault they cannot. A fault may be added in a minor release, so a `match`
+/// on, or a fault they cannot. A fault may be added without a breaking release, so a `match`
 /// on it ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

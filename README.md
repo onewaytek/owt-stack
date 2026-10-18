@@ -1163,7 +1163,7 @@ use owt_web::ui::Kind; // what each pager item is, for the `match` below
 {% when Kind::Next %}<a href="{{ i.href }}" rel="next">Next</a>
 {% when Kind::Current %}<span aria-current="page">{{ i.label }}</span>
 {% when Kind::Gap %}<span aria-hidden="true">…</span>
-{% when _ %}<a href="{{ i.href }}">{{ i.label }}</a>{# a page link; the arm every match on Kind ends with #}
+{% when _ %}<a href="{{ i.href }}">{{ i.label }}</a>{# a page link, and whatever kind comes later #}
 {% endmatch %}{% endfor %}</nav>{% endif %}"#, ext = "html")]
 struct AccountList<'a, 'b> { v: &'a ListView<'b> }
 
@@ -2660,7 +2660,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `owt_auth::jwt::Error` and `owt_change::ConfigError` (`oauth::Error` and
   `admin::Level` were already). A `match` on one of them in the app, a template's
   `{% match %}` on `Kind` included, ends with a `_` arm; a variant added later is
-  then a minor release, not a breaking one. Nothing else changes: the variants are
+  then no breaking change. `owt_web::ui::Item` is `#[non_exhaustive]` too: read its
+  fields, never build or destructure it. Nothing else changes: the variants are
   still constructed and matched by name, and `Refused`'s `Display` is still the
   sentence to show for any of them.
 

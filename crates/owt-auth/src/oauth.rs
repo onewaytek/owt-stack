@@ -496,8 +496,8 @@ pub fn http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Why a sign-in failed. New variants may come in a minor release, so a `match` on it
-/// ends with a `_` arm.
+/// Why a sign-in failed. A variant may be added without a breaking release, so a
+/// `match` on it ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {

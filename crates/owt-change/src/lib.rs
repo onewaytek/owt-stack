@@ -89,7 +89,7 @@ impl fmt::Debug for Config {
     }
 }
 
-/// A configuration that cannot be used. A check may be added in a minor release, so
+/// A configuration that cannot be used. A check may be added without a breaking release, so
 /// a `match` on it ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
