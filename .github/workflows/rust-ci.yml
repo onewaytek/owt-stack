@@ -4,8 +4,13 @@ name: Rust CI
 #
 #   jobs:
 #     ci:
-#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@vX.Y.Z  # the release the app uses
+#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # vX.Y.Z, the app's release
 #       with: {database: myapp, redis: true}
+#       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
+#
+# Pinned by commit, not by tag: a tag can be moved, and this workflow runs inside the
+# app's job with whatever the app passes it. The app passes the one secret below by
+# name, never `secrets: inherit`: what this workflow is given is what it can leak.
 #
 # Runs on the arc-openshift-k8s ARC scale set (override with the RUNS_ON
 # repository or organization variable, a JSON string such as '"ubuntu-latest"').
@@ -98,13 +103,13 @@ on:
         type: string
         default: redis://sccache-redis.sccache.svc:6379
     secrets:
-      # Named as the organization secret, because `secrets: inherit` passes a
-      # caller's secrets under their own names.
+      # Named as the organization secret, so an app passes it on under one name.
       SCCACHE_REDIS_PASSWORD:
         description: >-
-          The password of that Redis. An app passes `secrets: inherit`, so the
-          organization secret of this name reaches it; without it the job compiles
-          without sccache.
+          The password of that Redis. An app passes it by name
+          (`secrets: {SCCACHE_REDIS_PASSWORD: ...}`), never with `secrets: inherit`,
+          which would hand this workflow every secret the app holds; without it the
+          job compiles without sccache.
         required: false
 
 # The jobs read the repository and nothing else.

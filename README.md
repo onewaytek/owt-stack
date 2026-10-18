@@ -2074,20 +2074,20 @@ The cargo registry comes from GitHub's cache. Compiled crates come from
 the runners. sccache keys a Rust compile by its absolute paths and the toolchain's
 files, so a hit needs the same crate built at the same paths by the same toolchain:
 jobs in one image share registry crates across repositories, and a repository's own
-crates hit its earlier runs. It is on when the `SCCACHE_REDIS_PASSWORD` secret reaches
-the workflow (`secrets: inherit` below passes an organization or repository secret of
-that name; an organization secret reaches a private repository only on a paid plan, so
-a private repository on GitHub Free sets it as a repository secret) and
-`sccache-redis` names the Redis (default `redis://sccache-redis.sccache.svc:6379`, a
-Service in the cluster the runners run in). The password goes to the sccache server
-alone, never into the environment of the gate, build scripts or tests. Without the
-secret the job compiles without a cache. If the Redis cannot be used (unreachable, or
-the password is wrong), the job warns after about ten seconds and compiles without it;
-it does not fail. The job summary shows sccache's hit and miss counts. The Redis is
-bounded (`maxmemory`, least recently used evicted) and entries expire after a month
-unused. A developer machine can use the same Redis; its paths differ from the
-runners', so its entries are its own (its registry crates hit across its clean
-rebuilds and worktrees, not CI's). It joins with `~/.config/sccache/config`:
+crates hit its earlier runs. It is on when the app passes the `SCCACHE_REDIS_PASSWORD`
+secret to the workflow, by name as below (an organization secret reaches a private
+repository only on a paid plan, so a private repository on GitHub Free sets it as a
+repository secret), and `sccache-redis` names the Redis (default
+`redis://sccache-redis.sccache.svc:6379`, a Service in the cluster the runners run
+in). The password goes to the sccache server alone, never into the environment of the
+gate, build scripts or tests. Without the secret the job compiles without a cache. If
+the Redis cannot be used (unreachable, or the password is wrong), the job warns after
+about ten seconds and compiles without it; it does not fail. The job summary shows
+sccache's hit and miss counts. The Redis is bounded (`maxmemory`, least recently used
+evicted) and entries expire after a month unused. A developer machine can use the
+same Redis; its paths differ from the runners', so its entries are its own (its
+registry crates hit across its clean rebuilds and worktrees, not CI's). It joins with
+`~/.config/sccache/config`:
 
 ```toml
 [cache.redis]
@@ -2111,9 +2111,24 @@ jobs:
       css-script: css:build  # empty to skip the stylesheet job
       extra-env: |           # test-only values, never real secrets
         SESSION_SECRET=...
-    secrets: inherit
+    secrets:                 # the one secret it declares, never `inherit`
+      SCCACHE_REDIS_PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
 ```
 <!-- x-release-please-end -->
+
+**What a reusable workflow is given is what it can leak.** A reusable workflow runs
+inside the app's job, so pass it the secrets it declares, by name, and never
+`secrets: inherit`, which hands it every secret the app holds; the same for
+`release.yml`, `image.yml`, `promote-rc.yml`, `publish-rc.yml` and `requeue-rc.yml`
+below, which declare none and need only their job's token. And pin each `uses:` by
+commit rather than by tag, with the tag in a comment
+(`uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit> # vX.Y.Z`): GitHub
+resolves a tag on every run, and a tag can be moved, while a commit cannot; Dependabot
+(the `github-actions` ecosystem in the app's `.github/dependabot.yml`) keeps such a
+pin moving with the releases, tag comment included. `Cargo.lock` and
+`package-lock.json` already pin the crates and the stylesheet to a commit. A workflow
+in the app's own repository (`ci.yml` called from `release.yml`) is the app's own
+code: `secrets: inherit` on that call is fine, and it passes the one secret on.
 
 The checks run on the `arc-openshift-k8s` scale set unless the repository or
 organization variable `RUNS_ON` names other runners, as JSON (`"ubuntu-latest"`). A
@@ -2143,7 +2158,7 @@ on:
   workflow_dispatch:          # promote-rc.yml starts rc releases this way
 jobs:
   ci:
-    uses: ./.github/workflows/ci.yml
+    uses: ./.github/workflows/ci.yml   # the app's own: it passes the sccache secret on
     secrets: inherit
   release:
     needs: ci
@@ -2229,6 +2244,7 @@ jobs:
     if: needs.candidate.outputs.changed == 'true'
     uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.6.1
     with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
+    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   promote:
     needs: [candidate, check-rc]
     permissions: {contents: write, actions: write}
@@ -2623,13 +2639,20 @@ The router example under "Wiring an app" composes the layers; beyond it:
 ## Upgrading from 0.6
 
 - `rust-ci.yml` compiles through sccache over a shared Redis instead of a cargo cache
-  volume at `/cache`. To use it, pass `secrets: inherit` on the call of `rust-ci.yml`
-  and at every level of workflow that calls the one that calls it, and make a secret
-  `SCCACHE_REDIS_PASSWORD` visible to the repository (an organization secret, or a
-  repository secret for a private repository on GitHub Free). An app on GitHub-hosted
-  runners (`RUNS_ON`) passes `sccache-redis: ""`. The job uses no `/cache` volume:
-  remove its mount from the runner pod template. Without the secret the checks pass,
-  uncached.
+  volume at `/cache`. To use it, pass the secret by name on the call of `rust-ci.yml`
+  (`secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}`, as
+  the CI snippet shows; not `secrets: inherit`, which hands the workflow every secret
+  the app holds; a workflow of the app's own that calls the one that calls it may
+  use `secrets: inherit`, being the app's code), and make a secret
+  `SCCACHE_REDIS_PASSWORD` visible to the repository (an
+  organization secret, or a repository secret for a private repository on GitHub
+  Free). An app on GitHub-hosted runners (`RUNS_ON`) passes `sccache-redis: ""`. The
+  job uses no `/cache` volume: remove its mount from the runner pod template. Without
+  the secret the checks pass, uncached.
+- Pin the reusable workflows by commit, with the tag in a comment, and let Dependabot
+  (its `github-actions` ecosystem, in the app's `.github/dependabot.yml`) move the pin
+  ("What a reusable workflow is given is what it can leak", under "Commands, CI,
+  releases and deployment").
 
 ## Upgrading from 0.5
 
