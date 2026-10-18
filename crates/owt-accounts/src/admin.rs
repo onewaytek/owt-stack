@@ -115,7 +115,10 @@ pub struct Page<'a> {
     pub body: Body,
 }
 
-/// The app's layout: wraps an admin page's body in the app's shell and answers it.
+/// The app's layout: wraps an admin page's body in the app's shell and answers it,
+/// without awaiting anything. A closure `|page: Page<'_>| -> owt_web::Result<Response>`
+/// is one. A layout that awaits (a nav count, the viewer's name from the database)
+/// implements [`AsyncChrome`] instead; every `Chrome` is an `AsyncChrome` too.
 pub trait Chrome: Send + Sync + 'static {
     /// The whole page.
     ///
@@ -131,6 +134,54 @@ where
 {
     fn page(&self, page: Page<'_>) -> owt_web::Result<Response> {
         self(page)
+    }
+}
+
+/// The app's layout, awaited: for a shell that reads something per page (an inbox
+/// count, the viewer's display name, a feature flag) before it wraps the body. The
+/// future borrows the page, so it is boxed:
+///
+/// ```
+/// use std::pin::Pin;
+/// use axum::response::{Html, IntoResponse, Response};
+/// use owt_accounts::admin::{AsyncChrome, Page};
+///
+/// struct Shell { pool: sqlx::PgPool }
+///
+/// impl AsyncChrome for Shell {
+///     fn page<'a>(&'a self, page: Page<'a>) -> Pin<Box<dyn Future<Output = owt_web::Result<Response>> + Send + 'a>> {
+///         Box::pin(async move {
+///             let unread: i64 = sqlx::query_scalar("SELECT count(*) FROM inbox WHERE account_id = $1")
+///                 .bind(page.me.id)
+///                 .fetch_one(&self.pool)
+///                 .await?;
+///             // An Askama layout escapes the title and embeds the body as it is.
+///             Ok(Html(format!("<title>{}</title><nav>{unread}</nav>{}", page.title, page.body)).into_response())
+///         })
+///     }
+/// }
+/// ```
+///
+/// Every [`Chrome`] is an `AsyncChrome` whose future is ready at once, so the sync
+/// closures still go wherever one is asked for.
+pub trait AsyncChrome: Send + Sync + 'static {
+    /// The whole page.
+    ///
+    /// # Errors
+    ///
+    /// When the app's template does not render, or what the layout reads fails.
+    fn page<'a>(
+        &'a self,
+        page: Page<'a>,
+    ) -> Pin<Box<dyn Future<Output = owt_web::Result<Response>> + Send + 'a>>;
+}
+
+impl<T: Chrome> AsyncChrome for T {
+    fn page<'a>(
+        &'a self,
+        page: Page<'a>,
+    ) -> Pin<Box<dyn Future<Output = owt_web::Result<Response>> + Send + 'a>> {
+        Box::pin(std::future::ready(Chrome::page(self, page)))
     }
 }
 
@@ -467,7 +518,7 @@ pub struct Admin {
     pool: PgPool,
     base: String,
     roles: Vec<Role>,
-    chrome: Box<dyn Chrome>,
+    chrome: Box<dyn AsyncChrome>,
     views: Box<dyn Views>,
     links: Option<(Duration, LinkUrl)>,
     more: Option<(&'static str, MoreHref)>,
@@ -485,12 +536,12 @@ impl fmt::Debug for Admin {
 
 impl Admin {
     /// The admin over `pool`'s accounts, at `base` (`/staff/accounts`), drawn inside
-    /// `chrome`.
+    /// `chrome`: a [`Chrome`] closure, or an [`AsyncChrome`] that awaits.
     ///
     /// # Panics
     ///
     /// When `base` is not a path below the root (`/`, `staff`).
-    pub fn new(pool: PgPool, base: impl Into<String>, chrome: impl Chrome) -> Self {
+    pub fn new(pool: PgPool, base: impl Into<String>, chrome: impl AsyncChrome) -> Self {
         let base = base.into().trim_end_matches('/').to_owned();
         assert!(
             base.starts_with('/') && base.len() > 1,
@@ -591,21 +642,26 @@ impl Admin {
         Router::new().nest(&base, pages)
     }
 
-    fn render(
+    async fn render(
         &self,
         request: &Parts,
         me: &Account,
         title: &str,
         body: owt_web::Result<Body>,
     ) -> Response {
-        let page = body.and_then(|body| {
-            self.chrome.page(Page {
-                request,
-                me,
-                title,
-                body,
-            })
-        });
+        let page = match body {
+            Ok(body) => {
+                self.chrome
+                    .page(Page {
+                        request,
+                        me,
+                        title,
+                        body,
+                    })
+                    .await
+            }
+            Err(e) => Err(e),
+        };
         match page {
             Ok(response) => (CachePolicy::no_store(), response).into_response(),
             Err(e) => e.into_response(),
@@ -626,7 +682,7 @@ type Shared = State<Arc<Admin>>;
 /// The request's parts, for the app's chrome, with the URI the client sent: the
 /// routes are nested, so the parts' own URI has the base stripped (`/` for the
 /// list at `/staff/accounts`), and a layout that reads it would name the wrong
-/// page. `OriginalUri` (axum keeps it on every nested request) is put in its place.
+/// page. `OriginalUri` (axum sets it on every request) is put in its place.
 struct Req(Parts);
 
 // Answers without awaiting; the trait is async.
@@ -845,7 +901,7 @@ async fn list(
         pagination: Pagination::new(pager, &info),
     };
     let body = admin.views.list(&parts, &view);
-    Ok(admin.render(&parts, &me, "Accounts", body))
+    Ok(admin.render(&parts, &me, "Accounts", body).await)
 }
 
 /// The list's filters, as `(value, label)`: staff, each role, deactivated.
@@ -944,7 +1000,7 @@ impl Posted {
 }
 
 /// The new-account form, with what was posted and why it was refused.
-fn new_page(
+async fn new_page(
     admin: &Admin,
     parts: &Parts,
     me: &Account,
@@ -961,11 +1017,11 @@ fn new_page(
         roles: boxes(&admin.roles, &form.roles()),
     };
     let body = admin.views.new_account(parts, &view);
-    admin.render(parts, me, "New account", body)
+    admin.render(parts, me, "New account", body).await
 }
 
 async fn new_form(State(admin): Shared, Staff(me): Staff, Req(parts): Req) -> Response {
-    new_page(&admin, &parts, &me, &Posted(Vec::new()), None)
+    new_page(&admin, &parts, &me, &Posted(Vec::new()), None).await
 }
 
 /// Lock the acting member of staff's row and `target`'s, in id order (two staff
@@ -1015,7 +1071,7 @@ async fn create(
     let account = match made {
         Ok(account) => account,
         Err(crate::Error::Refused(r)) => {
-            let mut response = new_page(&admin, &parts, &me, &form, Some(r.to_string()));
+            let mut response = new_page(&admin, &parts, &me, &form, Some(r.to_string())).await;
             *response.status_mut() = StatusCode::UNPROCESSABLE_ENTITY;
             return Ok(response);
         }
@@ -1186,7 +1242,7 @@ async fn show(
         }
         body => body,
     };
-    Ok(admin.render(parts, me, &account.username, body))
+    Ok(admin.render(parts, me, &account.username, body).await)
 }
 
 /// A lifetime in words: `15 minutes`, `24 hours`, `7 days`.

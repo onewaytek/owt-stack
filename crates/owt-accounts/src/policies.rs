@@ -22,6 +22,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -447,7 +448,10 @@ pub struct Page<'a> {
     pub body: Body,
 }
 
-/// The app's layout: wraps a page's body in the app's shell and answers it.
+/// The app's layout: wraps a page's body in the app's shell and answers it,
+/// without awaiting anything. A closure `|page: Page<'_>| -> owt_web::Result<Response>`
+/// is one. A layout that awaits (a nav count, the viewer's name from the database)
+/// implements [`AsyncChrome`] instead; every `Chrome` is an `AsyncChrome` too.
 pub trait Chrome: Send + Sync + 'static {
     /// The whole page.
     ///
@@ -466,6 +470,53 @@ where
     }
 }
 
+/// The app's layout, awaited: for a shell that reads something per page (an inbox
+/// count, the viewer's display name, a feature flag) before it wraps the body. The
+/// future borrows the page, so it is boxed:
+///
+/// ```
+/// use std::pin::Pin;
+/// use axum::response::{Html, IntoResponse, Response};
+/// use owt_accounts::policies::{AsyncChrome, Page};
+///
+/// struct Shell { pool: sqlx::PgPool }
+///
+/// impl AsyncChrome for Shell {
+///     fn page<'a>(&'a self, page: Page<'a>) -> Pin<Box<dyn Future<Output = owt_web::Result<Response>> + Send + 'a>> {
+///         Box::pin(async move {
+///             let open: i64 = sqlx::query_scalar("SELECT count(*) FROM policy_versions WHERE published_at IS NULL")
+///                 .fetch_one(&self.pool)
+///                 .await?;
+///             // An Askama layout escapes the title and embeds the body as it is.
+///             Ok(Html(format!("<title>{}</title><nav>{open}</nav>{}", page.title, page.body)).into_response())
+///         })
+///     }
+/// }
+/// ```
+///
+/// Every [`Chrome`] is an `AsyncChrome` whose future is ready at once, so the sync
+/// closures still go wherever one is asked for.
+pub trait AsyncChrome: Send + Sync + 'static {
+    /// The whole page.
+    ///
+    /// # Errors
+    ///
+    /// When the app's template does not render, or what the layout reads fails.
+    fn page<'a>(
+        &'a self,
+        page: Page<'a>,
+    ) -> Pin<Box<dyn Future<Output = owt_web::Result<Response>> + Send + 'a>>;
+}
+
+impl<T: Chrome> AsyncChrome for T {
+    fn page<'a>(
+        &'a self,
+        page: Page<'a>,
+    ) -> Pin<Box<dyn Future<Output = owt_web::Result<Response>> + Send + 'a>> {
+        Box::pin(std::future::ready(Chrome::page(self, page)))
+    }
+}
+
 /// This replica's copy of the current versions, read on every page load.
 type Cached = Mutex<Option<(Instant, Arc<Vec<Version>>)>>;
 
@@ -473,7 +524,7 @@ type Cached = Mutex<Option<(Instant, Arc<Vec<Version>>)>>;
 struct Inner {
     pool: PgPool,
     documents: Vec<Document>,
-    chrome: Arc<dyn Chrome>,
+    chrome: Arc<dyn AsyncChrome>,
     agree: String,
     admin: Option<String>,
     agreement: String,
@@ -503,14 +554,15 @@ impl fmt::Debug for Policies {
 const AGREEMENT: &str = "I have read and agree to the documents above.";
 
 impl Policies {
-    /// `documents` over `pool`, drawn inside `chrome`. Each is read at `/{slug}`, and
-    /// the page that asks is at `/agree`.
+    /// `documents` over `pool`, drawn inside `chrome` (a [`Chrome`] closure, or an
+    /// [`AsyncChrome`] that awaits). Each is read at `/{slug}`, and the page that asks
+    /// is at `/agree`.
     ///
     /// # Panics
     ///
     /// When there is no document, a slug is not one [`Document`] allows, or two
     /// documents share one.
-    pub fn new(pool: PgPool, chrome: impl Chrome, documents: &[Document]) -> Self {
+    pub fn new(pool: PgPool, chrome: impl AsyncChrome, documents: &[Document]) -> Self {
         assert!(!documents.is_empty(), "declare at least one document");
         for (i, d) in documents.iter().enumerate() {
             assert!(
@@ -742,17 +794,20 @@ impl Policies {
         self.document(slug).map_or(slug, |d| d.label)
     }
 
-    fn render(&self, request: &Parts, title: &str, body: &impl Template) -> Response {
-        let page = body
-            .render()
-            .map_err(|e| owt_web::Error::Internal(e.into()))
-            .and_then(|html| {
-                self.0.chrome.page(Page {
-                    request,
-                    title,
-                    body: Body(html),
-                })
-            });
+    async fn render(&self, request: &Parts, title: &str, body: &impl Template) -> Response {
+        let page = match body.render() {
+            Ok(html) => {
+                self.0
+                    .chrome
+                    .page(Page {
+                        request,
+                        title,
+                        body: Body(html),
+                    })
+                    .await
+            }
+            Err(e) => Err(owt_web::Error::Internal(e.into())),
+        };
         match page {
             Ok(response) => (CachePolicy::no_store(), response).into_response(),
             Err(e) => e.into_response(),
@@ -796,9 +851,9 @@ fn is_page(req: &Request) -> bool {
 type Shared = State<Policies>;
 
 /// The request's parts, for the app's chrome, with the URI the client sent: the
-/// routes are nested, so the parts' own URI has the base stripped (`/` for the
-/// list at `/staff/accounts`), and a layout that reads it would name the wrong
-/// page. `OriginalUri` (axum keeps it on every nested request) is put in its place.
+/// staff pages are nested, so the parts' own URI has the base stripped (`/` for
+/// the list at `/staff/policies`), and a layout that reads it would name the wrong
+/// page. `OriginalUri` (axum sets it on every request) is put in its place.
 struct Req(Parts);
 
 // Answers without awaiting; the trait is async.
@@ -867,7 +922,7 @@ async fn show(
         versions,
         mine,
     };
-    Ok(this.render(&parts, &doc.title, &page))
+    Ok(this.render(&parts, &doc.title, &page).await)
 }
 
 /// A document the account is asked to agree to.
@@ -929,7 +984,7 @@ async fn asking(
         agreement: &this.0.agreement,
         error,
     };
-    Ok(Some(this.render(parts, "Review and agree", &page)))
+    Ok(Some(this.render(parts, "Review and agree", &page).await))
 }
 
 async fn agree_form(
@@ -1109,7 +1164,7 @@ async fn listing(
         notice,
         docs,
     };
-    Ok(this.render(parts, "Site policies", &page))
+    Ok(this.render(parts, "Site policies", &page).await)
 }
 
 async fn list(
@@ -1218,7 +1273,7 @@ async fn edit(
         holders,
     );
     let title = format!("{}: {}", this.label(&doc.kind), doc.title);
-    Ok(this.render(&parts, &title, &page))
+    Ok(this.render(&parts, &title, &page).await)
 }
 
 #[derive(Deserialize)]
@@ -1267,7 +1322,7 @@ async fn save_draft(
     };
     let page = form_page(&this, &shown, None, errors, 0);
     let title = format!("{}: {}", this.label(&shown.kind), shown.title);
-    let mut response = this.render(&parts, &title, &page);
+    let mut response = this.render(&parts, &title, &page).await;
     *response.status_mut() = StatusCode::UNPROCESSABLE_ENTITY;
     Ok(response)
 }
