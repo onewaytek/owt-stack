@@ -731,7 +731,7 @@ mod env_tests {
         .expect("refused");
         assert!(!short.to_string().contains("c2hvcnQ"), "{short}");
         assert!(short.to_string().contains("SESSION_SECRET"), "{short}");
-        let pod = Sessions::<D>::from_vars(
+        let in_a_pod = Sessions::<D>::from_vars(
             "myapp",
             "s",
             age,
@@ -743,7 +743,7 @@ mod env_tests {
         )
         .err()
         .expect("refused");
-        assert!(pod.to_string().contains("POD_NAMESPACE"), "{pod}");
+        assert!(in_a_pod.to_string().contains("POD_NAMESPACE"), "{in_a_pod}");
         assert!(
             Sessions::<D>::from_vars(
                 "myapp",
