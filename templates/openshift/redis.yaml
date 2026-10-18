@@ -27,7 +27,10 @@ parameters:
     required: true
   - name: NAMESPACE
     required: true
-  - name: IMAGE
+  # Named apart from app.yaml's IMAGE (the app's): apply.sh hands every template the
+  # parameters it declares from one params.env, so a name two templates share means
+  # one thing in both.
+  - name: REDIS_IMAGE
     description: >-
       The Redis image. Docker Hub's official image through Google's mirror, out of
       reach of Docker Hub's anonymous pull limit; it runs under the arbitrary UID
@@ -65,7 +68,7 @@ objects:
           automountServiceAccountToken: false
           containers:
             - name: redis
-              image: ${IMAGE}
+              image: ${REDIS_IMAGE}
               env:
                 - name: REDIS_PASSWORD
                   valueFrom:

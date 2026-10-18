@@ -30,6 +30,7 @@ Outside the crates:
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger and the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone, connecting to nothing |
 | `templates/openshift/egress.yaml` | where the app's pods (or a task's) may connect: its database, its Redis, the cluster's DNS and port 443 of the internet, and nothing else |
+| `templates/openshift/apply.sh` | renders every template present from the app's `params.env` (and `jobs/*.env`), `oc diff` by default, `--apply` to apply; `apply-test.sh` proves it against a stand-in `oc` |
 | `templates/openshift/cronjob.yaml` | a scheduled task in the app's image, with the app's database, TLS, environment and NetworkPolicies |
 | `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters, and rehearses a Postgres major upgrade |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
@@ -2367,15 +2368,36 @@ registry prompt. An app on the earlier distroless template moves by copying the
 template again; one with its own runtime stage changes `FROM` and `USER nonroot`
 (to `USER 65532`).
 
-**OpenShift:**
+**OpenShift:** the app keeps its copies of the templates in `deploy/openshift/`, with
+`apply.sh` beside them and its parameters in `params.env`, one `KEY=VALUE` a line
+(`NAME`, `NAMESPACE`, `IMAGE`, `CHANNEL`, `PORT`, `POSTGRES_MAJOR`, and whatever else
+it sets). The script renders each template present with the parameters it declares,
+`oc diff`s by default and applies with `--apply`:
+
+```sh
+deploy/openshift/apply.sh            # what an apply would change (exit 1 when something)
+deploy/openshift/apply.sh --apply
+```
+
+`app.yaml` is always rendered; `redis.yaml`, `monitoring.yaml` (a cluster admin's, see
+"Monitoring") and `egress.yaml` (for the app's pods, then each task's) when present;
+`cronjob.yaml` once per `deploy/openshift/jobs/<JOB>.env`, whose lines (`JOB`,
+`SCHEDULE`, `ARGS`, and any override such as `INTERNET_CIDR`) are read over
+`params.env`. A name two templates declare means one thing in both (`NAME`,
+`NAMESPACE`, `CHANNEL`, `DB_SUFFIX`); the Redis image is `REDIS_IMAGE`, apart from the
+app's `IMAGE`. Upgrading owt-stack is: copy the templates again, keep `params.env`.
+The script writes no Secret: the app's environment and a Redis password are made by
+hand, as below. `templates/openshift/apply-test.sh` proves the script against a
+stand-in `oc` (`just templates` runs it here).
+
+The ImageStream polls ghcr for the channel's tag (`rc` or `latest`), and the
+Deployment's trigger rolls out each new digest. By hand, the same is one
+`oc process … | oc apply -f -` per template:
 
 ```sh
 oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
   -p IMAGE=ghcr.io/onewaytek/myapp -p CHANNEL=rc -p PORT=8000 | oc apply -f -
 ```
-
-The ImageStream polls ghcr for the channel's tag (`rc` or `latest`), and the
-Deployment's trigger rolls out each new digest.
 
 **The app's environment** (`SESSION_SECRET`, a provider's credentials, its own
 tuning) lives in a Secret named `myapp-env`, which the Deployment reads whole. It is
@@ -2757,6 +2779,14 @@ The router example under "Wiring an app" composes the layers; beyond it:
   ```
 
 ## Upgrading from 0.6
+
+- `redis.yaml`'s image parameter is `REDIS_IMAGE` (it was `IMAGE`), apart from
+  `app.yaml`'s `IMAGE`, so one `params.env` serves every template through
+  `deploy/openshift/apply.sh`. An apply that passed `-p IMAGE=` to `redis.yaml` passes
+  `-p REDIS_IMAGE=`; the default is unchanged.
+- Keep the templates in `deploy/openshift/` with `apply.sh` and `params.env` beside
+  them, and drop the app's own process or apply script where the template's does
+  the same ("OpenShift" under "Commands, CI, releases and deployment").
 
 - `rust-ci.yml` compiles through sccache over a shared Redis instead of a cargo cache
   volume at `/cache`. To use it, pass the secret by name on the call of `rust-ci.yml`
