@@ -644,9 +644,11 @@ impl Policies {
 
     /// The middleware that sends a signed-in account which has not accepted the
     /// current version of every document to the page that asks, with `?next=` naming
-    /// where it was going. Only full page loads (a `GET` that is not htmx's and
-    /// accepts HTML) are sent, so a socket, a stream or a fragment is never
-    /// interrupted. When the database cannot say, the request goes through.
+    /// where it was going. Only a document load is sent (a `GET` that is not htmx's,
+    /// for a `Sec-Fetch-Dest: document` or, without that header, one asking for
+    /// `text/html`), so an image, a stylesheet, a script, a fetch, a socket, a stream
+    /// or a fragment is never interrupted. When the database cannot say, the request
+    /// goes through.
     ///
     /// Install it inside the accounts layer, which it reads the account from:
     /// `.layer(from_fn_with_state(policies.clone(), Policies::gate))` before
@@ -782,15 +784,20 @@ fn below_root(path: &str) -> String {
     path
 }
 
-/// A full page load: what the gate may redirect.
+/// A full page load: what the gate may redirect. A `GET` the browser makes for a
+/// document, and nothing it makes for a page's parts: an `<img>`, a stylesheet, a
+/// script or a fetch sent to `/agree` would be answered with a page they cannot use,
+/// and the page would break. Browsers say what a request is for in
+/// `Sec-Fetch-Dest` (`document` for a navigation); where it is absent, a navigation
+/// is the request that asks for `text/html` by name (an `<img>` asks for images and
+/// `*/*`, a fetch for `*/*` or JSON). An htmx request is a fragment, whatever it says.
 fn is_page(req: &Request) -> bool {
-    req.method() == Method::GET
-        && !req.headers().contains_key("hx-request")
-        && req
-            .headers()
-            .get(header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .is_none_or(|a| a.contains("text/html") || a.contains("*/*"))
+    let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+    let document = match header("sec-fetch-dest") {
+        Some(dest) => dest.eq_ignore_ascii_case("document"),
+        None => header(header::ACCEPT.as_str()).is_some_and(|a| a.contains("text/html")),
+    };
+    req.method() == Method::GET && !req.headers().contains_key("hx-request") && document
 }
 
 type Shared = State<Policies>;
@@ -1383,6 +1390,51 @@ mod tests {
         assert_eq!(asked.iter().map(|v| v.id).collect::<Vec<_>>(), [3]);
         assert_eq!(outstanding(&current, &[]).len(), 2);
         assert_eq!(outstanding(&[], &[]), none, "no version yet asks nothing");
+    }
+
+    /// Only a document load is a page: a browser's navigation says so in
+    /// `Sec-Fetch-Dest`, or asks for `text/html`; what a page loads for itself
+    /// (an image, a script, a fetch) and a non-browser client never are.
+    #[test]
+    fn only_a_document_load_is_a_page() {
+        let get = |pairs: &[(&str, &str)]| {
+            let mut req = Request::get("/");
+            for (k, v) in pairs {
+                req = req.header(*k, *v);
+            }
+            req.body(axum::body::Body::empty()).unwrap()
+        };
+        for pairs in [
+            &[("sec-fetch-dest", "document")][..],
+            &[("sec-fetch-dest", "document"), ("accept", "*/*")],
+            &[("accept", "text/html,application/xhtml+xml,*/*;q=0.8")],
+            &[("accept", "text/html")],
+        ] {
+            assert!(is_page(&get(pairs)), "{pairs:?}");
+        }
+        for pairs in [
+            &[
+                ("sec-fetch-dest", "image"),
+                ("accept", "image/avif,image/webp,*/*"),
+            ][..],
+            &[("sec-fetch-dest", "empty"), ("accept", "text/html")],
+            &[("sec-fetch-dest", "script")],
+            &[("sec-fetch-dest", "iframe")],
+            &[("accept", "image/avif,image/webp,*/*")],
+            &[("accept", "*/*")],
+            &[("accept", "application/json")],
+            &[],
+            &[("sec-fetch-dest", "document"), ("hx-request", "true")],
+        ] {
+            assert!(!is_page(&get(pairs)), "{pairs:?}");
+        }
+        let mut post = Request::post("/")
+            .header("sec-fetch-dest", "document")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(!is_page(&post));
+        *post.method_mut() = Method::GET;
+        assert!(is_page(&post));
     }
 
     #[test]
