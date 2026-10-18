@@ -1163,7 +1163,7 @@ use owt_web::ui::Kind; // what each pager item is, for the `match` below
 {% when Kind::Next %}<a href="{{ i.href }}" rel="next">Next</a>
 {% when Kind::Current %}<span aria-current="page">{{ i.label }}</span>
 {% when Kind::Gap %}<span aria-hidden="true">…</span>
-{% when _ %}<a href="{{ i.href }}">{{ i.label }}</a>
+{% when _ %}<a href="{{ i.href }}">{{ i.label }}</a>{# a page link, and whatever kind comes later #}
 {% endmatch %}{% endfor %}</nav>{% endif %}"#, ext = "html")]
 struct AccountList<'a, 'b> { v: &'a ListView<'b> }
 
@@ -2653,6 +2653,17 @@ The router example under "Wiring an app" composes the layers; beyond it:
   (its `github-actions` ecosystem, in the app's `.github/dependabot.yml`) move the pin
   ("What a reusable workflow is given is what it can leak", under "Commands, CI,
   releases and deployment").
+- **Every public enum that can grow is `#[non_exhaustive]`:** `owt_web::Error`,
+  `owt_web::client_ip::Source`, `owt_web::ui::Kind`, `owt_accounts::Refused`,
+  `owt_accounts::Error`, `owt_accounts::password::Problem`,
+  `owt_accounts::identities::{Arrival, RekeyError}`, `owt_accounts::social::ConfigError`,
+  `owt_auth::jwt::Error` and `owt_change::ConfigError` (`oauth::Error` and
+  `admin::Level` were already). A `match` on one of them in the app, a template's
+  `{% match %}` on `Kind` included, ends with a `_` arm; a variant added later is
+  then no breaking change. `owt_web::ui::Item` is `#[non_exhaustive]` too: read its
+  fields, never build or destructure it. Nothing else changes: the variants are
+  still constructed and matched by name, and `Refused`'s `Display` is still the
+  sentence to show for any of them.
 
 ## Upgrading from 0.5
 

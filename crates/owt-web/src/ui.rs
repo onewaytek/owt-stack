@@ -189,8 +189,10 @@ impl<'a> Field<'a> {
     }
 }
 
-/// What one thing in a pager's row is.
+/// What one thing in a pager's row is. A kind may be added without a breaking release, so a
+/// template's `{% match %}` on it (or a `match` in code) ends with a `_` arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     /// The link to the page before.
     Previous,
@@ -204,8 +206,10 @@ pub enum Kind {
     Next,
 }
 
-/// One thing in a pager's row.
+/// One thing in a pager's row. A field may be added without a breaking release, so
+/// it is read by name, never built or destructured as a whole.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Item {
     /// Where it links; empty for the current page and a gap.
     pub href: String,
