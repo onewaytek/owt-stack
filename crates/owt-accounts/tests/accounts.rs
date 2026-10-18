@@ -1342,6 +1342,8 @@ async fn the_admin_shows_and_turns_password_sign_in() {
         html.contains(r#"<span class="owt-badge owt-badge-quiet">Password sign-in off</span>"#),
         "{html}"
     );
+    // The chrome sees the page's own URI, not the nested router's stripped one.
+    assert!(html.contains("<p>at: /staff/accounts?q=jobs</p>"), "{html}");
     let html = client.get("/staff/accounts?q=boss").await.text();
     assert!(!html.contains("Password sign-in off"), "{html}");
     let html = client.get(&at).await.text();
@@ -2020,9 +2022,10 @@ fn admin(db: &Db) -> owt_accounts::admin::Admin {
     let chrome = |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
         use axum::response::IntoResponse;
         Ok(axum::response::Html(format!(
-            "<title>{}</title><p>me: {}</p>{}",
+            "<title>{}</title><p>me: {}</p><p>at: {}</p>{}",
             escaped(page.title),
             escaped(&page.me.username),
+            escaped(&page.request.uri.to_string()),
             page.body
         ))
         .into_response())

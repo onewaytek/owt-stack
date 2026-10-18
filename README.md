@@ -1091,7 +1091,8 @@ use owt_accounts::admin::{Admin, Body, Page};
 // The app's shell around the admin's body: its own Askama layout, which escapes the
 // title (an account's username, which its owner chose) and embeds the body, already
 // escaped by the admin, as it is. Never `format!` the title into HTML. The request's
-// extensions hold what the layout reads (session, nonce, account).
+// extensions hold what the layout reads (session, nonce, account), and its `uri` is
+// the page's own (`/staff/accounts?q=ada`), not the nested router's stripped path.
 #[derive(Template)]
 #[template(source = "<!doctype html><title>{{ title }}</title><main>{{ body }}</main>", ext = "html")]
 struct Shell<'a> { title: &'a str, body: Body }
