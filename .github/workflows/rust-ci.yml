@@ -221,9 +221,19 @@ jobs:
       # paths differ, keeps entries of its own.
       # Prebuilt and checksummed, as the gate's tools are. Only with the secret: a job
       # without it compiles without sccache. The Redis is bounded (maxmemory, least
-      # recently used evicted) and holds only objects whose key names their inputs, so
-      # a poisoned entry needs a write to the Redis, which the password guards; every
-      # repository on the scale set shares that trust.
+      # recently used evicted) and holds objects whose key names their inputs.
+      #
+      # The trust model, plainly: every repository given the secret trusts every
+      # other repository given it, as it would with a shared cache volume. The
+      # password guards the Redis from the network, not from a job: any code a job
+      # runs (a build script, a test, the gate) can reach the job's own sccache
+      # server, which writes entries without the password, and sccache keys a Rust
+      # compile by what rustc reports about itself (`-vV`, its sysroot), not by the
+      # binary's hash, so a fake rustc that answers those queries can store an object
+      # under a registry crate's real key for every other job to read. Where the
+      # runner allows same-user ptrace, job code can read the password from the
+      # server's memory too. So the secret goes only to repositories whose code is
+      # trusted to run on the scale set at all, which is what RUNS_ON already decides.
       # A step's `if` cannot read secrets, so this step decides for the two after it.
       - name: Is sccache configured
         id: sccache
@@ -247,13 +257,19 @@ jobs:
       # an unreachable Redis or a wrong password stops it here, within about ten
       # seconds; the job then warns and compiles without sccache.
       #
-      # The password reaches the server and nothing else: it is in a config file only
-      # while the server starts (before any of the app's code has run), and not in the
-      # server's environment, nor in any later step's, where the gate, every build
-      # script and every test could read it. The server lives for the job
+      # The password is handed to the server and to nothing else: it is in a config
+      # file only while the server starts (before any of the app's code has run), and
+      # not in the server's environment, nor in any later step's, where the gate,
+      # every build script and every test could read it (what they can still reach is
+      # the server itself: see the trust model above). The server lives for the job
       # (SCCACHE_IDLE_TIMEOUT=0). Should it exit anyway, the next compile starts one
       # without the config, which caches on local disk, and SCCACHE_IGNORE_SERVER_IO_ERROR
       # compiles directly when no server answers: either way the build goes on.
+      #
+      # A password with a control character (a newline pasted into the secret, say)
+      # would make the config unparseable, and sccache's parse error can print a
+      # fragment of it; the step refuses such a password before writing anything and
+      # compiles uncached, with a warning that names the cause and not the value.
       - name: Start sccache
         if: ${{ steps.sccache.outputs.enabled == 'true' }}
         env:
@@ -261,6 +277,10 @@ jobs:
           ENDPOINT: ${{ inputs.sccache-redis }}
         shell: bash
         run: |
+          if [[ "$PASSWORD" == *[[:cntrl:]]* ]]; then
+            echo "::warning::SCCACHE_REDIS_PASSWORD holds a control character (a newline, say): compiling without sccache"
+            exit 0
+          fi
           conf="$RUNNER_TEMP/sccache.toml"
           # A TOML basic string: backslashes and quotes escaped.
           pw=${PASSWORD//\\/\\\\}
