@@ -343,8 +343,9 @@ pub trait Social: SignedData {
     fn set_started(&mut self, started: Option<Started>);
 }
 
-/// [`session::Data`](crate::session::Data) with room for a [`Started`] sign-in:
-/// the session type for an app that keeps nothing else in its session.
+/// [`session::Data`](crate::session::Data) (a signature and flash messages) with room
+/// for a [`Started`] sign-in: the session type for an app that keeps nothing else in
+/// its session.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Data {
     /// The signature.
@@ -353,6 +354,16 @@ pub struct Data {
     /// The sign-in in progress.
     #[serde(rename = "o", default, skip_serializing_if = "Option::is_none")]
     pub started: Option<Started>,
+}
+
+impl owt_web::flash::HasFlashes for Data {
+    fn flashes(&self) -> &[Flash] {
+        &self.signed.flashes
+    }
+
+    fn flashes_mut(&mut self) -> &mut Vec<Flash> {
+        &mut self.signed.flashes
+    }
 }
 
 impl SignedData for Data {
@@ -1648,5 +1659,40 @@ mod tests {
     fn the_session_carries_short_names() {
         let d = Data::default();
         assert_eq!(serde_json::to_string(&d).unwrap(), "{}");
+    }
+
+    #[test]
+    fn flashes_ride_in_the_sealed_session() {
+        use owt_web::flash::HasFlashes;
+        let mut d = Data::default();
+        d.flashes_mut()
+            .push(Flash(Level::Success, "Connected.".into()));
+        d.signed.account = Some(7);
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(json.contains("\"f\":["), "{json}");
+        let key = owt_web::session::key_for(
+            &base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                (0..64u8).collect::<Vec<_>>(),
+            ),
+            "myapp/test",
+        )
+        .unwrap();
+        let sessions: owt_web::session::Sessions<Data> =
+            owt_web::session::Sessions::new(key, "s", Duration::from_secs(60), true);
+        let (_, back) = sessions.unseal(&sessions.seal("id", &d)).unwrap();
+        assert_eq!(back.flashes(), d.flashes());
+        assert_eq!(back.signed.account, Some(7));
+        // The bare signature data carries them under the same name.
+        let mut bare = session::Data::default();
+        bare.flashes_mut().push(Flash(Level::Error, "No.".into()));
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            serde_json::to_string(&Data {
+                signed: bare.clone(),
+                started: None
+            })
+            .unwrap()
+        );
     }
 }

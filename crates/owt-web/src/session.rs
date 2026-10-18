@@ -93,6 +93,20 @@ pub fn key_for(secret: &str, purpose: &str) -> anyhow::Result<Key> {
     Ok(Key::from(&key))
 }
 
+/// The purpose [`Sessions::from_env`] derives its key for: `{app}/` and then
+/// `SESSION_PURPOSE`, else the namespace the pod runs in (`POD_NAMESPACE`, which the
+/// downward API sets), else `local`. `var` reads a variable; a blank one counts as
+/// unset. Changing the purpose signs everyone out: an app moving onto this from a
+/// purpose of its own sets `SESSION_PURPOSE` to what followed its `app/`.
+#[must_use]
+pub fn purpose_from(app: &str, var: impl Fn(&str) -> Option<String>) -> String {
+    let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+    let environment = set("SESSION_PURPOSE")
+        .or_else(|| set("POD_NAMESPACE"))
+        .unwrap_or_else(|| "local".into());
+    format!("{app}/{environment}")
+}
+
 /// Fewer distinct byte values than this in a secret is a pattern, not randomness:
 /// 64 random bytes take about 57 values, and fewer than 8 has odds far below 1e-60.
 /// Low enough that base64 of text (hex digits take 16 values) still passes; that
@@ -237,6 +251,57 @@ impl<T: SessionData> Sessions<T> {
             }),
             validator: None,
         }
+    }
+
+    /// Sessions as [`new`](Self::new) makes them, keyed from the environment: the
+    /// secret `SESSION_SECRET` (required), derived with [`key_for`] for the purpose
+    /// [`purpose_from`] reads (`myapp/production`, `myapp/local`).
+    ///
+    /// # Errors
+    ///
+    /// `SESSION_SECRET` is unset or not a secret [`key_for`] takes, the purpose is not
+    /// one it takes, or the app runs in a pod (`KUBERNETES_SERVICE_HOST` is set) and
+    /// neither `SESSION_PURPOSE` nor `POD_NAMESPACE` is: `local` is for development.
+    /// The error names the variable, never the secret.
+    pub fn from_env(
+        app: &str,
+        cookie: impl Into<String>,
+        max_age: Duration,
+        secure: bool,
+    ) -> anyhow::Result<Self> {
+        Self::from_vars(app, cookie, max_age, secure, |name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    /// [`from_env`](Self::from_env), reading variables through `var`: a test's map,
+    /// or configuration the app gathered itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_env`](Self::from_env).
+    pub fn from_vars(
+        app: &str,
+        cookie: impl Into<String>,
+        max_age: Duration,
+        secure: bool,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
+        let secret = var("SESSION_SECRET")
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("SESSION_SECRET is not set"))?;
+        let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+        // `local` is for development: in a pod it would make every environment's
+        // purpose one, and a secret copied between them one key again.
+        anyhow::ensure!(
+            set("SESSION_PURPOSE").is_some()
+                || set("POD_NAMESPACE").is_some()
+                || set("KUBERNETES_SERVICE_HOST").is_none(),
+            "set SESSION_PURPOSE or POD_NAMESPACE: in a pod the session key's purpose is not `{app}/local`"
+        );
+        let key = key_for(&secret, &purpose_from(app, &var))
+            .map_err(|e| anyhow::anyhow!("the session key from SESSION_SECRET: {e}"))?;
+        Ok(Self::new(key, cookie, max_age, secure))
     }
 
     /// End every session this long after it began, however recently it was re-sealed.
@@ -577,6 +642,122 @@ impl<S: Send + Sync, T: SessionData> FromRequestParts<S> for Session<T> {
             .get::<Session<T>>()
             .cloned()
             .unwrap_or_default()))
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    /// Session data, as an app's is: a map of fields.
+    #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct D {
+        n: u8,
+    }
+
+    fn secret() -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode((0..64u8).collect::<Vec<_>>())
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn the_purpose_is_the_apps_and_its_environments() {
+        let p = |pairs: &[(&str, &str)]| purpose_from("myapp", vars(pairs));
+        assert_eq!(p(&[]), "myapp/local");
+        assert_eq!(p(&[("POD_NAMESPACE", "myapp-prod")]), "myapp/myapp-prod");
+        assert_eq!(
+            p(&[
+                ("SESSION_PURPOSE", "production"),
+                ("POD_NAMESPACE", "myapp-prod")
+            ]),
+            "myapp/production"
+        );
+        assert_eq!(
+            p(&[("SESSION_PURPOSE", " "), ("POD_NAMESPACE", "ns")]),
+            "myapp/ns",
+            "blank is unset"
+        );
+    }
+
+    #[test]
+    fn sessions_from_the_environment_open_only_their_own_purpose() {
+        let s = secret();
+        let age = Duration::from_secs(60);
+        let prod: Sessions<D> = Sessions::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[("SESSION_SECRET", &s), ("SESSION_PURPOSE", "production")]),
+        )
+        .unwrap();
+        let same = Sessions::<D>::new(key_for(&s, "myapp/production").unwrap(), "s", age, true);
+        let sealed = prod.seal("id", &D { n: 7 });
+        assert_eq!(same.unseal(&sealed), Some(("id".to_owned(), D { n: 7 })));
+        let staging: Sessions<D> = Sessions::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[("SESSION_SECRET", &s), ("POD_NAMESPACE", "staging")]),
+        )
+        .unwrap();
+        assert_eq!(
+            staging.unseal(&sealed),
+            None,
+            "a copied secret is another key"
+        );
+
+        let missing = Sessions::<D>::from_vars("myapp", "s", age, true, vars(&[]))
+            .err()
+            .expect("refused");
+        assert!(missing.to_string().contains("SESSION_SECRET is not set"));
+        let short = Sessions::<D>::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[("SESSION_SECRET", "c2hvcnQ=")]),
+        )
+        .err()
+        .expect("refused");
+        assert!(!short.to_string().contains("c2hvcnQ"), "{short}");
+        assert!(short.to_string().contains("SESSION_SECRET"), "{short}");
+        let in_a_pod = Sessions::<D>::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[
+                ("SESSION_SECRET", &s),
+                ("KUBERNETES_SERVICE_HOST", "10.0.0.1"),
+            ]),
+        )
+        .err()
+        .expect("refused");
+        assert!(in_a_pod.to_string().contains("POD_NAMESPACE"), "{in_a_pod}");
+        assert!(
+            Sessions::<D>::from_vars(
+                "myapp",
+                "s",
+                age,
+                true,
+                vars(&[
+                    ("SESSION_SECRET", &s),
+                    ("KUBERNETES_SERVICE_HOST", "10.0.0.1"),
+                    ("POD_NAMESPACE", "myapp-prod"),
+                ]),
+            )
+            .is_ok()
+        );
     }
 }
 

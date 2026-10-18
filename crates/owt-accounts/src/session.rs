@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use owt_auth::throttle::Throttle;
+use owt_web::flash::{Flash, HasFlashes};
 use owt_web::session::{Session, SessionData, Verdict};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool};
@@ -37,8 +38,10 @@ pub trait Signed: SessionData {
     fn set_signature(&mut self, signature: Option<Signature>);
 }
 
-/// Session data that holds a signature and nothing else.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Session data that holds a signature and the flash messages for the next page
+/// ([`HasFlashes`]): the session type of an app that keeps nothing else in its
+/// session. Build one with `..Data::default()`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Data {
     /// The account, when signed in.
     #[serde(rename = "a", default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +49,19 @@ pub struct Data {
     /// The epoch the sign-in was under.
     #[serde(rename = "e", default, skip_serializing_if = "is_zero")]
     pub epoch: i32,
+    /// The messages for the next page ([`Session::flash`]).
+    #[serde(rename = "f", default, skip_serializing_if = "Vec::is_empty")]
+    pub flashes: Vec<Flash>,
+}
+
+impl HasFlashes for Data {
+    fn flashes(&self) -> &[Flash] {
+        &self.flashes
+    }
+
+    fn flashes_mut(&mut self) -> &mut Vec<Flash> {
+        &mut self.flashes
+    }
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's signature
