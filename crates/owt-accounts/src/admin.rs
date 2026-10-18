@@ -350,7 +350,7 @@ pub struct AccountView<'a> {
     /// Where "issue a sign-in link" posts, when the admin offers them
     /// ([`Admin::sign_in_links`]).
     pub issue_link: Option<String>,
-    /// How long an issued link lasts, in words (`24 hours`); empty without links.
+    /// How long an issued link lasts, in words (`1 day`); empty without links.
     pub link_lifetime: String,
     /// Where "sign out everywhere" posts.
     pub sign_out: String,
@@ -439,9 +439,12 @@ pub struct Secret {
 /// `test-util`): every field holds a representative value, with one of each
 /// [`Badge`], a [`Notice`], a [`Secret`], a [`Connection`], a [`LocalIdentity`], a
 /// declared and an undeclared role, so a template that prints every field is
-/// exercised without a database. The values are fixed, so a snapshot of the
-/// rendered page is stable across releases of this crate's own pages; the URLs are
-/// what an admin at `/staff/accounts` with roles `host` and `editor` would hand over.
+/// exercised without a database, and a username holds a `<`, so a template that
+/// stops escaping fails. The values are fixed, so a snapshot of the rendered page is
+/// stable; the URLs are what an admin at `/staff/accounts` with roles `host` and
+/// `editor` would hand over. The states are combined for coverage (a success notice
+/// beside a refused email, a deactivated staff row), not as the admin would show
+/// them together.
 #[cfg(feature = "test-util")]
 mod examples {
     use std::sync::LazyLock;
@@ -526,10 +529,11 @@ mod examples {
                         password_sign_in: false,
                         last_sign_in: "2026-10-16".into(),
                     },
+                    // A name that must be escaped: a `|safe` in a template shows here.
                     Row {
                         id: 43,
                         href: "/staff/accounts/43".into(),
-                        username: "adam".into(),
+                        username: "adam<b>".into(),
                         email: String::new(),
                         badges: vec![badge("User", true)],
                         password_sign_in: true,
@@ -608,7 +612,7 @@ mod examples {
                 set_password: "/staff/accounts/42/password".into(),
                 set_password_sign_in: "/staff/accounts/42/password-sign-in".into(),
                 issue_link: Some("/staff/accounts/42/link".into()),
-                link_lifetime: "24 hours".into(),
+                link_lifetime: "1 day".into(),
                 sign_out: "/staff/accounts/42/sign-out".into(),
             }
         }
@@ -1762,7 +1766,10 @@ mod tests {
             .0;
         let list = Tailwind.list(&parts, &ListView::example()).unwrap().0;
         assert!(
-            list.contains("Password sign-in off") && list.contains("owt-pager"),
+            list.contains("Password sign-in off")
+                && list.contains("owt-pager")
+                && list.contains("adam&#60;b&#62;")
+                && !list.contains("adam<b>"),
             "{list}"
         );
         let new = Tailwind.new_account(&parts, &NewView::example()).unwrap().0;
@@ -1777,7 +1784,7 @@ mod tests {
             "reviewer",
             "desk-1",
             "Profile",
-            "Issue a sign-in link (24 hours)",
+            "Issue a sign-in link (1 day)",
         ] {
             assert!(account.contains(shown), "{shown}: {account}");
         }

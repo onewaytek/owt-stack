@@ -61,6 +61,8 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.6.1" }
 `owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export,
 `redis` for leases and leased jobs.
 `owt-change`'s: `accounts` (default) for `owt_accounts::Staff` as its admin.
+`owt-accounts`' `test-util` (off by default, for `[dev-dependencies]`) gives the admin's
+view models an `example()` each, for an app's tests of its own templates.
 `owt-auth`'s: `jwt` (default) for bearer-token verification, which brings `rsa` and an
 audit ignore (see "Authentication").
 
@@ -1184,13 +1186,16 @@ let admin = owt_accounts::admin::Admin::new(pool, "/staff/accounts", chrome).vie
 # }
 ```
 
-**Testing your templates.** With `owt-accounts`' `test-util` feature (in the app's
-`[dev-dependencies]`), `ListView::example()`, `NewView::example()` and
-`AccountView::example()` are filled-in view models: every field holds a value, with
-one of each badge, a notice, a secret, a refused email, a declared and an undeclared
-role, a connection and a local identity, so a template that prints every field is
-exercised with no database and no sign-in. Render each page through the app's
-`Views` and snapshot the body with `owt_test::golden`, or assert on it:
+**Testing your templates.** With `owt-accounts`' `test-util` feature in the app's
+dev-dependencies (`owt-accounts = { git = "…", tag = "…", features = ["test-util"] }`
+under `[dev-dependencies]`, beside the plain one under `[dependencies]`),
+`ListView::example()`, `NewView::example()` and `AccountView::example()` are filled-in
+view models: every field holds a value, with one of each badge, a notice, a secret, a
+refused email, a declared and an undeclared role, a connection and a local identity,
+so a template that prints every field is exercised with no database and no sign-in.
+A username in them holds a `<`, so a template that stops escaping fails its test.
+Render each page through the app's `Views` and snapshot the body with
+`owt_test::golden`, or assert on it:
 
 ```rust
 use axum::http::Request;
