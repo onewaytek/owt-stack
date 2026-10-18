@@ -1,28 +1,28 @@
 <section class="owt-admin">
 <header class="owt-admin-head">
-<h1>Accounts</h1>
-<a class="owt-button" href="{{ v.new_account }}">New account</a>
+<h1>{{ v.words.accounts }}</h1>
+<a class="owt-button" href="{{ v.new_account }}">{{ v.words.new_account }}</a>
 </header>
 <form class="owt-toolbar" method="get" action="{{ v.url }}" role="search">
 <label class="owt-sr" for="owt-admin-q">{{ v.placeholder }}</label>
 <input class="owt-input" id="owt-admin-q" name="q" type="search" value="{{ v.q }}" placeholder="{{ v.placeholder }}">
-<label class="owt-sr" for="owt-admin-role">Show</label>
+<label class="owt-sr" for="owt-admin-role">{{ v.words.show }}</label>
 <select class="owt-input" id="owt-admin-role" name="role">
-<option value="">Everyone</option>
+<option value="">{{ v.words.everyone }}</option>
 {% for (value, label) in v.filters %}<option value="{{ value }}"{% if value == v.filter %} selected{% endif %}>{{ label }}</option>
 {% endfor %}</select>
-<button class="owt-button owt-button-secondary" type="submit">Search</button>
+<button class="owt-button owt-button-secondary" type="submit">{{ v.words.search_button }}</button>
 </form>
 {% if let Some(n) = v.notice %}<div class="owt-alert owt-alert-error" role="alert">{{ n.text }}</div>
-{% endif %}<p class="owt-hint">{{ v.total }} {% if v.total == 1 %}account{% else %}accounts{% endif %}</p>
-{% if v.rows.is_empty() %}<p>No accounts match.</p>
+{% endif %}<p class="owt-hint">{{ v.total }} {% if v.total == 1 %}{{ v.words.account_one }}{% else %}{{ v.words.account_many }}{% endif %}</p>
+{% if v.rows.is_empty() %}<p>{{ v.words.no_accounts_match }}</p>
 {% else %}<table class="owt-table">
-<thead><tr><th scope="col">Account</th><th scope="col">Access</th><th scope="col">Last sign-in</th></tr></thead>
+<thead><tr><th scope="col">{{ v.words.column_account }}</th><th scope="col">{{ v.words.column_access }}</th><th scope="col">{{ v.words.last_sign_in }}</th></tr></thead>
 <tbody>
 {% for a in v.rows %}<tr>
 <td><a href="{{ a.href }}">{{ a.username }}</a>{% if !a.email.is_empty() %}<span class="owt-hint owt-block">{{ a.email }}</span>{% endif %}</td>
 <td>{% for b in a.badges %}{% if b.quiet %}<span class="owt-badge owt-badge-quiet">{{ b.text }}</span>{% else %}<span class="owt-badge">{{ b.text }}</span>{% endif %} {% endfor %}</td>
-<td>{% if a.last_sign_in.is_empty() %}<span class="owt-hint">never</span>{% else %}{{ a.last_sign_in }}{% endif %}</td>
+<td>{% if a.last_sign_in.is_empty() %}<span class="owt-hint">{{ v.words.never }}</span>{% else %}{{ a.last_sign_in }}{% endif %}</td>
 </tr>
 {% endfor %}</tbody>
 </table>

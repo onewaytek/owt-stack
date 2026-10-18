@@ -1167,6 +1167,30 @@ Its markup (`admin::Tailwind`, the default) carries only `owt-*` classes from
 with no CSS of the app's. A test here fails if a template names a class the stylesheet
 lacks.
 
+**Its words** are `admin::Words`: what staff are called, the headings, hints, buttons,
+badges, filters and the one-line outcomes, English (`Words::ENGLISH`) unless the app
+passes its own to `Admin::words`. Build them from the English with struct update
+syntax, so a word added later needs nothing from the app; a `{what}`, `{name}`,
+`{username}` or `{lifetime}` in a sentence stands for what the admin fills in. The
+view models carry the words (`ListView::words`, and the others'), so an app's own
+`Views` draws its markup with the same ones, and `Words::duration` writes a lifetime
+in them.
+
+```rust,no_run
+use owt_accounts::admin::{Admin, Words};
+# fn demo(pool: sqlx::PgPool, chrome: fn(owt_accounts::admin::Page<'_>) -> owt_web::Result<axum::response::Response>) {
+let words = Words {
+    staff: "Team",
+    staff_hint: "May use the team pages, this one included. Removing it signs the account out.",
+    staff_hint_new: "May use the team pages, this one included.",
+    cannot_remove_own_staff: "You cannot take away your own team access.",
+    ..Words::ENGLISH
+};
+let admin = Admin::new(pool, "/staff/accounts", chrome).words(words);
+# let _: axum::Router = admin.routes();
+# }
+```
+
 An app with another design system draws the pages itself: it implements
 `admin::Views` and passes it to `Admin::views`. Each method gets a page's view model
 (`ListView`, `NewView`, `AccountView`: what the page shows, the URLs its links and

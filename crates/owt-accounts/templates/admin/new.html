@@ -1,19 +1,19 @@
 <section class="owt-admin">
 <header class="owt-admin-head">
-<h1>New account</h1>
-<a href="{{ v.list }}">All accounts</a>
+<h1>{{ v.words.new_account }}</h1>
+<a href="{{ v.list }}">{{ v.words.all_accounts }}</a>
 </header>
 {% if let Some(e) = v.error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
 {% endif %}<form class="owt-form" method="post" action="{{ v.action }}">
 {{ username }}
 {{ email }}
 <fieldset class="owt-fieldset">
-<legend class="owt-label">Access</legend>
-<p class="owt-hint">Every account is a user. Add more only where it is needed.</p>
-<label class="owt-check"><input type="checkbox" name="staff"{% if v.staff %} checked{% endif %}><span><strong>Staff</strong><span class="owt-hint owt-block">May use the staff pages, this one included.</span></span></label>
-{% for r in v.roles %}<label class="owt-check"><input type="checkbox" name="role" value="{{ r.name }}"{% if r.checked %} checked{% endif %}><span><strong>{{ r.label }}</strong><span class="owt-hint owt-block">{{ r.description }}{% if r.staff %} Staff hold it anyway.{% endif %}</span></span></label>
+<legend class="owt-label">{{ v.words.access }}</legend>
+<p class="owt-hint">{{ v.words.every_account_is_a_user }}</p>
+<label class="owt-check"><input type="checkbox" name="staff"{% if v.staff %} checked{% endif %}><span><strong>{{ v.words.staff }}</strong><span class="owt-hint owt-block">{{ v.words.staff_hint_new }}</span></span></label>
+{% for r in v.roles %}<label class="owt-check"><input type="checkbox" name="role" value="{{ r.name }}"{% if r.checked %} checked{% endif %}><span><strong>{{ r.label }}</strong><span class="owt-hint owt-block">{{ r.description }}{% if r.staff %} {{ v.words.staff_hold_it_anyway }}{% endif %}</span></span></label>
 {% endfor %}</fieldset>
-<p class="owt-hint">The account starts with no password. Its page offers a way in afterwards.</p>
-<div class="owt-actions"><button class="owt-button" type="submit">Create account</button></div>
+<p class="owt-hint">{{ v.words.no_password_yet }}</p>
+<div class="owt-actions"><button class="owt-button" type="submit">{{ v.words.create_account }}</button></div>
 </form>
 </section>
