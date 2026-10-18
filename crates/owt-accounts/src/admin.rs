@@ -63,6 +63,10 @@ use crate::roles::{self, Role};
 use crate::store::{self, Account, COLUMNS, New};
 use crate::{Refused, Staff, identities, links};
 
+mod words;
+
+pub use words::Words;
+
 /// Accounts on one list page.
 pub const PER_PAGE: usize = 50;
 
@@ -218,14 +222,14 @@ pub trait Views: Send + Sync + 'static {
         let _ = request;
         Body::render(&NewHtml {
             v: view,
-            username: Field::text("username", "Username")
+            username: Field::text("username", view.words.username)
                 .value(view.username)
-                .hint("One word, no “@”. It does not change later.")
+                .hint(view.words.username_hint)
                 .required()
                 .autofocus(),
-            email: Field::email("email", "Email")
+            email: Field::email("email", view.words.email)
                 .value(view.email)
-                .hint("Optional. It signs in with the password, as the username does; a provider sign-in never matches it."),
+                .hint(view.words.email_hint_new),
         })
     }
 
@@ -242,10 +246,10 @@ pub trait Views: Send + Sync + 'static {
         let _ = request;
         Body::render(&AccountHtml {
             v: view,
-            email: Field::email("email", "Email")
+            email: Field::email("email", view.words.email)
                 .value(&view.email)
                 .error(view.email_error.as_deref())
-                .hint("It signs in with the password, as the username does; a provider sign-in never matches it."),
+                .hint(view.words.email_hint),
         })
     }
 }
@@ -269,9 +273,11 @@ pub struct ListView<'a> {
     pub new_account: String,
     /// The search term, trimmed.
     pub q: &'a str,
-    /// What the search box finds: `Username or email`, or with the app's own
-    /// ([`Admin::search`]) `Username, email or nickname`.
+    /// What the search box finds ([`Words::search`]), or with the app's own
+    /// ([`Admin::search`]) [`Words::search_with`] filled in: `Username, email or nickname`.
     pub placeholder: String,
+    /// The words the page writes ([`Admin::words`]).
+    pub words: Words,
     /// A failure to report: the app's search failed.
     pub notice: Option<Notice>,
     /// The filter in force: a value of [`ListView::filters`], or empty for everyone.
@@ -337,6 +343,8 @@ pub struct NewView<'a> {
     pub staff: bool,
     /// The app's roles, ticked as posted.
     pub roles: Vec<RoleChoice>,
+    /// The words the page writes ([`Admin::words`]).
+    pub words: Words,
 }
 
 /// An account's page. Its forms `POST` no fields except these:
@@ -382,7 +390,8 @@ pub struct AccountView<'a> {
     pub password_sign_in: bool,
     /// The day it was created (`YYYY-MM-DD`).
     pub joined: String,
-    /// When it last signed in (`YYYY-MM-DD HH:MM`), or `never`.
+    /// When it last signed in (`YYYY-MM-DD HH:MM`), or empty for never
+    /// ([`Words::never`]).
     pub last_sign_in: String,
     /// Its linked provider identities.
     pub connections: Vec<Connection>,
@@ -405,6 +414,8 @@ pub struct AccountView<'a> {
     pub link_lifetime: String,
     /// Where "sign out everywhere" posts.
     pub sign_out: String,
+    /// The words the page writes ([`Admin::words`]).
+    pub words: Words,
 }
 
 /// A provider identity linked to an account.
@@ -502,7 +513,7 @@ mod examples {
 
     use super::{
         AccountView, Badge, Connection, Level, ListView, LocalIdentity, NewView, Notice,
-        RoleChoice, Row, Secret,
+        RoleChoice, Row, Secret, Words,
     };
     use crate::store::Account;
     use owt_web::pager::Pager;
@@ -552,6 +563,7 @@ mod examples {
                 new_account: "/staff/accounts/new".into(),
                 q: "ada",
                 placeholder: "Username, email or nickname".into(),
+                words: Words::ENGLISH,
                 notice: Some(Notice {
                     level: Level::Error,
                     text: "Searching by nickname failed, so these are username and email matches only.".into(),
@@ -615,6 +627,7 @@ mod examples {
                 email: "ada@example.com",
                 staff: true,
                 roles: roles(&["editor"]),
+                words: Words::ENGLISH,
             }
         }
     }
@@ -665,8 +678,29 @@ mod examples {
                 issue_link: Some("/staff/accounts/42/link".into()),
                 link_lifetime: "1 day".into(),
                 sign_out: "/staff/accounts/42/sign-out".into(),
+                words: Words::ENGLISH,
             }
         }
+    }
+}
+
+/// The templates' own filters.
+#[expect(
+    clippy::inline_always,
+    clippy::unnecessary_wraps,
+    reason = "askama's filter_fn wraps the function in its filter type, in this shape"
+)]
+mod filters {
+    /// `{{ v.words.issue_link|replace("{lifetime}", v.link_lifetime) }}`: what the
+    /// admin fills into a sentence of [`super::Words`].
+    #[askama::filter_fn]
+    pub fn replace(
+        s: &str,
+        _: &dyn askama::Values,
+        from: &str,
+        to: &str,
+    ) -> askama::Result<String> {
+        Ok(s.replace(from, to))
     }
 }
 
@@ -707,6 +741,7 @@ pub struct Admin {
     links: Option<(Duration, LinkUrl)>,
     more: Option<(&'static str, MoreHref)>,
     search: Option<(&'static str, Search)>,
+    words: Words,
 }
 
 impl fmt::Debug for Admin {
@@ -740,7 +775,17 @@ impl Admin {
             links: None,
             more: None,
             search: None,
+            words: Words::ENGLISH,
         }
+    }
+
+    /// The words the pages and notices write, in place of [`Words::ENGLISH`]: what
+    /// staff are called, the headings, hints, buttons and outcomes. Build them from the
+    /// English with `..Words::ENGLISH`.
+    #[must_use]
+    pub fn words(mut self, words: Words) -> Self {
+        self.words = words;
+        self
     }
 
     /// The app's roles, as checkboxes and list filters, in this order.
@@ -904,29 +949,19 @@ impl Notice {
         self.level == Level::Error
     }
 
-    /// The notice a redirect named; unknown names show nothing.
-    fn named(name: Option<&str>) -> Option<Self> {
+    /// The notice a redirect named, in the admin's words; unknown names show nothing.
+    fn named(name: Option<&str>, words: &Words) -> Option<Self> {
         Some(match name? {
-            "created" => Self::success("Account created. Give it a way in below."),
-            "saved" => Self::success("Saved."),
-            "signed-out" => Self::success("Signed out everywhere."),
-            "unlinked" => {
-                Self::success("Sign-in connection removed, and the account signed out everywhere.")
-            }
-            // Its own words: staff read this about someone else's account, and a
-            // password is refused while password sign-in is off.
-            "last-way-in" => Self::error(
-                "That is this account's only way in, so it cannot be removed. Set a password (with password sign-in on), or add a connection first.",
-            ),
-            "password-sign-in-on" => Self::success(
-                "Password sign-in is on. The account has no password until one is set.",
-            ),
-            "password-sign-in-off" => Self::success(
-                "Password sign-in is off: its password is gone, and the account signed out everywhere.",
-            ),
-            "forgotten" => {
-                Self::success("Local identity retired, and the account signed out everywhere.")
-            }
+            "created" => Self::success(words.notice_created),
+            "saved" => Self::success(words.notice_saved),
+            "signed-out" => Self::success(words.notice_signed_out),
+            "unlinked" => Self::success(words.notice_unlinked),
+            // Its own words, not `Refused::LastWayIn`'s: staff read this about someone
+            // else's account, and a password is refused while password sign-in is off.
+            "last-way-in" => Self::error(words.notice_last_way_in),
+            "password-sign-in-on" => Self::success(words.notice_password_sign_in_on),
+            "password-sign-in-off" => Self::success(words.notice_password_sign_in_off),
+            "forgotten" => Self::success(words.notice_forgotten),
             _ => return None,
         })
     }
@@ -1060,7 +1095,7 @@ async fn list(
     let rows = accounts
         .into_iter()
         .map(|(a, last_sign_in, password_sign_in)| Row {
-            badges: badges(&admin.roles, &a, password_sign_in),
+            badges: badges(&admin.roles, &a, password_sign_in, &admin.words),
             password_sign_in,
             href: format!("{}/{}", admin.base, a.id),
             id: a.id,
@@ -1074,29 +1109,30 @@ async fn list(
         new_account: format!("{}/new", admin.base),
         q: query.q.trim(),
         placeholder: admin.search.as_ref().map_or_else(
-            || "Username or email".to_owned(),
-            |(what, _)| format!("Username, email or {what}"),
+            || admin.words.search.to_owned(),
+            |(what, _)| admin.words.search_with.replace("{what}", what),
         ),
         notice,
         filter,
-        filters: filters(&admin.roles),
+        filters: list_filters(&admin.roles, &admin.words),
         total,
         rows,
         pagination: Pagination::new(pager, &info),
+        words: admin.words,
     };
     let body = admin.views.list(&parts, &view);
-    Ok(admin.render(&parts, &me, "Accounts", body).await)
+    Ok(admin.render(&parts, &me, admin.words.accounts, body).await)
 }
 
 /// The list's filters, as `(value, label)`: staff, each role, deactivated.
-fn filters(roles: &[Role]) -> Vec<(String, String)> {
-    let mut filters = vec![("staff".to_owned(), "Staff".to_owned())];
+fn list_filters(roles: &[Role], words: &Words) -> Vec<(String, String)> {
+    let mut filters = vec![("staff".to_owned(), words.staff.to_owned())];
     filters.extend(
         roles
             .iter()
             .map(|r| (r.name.to_owned(), r.label.to_owned())),
     );
-    filters.push(("inactive".to_owned(), "Deactivated".to_owned()));
+    filters.push(("inactive".to_owned(), words.deactivated.to_owned()));
     filters
 }
 
@@ -1110,25 +1146,23 @@ async fn app_matches(admin: &Admin, term: &str) -> (Vec<i64>, Option<Notice>) {
         Ok(ids) => (ids, None),
         Err(e) => {
             tracing::warn!(error = ?e, "the app's admin search failed");
-            let notice = Notice::error(format!(
-                "Searching by {what} failed, so these are username and email matches only."
-            ));
+            let notice = Notice::error(admin.words.search_failed.replace("{what}", what));
             (Vec::new(), Some(notice))
         }
     }
 }
 
-fn badges(roles: &[Role], a: &Account, password_sign_in: bool) -> Vec<Badge> {
+fn badges(roles: &[Role], a: &Account, password_sign_in: bool, words: &Words) -> Vec<Badge> {
     let mut out = Vec::new();
     if !a.is_active {
         out.push(Badge {
-            text: "Deactivated".into(),
+            text: words.deactivated.into(),
             quiet: true,
         });
     }
     if a.is_staff {
         out.push(Badge {
-            text: "Staff".into(),
+            text: words.staff.into(),
             quiet: false,
         });
     }
@@ -1140,19 +1174,19 @@ fn badges(roles: &[Role], a: &Account, password_sign_in: bool) -> Vec<Badge> {
     }
     for name in undeclared(roles, &a.roles) {
         out.push(Badge {
-            text: format!("{name} (undeclared)"),
+            text: words.undeclared.replace("{name}", name),
             quiet: true,
         });
     }
     if out.is_empty() {
         out.push(Badge {
-            text: "User".into(),
+            text: words.user.into(),
             quiet: true,
         });
     }
     if !password_sign_in {
         out.push(Badge {
-            text: "Password sign-in off".into(),
+            text: words.password_sign_in_off.into(),
             quiet: true,
         });
     }
@@ -1199,9 +1233,10 @@ async fn new_page(
         email: form.value("email"),
         staff: form.ticked("staff"),
         roles: boxes(&admin.roles, &form.roles()),
+        words: admin.words,
     };
     let body = admin.views.new_account(parts, &view);
-    admin.render(parts, me, "New account", body).await
+    admin.render(parts, me, admin.words.new_account, body).await
 }
 
 async fn new_form(State(admin): Shared, Staff(me): Staff, Req(parts): Req) -> Response {
@@ -1302,7 +1337,7 @@ async fn load(db: impl PgExecutor<'_>, id: i64) -> owt_web::Result<Loaded> {
         ),
     >(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS}, to_char(created_at, 'YYYY-MM-DD'),
-                    coalesce(to_char(last_sign_in, 'YYYY-MM-DD HH24:MI'), 'never'),
+                    coalesce(to_char(last_sign_in, 'YYYY-MM-DD HH24:MI'), ''),
                     password_sign_in
              FROM accounts WHERE id = $1"
     )))
@@ -1382,10 +1417,9 @@ async fn show(
             provider: l.provider,
         })
         .collect();
-    let link_lifetime = admin
-        .links
-        .as_ref()
-        .map_or_else(String::new, |(ttl, _)| human(ttl.min(&links::MAX_TTL)));
+    let link_lifetime = admin.links.as_ref().map_or_else(String::new, |(ttl, _)| {
+        admin.words.duration(*ttl.min(&links::MAX_TTL))
+    });
     let more = admin
         .more
         .as_ref()
@@ -1417,6 +1451,7 @@ async fn show(
         issue_link: admin.links.as_ref().map(|_| format!("{at}/link")),
         link_lifetime,
         sign_out: format!("{at}/sign-out"),
+        words: admin.words,
     };
     let body = match admin.views.account(parts, &view) {
         // The secret is made and committed: a 500 would lose it.
@@ -1427,19 +1462,6 @@ async fn show(
         body => body,
     };
     Ok(admin.render(parts, me, &account.username, body).await)
-}
-
-/// A lifetime in words: `15 minutes`, `24 hours`, `7 days`.
-fn human(d: &Duration) -> String {
-    let s = d.as_secs();
-    let (n, unit) = if s.is_multiple_of(86_400) && s >= 86_400 {
-        (s / 86_400, "day")
-    } else if s.is_multiple_of(3_600) && s >= 3_600 {
-        (s / 3_600, "hour")
-    } else {
-        ((s / 60).max(1), "minute")
-    };
-    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
 #[derive(Deserialize)]
@@ -1459,7 +1481,7 @@ async fn detail(
         &parts,
         &me,
         id,
-        Notice::named(q.notice.as_deref()),
+        Notice::named(q.notice.as_deref(), &admin.words),
         None,
         None,
     )
@@ -1502,9 +1524,7 @@ async fn save(
             &parts,
             &me,
             id,
-            Some(Notice::error(
-                "You cannot take away your own staff access or deactivate yourself. Ask another member of staff.",
-            )),
+            Some(Notice::error(admin.words.not_own_staff_or_active)),
             None,
             None,
         )
@@ -1615,10 +1635,10 @@ async fn reset_password(
     tx.commit().await?;
     tracing::info!(by = me.id, account = id, "admin set a generated password");
     let secret = Secret {
-        what: format!(
-            "New password for {}. It has signed out every session and voided its unused sign-in links.",
-            account.username
-        ),
+        what: admin
+            .words
+            .new_password
+            .replace("{username}", &account.username),
         value: password,
     };
     show(&admin, &parts, &me, id, None, Some(secret), None).await
@@ -1638,8 +1658,7 @@ async fn issue_link(
     let Loaded { account, .. } = load(&mut *tx, id).await?;
     if !account.is_active {
         drop(tx);
-        let notice =
-            Notice::error("A deactivated account cannot use a sign-in link. Activate it first.");
+        let notice = Notice::error(admin.words.deactivated_no_link);
         let mut response = show(&admin, &parts, &me, id, Some(notice), None, None).await?;
         *response.status_mut() = StatusCode::CONFLICT;
         return Ok(response);
@@ -1649,11 +1668,14 @@ async fn issue_link(
     tx.commit().await?;
     tracing::info!(by = me.id, account = id, "admin issued a sign-in link");
     let secret = Secret {
-        what: format!(
-            "Sign-in link for {}, good once within {}.",
-            account.username,
-            human(&(*ttl).min(links::MAX_TTL))
-        ),
+        what: admin
+            .words
+            .sign_in_link
+            .replace("{username}", &account.username)
+            .replace(
+                "{lifetime}",
+                &admin.words.duration((*ttl).min(links::MAX_TTL)),
+            ),
         value: url(&minted.token),
     };
     show(&admin, &parts, &me, id, None, Some(secret), None).await
@@ -1709,9 +1731,7 @@ async fn not_on_yourself(
     me: &Account,
     what: &str,
 ) -> owt_web::Result<Response> {
-    let notice = Notice::error(format!(
-        "You cannot {what} on your own account. Ask another member of staff."
-    ));
+    let notice = Notice::error(admin.words.not_on_yourself.replace("{what}", what));
     let mut response = show(admin, parts, me, me.id, Some(notice), None, None).await?;
     *response.status_mut() = StatusCode::FORBIDDEN;
     Ok(response)
@@ -1729,13 +1749,13 @@ async fn set_password_sign_in(
         "off" => false,
         _ => {
             return Err(owt_web::Error::Unprocessable(
-                "Say on or off for password sign-in.".into(),
+                admin.words.say_on_or_off.into(),
             ));
         }
     };
     // Turning it off removes the password and ends every session, the actor's too.
     if id == me.id && !allowed {
-        return not_on_yourself(&admin, &parts, &me, "turn password sign-in off").await;
+        return not_on_yourself(&admin, &parts, &me, admin.words.what_turn_off).await;
     }
     let mut tx = admin.pool.begin().await?;
     lock(&mut tx, &me, id).await?;
@@ -1771,7 +1791,7 @@ async fn forget_local(
     let (key, subject) = (form.value("key"), form.value("subject"));
     // Retiring one signs the account out everywhere and may leave it no way in.
     if id == me.id {
-        return not_on_yourself(&admin, &parts, &me, "retire a local identity").await;
+        return not_on_yourself(&admin, &parts, &me, admin.words.what_retire).await;
     }
     let mut tx = admin.pool.begin().await?;
     lock(&mut tx, &me, id).await?;
@@ -1853,10 +1873,58 @@ mod tests {
 
     #[test]
     fn lifetimes_read_as_words() {
-        assert_eq!(human(&Duration::from_secs(900)), "15 minutes");
-        assert_eq!(human(&Duration::from_secs(3_600)), "1 hour");
-        assert_eq!(human(&Duration::from_secs(86_400 * 7)), "7 days");
-        assert_eq!(human(&Duration::from_secs(5_400)), "90 minutes");
+        let words = Words::ENGLISH;
+        assert_eq!(words.duration(Duration::from_secs(900)), "15 minutes");
+        assert_eq!(words.duration(Duration::from_secs(3_600)), "1 hour");
+        assert_eq!(words.duration(Duration::from_secs(86_400 * 7)), "7 days");
+        assert_eq!(words.duration(Duration::from_secs(5_400)), "90 minutes");
+        let french = Words {
+            day: "{n} jour",
+            days: "{n} jours",
+            ..Words::ENGLISH
+        };
+        assert_eq!(french.duration(Duration::from_secs(86_400 * 7)), "7 jours");
+    }
+
+    /// Every word on the pages comes from `Words`: another set leaves no English behind.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn the_pages_write_the_words_given() {
+        let parts = axum::http::Request::get("/staff/accounts")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let words = Words {
+            staff: "Team",
+            staff_hint: "May use the team pages.",
+            save: "Enregistrer",
+            ways_in: "Accès",
+            everyone: "Tout le monde",
+            ..Words::ENGLISH
+        };
+        let list = ListView {
+            words,
+            ..ListView::example()
+        };
+        let account = AccountView {
+            words,
+            ..AccountView::example()
+        };
+        let list = Tailwind.list(&parts, &list).unwrap().0;
+        let account = Tailwind.account(&parts, &account).unwrap().0;
+        assert!(
+            account.contains("Enregistrer") && !account.contains(">Save<"),
+            "{account}"
+        );
+        assert!(account.contains("Accès") && account.contains("May use the team pages."));
+        assert!(account.contains("<strong>Team</strong>") && !account.contains("<strong>Staff<"));
+        // The example's badges and filters hold the English the list route would
+        // have made from `words`; the page's own text is the words'.
+        assert!(
+            list.contains("Tout le monde") && !list.contains("Everyone"),
+            "{list}"
+        );
     }
 
     #[test]

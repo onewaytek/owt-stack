@@ -1,60 +1,60 @@
 <section class="owt-admin">
 <header class="owt-admin-head">
 <h1>{{ v.account.username }}</h1>
-<a href="{{ v.list }}">All accounts</a>
+<a href="{{ v.list }}">{{ v.words.all_accounts }}</a>
 </header>
 {% if let Some(n) = v.notice %}{% if n.is_error() %}<div class="owt-alert owt-alert-error" role="alert">{{ n.text }}</div>
 {% else %}<div class="owt-alert owt-alert-success" role="status">{{ n.text }}</div>
 {% endif %}{% endif %}{% if let Some(s) = v.secret %}<div class="owt-secret" role="status">
 <p>{{ s.what }}</p>
 <p><code class="owt-secret-value">{{ s.value }}</code></p>
-<p class="owt-hint">Shown this once. Pass it on privately; nothing here can show it again.</p>
+<p class="owt-hint">{{ v.words.shown_once }}</p>
 </div>
 {% endif %}<dl class="owt-facts">
-<dt>Joined</dt><dd>{{ v.joined }}</dd>
-<dt>Last sign-in</dt><dd>{{ v.last_sign_in }}</dd>
-<dt>Status</dt><dd>{% if v.account.is_active %}Active{% else %}Deactivated{% endif %}</dd>
+<dt>{{ v.words.joined }}</dt><dd>{{ v.joined }}</dd>
+<dt>{{ v.words.last_sign_in }}</dt><dd>{% if v.last_sign_in.is_empty() %}<span class="owt-hint">{{ v.words.never }}</span>{% else %}{{ v.last_sign_in }}{% endif %}</dd>
+<dt>{{ v.words.status }}</dt><dd>{% if v.account.is_active %}{{ v.words.active }}{% else %}{{ v.words.deactivated }}{% endif %}</dd>
 </dl>
 {% if let Some((label, href)) = v.more %}<p><a href="{{ href }}">{{ label }}</a></p>
 {% endif %}<form class="owt-form" method="post" action="{{ v.save }}">
 {{ email }}
 <fieldset class="owt-fieldset">
-<legend class="owt-label">Access</legend>
-<p class="owt-hint">Every active account is a user.</p>
+<legend class="owt-label">{{ v.words.access }}</legend>
+<p class="owt-hint">{{ v.words.every_active_account_is_a_user }}</p>
 {% if v.myself %}<input type="hidden" name="active" value="on"><input type="hidden" name="staff" value="on">
-<label class="owt-check"><input type="checkbox" checked disabled><span><strong>Active</strong><span class="owt-hint owt-block">You cannot deactivate yourself.</span></span></label>
-<label class="owt-check"><input type="checkbox" checked disabled><span><strong>Staff</strong><span class="owt-hint owt-block">You cannot take away your own staff access.</span></span></label>
-{% else %}<label class="owt-check"><input type="checkbox" name="active"{% if v.account.is_active %} checked{% endif %}><span><strong>Active</strong><span class="owt-hint owt-block">Deactivating signs the account out everywhere and keeps its data.</span></span></label>
-<label class="owt-check"><input type="checkbox" name="staff"{% if v.account.is_staff %} checked{% endif %}><span><strong>Staff</strong><span class="owt-hint owt-block">May use the staff pages, this one included. Removing it signs the account out.</span></span></label>
-{% endif %}{% for r in v.roles %}<label class="owt-check"><input type="checkbox" name="role" value="{{ r.name }}"{% if r.checked %} checked{% endif %}><span><strong>{{ r.label }}</strong><span class="owt-hint owt-block">{{ r.description }}{% if r.staff %} Staff hold it anyway.{% endif %}</span></span></label>
-{% endfor %}{% for name in v.undeclared %}<label class="owt-check"><input type="checkbox" name="role" value="{{ name }}" checked><span><strong>{{ name }}</strong><span class="owt-hint owt-block">Held, but this app does not declare it. Untick to revoke it; it cannot be granted here.</span></span></label>
+<label class="owt-check"><input type="checkbox" checked disabled><span><strong>{{ v.words.active }}</strong><span class="owt-hint owt-block">{{ v.words.cannot_deactivate_yourself }}</span></span></label>
+<label class="owt-check"><input type="checkbox" checked disabled><span><strong>{{ v.words.staff }}</strong><span class="owt-hint owt-block">{{ v.words.cannot_remove_own_staff }}</span></span></label>
+{% else %}<label class="owt-check"><input type="checkbox" name="active"{% if v.account.is_active %} checked{% endif %}><span><strong>{{ v.words.active }}</strong><span class="owt-hint owt-block">{{ v.words.active_hint }}</span></span></label>
+<label class="owt-check"><input type="checkbox" name="staff"{% if v.account.is_staff %} checked{% endif %}><span><strong>{{ v.words.staff }}</strong><span class="owt-hint owt-block">{{ v.words.staff_hint }}</span></span></label>
+{% endif %}{% for r in v.roles %}<label class="owt-check"><input type="checkbox" name="role" value="{{ r.name }}"{% if r.checked %} checked{% endif %}><span><strong>{{ r.label }}</strong><span class="owt-hint owt-block">{{ r.description }}{% if r.staff %} {{ v.words.staff_hold_it_anyway }}{% endif %}</span></span></label>
+{% endfor %}{% for name in v.undeclared %}<label class="owt-check"><input type="checkbox" name="role" value="{{ name }}" checked><span><strong>{{ name }}</strong><span class="owt-hint owt-block">{{ v.words.undeclared_hint }}</span></span></label>
 {% endfor %}</fieldset>
-<div class="owt-actions"><button class="owt-button" type="submit">Save</button></div>
+<div class="owt-actions"><button class="owt-button" type="submit">{{ v.words.save }}</button></div>
 </form>
 <section class="owt-section">
-<h2>Ways in</h2>
-<p>{% if !v.password_sign_in %}Password sign-in off: no password opens it.{% else if v.has_password %}Has a password.{% else %}No password.{% endif %}</p>
+<h2>{{ v.words.ways_in }}</h2>
+<p>{% if !v.password_sign_in %}{{ v.words.password_sign_in_off_sentence }}{% else if v.has_password %}{{ v.words.has_password }}{% else %}{{ v.words.no_password }}{% endif %}</p>
 <div class="owt-actions">
-{% if v.password_sign_in %}<form method="post" action="{{ v.set_password }}"><button class="owt-button owt-button-secondary" type="submit">Set a generated password</button></form>
-{% if !v.myself %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="off"><button class="owt-button owt-button-danger" type="submit">Turn password sign-in off</button></form>
-{% endif %}{% else %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="on"><button class="owt-button owt-button-secondary" type="submit">Turn password sign-in on</button></form>
-{% endif %}{% if let Some(issue) = v.issue_link %}<form method="post" action="{{ issue }}"><button class="owt-button owt-button-secondary" type="submit">Issue a sign-in link ({{ v.link_lifetime }})</button></form>
-{% endif %}<form method="post" action="{{ v.sign_out }}"><button class="owt-button owt-button-danger" type="submit">Sign out everywhere</button></form>
+{% if v.password_sign_in %}<form method="post" action="{{ v.set_password }}"><button class="owt-button owt-button-secondary" type="submit">{{ v.words.set_generated_password }}</button></form>
+{% if !v.myself %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="off"><button class="owt-button owt-button-danger" type="submit">{{ v.words.turn_password_sign_in_off }}</button></form>
+{% endif %}{% else %}<form method="post" action="{{ v.set_password_sign_in }}"><input type="hidden" name="password_sign_in" value="on"><button class="owt-button owt-button-secondary" type="submit">{{ v.words.turn_password_sign_in_on }}</button></form>
+{% endif %}{% if let Some(issue) = v.issue_link %}<form method="post" action="{{ issue }}"><button class="owt-button owt-button-secondary" type="submit">{{ v.words.issue_link|replace("{lifetime}", v.link_lifetime) }}</button></form>
+{% endif %}<form method="post" action="{{ v.sign_out }}"><button class="owt-button owt-button-danger" type="submit">{{ v.words.sign_out_everywhere }}</button></form>
 </div>
-<h3>Sign-in connections</h3>
-{% if v.connections.is_empty() %}<p class="owt-hint">None. Only the account's owner can connect one, while signed in.</p>
+<h3>{{ v.words.connections }}</h3>
+{% if v.connections.is_empty() %}<p class="owt-hint">{{ v.words.no_connections }}</p>
 {% else %}<table class="owt-table">
-<thead><tr><th scope="col">Provider</th><th scope="col">Shown as</th><th scope="col"><span class="owt-sr">Actions</span></th></tr></thead>
+<thead><tr><th scope="col">{{ v.words.provider }}</th><th scope="col">{{ v.words.shown_as }}</th><th scope="col"><span class="owt-sr">{{ v.words.actions }}</span></th></tr></thead>
 <tbody>
-{% for i in v.connections %}<tr><td>{{ i.provider }}</td><td>{{ i.label }}</td><td><form method="post" action="{{ i.unlink }}"><button class="owt-button owt-button-quiet" type="submit">Remove</button></form></td></tr>
+{% for i in v.connections %}<tr><td>{{ i.provider }}</td><td>{{ i.label }}</td><td><form method="post" action="{{ i.unlink }}"><button class="owt-button owt-button-quiet" type="submit">{{ v.words.remove }}</button></form></td></tr>
 {% endfor %}</tbody>
 </table>
-{% endif %}{% if !v.local_identities.is_empty() %}<h3>Local identities</h3>
-<p class="owt-hint">How the app itself reaches this account. Retiring one signs the account out everywhere.</p>
+{% endif %}{% if !v.local_identities.is_empty() %}<h3>{{ v.words.local_identities }}</h3>
+<p class="owt-hint">{{ v.words.local_identities_hint }}</p>
 <table class="owt-table">
-<thead><tr><th scope="col">Key</th><th scope="col">Subject</th><th scope="col">Added</th><th scope="col">Last sign-in</th><th scope="col"><span class="owt-sr">Actions</span></th></tr></thead>
+<thead><tr><th scope="col">{{ v.words.key }}</th><th scope="col">{{ v.words.subject }}</th><th scope="col">{{ v.words.added }}</th><th scope="col">{{ v.words.last_sign_in }}</th><th scope="col"><span class="owt-sr">{{ v.words.actions }}</span></th></tr></thead>
 <tbody>
-{% for l in v.local_identities %}<tr><td>{{ l.key }}</td><td>{{ l.subject }}</td><td>{{ l.created }}</td><td>{{ l.last_sign_in }}</td><td>{% if !v.myself %}<form method="post" action="{{ l.forget }}"><input type="hidden" name="key" value="{{ l.key }}"><input type="hidden" name="subject" value="{{ l.subject }}"><button class="owt-button owt-button-quiet" type="submit">Retire</button></form>{% endif %}</td></tr>
+{% for l in v.local_identities %}<tr><td>{{ l.key }}</td><td>{{ l.subject }}</td><td>{{ l.created }}</td><td>{{ l.last_sign_in }}</td><td>{% if !v.myself %}<form method="post" action="{{ l.forget }}"><input type="hidden" name="key" value="{{ l.key }}"><input type="hidden" name="subject" value="{{ l.subject }}"><button class="owt-button owt-button-quiet" type="submit">{{ v.words.retire }}</button></form>{% endif %}</td></tr>
 {% endfor %}</tbody>
 </table>
 {% endif %}</section>
