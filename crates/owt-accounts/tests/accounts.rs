@@ -4976,3 +4976,77 @@ async fn a_sign_up_hears_every_problem_at_once() {
     store::create(&db.pool, fine).await.unwrap();
     db.drop().await;
 }
+
+#[tokio::test]
+async fn an_arrival_waiting_on_an_unlink_does_not_link_again() {
+    let db = db!();
+    let provider = sso("https://id.example.com");
+    let open = identities::Welcome {
+        create: true,
+        record_email: false,
+    };
+    let who = identity("u-1", None, false);
+    let identities::Arrival::Created(ada) = identities::arrive(&db.pool, &provider, &who, open)
+        .await
+        .unwrap()
+    else {
+        panic!("created")
+    };
+    store::set_password(&db.pool, &ada, "correct horse battery")
+        .await
+        .unwrap();
+    // Staff unlink it, holding the account as `unlink` does, while it signs in.
+    let mut unlink = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(ada.id)
+        .execute(&mut *unlink)
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let (p, w) = (provider.clone(), who.clone());
+    let arriving =
+        tokio::spawn(async move { identities::arrive(&pool, &p, &w, open).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!arriving.is_finished(), "the arrival waits on the account");
+    sqlx::query("DELETE FROM account_identities WHERE account_id = $1")
+        .bind(ada.id)
+        .execute(&mut *unlink)
+        .await
+        .unwrap();
+    unlink.commit().await.unwrap();
+    assert_eq!(arriving.await.unwrap(), identities::Arrival::Unknown);
+    assert!(
+        identities::list(&db.pool, ada.id).await.unwrap().is_empty(),
+        "not linked again"
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn an_arrival_waiting_on_a_retirement_reaches_nothing() {
+    let db = db!();
+    let identities::Arrival::Created(desk) =
+        identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("desk"))
+            .await
+            .unwrap()
+    else {
+        panic!("created")
+    };
+    let mut retire = db.pool.begin().await.unwrap();
+    assert_eq!(
+        identities::forget_as(&mut *retire, "kiosk", "desk-1")
+            .await
+            .unwrap(),
+        Some(desk.id)
+    );
+    let pool = db.pool.clone();
+    let arriving = tokio::spawn(async move {
+        identities::arrive_as(&pool, "kiosk", "desk-1", None)
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    retire.commit().await.unwrap();
+    assert_eq!(arriving.await.unwrap(), identities::Arrival::Unknown);
+    db.drop().await;
+}

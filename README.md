@@ -910,8 +910,12 @@ assert_eq!(store::username_problem("Ada"), None);
 let new = New {
     username: "Ada", email: "ada@example.com", password: Some("correct horse battery"), is_staff: false,
 };
-if !throttle.attempt(ip) { /* 429 */ }
-let problems = store::problems(&pool, &new).await?; // the form again when not empty
+if !throttle.attempt(ip) {
+    return Ok(()); // 429
+}
+if !store::problems(&pool, &new).await?.is_empty() {
+    return Ok(()); // the form again, with every problem
+}
 // `create_in` instead, inside the transaction that makes the app's own rows.
 let ada = store::create(&pool, new).await?;
 store::set_password(&pool, &ada, "a different passphrase").await?; // staff or a link's reset: signs out everywhere
