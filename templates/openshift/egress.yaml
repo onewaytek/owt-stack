@@ -1,0 +1,95 @@
+# Where the pods of an app deployed from app.yaml may connect, for one set of pods at
+# a time: the app's (POD=<NAME>), or a task's from cronjob.yaml (POD=<NAME>-<JOB>).
+#
+#   oc process -f egress.yaml -p NAME=myapp -p NAMESPACE=myapp -p POD=myapp | oc apply -f -
+#   oc process -f egress.yaml -p NAME=myapp -p NAMESPACE=myapp -p POD=myapp-digest \
+#     -p INTERNET_CIDR=0.0.0.0/32 | oc apply -f -
+#
+# app.yaml's policies say who may reach the app; this one says where it may go, and
+# nothing else: a pod that is compromised (a dependency's bug, a request forged
+# through an app's own route) can then open connections to its database, its Redis,
+# the cluster's DNS and port 443 of the internet, and to no other namespace, the
+# cluster API, the node or the internet's other ports. The selected pods lose every
+# other egress the moment this applies, so read the rules against what the app
+# calls before applying it, and apply it in a staging namespace first; a wrong rule
+# looks like a DNS failure. Deleting the policy restores the open egress.
+#
+# What the rules cover, and what an app adds in a policy of its own:
+# - DNS: the cluster's resolvers, in DNS_NAMESPACE on DNS_PORT (OpenShift's CoreDNS
+#   answers on 5353; a policy is matched against the pod the Service forwards to).
+# - Postgres: the instances of <NAME>-<DB_SUFFIX>. (The instances get no egress
+#   policy here: the CloudNativePG instance manager talks to the cluster API.)
+# - Redis: the pods redis.yaml makes, if any. Those pods get a policy of their own
+#   there, admitting no egress at all.
+# - The internet, on port 443: a sign-in provider, a tracker for change requests,
+#   an OTLP collector over the public web, and the cluster's own Routes, which the
+#   router answers at a node address. INTERNET_CIDR bounds it: 0.0.0.0/0 (the
+#   default) is anywhere, 0.0.0.0/32 is nowhere (a task that sends no mail and calls
+#   no API), and a narrower range is a provider's. Another port, a cluster service
+#   in another namespace (a collector, a mail relay, a tracker at its
+#   `.svc.cluster.local.` name) or a second CIDR is a further NetworkPolicy of the
+#   app's own with the same podSelector: policies add up.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: owt-app-egress
+  annotations:
+    description: Where the pods of an owt-stack app (or one of its tasks) may connect.
+parameters:
+  - name: NAME
+    description: The app's name, as given to app.yaml.
+    required: true
+  - name: NAMESPACE
+    required: true
+  - name: POD
+    description: >-
+      The `app` label of the pods to bound: the app's own (<NAME>), or a task's from
+      cronjob.yaml (<NAME>-<JOB>). One policy per value; its objects are named after it.
+    required: true
+  - name: DB_SUFFIX
+    description: The database cluster is <NAME>-<DB_SUFFIX>, as given to app.yaml.
+    value: db
+  - name: INTERNET_CIDR
+    description: >-
+      The addresses the pods may reach on port 443: 0.0.0.0/0 for the internet (sign-in
+      providers, trackers, the cluster's own Routes), 0.0.0.0/32 for none.
+    value: 0.0.0.0/0
+  - name: DNS_NAMESPACE
+    description: The namespace the cluster's DNS pods run in.
+    value: openshift-dns
+  - name: DNS_PORT
+    description: The port those pods answer on (OpenShift's CoreDNS listens on 5353).
+    value: "5353"
+objects:
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${POD}-egress
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      podSelector:
+        matchLabels: {app: "${POD}"}
+      policyTypes: [Egress]
+      egress:
+        # The cluster's resolvers.
+        - to:
+            - namespaceSelector:
+                matchLabels: {kubernetes.io/metadata.name: "${DNS_NAMESPACE}"}
+          ports:
+            - {protocol: UDP, port: "${{DNS_PORT}}"}
+            - {protocol: TCP, port: "${{DNS_PORT}}"}
+        # Postgres.
+        - to:
+            - podSelector:
+                matchLabels: {cnpg.io/cluster: "${NAME}-${DB_SUFFIX}"}
+          ports: [{port: 5432}]
+        # Redis, if redis.yaml made one; without it this selects nothing.
+        - to:
+            - podSelector:
+                matchLabels: {app: "${NAME}-redis"}
+          ports: [{port: 6379}]
+        # HTTPS to the internet (and to the cluster's Routes, at the router's address).
+        - to:
+            - ipBlock: {cidr: "${INTERNET_CIDR}"}
+          ports: [{port: 443}]

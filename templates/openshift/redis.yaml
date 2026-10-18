@@ -131,3 +131,17 @@ objects:
             - podSelector:
                 matchLabels: {app: "${NAME}"}
           ports: [{port: redis}]
+
+  # Redis connects to nothing: no replication, no persistence, no DNS to look up.
+  # A compromised Redis (or a pod that reached it) opens no connection from here.
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME}-redis-egress
+      namespace: ${NAMESPACE}
+      labels: {app: "${NAME}"}
+    spec:
+      podSelector:
+        matchLabels: {app: "${NAME}-redis"}
+      policyTypes: [Egress]
+      egress: []
