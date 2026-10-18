@@ -12,7 +12,7 @@ anyhow.workspace = true
 askama.workspace = true
 axum = { workspace = true, features = ["tokio", "http1"] }
 cookie.workspace = true
-owt-accounts.workspace = true
+owt-accounts = { workspace = true, features = ["test-util"] }
 owt-auth = { workspace = true, features = ["jwt"] }
 owt-bus.workspace = true
 owt-change.workspace = true

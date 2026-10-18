@@ -3,8 +3,8 @@
 #
 # `just check` is the gate: run it before every commit, and CI runs the same
 # command (rust-ci.yml's `check-command: just check`), so the list of checks can't
-# drift between the two. It needs a migrated database for the .sqlx check:
-# `just db` first.
+# drift between the two. Its .sqlx check migrates DATABASE_URL first: `just db`
+# gives it a database of this app's own.
 
 set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]

@@ -1184,6 +1184,28 @@ let admin = owt_accounts::admin::Admin::new(pool, "/staff/accounts", chrome).vie
 # }
 ```
 
+**Testing your templates.** With `owt-accounts`' `test-util` feature (in the app's
+`[dev-dependencies]`), `ListView::example()`, `NewView::example()` and
+`AccountView::example()` are filled-in view models: every field holds a value, with
+one of each badge, a notice, a secret, a refused email, a declared and an undeclared
+role, a connection and a local identity, so a template that prints every field is
+exercised with no database and no sign-in. Render each page through the app's
+`Views` and snapshot the body with `owt_test::golden`, or assert on it:
+
+```rust
+use axum::http::Request;
+use owt_accounts::admin::{AccountView, ListView, NewView, Views};
+# struct MyViews;
+# impl Views for MyViews {}
+
+let parts = Request::get("/staff/accounts").body(()).unwrap().into_parts().0;
+let list = MyViews.list(&parts, &ListView::example()).unwrap();
+assert!(list.to_string().contains("ada"));
+let _new = MyViews.new_account(&parts, &NewView::example()).unwrap();
+let account = MyViews.account(&parts, &AccountView::example()).unwrap();
+assert!(account.to_string().contains("correct-horse-battery-staple")); // the secret shown once
+```
+
 #### Site policies
 
 `owt_accounts::policies` tracks which version of each of the app's policies (its
@@ -2028,8 +2050,8 @@ fragment::assert_same_element(&page.text(), "<main id=\"m\"> <p>Hi</p></main>", 
 
 // Golden pages: compared modulo layout, with what changes per run masked.
 // `UPDATE_GOLDEN=1 cargo test` rewrites the snapshots; review the diff.
-// `asset_versions` drops the `?v=<hash>` on static URLs, so a snapshot recorded with
-// the stylesheet built matches a test job that builds no CSS.
+// `asset_versions` drops a URL's leading `?v=…` (the fingerprint on static URLs), so
+// a snapshot recorded with the stylesheet built matches a test job that builds no CSS.
 let normalize = Normalizer::new().uuids("<uuid>").asset_versions();
 # if false { // no snapshots beside the README
 let mut golden = Golden::new("tests/golden/pages");
