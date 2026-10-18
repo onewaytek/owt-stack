@@ -24,7 +24,7 @@
 //! the second is refused, so staff never reach zero this way.
 //!
 //! A password or link is shown once, in the answer to the `POST` that made it; every
-//! page here is `no-store`. Each change is logged at `info` with who made it and what
+//! response here is `no-store` and never framed, a refusal included. Each change is logged at `info` with who made it and what
 //! it changed.
 //!
 //! The app supplies its layout through a [`Chrome`] function: the admin renders the
@@ -585,7 +585,7 @@ impl Admin {
                 CrossOrigin::new(),
                 CrossOrigin::layer,
             ))
-            .layer(axum::middleware::map_response(never_framed));
+            .layer(axum::middleware::map_response(never_cached_or_framed));
         Router::new().nest(&base, pages)
     }
 
@@ -1217,14 +1217,21 @@ async fn detail(
     .await
 }
 
-/// No admin page is shown inside another's frame, whatever the app's own CSP (one in
-/// report-only mode enforces no `frame-ancestors`, and browsers then obey
-/// `X-Frame-Options`): framed by a hostile sibling subdomain, which `SameSite=Lax`
-/// and [`CrossOrigin`] treat as the site itself, a click would act with staff's
-/// authority. No `Content-Security-Policy` of its own: the app's `Csp` layer adds its
-/// policy only to a response that has none, so one here would replace it.
-pub(crate) async fn never_framed(mut response: Response) -> Response {
-    response.headers_mut().insert(
+/// No admin response is cached or shown inside another page's frame, whatever it
+/// answers: a page, a redirect, or a refusal (a 403, a 404, a 422) that an
+/// [`owt_web::Error`] built without a cache policy. `Cache-Control: no-store` is
+/// added where the response says nothing about caching (a page sets it itself).
+/// `X-Frame-Options: DENY` is set whatever the app's own CSP (one in report-only mode
+/// enforces no `frame-ancestors`, and browsers then obey `X-Frame-Options`): framed
+/// by a hostile sibling subdomain, which `SameSite=Lax` and [`CrossOrigin`] treat as
+/// the site itself, a click would act with staff's authority. No
+/// `Content-Security-Policy` of its own: the app's `Csp` layer adds its policy only
+/// to a response that has none, so one here would replace it.
+pub(crate) async fn never_cached_or_framed(mut response: Response) -> Response {
+    let h = response.headers_mut();
+    h.entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(axum::http::HeaderValue::from_static("no-store"));
+    h.insert(
         axum::http::header::X_FRAME_OPTIONS,
         axum::http::HeaderValue::from_static("DENY"),
     );

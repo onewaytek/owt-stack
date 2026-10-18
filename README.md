@@ -1064,8 +1064,9 @@ there removes the password and signs the account out everywhere, as
   same statement); removing a sign-in connection, retiring a local identity and
   turning password sign-in off sign the account out everywhere too.
   A link is not issued to a deactivated account.
-- **What is kept:** every page is `no-store`; a password or link is shown once; each
-  change is logged at `info` with who made it and what changed.
+- **What is kept:** every response is `no-store` and never framed, a refusal (a 403,
+  a 404, a 422) included; a password or link is shown once; each change is logged at
+  `info` with who made it and what changed.
 
 The app gives it a layout and, optionally, its roles, a sign-in-link route, a link
 to its own page about each account (what the admin does not show: a nickname, what
