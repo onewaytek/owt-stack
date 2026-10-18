@@ -7,10 +7,28 @@
 //!
 //! Rate limits keyed on the wrong address either lump everyone together (the proxy's)
 //! or let an attacker pick a fresh key per request (a forged header).
+//!
+//! An app reads its [`Source`] once ([`Source::from_env`]), adds it to every request
+//! as an `Extension`, serves with `into_make_service_with_connect_info::<SocketAddr>()`,
+//! and takes [`ClientIp`] in a handler:
+//!
+//! ```
+//! use axum::{Extension, Router, routing::get};
+//! use owt_web::client_ip::{ClientIp, Source};
+//!
+//! async fn hello(ClientIp(ip): ClientIp) -> String { ip.to_string() }
+//!
+//! let source: Source = "forwarded-for:1".parse().unwrap();
+//! let app: Router = Router::new().route("/", get(hello)).layer(Extension(source));
+//! ```
 
-use std::net::IpAddr;
+use std::fmt;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 
+use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::HeaderMap;
+use axum::http::request::Parts;
 
 /// Where the client's address is. A source may be added without a breaking release (the
 /// `Forwarded` header, say), so a `match` on it ends with a `_` arm.
@@ -33,7 +51,88 @@ pub enum Source {
     },
 }
 
+/// A [`Source`] that does not parse, naming the grammar.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a client address source is forwarded-for:N (N at least 1), header:NAME or peer, not {0:?}"
+)]
+pub struct BadSource(pub String);
+
+impl FromStr for Source {
+    type Err = BadSource;
+
+    /// `peer`, `forwarded-for:N` (N trusted proxies append to `X-Forwarded-For`, at
+    /// least 1) or `header:NAME` (one trusted proxy's header), as `CLIENT_IP` holds it.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bad = || BadSource(s.to_owned());
+        let v = s.trim();
+        if v == "peer" {
+            return Ok(Self::Peer);
+        }
+        if let Some(n) = v.strip_prefix("forwarded-for:") {
+            let proxies: usize = n.trim().parse().map_err(|_| bad())?;
+            return if proxies >= 1 {
+                Ok(Self::ForwardedFor { proxies })
+            } else {
+                Err(bad())
+            };
+        }
+        match v.strip_prefix("header:").map(str::trim) {
+            Some(name) if axum::http::HeaderName::from_bytes(name.as_bytes()).is_ok() => {
+                Ok(Self::Header(name.to_ascii_lowercase()))
+            }
+            _ => Err(bad()),
+        }
+    }
+}
+
+impl fmt::Display for Source {
+    /// As [`FromStr`] reads it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Peer => f.write_str("peer"),
+            Self::Header(name) => write!(f, "header:{name}"),
+            Self::ForwardedFor { proxies } => write!(f, "forwarded-for:{proxies}"),
+        }
+    }
+}
+
 impl Source {
+    /// How the app is deployed, from the environment: `CLIENT_IP` (`forwarded-for:N`,
+    /// `header:NAME` or `peer`), else `TRUSTED_PROXIES` (a count: `0` is `peer`, `N`
+    /// is `forwarded-for:N`), else `peer`. Behind the `OpenShift` router alone it is
+    /// `forwarded-for:1`; the peer is never forged, but behind a proxy it is the
+    /// proxy, and every client shares one rate limit. A blank variable is unset.
+    ///
+    /// # Errors
+    ///
+    /// A variable that is set and does not parse, named.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    /// [`from_env`](Self::from_env), reading variables through `var`.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_env`](Self::from_env).
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+        if let Some(v) = set("CLIENT_IP") {
+            return v.parse().map_err(|e| anyhow::anyhow!("CLIENT_IP: {e}"));
+        }
+        if let Some(v) = set("TRUSTED_PROXIES") {
+            let proxies: usize = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!("TRUSTED_PROXIES is a count of proxies: 0 for none")
+            })?;
+            return Ok(match proxies {
+                0 => Self::Peer,
+                proxies => Self::ForwardedFor { proxies },
+            });
+        }
+        Ok(Self::Peer)
+    }
+
     /// The client's address for a request with these headers from this peer.
     #[must_use]
     pub fn client_ip(&self, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
@@ -60,6 +159,52 @@ impl Source {
             }
         };
         found.unwrap_or(peer)
+    }
+}
+
+/// The client's address, as the request's [`Source`] says to read it: the extractor.
+///
+/// The `Source` is the request's `Extension` (the [`Peer`](Source::Peer) when none
+/// was added) and the peer is axum's `ConnectInfo<SocketAddr>`. Without that (an app
+/// served without `into_make_service_with_connect_info`, or a test client), a header
+/// the source names still answers, and otherwise the request fails with a 500 and a
+/// logged error: guessing would key every client's rate limit alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientIp(pub IpAddr);
+
+impl ClientIp {
+    /// The client's address for `parts`, as the extractor reads it; `None` when it
+    /// cannot say (no peer, and no header the source believes).
+    #[must_use]
+    pub fn of(parts: &Parts) -> Option<IpAddr> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip());
+        let source = parts.extensions.get::<Source>().unwrap_or(&Source::Peer);
+        // A stand-in peer no header parses to tells "the header answered" apart.
+        let unspecified = IpAddr::from([0, 0, 0, 0]);
+        let found = source.client_ip(&parts.headers, peer.unwrap_or(unspecified));
+        if found == unspecified {
+            peer
+        } else {
+            Some(found)
+        }
+    }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
+    type Rejection = crate::Error;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Self::of(parts).map(Self).ok_or_else(|| {
+            crate::Error::Internal(anyhow::anyhow!(
+                "no client address: serve with into_make_service_with_connect_info::<SocketAddr>()"
+            ))
+        }))
     }
 }
 
@@ -117,5 +262,127 @@ mod tests {
         assert_eq!(cf.client_ip(&h, PEER), ip("2001:db8::1"));
         assert_eq!(cf.client_ip(&headers(&[]), PEER), PEER);
         assert_eq!(Source::Peer.client_ip(&h, PEER), PEER);
+    }
+
+    #[test]
+    fn the_environment_names_the_source() {
+        let from = |pairs: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            Source::from_vars(move |n| map.get(n).cloned())
+        };
+        assert_eq!(from(&[]).unwrap(), Source::Peer);
+        assert_eq!(
+            from(&[("CLIENT_IP", "forwarded-for:2")]).unwrap(),
+            Source::ForwardedFor { proxies: 2 }
+        );
+        assert_eq!(
+            from(&[("CLIENT_IP", " header:CF-Connecting-IP ")]).unwrap(),
+            Source::Header("cf-connecting-ip".into())
+        );
+        assert_eq!(from(&[("CLIENT_IP", "peer")]).unwrap(), Source::Peer);
+        assert_eq!(from(&[("TRUSTED_PROXIES", "0")]).unwrap(), Source::Peer);
+        assert_eq!(
+            from(&[("TRUSTED_PROXIES", "1")]).unwrap(),
+            Source::ForwardedFor { proxies: 1 }
+        );
+        assert_eq!(
+            from(&[("CLIENT_IP", "peer"), ("TRUSTED_PROXIES", "3")]).unwrap(),
+            Source::Peer,
+            "CLIENT_IP wins"
+        );
+        assert_eq!(
+            from(&[("CLIENT_IP", " "), ("TRUSTED_PROXIES", "1")]).unwrap(),
+            Source::ForwardedFor { proxies: 1 },
+            "blank is unset"
+        );
+        for bad in [
+            "forwarded-for:0",
+            "forwarded-for:x",
+            "header:",
+            "header:a b",
+            "xff",
+        ] {
+            let e = from(&[("CLIENT_IP", bad)]).unwrap_err().to_string();
+            assert!(e.starts_with("CLIENT_IP:"), "{bad}: {e}");
+        }
+        assert!(from(&[("TRUSTED_PROXIES", "-1")]).is_err());
+        for s in [
+            Source::Peer,
+            Source::Header("x-real-ip".into()),
+            Source::ForwardedFor { proxies: 2 },
+        ] {
+            assert_eq!(s.to_string().parse::<Source>().unwrap(), s);
+        }
+    }
+
+    fn parts(source: Option<Source>, peer: Option<IpAddr>, xff: &[&'static str]) -> Parts {
+        let mut req = axum::http::Request::new(());
+        for v in xff {
+            req.headers_mut()
+                .append("x-forwarded-for", HeaderValue::from_static(v));
+        }
+        req.headers_mut()
+            .insert("x-real-ip", HeaderValue::from_static("198.51.100.20"));
+        if let Some(s) = source {
+            req.extensions_mut().insert(s);
+        }
+        if let Some(p) = peer {
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(p, 40_000)));
+        }
+        req.into_parts().0
+    }
+
+    #[tokio::test]
+    async fn the_extractor_reads_the_requests_source() {
+        let three = ["1.1.1.1, 203.0.113.9, 198.51.100.7"];
+        let get = |p: Parts| async move {
+            let mut p = p;
+            ClientIp::from_request_parts(&mut p, &()).await.map(|c| c.0)
+        };
+        let one = Source::ForwardedFor { proxies: 1 };
+        let two = Source::ForwardedFor { proxies: 2 };
+        assert_eq!(
+            get(parts(Some(one), Some(PEER), &three)).await.unwrap(),
+            ip("198.51.100.7")
+        );
+        assert_eq!(
+            get(parts(Some(two), Some(PEER), &three)).await.unwrap(),
+            ip("203.0.113.9")
+        );
+        let header = Source::Header("x-real-ip".into());
+        assert_eq!(
+            get(parts(Some(header.clone()), Some(PEER), &three))
+                .await
+                .unwrap(),
+            ip("198.51.100.20")
+        );
+        // A header answers without a peer.
+        assert_eq!(
+            get(parts(Some(header), None, &[])).await.unwrap(),
+            ip("198.51.100.20")
+        );
+        // The peer ignores every header; no source is the peer.
+        assert_eq!(
+            get(parts(Some(Source::Peer), Some(PEER), &three))
+                .await
+                .unwrap(),
+            PEER
+        );
+        assert_eq!(get(parts(None, Some(PEER), &three)).await.unwrap(), PEER);
+        // Nothing to go on: a 500, never a guess.
+        let e = get(parts(None, None, &three)).await.unwrap_err();
+        assert!(matches!(e, crate::Error::Internal(_)), "{e:?}");
+        let e = get(parts(
+            Some(Source::ForwardedFor { proxies: 1 }),
+            None,
+            &["garbage"],
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(e, crate::Error::Internal(_)), "{e:?}");
     }
 }
