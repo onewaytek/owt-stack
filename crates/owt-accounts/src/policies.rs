@@ -696,11 +696,11 @@ impl Policies {
 
     /// The middleware that sends a signed-in account which has not accepted the
     /// current version of every document to the page that asks, with `?next=` naming
-    /// where it was going. Only a document load is sent (a `GET` that is not htmx's,
-    /// for a `Sec-Fetch-Dest: document` or, without that header, one asking for
-    /// `text/html`), so an image, a stylesheet, a script, a fetch, a socket, a stream
-    /// or a fragment is never interrupted. When the database cannot say, the request
-    /// goes through.
+    /// where it was going. Only a document load is sent (a `GET` for a
+    /// `Sec-Fetch-Dest: document` or, without that header, one asking for
+    /// `text/html`; an htmx request only when it is a boosted navigation), so an
+    /// image, a stylesheet, a script, a fetch, a socket, a stream or a fragment is
+    /// never interrupted. When the database cannot say, the request goes through.
     ///
     /// Install it inside the accounts layer, which it reads the account from:
     /// `.layer(from_fn_with_state(policies.clone(), Policies::gate))` before
@@ -845,14 +845,24 @@ fn below_root(path: &str) -> String {
 /// and the page would break. Browsers say what a request is for in
 /// `Sec-Fetch-Dest` (`document` for a navigation); where it is absent, a navigation
 /// is the request that asks for `text/html` by name (an `<img>` asks for images and
-/// `*/*`, a fetch for `*/*` or JSON). An htmx request is a fragment, whatever it says.
+/// `*/*`, a fetch for `*/*` or JSON). An htmx request is a fragment, whatever it says,
+/// except a boosted navigation (`HX-Boosted`): that is a whole page swapped in, and
+/// htmx follows the 303 to the page that asks as a browser would.
 fn is_page(req: &Request) -> bool {
+    let flag = |name: &str| {
+        req.headers()
+            .get(name)
+            .is_some_and(|v| v.as_bytes() == b"true")
+    };
     let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+    if flag("hx-request") {
+        return req.method() == Method::GET && flag("hx-boosted");
+    }
     let document = match header("sec-fetch-dest") {
         Some(dest) => dest.eq_ignore_ascii_case("document"),
         None => header(header::ACCEPT.as_str()).is_some_and(|a| a.contains("text/html")),
     };
-    req.method() == Method::GET && !req.headers().contains_key("hx-request") && document
+    req.method() == Method::GET && document
 }
 
 type Shared = State<Policies>;
@@ -1480,9 +1490,21 @@ mod tests {
             &[("accept", "application/json")],
             &[],
             &[("sec-fetch-dest", "document"), ("hx-request", "true")],
+            &[
+                ("hx-request", "true"),
+                ("hx-boosted", "true"),
+                ("sec-fetch-dest", "empty"),
+            ][..1],
         ] {
             assert!(!is_page(&get(pairs)), "{pairs:?}");
         }
+        // A boosted navigation is a page, whatever else it sends.
+        assert!(is_page(&get(&[
+            ("hx-request", "true"),
+            ("hx-boosted", "true"),
+            ("sec-fetch-dest", "empty"),
+            ("accept", "*/*"),
+        ])));
         let mut post = Request::post("/")
             .header("sec-fetch-dest", "document")
             .body(axum::body::Body::empty())
