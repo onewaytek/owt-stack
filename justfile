@@ -11,7 +11,7 @@ default:
 # when REDIS_URL is set.
 #
 # Everything that must pass before a commit.
-check: fmt lint features test audit
+check: fmt lint features test audit templates
 
 # Formatting, checked rather than applied.
 fmt:
@@ -34,3 +34,7 @@ test *args:
 # No advisories against Cargo.lock (ignored ones are in .cargo/audit.toml, with why).
 audit:
     cargo audit --deny warnings
+
+# The deploy script against a stand-in `oc` (bash only; no cluster, no Rust).
+templates:
+    bash templates/openshift/apply-test.sh
