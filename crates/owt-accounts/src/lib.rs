@@ -86,8 +86,12 @@ pub enum Refused {
     /// [`store::set_password_sign_in`]), so none can be set on it.
     #[error("This account does not sign in with a password.")]
     NoPasswordSignIn,
-    /// Unlinking would leave the account with no way to sign in.
-    #[error("Your account has no password, so its only connection cannot be removed.")]
+    /// Unlinking would leave the account with no way to sign in. Read by the
+    /// account's owner and by staff alike, so it names "the account", not "yours";
+    /// the social routes and the admin each show words of their own for it.
+    #[error(
+        "This is the only way into the account, so it cannot be removed. Set a password or add another way in first."
+    )]
     LastWayIn,
     /// A sign-in link that is unknown, used or expired.
     #[error("That sign-in link is not valid any more.")]

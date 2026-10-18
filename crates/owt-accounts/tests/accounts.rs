@@ -2358,6 +2358,7 @@ async fn the_admin_never_lets_its_user_lock_themselves_out() {
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "every way in and out, in order")]
 async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
     use owt_auth::oauth;
     let db = db!();
@@ -2463,6 +2464,20 @@ async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
         Some(format!("/staff/accounts/{}?notice=last-way-in", lone.id).as_str())
     );
     assert_eq!(identities::list(&db.pool, lone.id).await.unwrap().len(), 1);
+    // The notice speaks to staff about this account, never as to its owner, and
+    // the refusal's own sentence (shown to both) names the account, not "yours".
+    let html = client.get(r.location().unwrap()).await.text();
+    assert!(
+        html.contains("That is this account&#x27;s only way in")
+            || html.contains("That is this account&#39;s only way in"),
+        "{html}"
+    );
+    assert!(!html.contains("Your account"), "{html}");
+    assert!(
+        !owt_accounts::Refused::LastWayIn
+            .to_string()
+            .contains("Your account")
+    );
 
     assert_eq!(client.get("/staff/accounts/999999").await.status, 404);
     db.drop().await;
