@@ -1605,7 +1605,10 @@ and say what should change. The site's server forwards that, with who asked, to 
 work tracker.
 
 - **The browser never holds a credential.** It posts to the site, same origin, with
-  the admin's session; the site's server forwards under its key from a Secret.
+  the admin's session; the site's server forwards under its key from a Secret. The
+  routes refuse a cross-origin `POST` themselves, as the accounts admin's do, so a
+  sibling subdomain (same-site, whose forms come with `Lax` cookies) cannot file a
+  request as the admin whatever the app layers around them.
 - **Who asked comes from the session.** `requested_by` is filled by the server
   (`Admin::requester`), so a browser cannot name somebody else.
 - **Only the page's origin and path are sent.** Its query and fragment, which can
@@ -1628,8 +1631,8 @@ use owt_change::{ChangeRequests, Config};
 let changes = ChangeRequests::new(Config::from_env()?, http); // in the app's state
 // `POST /change-requests` and `GET /change.js`, for staff (`owt_accounts::Staff`).
 // Merge them into a router the accounts layer wraps (where the app's staff pages
-// are), behind `CrossOrigin`: outside the layer nobody is signed in, and every
-// request is walled.
+// are): outside the layer nobody is signed in, and every request is walled. They
+// refuse a cross-origin POST on their own, inside or outside the app's `CrossOrigin`.
 let staff_pages: Router = Router::new(); // the app's own, under the accounts layer
 let app: Router = Router::new().nest("/staff", staff_pages.merge(changes.routes::<owt_accounts::Staff, ()>()));
 

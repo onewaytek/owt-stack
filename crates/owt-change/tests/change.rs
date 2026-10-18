@@ -153,6 +153,63 @@ async fn only_an_admin_may_send() {
     assert!(seen.lock().unwrap().is_empty());
 }
 
+/// A page on another origin cannot file a request with the admin's session: the
+/// routes refuse it before the admin extractor or the tracker is reached, whatever
+/// the app layers around them.
+#[tokio::test]
+async fn a_cross_origin_post_is_refused_before_anything_runs() {
+    let (server, seen) = tracker().await;
+    let client = app(&feature(&server.url("/api/change-requests")));
+    for (site, origin) in [
+        ("cross-site", "https://evil.test"),
+        // A sibling subdomain: same-site to the browser, so Lax cookies come with it.
+        ("same-site", "https://evil.site.test"),
+    ] {
+        let request = Request::post("/staff/change-requests")
+            .header("content-type", "application/json")
+            .header("x-admin", "ana")
+            .header("sec-fetch-site", site)
+            .header("origin", origin)
+            .header("host", "site.test")
+            .body(Body::from(draft("Bigger prices").to_string()))
+            .unwrap();
+        let refused = client.send(request).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "{site} from {origin}"
+        );
+    }
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "nothing reached the tracker"
+    );
+    // The same request from the site's own page goes through.
+    let request = Request::post("/staff/change-requests")
+        .header("content-type", "application/json")
+        .header("x-admin", "ana")
+        .header("sec-fetch-site", "same-origin")
+        .header("origin", "https://site.test")
+        .header("host", "site.test")
+        .body(Body::from(draft("Bigger prices").to_string()))
+        .unwrap();
+    assert_eq!(client.send(request).await.status, StatusCode::CREATED);
+    // The script is a GET, which the check never refuses.
+    let tag = askama::Template::render(&feature(&server.url("/x")).button("/staff", true)).unwrap();
+    let src = tag
+        .split(r#"src=""#)
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let request = Request::get(src)
+        .header("sec-fetch-site", "cross-site")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(client.send(request).await.status, StatusCode::OK);
+}
+
 #[cfg(feature = "accounts")]
 #[tokio::test]
 async fn staff_is_walled_like_any_staff_page() {

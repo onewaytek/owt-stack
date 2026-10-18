@@ -6,7 +6,10 @@
 //! as JSON to [`Config::endpoint`], under the site's key as a bearer.
 //!
 //! - **The browser never holds the key.** It posts to the site, same origin, with
-//!   the admin's session cookie; the app's `CrossOrigin` layer refuses anything else.
+//!   the admin's session cookie. The routes refuse a cross-origin `POST` themselves
+//!   ([`CrossOrigin`]), as the accounts admin's do, whatever the app layers around
+//!   them: a sibling subdomain is same-site, so `SameSite=Lax` cookies come with its
+//!   forms, and a JSON content type is a brittle guard on its own.
 //! - **Who asked comes from the session.** [`Admin::requester`] fills
 //!   `requested_by`; a browser cannot name somebody else.
 //! - **Off unless configured.** Without [`Config`] the routes answer 404 and the
@@ -32,6 +35,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use owt_web::csrf::CrossOrigin;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -263,7 +267,9 @@ impl ChangeRequests {
 
     /// `POST /change-requests` and `GET /change.js`, for whoever `A` admits. Nest
     /// them where the app's accounts layer runs, and pass the same prefix to
-    /// [`ChangeRequests::button`].
+    /// [`ChangeRequests::button`]. They refuse a cross-origin `POST` on their own
+    /// ([`CrossOrigin`]), so a page on another origin, a sibling subdomain included,
+    /// cannot file a request with the admin's session.
     pub fn routes<A, S>(&self) -> Router<S>
     where
         A: Admin + FromRequestParts<Self> + Send + 'static,
@@ -273,6 +279,10 @@ impl ChangeRequests {
             .route("/change-requests", post(send::<A>))
             .route("/change.js", get(script))
             .with_state(self.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                CrossOrigin::new(),
+                CrossOrigin::layer,
+            ))
     }
 
     /// The button, for a page: the script tag when the feature is on and `admin` is
