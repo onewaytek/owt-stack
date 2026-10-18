@@ -205,6 +205,21 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// `GET uri` as a browser navigates to a page: it says so, and asks for HTML. The
+/// client's plain `get` sends neither, as a non-browser client (or a fetch) does,
+/// and the gate leaves those alone.
+async fn navigate(client: &owt_test::Client, uri: &str) -> owt_test::Response {
+    client
+        .send(
+            Request::get(uri)
+                .header("sec-fetch-dest", "document")
+                .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+}
+
 /// The test app, and a client signed in as `ada`, who has agreed to nothing.
 async fn signed_in(db: &Db) -> (owt_test::Client, store::Account, Sessions<Data>) {
     let sessions = sessions();
@@ -252,11 +267,36 @@ async fn the_gate_sends_signed_in_page_loads_to_the_page_that_asks() {
         Some("/login?next=%2Fagree")
     );
 
-    // Signed in: every full page goes to the page that asks first...
-    let r = client.get("/whoami?x=1").await;
+    // Signed in: every document load goes to the page that asks first, as a
+    // browser asks for one (naming the destination, or just text/html)...
+    let r = navigate(&client, "/whoami?x=1").await;
     assert_eq!(r.status, 303);
     assert_eq!(r.location(), Some("/agree?next=%2Fwhoami%3Fx%3D1"));
-    // ...but not a fragment, a non-page request, a document, an exemption, or a POST.
+    // An older browser names no destination but asks for HTML.
+    let old = Request::get("/whoami?x=1")
+        .header("accept", "text/html,*/*;q=0.8")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(client.send(old).await.status, 303);
+    // ...but not what a page loads for itself (an image, a script, a fetch), nor a
+    // fragment, a non-page request, a document, an exemption, or a POST.
+    let image = Request::get("/static/app.css")
+        .header("sec-fetch-dest", "image")
+        .header("accept", "image/avif,image/webp,*/*")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(client.send(image).await.status, 200);
+    let fetch = Request::get("/whoami")
+        .header("sec-fetch-dest", "empty")
+        .header("accept", "*/*")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(client.send(fetch).await.status, 200);
+    assert_eq!(
+        client.get("/whoami").await.status,
+        200,
+        "no Accept: not a browser's page"
+    );
     assert_eq!(client.get_htmx("/whoami").await.status, 200);
     let json = client
         .send(
@@ -387,7 +427,12 @@ async fn a_new_version_asks_again_and_old_ones_stay_while_held() {
 
     let v2 = published(&db, "terms", "Terms", "Second.", "Clearer wording.").await;
     assert_eq!(v2.version, Some(2));
-    assert_eq!(client.get("/whoami").await.status, 303);
+    assert_eq!(navigate(&client, "/whoami").await.status, 303);
+    assert_eq!(
+        client.get("/whoami").await.status,
+        200,
+        "a fetch is let through"
+    );
     let html = client.get("/agree").await.text();
     assert!(html.contains("We have updated our policies"), "{html}");
     assert!(
@@ -560,7 +605,7 @@ async fn a_draft_is_private_checked_and_fixed_once_published() {
     );
 
     // Staff are asked too, though not on the staff pages.
-    assert_eq!(client.get("/whoami").await.status, 303);
+    assert_eq!(navigate(&client, "/whoami").await.status, 303);
     assert_eq!(client.get("/staff/policies").await.status, 200);
     db.drop().await;
 }

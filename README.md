@@ -1257,9 +1257,12 @@ layout as for the admin. The tables come from `0004_owt_accounts_policies.sql`
 - **The gate:** a signed-in account that has not accepted the current version of
   each document is sent to the page that asks (`/agree?next=…`) before any other
   page. This includes an account just made through a provider, and someone already
-  signed in when a new version is published. Only full page loads are sent (a `GET`
-  that is not htmx's and accepts HTML), so a socket, a stream or a fragment is never
-  interrupted. If the database can't say, the request goes through. The gate reads
+  signed in when a new version is published. Only a document load is sent (a `GET`
+  that is not htmx's, made for a `Sec-Fetch-Dest: document` or, from a browser that
+  sends no such header, asking for `text/html`), so what a page loads for itself (an
+  image, a script, a fetch), a socket, a stream or a fragment is never interrupted;
+  nor is a non-browser client. If the database can't say, the request goes through.
+  The gate reads
   the account loaded for the request and caches nothing in the session, so a second
   person signing in on the same browser is asked for themselves.
 - **The page that asks** shows only what is outstanding. For a document agreed to
