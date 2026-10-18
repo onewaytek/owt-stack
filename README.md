@@ -267,6 +267,24 @@ the handler and write `<script nonce="{{ nonce }}">`.
   opening for that while too. After a leak, rotate without `also_open_with`: the old
   key must open nothing.
 
+  `Sessions::from_env("myapp", cookie, max_age, secure)` does the usual: the secret
+  from `SESSION_SECRET` (required), the purpose `myapp/` plus `SESSION_PURPOSE`, else
+  `POD_NAMESPACE`, else `local` (`session::purpose_from`). An app moving onto it from
+  a purpose of its own sets `SESSION_PURPOSE` to what followed its `myapp/`, or
+  everyone is signed out once. `Sessions::from_vars` reads a map instead, for tests.
+
+  ```rust,no_run
+  # fn main() -> anyhow::Result<()> {
+  use owt_web::session::Sessions;
+  let _sessions = Sessions::<owt_accounts::session::Data>::from_env(
+      "myapp",
+      "__Host-session",
+      std::time::Duration::from_secs(14 * 86_400),
+      true,
+  )?;
+  # Ok(()) }
+  ```
+
   ```rust,no_run
   # fn main() -> anyhow::Result<()> {
   use owt_web::session::{Sessions, key_for, key_from_base64};
@@ -346,6 +364,10 @@ could not answer *for now* (a dependency down), distinct from a 500 fault in its
 it is marked for the app's page too and carries `Retry-After`.
 An app may keep its own error enum in its domain's words and convert it with
 `impl From<AppError> for owt_web::Error`.
+
+`owt_accounts::session::Data` (and `social::Data`, which holds it) carries flash
+messages already, as `flashes`; an app whose session holds more implements
+`HasFlashes` on its own type, as below.
 
 A page's context carries the request (`RequestInfo`) and the flash messages, and
 derefs to the request, so templates write `layout.path` and `layout.url_with(..)` (a
@@ -2943,6 +2965,14 @@ The router example under "Wiring an app" composes the layers; beyond it:
   signs an account in through (a password, a provider, a local identity, a sign-in
   link) stamps `accounts.last_sign_in`, so an app that wrote it itself drops that
   write; one with a way in of its own calls `store::signed_in`.
+- **Breaking:** `owt_accounts::session::Data` has a third field, `flashes:
+  Vec<Flash>` (serialized as `f`, absent when empty, so sealed cookies stay
+  readable both ways), and implements `HasFlashes`, as `social::Data` does through it.
+  It is no longer `Copy`: clone it where a copy was taken. A literal
+  `Data { account, epoch }` adds `..Data::default()`. An app whose own session type
+  existed only to add flashes to it uses `Data` (or `social::Data`) instead.
+- `Sessions::from_env` replaces the app's own `SESSION_SECRET` and purpose code;
+  keep the purpose with `SESSION_PURPOSE` (see "Session key").
 - `redis.yaml`'s image and memory-limit parameters are `REDIS_IMAGE` and
   `REDIS_MEMORY_LIMIT` (they were `IMAGE` and `MEMORY_LIMIT`), apart from `app.yaml`'s,
   so one `params.env` serves every template through `deploy/openshift/apply.sh`. An
