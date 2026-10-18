@@ -1171,7 +1171,7 @@ lacks.
 badges, filters and the one-line outcomes, English (`Words::ENGLISH`) unless the app
 passes its own to `Admin::words`. Build them from the English with struct update
 syntax, so a word added later needs nothing from the app; a `{what}`, `{name}`,
-`{username}` or `{lifetime}` in a sentence stands for what the admin fills in. The
+`{username}`, `{lifetime}` or `{n}` in a sentence stands for what the admin fills in. The
 view models carry the words (`ListView::words`, and the others'), so an app's own
 `Views` draws its markup with the same ones, and `Words::duration` writes a lifetime
 in them.

@@ -390,7 +390,8 @@ pub struct AccountView<'a> {
     pub password_sign_in: bool,
     /// The day it was created (`YYYY-MM-DD`).
     pub joined: String,
-    /// When it last signed in (`YYYY-MM-DD HH:MM`), or `never`.
+    /// When it last signed in (`YYYY-MM-DD HH:MM`), or empty for never
+    /// ([`Words::never`]).
     pub last_sign_in: String,
     /// Its linked provider identities.
     pub connections: Vec<Connection>,
@@ -1336,7 +1337,7 @@ async fn load(db: impl PgExecutor<'_>, id: i64) -> owt_web::Result<Loaded> {
         ),
     >(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS}, to_char(created_at, 'YYYY-MM-DD'),
-                    coalesce(to_char(last_sign_in, 'YYYY-MM-DD HH24:MI'), 'never'),
+                    coalesce(to_char(last_sign_in, 'YYYY-MM-DD HH24:MI'), ''),
                     password_sign_in
              FROM accounts WHERE id = $1"
     )))

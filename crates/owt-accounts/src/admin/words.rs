@@ -12,11 +12,14 @@
 /// assert_eq!(words.save, "Save");
 /// ```
 ///
-/// A `{what}`, `{name}`, `{username}` or `{lifetime}` in a sentence stands for what
-/// the admin fills in. The view models carry the words
+/// A `{what}`, `{name}`, `{username}`, `{lifetime}` or `{n}` in a sentence stands
+/// for what the admin fills in. The view models carry the words
 /// ([`ListView::words`](super::ListView::words), and the others'), so an app's
 /// [`Views`](super::Views) draws its own markup with the same words. What an app's
-/// people chose (usernames, emails, a role's label) is never in here.
+/// people chose (usernames, emails, a role's label) is never in here, and neither
+/// are the account rules' refusals ([`Refused`](crate::Refused)), which an app
+/// words by matching on them. Build a `Words` with `..Words::ENGLISH`: a new field
+/// then takes its English, where a literal naming every field stops compiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Words {
     /// The list's title and the link back to it: `Accounts`.
@@ -101,10 +104,10 @@ pub struct Words {
     pub save: &'static str,
     /// The account page's facts: `Joined`, `Status`.
     pub joined: &'static str,
-    /// See [`Words::joined`].
+    /// See [`Words::joined`]. Its values: `Active` is [`Words::active`],
+    /// `Deactivated` is [`Words::deactivated`].
     pub status: &'static str,
-    /// The status's values: `Active` is [`Words::active`], `Deactivated` is
-    /// [`Words::deactivated`].
+    /// The heading over the ways into the account: `Ways in`.
     pub ways_in: &'static str,
     /// What the account's page says of its password: no password opens it, it has
     /// one, it has none.

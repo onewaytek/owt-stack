@@ -12,7 +12,7 @@
 </div>
 {% endif %}<dl class="owt-facts">
 <dt>{{ v.words.joined }}</dt><dd>{{ v.joined }}</dd>
-<dt>{{ v.words.last_sign_in }}</dt><dd>{{ v.last_sign_in }}</dd>
+<dt>{{ v.words.last_sign_in }}</dt><dd>{% if v.last_sign_in.is_empty() %}<span class="owt-hint">{{ v.words.never }}</span>{% else %}{{ v.last_sign_in }}{% endif %}</dd>
 <dt>{{ v.words.status }}</dt><dd>{% if v.account.is_active %}{{ v.words.active }}{% else %}{{ v.words.deactivated }}{% endif %}</dd>
 </dl>
 {% if let Some((label, href)) = v.more %}<p><a href="{{ href }}">{{ label }}</a></p>
