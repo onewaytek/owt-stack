@@ -187,8 +187,10 @@ pub struct Welcome {
     pub record_email: bool,
 }
 
-/// How a provider sign-in resolved.
+/// How a provider sign-in resolved. An outcome may be added in a minor release, so a
+/// `match` on it ends with a `_` arm; [`Arrival::account`] answers for all of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Arrival {
     /// The identity was linked already.
     Known(Account),
@@ -240,8 +242,10 @@ pub struct Rekeyed {
     pub conflicts: Vec<String>,
 }
 
-/// Why [`rekey`] refused.
+/// Why [`rekey`] refused. A reason may be added in a minor release, so a `match` on
+/// it ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RekeyError {
     /// `from` is `to`'s key already: there is nothing to move.
     #[error("the identities are under {0} already")]

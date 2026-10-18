@@ -2767,7 +2767,7 @@ mod plain {
 {% when Kind::Next %}<a class="pf-next" href="{{ i.href }}">Next</a>
 {% when Kind::Current %}<b class="pf-current">{{ i.label }}</b>
 {% when Kind::Gap %}…
-{% when Kind::Page %}<a class="pf-page" href="{{ i.href }}">{{ i.label }}</a>
+{% when _ %}<a class="pf-page" href="{{ i.href }}">{{ i.label }}</a>
 {% endmatch %}{% endfor %}
 <a href="{{ v.new_account }}">add</a>"#,
         ext = "html"

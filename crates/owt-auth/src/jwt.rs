@@ -61,8 +61,10 @@ pub const KEYS_STALE_LIMIT: Duration = Duration::from_secs(24 * 3600);
 /// How long a fetch of the provider's keys (or its discovery document) may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Why a token was refused.
+/// Why a token was refused. A reason may be added in a minor release, so a `match`
+/// on it ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Not a JWT, a bad signature, the wrong issuer or audience, expired, ...
     #[error("invalid token: {0}")]

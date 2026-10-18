@@ -89,8 +89,10 @@ impl fmt::Debug for Config {
     }
 }
 
-/// A configuration that cannot be used.
+/// A configuration that cannot be used. A check may be added in a minor release, so
+/// a `match` on it ends with a `_` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// One of the two variables is set without the other.
     #[error("set both {URL_VAR} and {KEY_VAR}, or neither")]

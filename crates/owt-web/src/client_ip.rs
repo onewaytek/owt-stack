@@ -12,8 +12,10 @@ use std::net::IpAddr;
 
 use axum::http::HeaderMap;
 
-/// Where the client's address is.
+/// Where the client's address is. A source may be added in a minor release (the
+/// `Forwarded` header, say), so a `match` on it ends with a `_` arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Source {
     /// The socket's peer: nothing is in front of the app.
     Peer,

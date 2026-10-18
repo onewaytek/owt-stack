@@ -189,8 +189,10 @@ impl<'a> Field<'a> {
     }
 }
 
-/// What one thing in a pager's row is.
+/// What one thing in a pager's row is. A kind may be added in a minor release, so a
+/// template's `{% match %}` on it (or a `match` in code) ends with a `_` arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     /// The link to the page before.
     Previous,
