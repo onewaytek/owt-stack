@@ -27,6 +27,7 @@ case "$*" in
     sed -nE 's/^  - name: ([A-Z_]+).*/\1/p' "$4"
     ;;
   "process --local -f "*)
+    [ "$(basename "$4")" != "${FAKE_PROCESS_FAIL:-}" ] || { echo "fake: render refused" >&2; exit 1; }
     printf 'rendered %s' "$(basename "$4")"
     shift 4
     while [ $# -gt 0 ]; do
@@ -125,7 +126,8 @@ grep -q "cronjob.yaml is here but" "$work/err" && fail "warned with jobs present
 rm "$work/deploy/redis.yaml" "$work/deploy/monitoring.yaml" "$work/deploy/egress.yaml" "$work/deploy/cronjob.yaml"
 rc=0; run || rc=$?
 grep -c "^oc diff -f " "$log" | grep -qx 1 || fail "app.yaml alone"
-rc=0; run --monitoring || rc=$?; [ "$rc" -eq 2 ] || fail "--monitoring without monitoring.yaml exits 2"
+rc=0; run --apply --monitoring || rc=$?; [ "$rc" -eq 2 ] || fail "--monitoring without monitoring.yaml exits 2"
+grep -q "^oc apply" "$log" && fail "--monitoring without monitoring.yaml applied something first"
 
 # 6. Refusals: no params.env, a malformed line, a missing NAME, an unknown flag.
 rc=0; PARAMS=$work/none.env run || rc=$?; [ "$rc" -eq 2 ] || fail "missing params.env exits 2"
@@ -135,7 +137,18 @@ rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a malformed line exits 2"
 grep -q "not a KEY=VALUE line" "$work/err" || fail "names the malformed line"
 grep -v '^NAME=' "$work/good.env" >"$work/deploy/params.env"
 rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a missing NAME exits 2 (got $rc)"
-grep -q "must set NAME" "$work/err" || fail "names the missing NAME"
+grep -q "params.env must set NAME" "$work/err" || fail "names the missing NAME and its file"
+grep -v '^NAMESPACE=' "$work/good.env" >"$work/deploy/params.env"
+rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a missing NAMESPACE exits 2 (got $rc)"
+cp "$work/good.env" "$work/deploy/params.env"
+cp "$here/cronjob.yaml" "$work/deploy/"
+echo "SCHEDULE=0 1 * * *" >"$work/deploy/jobs/nameless.env"
+rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a job without JOB exits 2 (got $rc)"
+grep -q "jobs/nameless.env must set JOB" "$work/err" || fail "names the job's file"
+rm "$work/deploy/jobs/nameless.env" "$work/deploy/cronjob.yaml"
+rc=0; FAKE_PROCESS_FAIL=app.yaml run || rc=$?; [ "$rc" -eq 2 ] || fail "a failed render exits 2 (got $rc)"
+grep -q "oc process failed on app.yaml" "$work/err" || fail "names the failed render"
+grep -q "^oc diff" "$log" && fail "a failed render was diffed"
 cp "$work/good.env" "$work/deploy/params.env"
 rc=0; run --force || rc=$?; [ "$rc" -eq 2 ] || fail "an unknown flag exits 2"
 

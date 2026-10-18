@@ -30,7 +30,8 @@
 #   redis.yaml       when present
 #   egress.yaml      when present: for the app's pods (POD=NAME), and each task's
 #   cronjob.yaml     when present: once per jobs/<JOB>.env, whose lines (JOB,
-#                    SCHEDULE, ARGS, and any override) are read over params.env
+#                    SCHEDULE, ARGS, and any override) are read over params.env;
+#                    a key the job's file leaves out keeps the app's value
 #   monitoring.yaml  with --monitoring: it needs monitoring-edit, which a cluster
 #                    admin grants, and a diff without it is refused
 #
@@ -59,6 +60,7 @@ done
 [ -f "$params" ] || { echo "$params: no such file (NAME=… lines, one per template parameter)" >&2; exit 2; }
 command -v oc >/dev/null || { echo "oc is not on the PATH" >&2; exit 2; }
 [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "apply.sh needs bash 4 or later" >&2; exit 2; }
+[ "$monitoring" = no ] || [ -f "$here/monitoring.yaml" ] || { echo "--monitoring: no monitoring.yaml here" >&2; exit 2; }
 rendered=$(mktemp)
 trap 'rm -f "$rendered"' EXIT
 
@@ -87,11 +89,12 @@ read_env() {
   done
 }
 
-# `given` must hold each KEY named, or the deploy is not described.
+# `given` must hold each KEY named, or `file` does not describe its deploy.
 need() {
-  local key
+  local file=$1 key
+  shift
   for key in "$@"; do
-    [ "${given[$key]+set}" ] || { echo "$params must set $key" >&2; exit 2; }
+    [ "${given[$key]+set}" ] || { echo "$file must set $key" >&2; exit 2; }
   done
 }
 
@@ -135,7 +138,7 @@ run() {
 }
 
 read_env "$params"
-need NAME NAMESPACE
+need "$params" NAME NAMESPACE
 
 run "$here/app.yaml" "app.yaml"
 [ -f "$here/redis.yaml" ] && run "$here/redis.yaml" "redis.yaml"
@@ -154,7 +157,7 @@ if [ -f "$here/cronjob.yaml" ]; then
   for k in "${!given[@]}"; do app_given[$k]=${given[$k]}; done
   for job in "${jobs[@]}"; do
     read_env "$job"
-    need JOB
+    need "$job" JOB
     run "$here/cronjob.yaml" "cronjob.yaml for ${given[JOB]}"
     if [ -f "$here/egress.yaml" ]; then
       given[POD]="${given[NAME]}-${given[JOB]}"
@@ -165,8 +168,5 @@ if [ -f "$here/cronjob.yaml" ]; then
     for k in "${!app_given[@]}"; do given[$k]=${app_given[$k]}; done
   done
 fi
-if [ "$monitoring" = yes ]; then
-  [ -f "$here/monitoring.yaml" ] || { echo "--monitoring: no monitoring.yaml here" >&2; exit 2; }
-  run "$here/monitoring.yaml" "monitoring.yaml"
-fi
+[ "$monitoring" = no ] || run "$here/monitoring.yaml" "monitoring.yaml"
 exit "$status"
