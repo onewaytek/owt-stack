@@ -1,0 +1,36 @@
+# Copy to the app's repository as .github/dependabot.yml. Dependabot then opens a pull
+# request for each dependency that moved: the actions and reusable workflows the
+# app's workflows pin by commit (`uses: …@<commit> # vX.Y.Z`: it moves the commit and
+# rewrites the comment with it, so a pin never goes stale and never floats), the crates
+# in Cargo.lock, and the npm packages, the stylesheet's `github:onewaytek/owt-stack#vX`
+# among them. Each is a `fix(deps):` commit, which release.yml turns into a patch
+# release; minor and patch updates of one ecosystem come grouped in one pull request.
+#
+# It opens pull requests and nothing more: the app's checks run on them as on any
+# other, and someone merges them. Security alerts are a repository setting of their
+# own ("Dependabot alerts"), not this file's.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    commit-message: {prefix: fix, include: scope}
+    groups:
+      patch-and-minor:
+        update-types: [minor, patch]
+  - package-ecosystem: cargo
+    directory: /
+    schedule: {interval: weekly}
+    # Dependabot counts every Cargo dependency as production (dev-dependencies too),
+    # so each update is "fix(deps): ..." and costs a patch release.
+    commit-message: {prefix: fix, include: scope}
+    groups:
+      patch-and-minor:
+        update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: /
+    schedule: {interval: weekly}
+    commit-message: {prefix: fix, include: scope}
+    groups:
+      patch-and-minor:
+        update-types: [minor, patch]

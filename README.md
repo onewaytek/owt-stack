@@ -26,6 +26,7 @@ Outside the crates:
 | `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
+| `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its action and workflow pins, its crates and its npm packages, minors and patches grouped |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger and the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone, connecting to nothing |
@@ -2109,8 +2110,11 @@ set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
 
 ## Commands, CI, releases and deployment
 
-**Day to day:** copy `templates/justfile` and `templates/compose.yaml` into the app.
-Every app then answers to the same commands:
+**Day to day:** copy `templates/justfile` and `templates/compose.yaml` into the app,
+and `templates/dependabot.yml` as `.github/dependabot.yml`, so the app's action and
+workflow pins, crates and npm packages (the stylesheet's `#vX.Y.Z` among them) move
+by weekly `fix(deps)` pull requests, each a patch release once merged, instead of by
+hand at the next adoption. Every app then answers to the same commands:
 
 ```sh
 just setup        # npm ci, sqlx-cli and cargo-audit at CI's versions
@@ -2210,8 +2214,11 @@ below, which declare none and need only their job's token. And pin each `uses:` 
 commit rather than by tag, with the tag in a comment
 (`uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit> # vX.Y.Z`): GitHub
 resolves a tag on every run, and a tag can be moved, while a commit cannot; Dependabot
-(the `github-actions` ecosystem in the app's `.github/dependabot.yml`) keeps such a
-pin moving with the releases, tag comment included. `Cargo.lock` and
+(the `github-actions` ecosystem in the app's `.github/dependabot.yml`, which
+`templates/dependabot.yml` is) keeps such a pin moving with the releases: it reads the
+tag in the comment, moves the commit to the release after it and rewrites the comment,
+for an action and for a reusable workflow alike (this repository's own pins move that
+way, in its `fix(deps): bump …` pull requests). `Cargo.lock` and
 `package-lock.json` already pin the crates and the stylesheet to a commit. A workflow
 in the app's own repository (`ci.yml` called from `release.yml`) is the app's own
 code: `secrets: inherit` on that call is fine, and it passes the one secret on.
