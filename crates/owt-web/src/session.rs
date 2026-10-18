@@ -736,7 +736,10 @@ mod env_tests {
             "s",
             age,
             true,
-            vars(&[("SESSION_SECRET", &s), ("KUBERNETES_SERVICE_HOST", "10.0.0.1")]),
+            vars(&[
+                ("SESSION_SECRET", &s),
+                ("KUBERNETES_SERVICE_HOST", "10.0.0.1"),
+            ]),
         )
         .err()
         .expect("refused");
