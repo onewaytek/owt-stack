@@ -84,8 +84,9 @@ fn escaped(text: &str) -> String {
 fn policies(db: &Db) -> Policies {
     let chrome = |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
         Ok(axum::response::Html(format!(
-            "<title>{}</title>{}",
+            "<title>{}</title><p>at: {}</p>{}",
             escaped(page.title),
+            escaped(&page.request.uri.to_string()),
             page.body
         ))
         .into_response())
@@ -486,6 +487,12 @@ async fn only_staff_reach_the_staff_pages() {
     assert_eq!(list.status, 200);
     assert_eq!(list.header("x-frame-options"), Some("DENY"));
     assert!(list.text().contains("No versions yet"), "{}", list.text());
+    // The chrome sees the page's own URI, not the nested router's stripped one.
+    assert!(
+        list.text().contains("<p>at: /staff/policies</p>"),
+        "{}",
+        list.text()
+    );
     assert_eq!(
         client
             .post_form("/staff/policies/new/cookies", &[])

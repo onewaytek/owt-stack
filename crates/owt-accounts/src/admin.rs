@@ -46,7 +46,7 @@ use std::time::Duration;
 use askama::Template;
 use askama::filters::HtmlSafe;
 use axum::Router;
-use axum::extract::{Form, FromRequestParts, Path, Query, State};
+use axum::extract::{Form, FromRequestParts, OriginalUri, Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -102,7 +102,9 @@ impl Body {
 #[non_exhaustive]
 pub struct Page<'a> {
     /// The request, for whatever the app's layout reads from it (its extensions hold
-    /// the session, the CSP nonce, the signed-in account).
+    /// the session, the CSP nonce, the signed-in account). Its `uri` is the one the
+    /// client sent (`/staff/accounts?q=ada`), not the path as the admin's nested
+    /// router sees it, so a layout's "you are here" and sign-in links name the page.
     pub request: &'a Parts,
     /// The member of staff looking at it.
     pub me: &'a Account,
@@ -621,7 +623,10 @@ impl Admin {
 
 type Shared = State<Arc<Admin>>;
 
-/// The request's parts, for the app's chrome.
+/// The request's parts, for the app's chrome, with the URI the client sent: the
+/// routes are nested, so the parts' own URI has the base stripped (`/` for the
+/// list at `/staff/accounts`), and a layout that reads it would name the wrong
+/// page. `OriginalUri` (axum keeps it on every nested request) is put in its place.
 struct Req(Parts);
 
 // Answers without awaiting; the trait is async.
@@ -630,7 +635,11 @@ impl<S: Send + Sync> FromRequestParts<S> for Req {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(parts.clone()))
+        let mut whole = parts.clone();
+        if let Some(original) = parts.extensions.get::<OriginalUri>() {
+            whole.uri = original.0.clone();
+        }
+        Ok(Self(whole))
     }
 }
 

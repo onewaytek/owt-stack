@@ -436,7 +436,9 @@ async fn holders(db: impl PgExecutor<'_>) -> sqlx::Result<Vec<(i64, i64)>> {
 #[non_exhaustive]
 pub struct Page<'a> {
     /// The request, for whatever the app's layout reads from it (its extensions hold
-    /// the session, the CSP nonce, the signed-in account).
+    /// the session, the CSP nonce, the signed-in account). Its `uri` is the one the
+    /// client sent (`/staff/policies/4`), not the path as a nested router sees it, so
+    /// a layout's "you are here" and sign-in links name the page.
     pub request: &'a Parts,
     /// The page's title, as plain text: a document's title, which staff wrote. Escape
     /// it (an Askama layout does); never format it into HTML.
@@ -791,7 +793,10 @@ fn is_page(req: &Request) -> bool {
 
 type Shared = State<Policies>;
 
-/// The request's parts, for the app's chrome.
+/// The request's parts, for the app's chrome, with the URI the client sent: the
+/// routes are nested, so the parts' own URI has the base stripped (`/` for the
+/// list at `/staff/accounts`), and a layout that reads it would name the wrong
+/// page. `OriginalUri` (axum keeps it on every nested request) is put in its place.
 struct Req(Parts);
 
 // Answers without awaiting; the trait is async.
@@ -800,7 +805,11 @@ impl<S: Send + Sync> FromRequestParts<S> for Req {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(parts.clone()))
+        let mut whole = parts.clone();
+        if let Some(original) = parts.extensions.get::<OriginalUri>() {
+            whole.uri = original.0.clone();
+        }
+        Ok(Self(whole))
     }
 }
 
