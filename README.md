@@ -623,7 +623,8 @@ and the leftmost entry is never believed. `header:NAME` is for one proxy that se
 the header itself and that nothing can bypass. Add the source to every request as
 an `Extension`, serve with `into_make_service_with_connect_info::<SocketAddr>()`, and
 a handler takes `ClientIp`; without the peer and a header to read, it answers 500
-rather than key every client alike.
+rather than key every client alike. `Policies::client_ip` takes its own copy: pass
+it the same source (`.client_ip(source.clone())`), so the two never disagree.
 
 ```rust,no_run
 # async fn demo() -> anyhow::Result<()> {
