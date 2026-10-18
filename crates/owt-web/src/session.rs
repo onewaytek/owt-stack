@@ -259,8 +259,10 @@ impl<T: SessionData> Sessions<T> {
     ///
     /// # Errors
     ///
-    /// `SESSION_SECRET` is unset or not a secret [`key_for`] takes, or the purpose is
-    /// not one it takes. The error names the variable, never its value.
+    /// `SESSION_SECRET` is unset or not a secret [`key_for`] takes, the purpose is not
+    /// one it takes, or the app runs in a pod (`KUBERNETES_SERVICE_HOST` is set) and
+    /// neither `SESSION_PURPOSE` nor `POD_NAMESPACE` is: `local` is for development.
+    /// The error names the variable, never the secret.
     pub fn from_env(
         app: &str,
         cookie: impl Into<String>,
@@ -288,8 +290,17 @@ impl<T: SessionData> Sessions<T> {
         let secret = var("SESSION_SECRET")
             .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("SESSION_SECRET is not set"))?;
+        let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+        // `local` is for development: in a pod it would make every environment's
+        // purpose one, and a secret copied between them one key again.
+        anyhow::ensure!(
+            set("SESSION_PURPOSE").is_some()
+                || set("POD_NAMESPACE").is_some()
+                || set("KUBERNETES_SERVICE_HOST").is_none(),
+            "set SESSION_PURPOSE or POD_NAMESPACE: in a pod the session key's purpose is not `{app}/local`"
+        );
         let key = key_for(&secret, &purpose_from(app, &var))
-            .map_err(|e| anyhow::anyhow!("SESSION_SECRET or SESSION_PURPOSE: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("the session key from SESSION_SECRET: {e}"))?;
         Ok(Self::new(key, cookie, max_age, secure))
     }
 
@@ -720,6 +731,30 @@ mod env_tests {
         .expect("refused");
         assert!(!short.to_string().contains("c2hvcnQ"), "{short}");
         assert!(short.to_string().contains("SESSION_SECRET"), "{short}");
+        let pod = Sessions::<D>::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[("SESSION_SECRET", &s), ("KUBERNETES_SERVICE_HOST", "10.0.0.1")]),
+        )
+        .err()
+        .expect("refused");
+        assert!(pod.to_string().contains("POD_NAMESPACE"), "{pod}");
+        assert!(
+            Sessions::<D>::from_vars(
+                "myapp",
+                "s",
+                age,
+                true,
+                vars(&[
+                    ("SESSION_SECRET", &s),
+                    ("KUBERNETES_SERVICE_HOST", "10.0.0.1"),
+                    ("POD_NAMESPACE", "myapp-prod"),
+                ]),
+            )
+            .is_ok()
+        );
     }
 }
 

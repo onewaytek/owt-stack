@@ -269,7 +269,9 @@ the handler and write `<script nonce="{{ nonce }}">`.
 
   `Sessions::from_env("myapp", cookie, max_age, secure)` does the usual: the secret
   from `SESSION_SECRET` (required), the purpose `myapp/` plus `SESSION_PURPOSE`, else
-  `POD_NAMESPACE`, else `local` (`session::purpose_from`). An app moving onto it from
+  `POD_NAMESPACE`, else `local` (`session::purpose_from`); `local` is for
+  development, and in a pod (`KUBERNETES_SERVICE_HOST` set) without either variable
+  it is an error. An app moving onto it from
   a purpose of its own sets `SESSION_PURPOSE` to what followed its `myapp/`, or
   everyone is signed out once. `Sessions::from_vars` reads a map instead, for tests.
 
