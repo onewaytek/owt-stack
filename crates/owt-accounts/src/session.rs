@@ -6,9 +6,14 @@
 //! bumping the account's epoch ends every session it has anywhere. That is the
 //! whole of revocation; there is no session table.
 
+use std::net::IpAddr;
+use std::time::Duration;
+
+use axum::http::StatusCode;
+use owt_auth::throttle::Throttle;
 use owt_web::session::{Session, SessionData, Verdict};
 use serde::{Deserialize, Serialize};
-use sqlx::PgExecutor;
+use sqlx::{PgExecutor, PgPool};
 
 use crate::store::{self, Account};
 
@@ -77,6 +82,68 @@ pub fn sign_in<T: Signed>(session: &Session<T>, account: &Account) {
             epoch: account.session_epoch,
         }));
     });
+}
+
+/// Why [`password_sign_in`] signed nobody in. A variant may be added without a
+/// breaking release, so a `match` on it ends with a `_` arm.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SignInRefused {
+    /// A budget of the throttle is spent: the password was not checked.
+    #[error("Too many attempts. Wait a minute and try again.")]
+    Throttled,
+    /// No active account that signs in with a password has that name and password.
+    /// It does not say which was wrong, nor whether the account exists.
+    #[error("That username or email and password do not match an account.")]
+    Mismatch,
+    /// A fault: the database.
+    #[error(transparent)]
+    Fault(#[from] crate::Error),
+}
+
+impl SignInRefused {
+    /// How long a throttled sign-in waits at most before a budget has room again: the
+    /// budgets are per minute. For a `Retry-After` header.
+    pub const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+    /// The status the sign-in form answers with: 429 throttled, 422 a mismatch, 500
+    /// a fault.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::Throttled => StatusCode::TOO_MANY_REQUESTS,
+            Self::Mismatch => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Fault(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+/// The whole password sign-in: charge `throttle` for a sign-in to `login` from `ip`
+/// (the client's address, [`owt_web::client_ip`]), check the password only if it
+/// allows one ([`store::authenticate`], which stamps the account's `last_sign_in`),
+/// and sign `session` in ([`sign_in`]). `login` is a username or an email. The
+/// handler then redirects, or shows the form again with the refusal's message and
+/// [`SignInRefused::status`].
+///
+/// # Errors
+///
+/// [`SignInRefused`]: throttled, a mismatch, or a fault.
+pub async fn password_sign_in<T: Signed>(
+    pool: &PgPool,
+    throttle: &Throttle,
+    session: &Session<T>,
+    ip: IpAddr,
+    login: &str,
+    password: &str,
+) -> Result<Account, SignInRefused> {
+    if !throttle.sign_in(ip, login) {
+        return Err(SignInRefused::Throttled);
+    }
+    let account = store::authenticate(pool, login, password)
+        .await?
+        .ok_or(SignInRefused::Mismatch)?;
+    sign_in(session, &account);
+    Ok(account)
 }
 
 /// Sign this session out: a new, empty one replaces it. Other sessions of the

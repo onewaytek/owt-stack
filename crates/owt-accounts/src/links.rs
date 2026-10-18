@@ -65,7 +65,8 @@ pub async fn mint(
 
 /// Redeem `token` from `from` (the client's address, for the trail): the account it
 /// signs in. [`Refused::Link`] when the token is unknown, used, expired, or its
-/// account is deactivated. The handler then calls [`crate::session::sign_in`].
+/// account is deactivated. The account's `last_sign_in` is stamped
+/// ([`store::signed_in`]); the handler then calls [`crate::session::sign_in`].
 pub async fn redeem(pool: &sqlx::PgPool, token: &str, from: &str) -> Result<Account> {
     // One transaction, the account read under a share lock: a revocation (which
     // voids this link and bumps the epoch in one statement) is either before it,
@@ -104,6 +105,9 @@ pub async fn redeem(pool: &sqlx::PgPool, token: &str, from: &str) -> Result<Acco
         return Err(Refused::Link.into());
     };
     tx.commit().await?;
+    // After the commit: inside, it would upgrade the share lock on the account, and
+    // two links of one account redeemed at once would deadlock.
+    store::signed_in(pool, account.id).await?;
     Ok(account)
 }
 

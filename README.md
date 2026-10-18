@@ -887,24 +887,32 @@ let app: Router = Router::new()
     .layer(from_fn_with_state(accounts, Accounts::load::<session::Data>));
 
 // Sign-in: throttle, authenticate (by username or email; an unknown login costs a
-// real check; an old hash is replaced), then the session: new id, account and epoch.
+// real check; an old hash is replaced; `last_sign_in` is stamped), then the session:
+// new id, account and epoch. A refusal's message is the form's error, its status the
+// answer's: 429 throttled (`Retry-After: SignInRefused::RETRY_AFTER`), 422 a mismatch
+// that says neither which part was wrong nor whether the account exists.
 let throttle = Throttle::default(); // in the app's state
-if throttle.sign_in(ip, login)
-    && let Some(account) = store::authenticate(&pool, login, given).await?
-{
-    session::sign_in(&session, &account);
+match session::password_sign_in(&pool, &throttle, &session, ip, login, given).await {
+    Ok(account) => { let _ = account; /* redirect to `next` */ }
+    Err(refused) => { let _ = (refused.status(), refused.to_string()); /* the form again */ }
 }
 session::sign_out(&session); // this session
 session::sign_out_everywhere(&pool, &session).await?; // every session: the epoch moves
 
 // Accounts: normalized, password rules checked (`owt_accounts::password`), a taken
 // username or email refused by the constraint, so two racing sign-ups cannot both win.
-// A form that checks every field before calling `create` asks the username rule up
-// front: the `Refused::Username` that `create` would return, or `None`.
+// A sign-up form shows every problem at once: `store::problems` lists each refusal
+// `create` would give (shapes, password rules, a name or email taken or too alike),
+// after `throttle.attempt(ip)`, since it says which names have accounts.
+// `store::username_problem` is the username rule alone, without the database.
 assert_eq!(store::username_problem("Ada"), None);
-let ada = store::create(&pool, New {
+let new = New {
     username: "Ada", email: "ada@example.com", password: Some("correct horse battery"), is_staff: false,
-}).await?;
+};
+if throttle.attempt(ip) && store::problems(&pool, &new).await?.is_empty() {
+    // `create_in` instead, inside the transaction that makes the app's own rows.
+}
+let ada = store::create(&pool, new).await?;
 store::set_password(&pool, &ada, "a different passphrase").await?; // staff or a link's reset: signs out everywhere
 // The account's own change asks for the current password (Refused::CurrentPassword),
 // so whoever holds a session cannot also take the password; throttle it like a sign-in.
@@ -2924,6 +2932,12 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ## Upgrading from 0.6
 
+- A password sign-in form calls `session::password_sign_in` instead of charging the
+  throttle, calling `store::authenticate` and `session::sign_in` itself, and a
+  sign-up form lists `store::problems` (after `Throttle::attempt`). Every way in owt
+  signs an account in through (a password, a provider, a local identity, a sign-in
+  link) stamps `accounts.last_sign_in`, so an app that wrote it itself drops that
+  write; one with a way in of its own calls `store::signed_in`.
 - `redis.yaml`'s image and memory-limit parameters are `REDIS_IMAGE` and
   `REDIS_MEMORY_LIMIT` (they were `IMAGE` and `MEMORY_LIMIT`), apart from `app.yaml`'s,
   so one `params.env` serves every template through `deploy/openshift/apply.sh`. An

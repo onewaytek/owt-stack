@@ -155,6 +155,76 @@ pub fn skeleton(username: &str) -> String {
         .to_lowercase()
 }
 
+/// Every refusal [`create`] would give `new`, at once, for a sign-up form that shows
+/// them all: the username's shape, the email's, each password rule it breaks, and
+/// a username or email another account has or a username too like another's. In
+/// that order; a username of the wrong shape is not looked up. Empty when `create`
+/// would take it, though a sign-up racing it can still take a name first: `create`
+/// decides, by the constraints.
+///
+/// It says whether a username or an email has an account, as `create` does: charge
+/// [`owt_auth::throttle::Throttle::attempt`] for the client's address first.
+///
+/// # Errors
+///
+/// The database.
+pub async fn problems(db: impl PgExecutor<'_>, new: &New<'_>) -> sqlx::Result<Vec<Refused>> {
+    let username = normalize(new.username);
+    let email = normalize(new.email);
+    let mut refused = Vec::new();
+    let shaped = valid_username(&username);
+    if !shaped {
+        refused.push(Refused::Username);
+    }
+    if !email.is_empty() && !valid_email(&email) {
+        refused.push(Refused::Email);
+    }
+    if let Some(password) = new.password {
+        let broken = password::check(password, &[&username, &email]);
+        if !broken.is_empty() {
+            refused.push(Refused::Password(broken));
+        }
+    }
+    let (name, lookalike, address): (bool, bool, bool) = sqlx::query_as(
+        "SELECT $4 AND EXISTS (SELECT 1 FROM accounts WHERE username = $1),
+                $4 AND EXISTS (SELECT 1 FROM accounts
+                               WHERE username_skeleton = $2 AND username <> $1),
+                $3 <> '' AND EXISTS (SELECT 1 FROM accounts WHERE email = $3)",
+    )
+    .bind(&username)
+    .bind(skeleton(&username))
+    .bind(&email)
+    .bind(shaped)
+    .fetch_one(db)
+    .await?;
+    if name {
+        refused.push(Refused::UsernameTaken(username.clone()));
+    } else if lookalike {
+        refused.push(Refused::UsernameLookalike(username.clone()));
+    }
+    if address {
+        refused.push(Refused::EmailTaken(email));
+    }
+    Ok(refused)
+}
+
+/// Stamp the account's `last_sign_in`, which the admin shows. Every way in owt
+/// signs an account in through does: [`authenticate`],
+/// [`identities::arrive`](crate::identities::arrive),
+/// [`identities::arrive_as`](crate::identities::arrive_as) and
+/// [`links::redeem`](crate::links::redeem). An app's own way in calls it too.
+///
+/// # Errors
+///
+/// The database.
+pub async fn signed_in(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<()> {
+    sqlx::query("UPDATE accounts SET last_sign_in = now() WHERE id = $1")
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 /// Create an account. Refuses an invalid username or email, a password that breaks
 /// a rule, a username or email another account has, and a username too like another
 /// account's ([`skeleton`]): by the constraints, so two racing sign-ups cannot both

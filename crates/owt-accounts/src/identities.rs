@@ -314,6 +314,7 @@ const ARRIVAL_LOCK: i32 = 0x6f77_7401;
 /// Resolve a provider's identity to an account, per `welcome`: by its subject, never
 /// its email. Refreshes the identity's claims. A deactivated account resolves to
 /// [`Arrival::Unknown`]; an identity with an empty subject is [`Refused::NoSubject`].
+/// An account it resolves to has its `last_sign_in` stamped ([`store::signed_in`]).
 ///
 /// One transaction, under a lock on the identity: two first sign-ins with it at once
 /// (a callback opened twice) resolve to one account, the second finding what the
@@ -374,6 +375,9 @@ pub async fn arrive_in(
     } else {
         Arrival::Unknown
     };
+    if let Arrival::Known(a) | Arrival::Created(a) = &arrival {
+        store::signed_in(&mut *tx, a.id).await?;
+    }
     tx.commit().await?;
     Ok(arrival)
 }
@@ -458,6 +462,9 @@ pub async fn arrive_as_in(
         }
         (None, None) => Arrival::Unknown,
     };
+    if let Arrival::Known(a) | Arrival::Created(a) = &arrival {
+        store::signed_in(&mut *tx, a.id).await?;
+    }
     tx.commit().await?;
     Ok(arrival)
 }
