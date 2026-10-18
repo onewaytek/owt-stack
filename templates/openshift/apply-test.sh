@@ -17,6 +17,8 @@ cat >"$work/bin/oc" <<'FAKE'
 #!/usr/bin/env bash
 # Answers the calls apply.sh makes, and logs each one. A rendered document is a line
 # naming the template and the parameters given, so the log shows what was applied.
+# It encodes two things about the real client: `--parameters` prints a header line
+# and then one parameter a line, name first; `diff` exits 1 on a difference.
 set -euo pipefail
 printf 'oc %s\n' "$*" >>"$FAKE_LOG"
 case "$*" in
@@ -32,12 +34,12 @@ case "$*" in
     done
     echo
     ;;
-  "diff -f -")
-    cat >>"$FAKE_LOG"
+  "diff -f "*)
+    cat "$3" >>"$FAKE_LOG"
     exit "${FAKE_DIFF:-1}"
     ;;
-  "apply -f -")
-    cat >>"$FAKE_LOG"
+  "apply -f "*)
+    cat "$3" >>"$FAKE_LOG"
     echo "applied"
     ;;
   *) echo "unexpected: oc $*" >&2; exit 9 ;;
@@ -62,32 +64,37 @@ CHANNEL=rc
 PORT=8000
 POSTGRES_MAJOR=16
 MAXMEMORY_POLICY=noeviction
+MEMORY_LIMIT=1Gi
 INTERNET_CIDR=0.0.0.0/0
 NOT_A_PARAMETER=ignored
 ENV
 
-# 1. A diff, by default, of every template present, each with the parameters it
-#    declares and no other; differences are the exit status 1.
+# 1. A diff, by default, of every template present but monitoring.yaml, each with
+#    the parameters it declares and no other; differences are the exit status 1.
 rc=0; run || rc=$?
 [ "$rc" -eq 1 ] || fail "diff with changes exits 1 (got $rc)"
-logged "rendered app.yaml NAME=myapp NAMESPACE=myapp-staging IMAGE=ghcr.io/example/myapp CHANNEL=rc PORT=8000 POSTGRES_MAJOR=16" || fail "app.yaml's parameters"
-logged "rendered redis.yaml NAME=myapp NAMESPACE=myapp-staging MAXMEMORY_POLICY=noeviction" || fail "redis.yaml's parameters (the app's IMAGE is not Redis's)"
-logged "rendered monitoring.yaml NAME=myapp NAMESPACE=myapp-staging" || fail "monitoring.yaml's parameters"
+logged "rendered app.yaml NAME=myapp NAMESPACE=myapp-staging IMAGE=ghcr.io/example/myapp CHANNEL=rc PORT=8000 POSTGRES_MAJOR=16 MEMORY_LIMIT=1Gi" || fail "app.yaml's parameters"
+logged "rendered redis.yaml NAME=myapp NAMESPACE=myapp-staging MAXMEMORY_POLICY=noeviction" || fail "redis.yaml's parameters (the app's IMAGE and MEMORY_LIMIT are not Redis's)"
 logged "rendered egress.yaml NAME=myapp NAMESPACE=myapp-staging POD=myapp INTERNET_CIDR=0.0.0.0/0" || fail "egress.yaml for the app"
 grep -q "NOT_A_PARAMETER" "$log" && fail "a key no template declares was passed"
+grep -q "monitoring.yaml" "$log" && fail "monitoring.yaml rendered without --monitoring"
 grep -q "^oc apply" "$log" && fail "a diff applied something"
-grep -c "^oc diff -f -" "$log" | grep -qx 4 || fail "four diffs"
+grep -c "^oc diff -f " "$log" | grep -qx 3 || fail "three diffs"
 grep -q "cronjob.yaml is here but jobs/ holds no" "$work/err" || fail "the empty jobs/ warning"
 
-# 2. No change: exit 0.
+# 2. No change: exit 0. A diff that fails (no rights to the kind, say): exit 2.
 FAKE_DIFF=0 run || fail "a diff with no changes exits 0"
 grep -q "no change" "$work/out" || fail "says no change"
+rc=0; FAKE_DIFF=3 run || rc=$?; [ "$rc" -eq 2 ] || fail "a failed diff exits 2 (got $rc)"
+grep -q "oc diff failed (3) on app.yaml" "$work/err" || fail "names the failed diff"
 
-# 3. --apply applies each rendered document, in order.
-run --apply || fail "apply"
-grep -c "^oc apply -f -" "$log" | grep -qx 4 || fail "four applies"
+# 3. --apply applies each rendered document, in order; --monitoring adds
+#    monitoring.yaml last, in either mode.
+run --apply --monitoring || fail "apply"
+grep -c "^oc apply -f " "$log" | grep -qx 4 || fail "four applies"
 grep -q "^oc diff" "$log" && fail "an apply diffed"
-awk '/^oc process --local -f .*-o yaml$/ { print $5 }' "$log" | tr '\n' ' ' | grep -q "app.yaml .*redis.yaml .*monitoring.yaml .*egress.yaml" || fail "order"
+logged "rendered monitoring.yaml NAME=myapp NAMESPACE=myapp-staging" || fail "monitoring.yaml's parameters"
+awk '/^oc process --local -f .*-o yaml$/ { print $5 }' "$log" | tr '\n' ' ' | grep -q "app.yaml .*redis.yaml .*egress.yaml .*monitoring.yaml" || fail "order"
 
 # 4. Each jobs/<JOB>.env renders cronjob.yaml over params.env, then its egress
 #    policy; nothing a job sets reaches the next, nor the app's own.
@@ -111,13 +118,14 @@ logged 'rendered cronjob.yaml NAME=myapp NAMESPACE=myapp-staging JOB=sweep SCHED
 logged "rendered egress.yaml NAME=myapp NAMESPACE=myapp-staging POD=myapp-sweep INTERNET_CIDR=0.0.0.0/0" || fail "sweep's egress keeps the app's CIDR"
 logged "rendered egress.yaml NAME=myapp NAMESPACE=myapp-staging POD=myapp INTERNET_CIDR=0.0.0.0/0" || fail "the app's egress"
 grep -q "MEMORY_LIMIT=512Mi.*sweep\|sweep.*MEMORY_LIMIT=512Mi" "$log" && fail "digest's override leaked into sweep"
-grep -q "rendered app.yaml.*MEMORY_LIMIT" "$log" && fail "a job's override leaked into the app"
+grep -q "rendered app.yaml.*MEMORY_LIMIT=512Mi" "$log" && fail "a job's override leaked into the app"
 grep -q "cronjob.yaml is here but" "$work/err" && fail "warned with jobs present"
 
 # 5. Only the templates present are rendered.
 rm "$work/deploy/redis.yaml" "$work/deploy/monitoring.yaml" "$work/deploy/egress.yaml" "$work/deploy/cronjob.yaml"
 rc=0; run || rc=$?
-grep -c "^oc diff -f -" "$log" | grep -qx 1 || fail "app.yaml alone"
+grep -c "^oc diff -f " "$log" | grep -qx 1 || fail "app.yaml alone"
+rc=0; run --monitoring || rc=$?; [ "$rc" -eq 2 ] || fail "--monitoring without monitoring.yaml exits 2"
 
 # 6. Refusals: no params.env, a malformed line, a missing NAME, an unknown flag.
 rc=0; PARAMS=$work/none.env run || rc=$?; [ "$rc" -eq 2 ] || fail "missing params.env exits 2"
@@ -126,14 +134,21 @@ echo "not a pair" >>"$work/deploy/params.env"
 rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a malformed line exits 2"
 grep -q "not a KEY=VALUE line" "$work/err" || fail "names the malformed line"
 grep -v '^NAME=' "$work/good.env" >"$work/deploy/params.env"
-rc=0; run || rc=$?; [ "$rc" -ne 0 ] || fail "a missing NAME is refused"
+rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a missing NAME exits 2 (got $rc)"
 grep -q "must set NAME" "$work/err" || fail "names the missing NAME"
 cp "$work/good.env" "$work/deploy/params.env"
 rc=0; run --force || rc=$?; [ "$rc" -eq 2 ] || fail "an unknown flag exits 2"
 
-# 7. A value is taken as written: spaces, `=` and quotes inside it stay.
-echo 'BACKUP_SCHEDULE="0 0 2 * * *"' >>"$work/deploy/params.env"
+# 7. One pair of quotes comes off a value; what is inside (spaces, `=`, `$`, a
+#    quote of the other kind) is taken as written.
+cat >>"$work/deploy/params.env" <<'ENV'
+BACKUP_SCHEDULE="0 0 2 * * *"
+CHANNEL='rc "quoted", it's'
+IMAGE=ghcr.io/example/my$app
+ENV
 rc=0; run || rc=$?
-logged 'BACKUP_SCHEDULE="0 0 2 * * *"' || fail "a value with spaces and quotes"
+logged 'BACKUP_SCHEDULE=0 0 2 * * *' || fail "a quoted value loses its quotes"
+grep -qF 'CHANNEL=rc "quoted", it'"'"'s' "$log" || fail "what is inside is kept"
+logged 'IMAGE=ghcr.io/example/my$app' || fail "a dollar is literal"
 
 echo "apply.sh: ok"

@@ -2379,13 +2379,17 @@ deploy/openshift/apply.sh            # what an apply would change (exit 1 when s
 deploy/openshift/apply.sh --apply
 ```
 
-`app.yaml` is always rendered; `redis.yaml`, `monitoring.yaml` (a cluster admin's, see
-"Monitoring") and `egress.yaml` (for the app's pods, then each task's) when present;
-`cronjob.yaml` once per `deploy/openshift/jobs/<JOB>.env`, whose lines (`JOB`,
-`SCHEDULE`, `ARGS`, and any override such as `INTERNET_CIDR`) are read over
-`params.env`. A name two templates declare means one thing in both (`NAME`,
-`NAMESPACE`, `CHANNEL`, `DB_SUFFIX`); the Redis image is `REDIS_IMAGE`, apart from the
-app's `IMAGE`. Upgrading owt-stack is: copy the templates again, keep `params.env`.
+`app.yaml` is always rendered; `redis.yaml` and `egress.yaml` (for the app's pods,
+then each task's) when present; `cronjob.yaml` once per
+`deploy/openshift/jobs/<JOB>.env`, whose lines (`JOB`, `SCHEDULE`, `ARGS`, and any
+override such as `INTERNET_CIDR` or the task's `MEMORY_LIMIT`) are read over
+`params.env`; `monitoring.yaml` with `--monitoring`, since it needs monitoring-edit
+(see "Monitoring"). One pair of quotes comes off a value (`BACKUP_SCHEDULE="0 0 2 * *
+*"`). A name two templates declare means one thing in both (`NAME`, `NAMESPACE`,
+`CHANNEL`, `DB_SUFFIX`); Redis's image and memory limit are `REDIS_IMAGE` and
+`REDIS_MEMORY_LIMIT`, apart from the app's. Upgrading owt-stack is: copy the templates
+again, keep `params.env`. Exit status 1 means the diff found changes, 2 a refusal or
+a failed `oc`.
 The script writes no Secret: the app's environment and a Redis password are made by
 hand, as below. `templates/openshift/apply-test.sh` proves the script against a
 stand-in `oc` (`just templates` runs it here).
@@ -2780,10 +2784,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ## Upgrading from 0.6
 
-- `redis.yaml`'s image parameter is `REDIS_IMAGE` (it was `IMAGE`), apart from
-  `app.yaml`'s `IMAGE`, so one `params.env` serves every template through
-  `deploy/openshift/apply.sh`. An apply that passed `-p IMAGE=` to `redis.yaml` passes
-  `-p REDIS_IMAGE=`; the default is unchanged.
+- `redis.yaml`'s image and memory-limit parameters are `REDIS_IMAGE` and
+  `REDIS_MEMORY_LIMIT` (they were `IMAGE` and `MEMORY_LIMIT`), apart from `app.yaml`'s,
+  so one `params.env` serves every template through `deploy/openshift/apply.sh`. An
+  apply that passed `-p IMAGE=` or `-p MEMORY_LIMIT=` to `redis.yaml` passes the new
+  names; the defaults are unchanged.
 - Keep the templates in `deploy/openshift/` with `apply.sh` and `params.env` beside
   them, and drop the app's own process or apply script where the template's does
   the same ("OpenShift" under "Commands, CI, releases and deployment").

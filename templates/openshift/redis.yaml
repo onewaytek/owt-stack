@@ -42,7 +42,8 @@ parameters:
   - name: MAXMEMORY_POLICY
     description: allkeys-lru for a cache; noeviction when a lost lease must not happen.
     value: allkeys-lru
-  - name: MEMORY_LIMIT
+  # Named apart from app.yaml's MEMORY_LIMIT (the app's), as REDIS_IMAGE is.
+  - name: REDIS_MEMORY_LIMIT
     description: The container's limit, above MAXMEMORY for Redis's own overhead.
     value: 256Mi
 objects:
@@ -97,7 +98,7 @@ objects:
                 periodSeconds: 30
               resources:
                 requests: {cpu: 20m, memory: 64Mi}
-                limits: {memory: "${MEMORY_LIMIT}"}
+                limits: {memory: "${REDIS_MEMORY_LIMIT}"}
               securityContext:
                 runAsNonRoot: true
                 allowPrivilegeEscalation: false
