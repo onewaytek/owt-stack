@@ -2139,20 +2139,35 @@ Docker Hub's official images, out of reach of Docker Hub's anonymous pull limit.
 
 The cargo registry comes from GitHub's cache. Compiled crates come from
 [sccache](https://github.com/mozilla/sccache) through one Redis shared by every job on
-the runners. sccache keys a Rust compile by its absolute paths and the toolchain's
-files, so a hit needs the same crate built at the same paths by the same toolchain:
+the runners. sccache keys a Rust compile by its inputs: the source, its absolute paths,
+the toolchain's own files, the flags, the features and the `CARGO_*` variables, so a
+hit needs the same crate built the same way at the same paths by the same toolchain:
 jobs in one image share registry crates across repositories, and a repository's own
 crates hit its earlier runs. It is on when the app passes the `SCCACHE_REDIS_PASSWORD`
 secret to the workflow, by name as below (an organization secret reaches a private
 repository only on a paid plan, so a private repository on GitHub Free sets it as a
 repository secret), and `sccache-redis` names the Redis (default
 `redis://sccache-redis.sccache.svc:6379`, a Service in the cluster the runners run
-in). The password goes to the sccache server alone, never into the environment of the
-gate, build scripts or tests. Without the secret the job compiles without a cache. If
-the Redis cannot be used (unreachable, or the password is wrong), the job warns after
-about ten seconds and compiles without it; it does not fail. The job summary shows
-sccache's hit and miss counts. The Redis is bounded (`maxmemory`, least recently used
-evicted) and entries expire after a month unused. A developer machine can use the
+in). The password is handed to the sccache server alone, never into the environment
+of the gate, build scripts or tests; a password with a control character in it (a
+newline pasted into the secret) is refused with a warning and the job compiles
+uncached. Without the secret the job compiles without a cache. If the Redis cannot be
+used (unreachable, or the password is wrong), the job warns after about ten seconds
+and compiles without it; it does not fail. The job summary shows sccache's hit and
+miss counts. The Redis is bounded (`maxmemory`, least recently used evicted) and
+entries expire after a month unused.
+
+**Who to give the secret to.** Every repository given the secret trusts every other
+repository given it, as with a shared cache volume: the password keeps the Redis from
+the network, not from a job. Any code a job runs can reach the job's own sccache
+server, which writes entries without the password, and an entry's key comes from
+what `rustc` reports about itself rather than the binary's hash, so a job's code can
+store an object under a registry crate's real key for every other job to read. Give
+the secret to the repositories whose code may run on the scale set at all (the same
+judgement `RUNS_ON` makes), and keep a public repository, whose pull requests anyone
+can open, on GitHub-hosted runners with `sccache-redis: ""`.
+
+A developer machine can use the
 same Redis; its paths differ from the runners', so its entries are its own (its
 registry crates hit across its clean rebuilds and worktrees, not CI's). It joins with
 `~/.config/sccache/config`:
@@ -2203,9 +2218,9 @@ organization variable `RUNS_ON` names other runners, as JSON (`"ubuntu-latest"`)
 public repository should: self-hosted runners in the cluster are no place for code
 anyone can propose. Off the cluster the Redis's Service name does not resolve, so such
 an app passes `sccache-redis: ""` (otherwise each job spends about ten seconds finding
-that out, warns, and compiles without sccache). Off ARC the services are at their names (`postgres`, `redis`)
-rather than localhost; `DATABASE_URL` and `REDIS_URL` follow, so build on those
-rather than naming a host.
+that out, warns, and compiles without sccache). Off ARC the services are at their
+names (`postgres`, `redis`) rather than localhost; `DATABASE_URL` and `REDIS_URL`
+follow, so build on those rather than naming a host.
 
 **Releasing an app:** this is how an *app* releases, with semantic-release through the
 reusable `release.yml`. owt-stack releases itself differently, with release-please
