@@ -2320,9 +2320,9 @@ jobs:
 
 ```yaml
 # in pr.yml, with concurrency: {group: promote-rc, cancel-in-progress: false}
-  commits:   # the title and every commit follow Conventional Commits (release.yml reads them)
-    permissions: {contents: read, pull-requests: read}
-    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@v0.6.1
+  commits:   # the title and every commit follow Conventional Commits (release.yml reads
+    permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
+    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@v0.6.1  # and "commits / commits"
   candidate:
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft

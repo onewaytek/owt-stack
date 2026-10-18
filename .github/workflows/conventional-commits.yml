@@ -16,9 +16,14 @@ name: Conventional Commits
 #       permissions: {contents: read, pull-requests: read}
 #       uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # vX.Y.Z
 #
-# The caller's event must be a pull request (the title and the commits are its). An
-# app with a commitlint configuration of its own (commitlint.config.*) is checked by
-# it; one without is checked by the rules below, written for the run.
+# The caller's event must be a pull request (the title and the commits are its),
+# never `pull_request_target`, whose checkout would run a fork's code with a token
+# that can write. An app with a commitlint configuration of its own
+# (commitlint.config.*, .commitlintrc*, a "commitlint" key in package.json) is
+# checked by it; one without is checked by the rules below, written for the run.
+# A title edited after the push is re-checked only when the caller's
+# `pull_request` types include `edited`; the requeue flow prefers the defaults, so
+# an app on it accepts that a title fixed by hand is checked at the next push.
 
 on:
   pull_request:
@@ -69,7 +74,11 @@ jobs:
             exit 1
           fi
           config=()
-          if ! ls commitlint.config.* .commitlintrc* >/dev/null 2>&1; then
+          shopt -s nullglob
+          own=(commitlint.config.* .commitlintrc*)
+          shopt -u nullglob
+          # Or a "commitlint" key in package.json, which commitlint reads too.
+          if [ "${#own[@]}" -eq 0 ] && ! grep -q '"commitlint"' package.json 2>/dev/null; then
             cat > "$RUNNER_TEMP/commitlint.config.mjs" <<'JS'
           export default {
             extends: ["@commitlint/config-conventional"],
