@@ -613,6 +613,33 @@ let claims: jwt::Claims = verifier.verify("eyJ...").await?;
 # let _ = claims; Ok(()) }
 ```
 
+**The client's address** is configuration, never a guess. `Source::from_env()` reads
+`CLIENT_IP` (`forwarded-for:N`, `header:NAME` or `peer`), else `TRUSTED_PROXIES` (a
+count: `0` is the peer), else the peer; behind the OpenShift router alone it is
+`CLIENT_IP=forwarded-for:1`. `forwarded-for:N` counts N entries from the right of
+`X-Forwarded-For`, the ones the app's own proxies appended: everything to the left
+is the client's to write, so a proxy at the edge appends (or replaces the header),
+and the leftmost entry is never believed. `header:NAME` is for one proxy that sets
+the header itself and that nothing can bypass. Add the source to every request as
+an `Extension`, serve with `into_make_service_with_connect_info::<SocketAddr>()`, and
+a handler takes `ClientIp`; without the peer and a header to read, it answers 500
+rather than key every client alike.
+
+```rust,no_run
+# async fn demo() -> anyhow::Result<()> {
+use std::net::SocketAddr;
+use axum::{Extension, Router, routing::post};
+use owt_web::client_ip::{ClientIp, Source};
+
+async fn sign_in(ClientIp(ip): ClientIp) -> String { ip.to_string() } // throttle on `ip`
+
+let source = Source::from_env()?; // a typo in CLIENT_IP stops the app here
+let app = Router::new().route("/login", post(sign_in)).layer(Extension(source));
+let listener = tokio::net::TcpListener::bind("0.0.0.0:8000").await?;
+axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+# Ok(()) }
+```
+
 **`jwt` is a feature** of `owt-auth`, on by default. It brings `jsonwebtoken` and,
 through its RustCrypto backend, `rsa`, which carries RUSTSEC-2023-0071 (Marvin) with
 no fixed release, so the app's `cargo audit` fails until it ignores that advisory.
@@ -2973,6 +3000,10 @@ The router example under "Wiring an app" composes the layers; beyond it:
   It is no longer `Copy`: clone it where a copy was taken. A literal
   `Data { account, epoch }` adds `..Data::default()`. An app whose own session type
   existed only to add flashes to it uses `Data` (or `social::Data`) instead.
+- `client_ip::Source::from_env` and the `ClientIp` extractor replace the app's own
+  client-address extractor and its `CLIENT_IP`/`TRUSTED_PROXIES` parsing (an app
+  that reads a header by default sets `CLIENT_IP=header:NAME`); nothing reads a raw
+  `X-Forwarded-For` any more.
 - `Sessions::from_env` replaces the app's own `SESSION_SECRET` and purpose code;
   keep the purpose with `SESSION_PURPOSE` (see "Session key").
 - `redis.yaml`'s image and memory-limit parameters are `REDIS_IMAGE` and
