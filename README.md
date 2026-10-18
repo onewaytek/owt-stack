@@ -890,7 +890,8 @@ let app: Router = Router::new()
 // real check; an old hash is replaced; `last_sign_in` is stamped), then the session:
 // new id, account and epoch. A refusal's message is the form's error, its status the
 // answer's: 429 throttled (`Retry-After: SignInRefused::RETRY_AFTER`), 422 a mismatch
-// that says neither which part was wrong nor whether the account exists.
+// that says neither which part was wrong nor whether the account exists, 500 a fault
+// (whose message says only that; log its source).
 let throttle = Throttle::default(); // in the app's state
 match session::password_sign_in(&pool, &throttle, &session, ip, login, given).await {
     Ok(account) => { let _ = account; /* redirect to `next` */ }
@@ -909,9 +910,9 @@ assert_eq!(store::username_problem("Ada"), None);
 let new = New {
     username: "Ada", email: "ada@example.com", password: Some("correct horse battery"), is_staff: false,
 };
-if throttle.attempt(ip) && store::problems(&pool, &new).await?.is_empty() {
-    // `create_in` instead, inside the transaction that makes the app's own rows.
-}
+if !throttle.attempt(ip) { /* 429 */ }
+let problems = store::problems(&pool, &new).await?; // the form again when not empty
+// `create_in` instead, inside the transaction that makes the app's own rows.
 let ada = store::create(&pool, new).await?;
 store::set_password(&pool, &ada, "a different passphrase").await?; // staff or a link's reset: signs out everywhere
 // The account's own change asks for the current password (Refused::CurrentPassword),

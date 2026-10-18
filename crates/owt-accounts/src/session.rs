@@ -96,8 +96,9 @@ pub enum SignInRefused {
     /// It does not say which was wrong, nor whether the account exists.
     #[error("That username or email and password do not match an account.")]
     Mismatch,
-    /// A fault: the database.
-    #[error(transparent)]
+    /// A fault: the database. Its message says only that; log its source, which
+    /// may name tables and columns, and never show it.
+    #[error("The sign-in could not be checked. Try again in a moment.")]
     Fault(#[from] crate::Error),
 }
 

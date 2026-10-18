@@ -158,9 +158,10 @@ pub fn skeleton(username: &str) -> String {
 /// Every refusal [`create`] would give `new`, at once, for a sign-up form that shows
 /// them all: the username's shape, the email's, each password rule it breaks, and
 /// a username or email another account has or a username too like another's. In
-/// that order; a username of the wrong shape is not looked up. Empty when `create`
-/// would take it, though a sign-up racing it can still take a name first: `create`
-/// decides, by the constraints.
+/// that order; a username of the wrong shape is not looked up. `create` still
+/// decides, by the constraints: a sign-up racing this one can take a name first, and
+/// a name too like an account [`migrations::complete`](crate::migrations::complete)
+/// has yet to key is refused there alone.
 ///
 /// It says whether a username or an email has an account, as `create` does: charge
 /// [`owt_auth::throttle::Throttle::attempt`] for the client's address first.
@@ -189,7 +190,7 @@ pub async fn problems(db: impl PgExecutor<'_>, new: &New<'_>) -> sqlx::Result<Ve
         "SELECT $4 AND EXISTS (SELECT 1 FROM accounts WHERE username = $1),
                 $4 AND EXISTS (SELECT 1 FROM accounts
                                WHERE username_skeleton = $2 AND username <> $1),
-                $3 <> '' AND EXISTS (SELECT 1 FROM accounts WHERE email = $3)",
+                $3 <> '' AND EXISTS (SELECT 1 FROM accounts WHERE email <> '' AND lower(email) = $3)",
     )
     .bind(&username)
     .bind(skeleton(&username))

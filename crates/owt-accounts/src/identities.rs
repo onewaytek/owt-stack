@@ -314,7 +314,9 @@ const ARRIVAL_LOCK: i32 = 0x6f77_7401;
 /// Resolve a provider's identity to an account, per `welcome`: by its subject, never
 /// its email. Refreshes the identity's claims. A deactivated account resolves to
 /// [`Arrival::Unknown`]; an identity with an empty subject is [`Refused::NoSubject`].
-/// An account it resolves to has its `last_sign_in` stamped ([`store::signed_in`]).
+/// An account it resolves to has its `last_sign_in` stamped ([`store::signed_in`]),
+/// before the identity is touched: the order an unlink locks them in. In the caller's
+/// transaction ([`arrive_in`]) the account's row stays locked until it ends.
 ///
 /// One transaction, under a lock on the identity: two first sign-ins with it at once
 /// (a callback opened twice) resolve to one account, the second finding what the
@@ -351,6 +353,8 @@ pub async fn arrive_in(
     let arrival = if let Some(linked) = find(&mut *tx, provider, &identity.uid).await? {
         match store::by_id(&mut *tx, linked.account_id).await? {
             Some(account) => {
+                // The account before the identity, the order an unlink locks them in.
+                store::signed_in(&mut *tx, account.id).await?;
                 link(&mut *tx, account.id, provider, identity).await?;
                 Arrival::Known(account)
             }
@@ -370,14 +374,12 @@ pub async fn arrive_in(
             ""
         };
         let account = create_for(&mut tx, &username_base(identity), email).await?;
+        store::signed_in(&mut *tx, account.id).await?;
         link(&mut *tx, account.id, provider, identity).await?;
         Arrival::Created(account)
     } else {
         Arrival::Unknown
     };
-    if let Arrival::Known(a) | Arrival::Created(a) = &arrival {
-        store::signed_in(&mut *tx, a.id).await?;
-    }
     tx.commit().await?;
     Ok(arrival)
 }
@@ -401,7 +403,8 @@ const LOCAL_ARRIVAL_LOCK: i32 = 0x6f77_7402;
 /// when `create` breaks the username rule.
 ///
 /// As [`arrive`], one transaction under a lock on the pair, so two at once resolve
-/// to one account.
+/// to one account, and the account's `last_sign_in` is stamped before the pair is
+/// touched, the order [`forget_as`] locks them in.
 pub async fn arrive_as(
     pool: &PgPool,
     key: &str,
@@ -432,19 +435,37 @@ pub async fn arrive_as_in(
         .execute(&mut *tx)
         .await?;
     let linked: Option<i64> = sqlx::query_scalar(
-        "UPDATE account_local_identities SET last_sign_in = now()
-         WHERE key = $1 AND subject = $2 RETURNING account_id",
+        "SELECT account_id FROM account_local_identities WHERE key = $1 AND subject = $2",
     )
     .bind(key)
     .bind(subject)
     .fetch_optional(&mut *tx)
     .await?;
     let arrival = match (linked, create) {
-        (Some(id), _) => store::by_id(&mut *tx, id)
+        (Some(id), _) => {
+            let account = store::by_id(&mut *tx, id).await?;
+            // The account before the pair, the order a retirement locks them in.
+            if let Some(a) = &account {
+                store::signed_in(&mut *tx, a.id).await?;
+            }
+            let still = sqlx::query(
+                "UPDATE account_local_identities SET last_sign_in = now()
+                 WHERE key = $1 AND subject = $2",
+            )
+            .bind(key)
+            .bind(subject)
+            .execute(&mut *tx)
             .await?
-            .map_or(Arrival::Unknown, Arrival::Known),
+            .rows_affected()
+                == 1;
+            // A pair retired while this waited for the account reaches nothing.
+            account
+                .filter(|_| still)
+                .map_or(Arrival::Unknown, Arrival::Known)
+        }
         (None, Some(username)) => {
             let account = create_for(&mut tx, &store::normalize(username), "").await?;
+            store::signed_in(&mut *tx, account.id).await?;
             sqlx::query("UPDATE accounts SET password_sign_in = false WHERE id = $1")
                 .bind(account.id)
                 .execute(&mut *tx)
@@ -462,9 +483,6 @@ pub async fn arrive_as_in(
         }
         (None, None) => Arrival::Unknown,
     };
-    if let Arrival::Known(a) | Arrival::Created(a) = &arrival {
-        store::signed_in(&mut *tx, a.id).await?;
-    }
     tx.commit().await?;
     Ok(arrival)
 }
