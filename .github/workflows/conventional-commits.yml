@@ -6,10 +6,29 @@ name: Conventional Commits
 # which a merge commit keeps. commitlint reads the pull request's commitlint
 # configuration, which is JavaScript and runs: so this job holds no secrets and only
 # a read token, and runs on GitHub-hosted runners, where a fork's code may run.
+#
+# Reusable too: an app whose release.yml derives its version from its commits calls
+# it from its pull-request workflow, so the same rules, commitlint and versions check
+# every app:
+#
+#   jobs:
+#     commits:
+#       permissions: {contents: read, pull-requests: read}
+#       uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # vX.Y.Z
+#
+# The caller's event must be a pull request (the title and the commits are its),
+# never `pull_request_target`, whose checkout would run a fork's code with a token
+# that can write. An app with a commitlint configuration of its own
+# (commitlint.config.*, .commitlintrc*, a "commitlint" key in package.json) is
+# checked by it; one without is checked by the rules below, written for the run.
+# A title edited after the push is re-checked only when the caller's
+# `pull_request` types include `edited`; the requeue flow prefers the defaults, so
+# an app on it accepts that a title fixed by hand is checked at the next push.
 
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
+  workflow_call:
 
 permissions: {}
 
@@ -38,10 +57,35 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
+      # The configuration: the repository's own where it has one, else the rules
+      # this repository checks itself by (commitlint.config.mjs here), written
+      # outside the checkout. Dependabot's commits are passed over either way: their
+      # bodies quote release notes whose lines run past the length limit, and their
+      # headers are generated.
       - name: commitlint
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
-        run: >-
-          npx --yes --ignore-scripts -p @commitlint/cli@21.2.3 -p @commitlint/config-conventional@21.2.3
-          commitlint --from "$BASE" --to "$HEAD" --verbose
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE" ] || [ -z "$HEAD" ]; then
+            echo "::error::not a pull request: the caller's event carries no base and head"
+            exit 1
+          fi
+          config=()
+          shopt -s nullglob
+          own=(commitlint.config.* .commitlintrc*)
+          shopt -u nullglob
+          # Or a "commitlint" key in package.json, which commitlint reads too.
+          if [ "${#own[@]}" -eq 0 ] && ! grep -q '"commitlint"' package.json 2>/dev/null; then
+            cat > "$RUNNER_TEMP/commitlint.config.mjs" <<'JS'
+          export default {
+            extends: ["@commitlint/config-conventional"],
+            ignores: [(message) => message.includes("Signed-off-by: dependabot[bot]")],
+          };
+          JS
+            config=(--config "$RUNNER_TEMP/commitlint.config.mjs")
+          fi
+          npx --yes --ignore-scripts -p @commitlint/cli@21.2.3 -p @commitlint/config-conventional@21.2.3 \
+            commitlint "${config[@]}" --from "$BASE" --to "$HEAD" --verbose
