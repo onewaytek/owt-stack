@@ -1,15 +1,15 @@
 <article class="owt-document">
 <header>
-<h1>{{ doc.title }}</h1>
-<p class="owt-hint">Version {{ doc.number() }} · Last updated {{ doc.effective_date }}{% if !current %} · <strong>Not the current version.</strong> <a href="/{{ doc.kind }}">Read the current version</a>{% endif %}</p>
+<h1>{{ v.version.title }}</h1>
+<p class="owt-hint">{{ crate::policies::sentence(v.words.header, crate::policies::numbered(v.words.version, v.version.number()), v.date.as_str()) }}{% if !v.current %} · <strong>{{ v.words.not_current }}</strong> <a href="{{ v.current_href }}">{{ v.words.read_current }}</a>{% endif %}</p>
 </header>
-{% if let Some(mine) = mine %}<div class="owt-alert owt-alert-info" role="status">You agreed to version {{ mine.version }} on {{ mine.accepted_at }}.{% if mine.version != doc.number() %} <a href="/{{ doc.kind }}/v/{{ mine.version }}">Read the version you agreed to</a>.{% endif %}</div>
+{% if let Some(mine) = v.mine %}<div class="owt-alert owt-alert-info" role="status">{{ crate::policies::sentence(v.words.you_agreed, crate::policies::numbered(v.words.version_in_sentence, mine.number), mine.date.as_str()) }}{% if mine.number != v.version.number() %} <a href="{{ mine.href }}">{{ v.words.read_yours }}</a>.{% endif %}</div>
 {% endif %}<div class="owt-prose">
-{{ body }}</div>
-{% if versions.len() > 1 %}<section class="owt-section">
-<h2>Versions on record</h2>
+{{ v.body }}</div>
+{% if v.versions.len() > 1 %}<section class="owt-section">
+<h2>{{ v.words.versions_on_record }}</h2>
 <ul>
-{% for (n, date) in versions %}<li>{% if *n == doc.number() %}Version {{ n }}{% else %}<a href="/{{ doc.kind }}/v/{{ n }}">Version {{ n }}</a>{% endif %}, last updated {{ date }}</li>
+{% for l in v.versions %}{% let (before, after) = crate::policies::around(v.words.version_dated, l.date.as_str()) %}<li>{{ before }}{% if l.number == v.version.number() %}{{ crate::policies::numbered(v.words.version, l.number) }}{% else %}<a href="{{ l.href }}">{{ crate::policies::numbered(v.words.version, l.number) }}</a>{% endif %}{{ after }}</li>
 {% endfor %}</ul>
 </section>
 {% endif %}</article>

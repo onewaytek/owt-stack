@@ -100,6 +100,11 @@ fn policies(db: &Db) -> Policies {
 
 /// The test app: the policies' routes and gate inside the accounts layer.
 fn app(db: &Db, sessions: &Sessions<Data>) -> Router {
+    app_with(db, sessions, policies(db))
+}
+
+/// The test app, with `policies` configured by the test.
+fn app_with(db: &Db, sessions: &Sessions<Data>, policies: Policies) -> Router {
     async fn whoami(Maybe(account): Maybe) -> String {
         account.map_or_else(|| "anonymous".to_owned(), |a| a.username)
     }
@@ -107,7 +112,6 @@ fn app(db: &Db, sessions: &Sessions<Data>) -> Router {
         session::sign_out(&session);
         "out"
     }
-    let policies = policies(db);
     let accounts = Accounts::new(db.pool.clone(), "/login");
     Router::new()
         .merge(policies.routes())
@@ -666,5 +670,74 @@ async fn a_new_version_says_what_changed_and_staff_prune_what_nobody_holds() {
         list.contains("Version 2") && !list.contains("Version 1<"),
         "{list}"
     );
+    db.drop().await;
+}
+
+/// A design of the app's own for a document's page; the others stay Tailwind's.
+struct Plain;
+
+impl policies::Views for Plain {
+    fn document(
+        &self,
+        _: &axum::http::request::Parts,
+        view: &policies::DocumentView<'_>,
+    ) -> owt_web::Result<owt_accounts::admin::Body> {
+        #[derive(askama::Template)]
+        #[template(
+            source = "<p>plain {{ v.version.title }}, {{ v.date }}, current at {{ v.current_href }}</p>",
+            ext = "html"
+        )]
+        struct Html<'a, 'b> {
+            v: &'a policies::DocumentView<'b>,
+        }
+        owt_accounts::admin::Body::render(&Html { v: view })
+    }
+}
+
+#[tokio::test]
+async fn an_app_draws_the_pages_at_its_paths_in_its_words() {
+    let db = db!();
+    let sessions = sessions();
+    let mine = policies(&db)
+        .views(Plain)
+        .documents_at("/legal/")
+        .sign_out("/out")
+        .dates(|d: &str| d.replace('-', "/"))
+        .words(policies::Words {
+            agree: "Agree, then",
+            ..policies::Words::ENGLISH
+        });
+    let client = owt_test::Client::new(app_with(&db, &sessions, mine));
+    let ada = account(&db, "ada", false).await;
+    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    published(&db, "terms", "Terms <1>", "First.", "").await;
+
+    // The app's own page, at the prefix; nothing at the root.
+    let r = navigate(&client, "/legal/terms").await;
+    assert_eq!(r.status, 200, "a document is never gated");
+    assert!(
+        r.text()
+            .contains("<p>plain Terms &#60;1&#62;, 2026/10/01, current at /legal/terms</p>"),
+        "{}",
+        r.text()
+    );
+    assert_eq!(client.get("/terms").await.status, 404);
+    assert_eq!(client.get("/legal/terms/v/1").await.status, 200);
+
+    // The page that asks stays Tailwind's, with the paths, the dates and the words.
+    let r = navigate(&client, "/whoami").await;
+    assert_eq!(r.location(), Some("/agree?next=%2Fwhoami"));
+    let html = client.get("/agree").await.text();
+    assert!(
+        html.contains("href=\"/legal/terms\"")
+            && html.contains("last updated 2026/10/01")
+            && html.contains("Agree, then")
+            && html.contains("<form method=\"post\" action=\"/out\">")
+            && html.contains("Sign out instead"),
+        "{html}"
+    );
+    let r = client.post_form("/out", &[]).await;
+    assert_eq!(r.text(), "out");
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
     db.drop().await;
 }

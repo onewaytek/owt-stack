@@ -1,26 +1,26 @@
 <section class="owt-admin">
 <header class="owt-admin-head">
 <h1>Site policies</h1>
-<form method="post" action="{{ base }}/prune"><button class="owt-button owt-button-secondary" type="submit">Remove versions nobody holds</button></form>
+<form method="post" action="{{ v.prune }}"><button class="owt-button owt-button-secondary" type="submit">Remove versions nobody holds</button></form>
 </header>
-{% if let Some(n) = notice %}{% if n.error %}<div class="owt-alert owt-alert-error" role="alert">{{ n.text }}</div>
+{% if let Some(n) = v.notice %}{% if n.is_error() %}<div class="owt-alert owt-alert-error" role="alert">{{ n.text }}</div>
 {% else %}<div class="owt-alert owt-alert-success" role="status">{{ n.text }}</div>
 {% endif %}{% endif %}<p class="owt-hint">Publishing a version asks everyone signed in to agree to it on their next page. An older version is kept while it is the last one somebody agreed to (“Held by”); the record of each agreement keeps its version and hash either way.</p>
-{% for d in docs %}<section class="owt-section">
+{% for d in v.documents %}<section class="owt-section">
 <header class="owt-admin-head">
-<h2><a href="/{{ d.doc.slug }}">{{ d.doc.label }}</a></h2>
-<form method="post" action="{{ base }}/new/{{ d.doc.slug }}"><button class="owt-button" type="submit">New draft</button></form>
+<h2><a href="{{ d.href }}">{{ d.document.label }}</a></h2>
+<form method="post" action="{{ d.new_draft }}"><button class="owt-button" type="submit">New draft</button></form>
 </header>
-{% if d.rows.is_empty() %}<p class="owt-hint">No versions yet: nobody is asked to agree to it until one is published.</p>
+{% if d.versions.is_empty() %}<p class="owt-hint">No versions yet: nobody is asked to agree to it until one is published.</p>
 {% else %}<table class="owt-table">
 <thead><tr><th scope="col">Version</th><th scope="col">Title</th><th scope="col">Last updated</th><th scope="col">Published (UTC)</th><th scope="col">Held by</th></tr></thead>
 <tbody>
-{% for r in d.rows %}{% let v = r.version %}<tr>
-<td><a href="{{ base }}/{{ v.id }}">{% if let Some(n) = v.version %}Version {{ n }}{% else %}Draft{% endif %}</a>{% if r.current %} <span class="owt-badge">Current</span>{% endif %}{% if v.version.is_none() %} <span class="owt-badge owt-badge-quiet">Draft</span>{% endif %}</td>
-<td>{{ v.title }}</td>
-<td>{{ v.effective_date }}</td>
-<td>{% if let Some(at) = v.published_at %}{{ at }}{% else %}<span class="owt-hint">not yet</span>{% endif %}</td>
-<td>{% if v.version.is_some() %}{{ r.holders }}{% endif %}</td>
+{% for r in d.versions %}{% let ver = r.version %}<tr>
+<td><a href="{{ r.href }}">{% if let Some(n) = ver.version %}Version {{ n }}{% else %}Draft{% endif %}</a>{% if r.current %} <span class="owt-badge">Current</span>{% endif %}{% if ver.version.is_none() %} <span class="owt-badge owt-badge-quiet">Draft</span>{% endif %}</td>
+<td>{{ ver.title }}</td>
+<td>{{ ver.effective_date }}</td>
+<td>{% if let Some(at) = ver.published_at %}{{ at }}{% else %}<span class="owt-hint">not yet</span>{% endif %}</td>
+<td>{% if ver.version.is_some() %}{{ r.holders }}{% endif %}</td>
 </tr>
 {% endfor %}</tbody>
 </table>
