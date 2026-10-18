@@ -401,7 +401,7 @@ pub struct AccountView<'a> {
     /// Where "issue a sign-in link" posts, when the admin offers them
     /// ([`Admin::sign_in_links`]).
     pub issue_link: Option<String>,
-    /// How long an issued link lasts, in words (`24 hours`); empty without links.
+    /// How long an issued link lasts, in words (`1 day`); empty without links.
     pub link_lifetime: String,
     /// Where "sign out everywhere" posts.
     pub sign_out: String,
@@ -484,6 +484,190 @@ pub struct Secret {
     pub what: String,
     /// The password or the link.
     pub value: String,
+}
+
+/// Filled-in view models for an app's tests of its own [`Views`] templates (feature
+/// `test-util`): every field holds a representative value, with one of each
+/// [`Badge`], a [`Notice`], a [`Secret`], a [`Connection`], a [`LocalIdentity`], a
+/// declared and an undeclared role, so a template that prints every field is
+/// exercised without a database, and a username holds a `<`, so a template that
+/// stops escaping fails. The values are fixed, so a snapshot of the rendered page is
+/// stable; the URLs are what an admin at `/staff/accounts` with roles `host` and
+/// `editor` would hand over. The states are combined for coverage (a success notice
+/// beside a refused email, a deactivated staff row), not as the admin would show
+/// them together.
+#[cfg(feature = "test-util")]
+mod examples {
+    use std::sync::LazyLock;
+
+    use super::{
+        AccountView, Badge, Connection, Level, ListView, LocalIdentity, NewView, Notice,
+        RoleChoice, Row, Secret,
+    };
+    use crate::store::Account;
+    use owt_web::pager::Pager;
+    use owt_web::request::RequestInfo;
+    use owt_web::ui::Pagination;
+
+    static LIST_REQUEST: LazyLock<RequestInfo> =
+        LazyLock::new(|| RequestInfo::at("/staff/accounts?q=ada&role=editor&page=2"));
+
+    static ADA: LazyLock<Account> = LazyLock::new(|| Account {
+        id: 42,
+        username: "ada".into(),
+        email: "ada@example.com".into(),
+        is_staff: false,
+        is_active: true,
+        session_epoch: 3,
+        roles: vec!["editor".into(), "reviewer".into()],
+    });
+
+    fn roles(checked: &[&str]) -> Vec<RoleChoice> {
+        [
+            ("host", "Host", "May run a live session.", true),
+            ("editor", "Editor", "May edit content.", false),
+        ]
+        .into_iter()
+        .map(|(name, label, description, staff)| RoleChoice {
+            name: name.into(),
+            label: label.into(),
+            description: description.into(),
+            staff,
+            checked: checked.contains(&name),
+        })
+        .collect()
+    }
+
+    impl ListView<'static> {
+        /// Page 2 of 3 of a search for `ada` among editors: two rows, one with every
+        /// kind of badge, and a notice that the app's own search failed.
+        #[must_use]
+        pub fn example() -> Self {
+            let badge = |text: &str, quiet| Badge {
+                text: text.into(),
+                quiet,
+            };
+            Self {
+                url: "/staff/accounts".into(),
+                new_account: "/staff/accounts/new".into(),
+                q: "ada",
+                placeholder: "Username, email or nickname".into(),
+                notice: Some(Notice {
+                    level: Level::Error,
+                    text: "Searching by nickname failed, so these are username and email matches only.".into(),
+                }),
+                filter: "editor",
+                filters: vec![
+                    ("staff".into(), "Staff".into()),
+                    ("host".into(), "Host".into()),
+                    ("editor".into(), "Editor".into()),
+                    ("inactive".into(), "Deactivated".into()),
+                ],
+                total: 101,
+                rows: vec![
+                    Row {
+                        id: 42,
+                        href: "/staff/accounts/42".into(),
+                        username: "ada".into(),
+                        email: "ada@example.com".into(),
+                        badges: vec![
+                            badge("Deactivated", true),
+                            badge("Staff", false),
+                            badge("Editor", false),
+                            badge("reviewer (undeclared)", true),
+                            badge("Password sign-in off", true),
+                        ],
+                        password_sign_in: false,
+                        last_sign_in: "2026-10-16".into(),
+                    },
+                    // A name that must be escaped: a `|safe` in a template shows here.
+                    Row {
+                        id: 43,
+                        href: "/staff/accounts/43".into(),
+                        username: "adam<b>".into(),
+                        email: String::new(),
+                        badges: vec![badge("User", true)],
+                        password_sign_in: true,
+                        last_sign_in: String::new(),
+                    },
+                ],
+                pagination: Pagination::new(
+                    Pager {
+                        number: 2,
+                        pages: 3,
+                    },
+                    &LIST_REQUEST,
+                ),
+            }
+        }
+    }
+
+    impl NewView<'static> {
+        /// The form after a refused attempt: a taken username, staff ticked, one
+        /// role ticked.
+        #[must_use]
+        pub fn example() -> Self {
+            Self {
+                action: "/staff/accounts".into(),
+                list: "/staff/accounts".into(),
+                error: Some("There is already an account named \u{201c}ada\u{201d}.".into()),
+                username: "ada",
+                email: "ada@example.com",
+                staff: true,
+                roles: roles(&["editor"]),
+            }
+        }
+    }
+
+    impl AccountView<'static> {
+        /// `ada`'s page, with a notice, a secret just made, a refused email, a
+        /// declared and an undeclared role, a connection, a local identity, the
+        /// app's own link and sign-in links on offer.
+        #[must_use]
+        pub fn example() -> Self {
+            Self {
+                account: &ADA,
+                myself: false,
+                notice: Some(Notice {
+                    level: Level::Success,
+                    text: "Saved.".into(),
+                }),
+                secret: Some(Secret {
+                    what: "New password for ada. It has signed out every session and voided its unused sign-in links.".into(),
+                    value: "correct-horse-battery-staple".into(),
+                }),
+                email: "ada@example".into(),
+                email_error: Some("Enter a valid email address.".into()),
+                roles: roles(&["editor"]),
+                undeclared: vec!["reviewer".into()],
+                has_password: true,
+                password_sign_in: true,
+                joined: "2026-01-15".into(),
+                last_sign_in: "2026-10-16 09:30".into(),
+                connections: vec![Connection {
+                    id: 7,
+                    provider: "google".into(),
+                    label: "ada@example.com".into(),
+                    unlink: "/staff/accounts/42/identities/7/unlink".into(),
+                }],
+                local_identities: vec![LocalIdentity {
+                    key: "kiosk".into(),
+                    subject: "desk-1".into(),
+                    created: "2026-03-02".into(),
+                    last_sign_in: "2026-10-15 17:05".into(),
+                    forget: "/staff/accounts/42/local-identities/forget".into(),
+                }],
+                more: Some(("Profile", "/staff/profiles/42".into())),
+                list: "/staff/accounts".into(),
+                save: "/staff/accounts/42".into(),
+                set_password: "/staff/accounts/42/password".into(),
+                set_password_sign_in: "/staff/accounts/42/password-sign-in".into(),
+                issue_link: Some("/staff/accounts/42/link".into()),
+                link_lifetime: "1 day".into(),
+                sign_out: "/staff/accounts/42/sign-out".into(),
+            }
+        }
+    }
 }
 
 #[derive(Template)]
@@ -1626,6 +1810,41 @@ async fn forget_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The examples carry every field, and the crate's own pages draw them.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn the_examples_render_on_the_crates_own_pages() {
+        let parts = axum::http::Request::get("/staff/accounts")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let list = Tailwind.list(&parts, &ListView::example()).unwrap().0;
+        assert!(
+            list.contains("Password sign-in off")
+                && list.contains("owt-pager")
+                && list.contains("adam&#60;b&#62;")
+                && !list.contains("adam<b>"),
+            "{list}"
+        );
+        let new = Tailwind.new_account(&parts, &NewView::example()).unwrap().0;
+        assert!(
+            new.contains("already an account") && new.contains(r#"value="ada""#),
+            "{new}"
+        );
+        let account = Tailwind.account(&parts, &AccountView::example()).unwrap().0;
+        for shown in [
+            "correct-horse-battery-staple",
+            "Enter a valid email address.",
+            "reviewer",
+            "desk-1",
+            "Profile",
+            "Issue a sign-in link (1 day)",
+        ] {
+            assert!(account.contains(shown), "{shown}: {account}");
+        }
+    }
 
     #[test]
     fn a_search_term_matches_its_wildcards_literally() {

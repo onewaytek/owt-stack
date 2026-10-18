@@ -75,7 +75,9 @@ impl Normalizer {
     /// Drop the `?v=<hash>` an `owt_web::assets::Assets` URL carries, so a page
     /// recorded with the stylesheet built compares equal to one rendered where it is
     /// not (a test job that builds no CSS gets the bare URL): the link reads
-    /// `/static/css/app.css` either way.
+    /// `/static/css/app.css` either way. The mask is `?v=` at the start of any query,
+    /// so a page link whose first parameter is `v` loses it too (the comparison is
+    /// unaffected: both sides lose it alike); one with `v` later in the query keeps it.
     #[must_use]
     pub fn asset_versions(self) -> Self {
         self.mask(r#"\?v=[^"'&<>\s]*"#, "")
