@@ -28,7 +28,8 @@ Outside the crates:
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger and the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
-| `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone |
+| `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone, connecting to nothing |
+| `templates/openshift/egress.yaml` | where the app's pods (or a task's) may connect: its database, its Redis, the cluster's DNS and port 443 of the internet, and nothing else |
 | `templates/openshift/cronjob.yaml` | a scheduled task in the app's image, with the app's database, TLS, environment and NetworkPolicies |
 | `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters, and rehearses a Postgres major upgrade |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
@@ -2424,6 +2425,36 @@ app's pods only, so the template brings two more admitting that label (policies 
 up). A worker that runs all the time is the same pod spec in a Deployment, with
 `app.yaml`'s strategy and image trigger (`fieldPath` naming its container), and the
 same label and policies.
+
+**Where the app may connect** is a template of its own, `egress.yaml`, applied once
+per set of pods: the app's, and each task's. `app.yaml`'s policies say who may reach
+the app; this one says where it may go, and nothing else. A pod that is compromised
+(a dependency's bug, a request forged through one of the app's own routes) can then
+open connections to the app's database, its Redis, the cluster's DNS and port 443 of
+`INTERNET_CIDR`, and to nothing else: not the cluster API, not another port
+anywhere. `INTERNET_CIDR` bounds the last: `0.0.0.0/0` (the default) is anywhere on
+443 (a sign-in provider, a tracker for change requests, an OTLP collector over the
+public web, and the cluster's own Routes, which the router answers at a node address;
+also any pod or node that listens on 443, since an `ipBlock` matches those addresses
+too), `0.0.0.0/32` is nowhere, for a task that sends no mail and calls no API. The
+cluster's resolvers are `DNS_NAMESPACE` on `DNS_PORT` (OpenShift's CoreDNS answers on
+5353).
+Anything else the app calls (a cluster service in another namespace, another port) is
+a further NetworkPolicy of the app's own with the same `podSelector`: policies add up.
+
+```sh
+oc process -f templates/openshift/egress.yaml -p NAME=myapp -p NAMESPACE=myapp \
+  -p POD=myapp | oc apply -f -
+oc process -f templates/openshift/egress.yaml -p NAME=myapp -p NAMESPACE=myapp \
+  -p POD=myapp-digest -p INTERNET_CIDR=0.0.0.0/32 | oc apply -f -
+```
+
+The selected pods lose every other egress the moment it applies, so read the rules
+against what the app calls, and apply it in a staging namespace first; a wrong rule
+looks like a DNS failure, and deleting the policy (`oc delete networkpolicy
+myapp-egress`) restores the open egress. The database's instances get no egress
+policy: the CloudNativePG instance manager talks to the cluster API. `redis.yaml`'s
+Redis gets one of its own there, admitting no egress at all.
 
 **An app whose database already exists passes the major it runs**, on every apply:
 `-p POSTGRES_MAJOR=16` if
