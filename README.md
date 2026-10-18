@@ -2252,8 +2252,8 @@ built.
 on:
   push: {branches: [main, rc]}
   workflow_dispatch:          # promote-rc.yml starts rc releases this way
-# One release at a time per branch, none cancelled: two pushes close together (a
-# merge, then a `chore(release)` commit-back) would otherwise cut the version twice.
+# One run at a time per branch, none cancelled. The release job serialises itself;
+# this keeps a second push's ci and image jobs from running beside the first's release.
 concurrency: {group: "release-${{ github.ref_name }}", cancel-in-progress: false}
 jobs:
   ci:
@@ -2333,8 +2333,9 @@ jobs:
   skipped it: a non-promoting one is re-run, succeeds having merged nothing, and the
   next pass looks beneath it. A run that timed out, failed to start or awaits
   approval is left for a person. Keeping the workflow's
-  `pull_request` types to the default (`opened`, `synchronize`, `reopened`) avoids
-  those wasted re-runs.
+  `pull_request` types to the default (`opened`, `synchronize`, `reopened`) plus
+  `ready_for_review` (a draft marked ready is promoted then, not at its next push)
+  avoids those wasted re-runs.
   A run that failed its checks is left alone, and so is one already on
   its fifth attempt (`max-attempts`). Run it after each promotion, so one hands on to
   the next, and on a schedule, for when none follows. The scheduled one sits outside
@@ -2355,6 +2356,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 concurrency: {group: promote-rc, cancel-in-progress: false}
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml   # the app's own
+    secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
     permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
     uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@v0.6.1  # and "commits / commits"
