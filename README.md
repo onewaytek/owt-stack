@@ -1259,10 +1259,12 @@ layout as for the admin. The tables come from `0004_owt_accounts_policies.sql`
   each document is sent to the page that asks (`/agree?next=…`) before any other
   page. This includes an account just made through a provider, and someone already
   signed in when a new version is published. Only a document load is sent (a `GET`
-  that is not htmx's, made for a `Sec-Fetch-Dest: document` or, from a browser that
-  sends no such header, asking for `text/html`), so what a page loads for itself (an
-  image, a script, a fetch), a socket, a stream or a fragment is never interrupted;
-  nor is a non-browser client. If the database can't say, the request goes through.
+  made for a `Sec-Fetch-Dest: document` or, from a browser that sends no such
+  header, asking for `text/html`; an htmx request only when it is a boosted
+  navigation, which swaps in a whole page), so what a page loads for itself (an
+  image, a script, a fetch), a socket, a stream or a fragment is never interrupted,
+  nor a non-browser client that asks for no HTML. If the database can't say, the
+  request goes through.
   The gate reads
   the account loaded for the request and caches nothing in the session, so a second
   person signing in on the same browser is asked for themselves.

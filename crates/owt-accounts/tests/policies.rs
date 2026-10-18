@@ -298,6 +298,14 @@ async fn the_gate_sends_signed_in_page_loads_to_the_page_that_asks() {
         "no Accept: not a browser's page"
     );
     assert_eq!(client.get_htmx("/whoami").await.status, 200);
+    // A boosted navigation is a page: htmx follows the 303 and swaps the whole page.
+    let boosted = Request::get("/whoami?x=1")
+        .header("hx-request", "true")
+        .header("hx-boosted", "true")
+        .header("accept", "*/*")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(client.send(boosted).await.status, 303);
     let json = client
         .send(
             Request::get("/whoami")
