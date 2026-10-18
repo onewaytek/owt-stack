@@ -65,9 +65,10 @@ pub async fn mint(
 
 /// Redeem `token` from `from` (the client's address, for the trail): the account it
 /// signs in. [`Refused::Link`] when the token is unknown, used, expired, or its
-/// account is deactivated. The handler then calls [`crate::session::sign_in`].
+/// account is deactivated. The account's `last_sign_in` is stamped in the same
+/// transaction; the handler then calls [`crate::session::sign_in`].
 pub async fn redeem(pool: &sqlx::PgPool, token: &str, from: &str) -> Result<Account> {
-    // One transaction, the account read under a share lock: a revocation (which
+    // One transaction, the account read under a row lock: a revocation (which
     // voids this link and bumps the epoch in one statement) is either before it,
     // and the link is spent, or after it, and the session this signs in is revoked.
     // The account is locked before the link, the order a revocation takes them in,
@@ -83,8 +84,10 @@ pub async fn redeem(pool: &sqlx::PgPool, token: &str, from: &str) -> Result<Acco
     else {
         return Err(Refused::Link.into());
     };
+    // Stamped here, under the row lock a revocation also takes: a refusal below
+    // rolls the stamp back with the rest.
     let account = sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "SELECT {} FROM accounts WHERE id = $1 AND is_active FOR SHARE",
+        "UPDATE accounts SET last_sign_in = now() WHERE id = $1 AND is_active RETURNING {}",
         store::COLUMNS
     )))
     .bind(account_id)

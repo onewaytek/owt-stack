@@ -314,6 +314,9 @@ const ARRIVAL_LOCK: i32 = 0x6f77_7401;
 /// Resolve a provider's identity to an account, per `welcome`: by its subject, never
 /// its email. Refreshes the identity's claims. A deactivated account resolves to
 /// [`Arrival::Unknown`]; an identity with an empty subject is [`Refused::NoSubject`].
+/// An account it resolves to has its `last_sign_in` stamped ([`store::signed_in`]),
+/// before the identity is touched: the order an unlink locks them in. In the caller's
+/// transaction ([`arrive_in`]) the account's row stays locked until it ends.
 ///
 /// One transaction, under a lock on the identity: two first sign-ins with it at once
 /// (a callback opened twice) resolve to one account, the second finding what the
@@ -348,12 +351,28 @@ pub async fn arrive_in(
         .execute(&mut *tx)
         .await?;
     let arrival = if let Some(linked) = find(&mut *tx, provider, &identity.uid).await? {
+        // The account before the identity, the order an unlink locks them in. An
+        // unlink that held it has removed the identity by now, and the refresh finds
+        // nothing: the identity reaches nothing, and is not linked again.
+        lock_account(&mut tx, linked.account_id).await?;
+        let refreshed = sqlx::query(
+            "UPDATE account_identities SET claims = $4, last_sign_in = now()
+             WHERE provider = $1 AND subject = $2 AND account_id = $3",
+        )
+        .bind(provider.key())
+        .bind(&identity.uid)
+        .bind(linked.account_id)
+        .bind(&identity.extra)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
         match store::by_id(&mut *tx, linked.account_id).await? {
-            Some(account) => {
-                link(&mut *tx, account.id, provider, identity).await?;
+            Some(account) if refreshed => {
+                store::signed_in(&mut *tx, account.id).await?;
                 Arrival::Known(account)
             }
-            None => Arrival::Unknown,
+            _ => Arrival::Unknown,
         }
     } else if welcome.create {
         let email = identity.email.as_deref().unwrap_or("");
@@ -369,6 +388,7 @@ pub async fn arrive_in(
             ""
         };
         let account = create_for(&mut tx, &username_base(identity), email).await?;
+        store::signed_in(&mut *tx, account.id).await?;
         link(&mut *tx, account.id, provider, identity).await?;
         Arrival::Created(account)
     } else {
@@ -376,6 +396,16 @@ pub async fn arrive_in(
     };
     tx.commit().await?;
     Ok(arrival)
+}
+
+/// Lock the account's row as an arrival changes it, before its identity's: the
+/// order an unlink and a retirement take them in.
+async fn lock_account(tx: &mut Transaction<'_, Postgres>, id: i64) -> sqlx::Result<()> {
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// The first key of the advisory lock [`arrive_as`] takes per local identity.
@@ -397,7 +427,8 @@ const LOCAL_ARRIVAL_LOCK: i32 = 0x6f77_7402;
 /// when `create` breaks the username rule.
 ///
 /// As [`arrive`], one transaction under a lock on the pair, so two at once resolve
-/// to one account.
+/// to one account, and the account's `last_sign_in` is stamped before the pair is
+/// touched, the order [`forget_as`] locks them in.
 pub async fn arrive_as(
     pool: &PgPool,
     key: &str,
@@ -428,19 +459,38 @@ pub async fn arrive_as_in(
         .execute(&mut *tx)
         .await?;
     let linked: Option<i64> = sqlx::query_scalar(
-        "UPDATE account_local_identities SET last_sign_in = now()
-         WHERE key = $1 AND subject = $2 RETURNING account_id",
+        "SELECT account_id FROM account_local_identities WHERE key = $1 AND subject = $2",
     )
     .bind(key)
     .bind(subject)
     .fetch_optional(&mut *tx)
     .await?;
     let arrival = match (linked, create) {
-        (Some(id), _) => store::by_id(&mut *tx, id)
+        (Some(id), _) => {
+            // The account before the pair, the order a retirement locks them in.
+            lock_account(&mut tx, id).await?;
+            let still = sqlx::query(
+                "UPDATE account_local_identities SET last_sign_in = now()
+                 WHERE key = $1 AND subject = $2",
+            )
+            .bind(key)
+            .bind(subject)
+            .execute(&mut *tx)
             .await?
-            .map_or(Arrival::Unknown, Arrival::Known),
+            .rows_affected()
+                == 1;
+            // A pair retired while this waited for the account reaches nothing.
+            match store::by_id(&mut *tx, id).await? {
+                Some(account) if still => {
+                    store::signed_in(&mut *tx, account.id).await?;
+                    Arrival::Known(account)
+                }
+                _ => Arrival::Unknown,
+            }
+        }
         (None, Some(username)) => {
             let account = create_for(&mut tx, &store::normalize(username), "").await?;
+            store::signed_in(&mut *tx, account.id).await?;
             sqlx::query("UPDATE accounts SET password_sign_in = false WHERE id = $1")
                 .bind(account.id)
                 .execute(&mut *tx)

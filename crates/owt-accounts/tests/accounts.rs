@@ -4769,3 +4769,284 @@ async fn an_apps_own_accounts_table_is_named_until_renamed() {
     assert!(found.is_empty(), "{found:?}");
     db.drop().await;
 }
+
+/// When the account last signed in, from the table.
+async fn last_sign_in(db: &Db, id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT to_char(last_sign_in, 'YYYY-MM-DD') FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+#[derive(serde::Deserialize)]
+struct Login {
+    login: String,
+    password: String,
+}
+
+/// A sign-in form's handler, as an app writes it with `password_sign_in`.
+async fn password_handler(
+    axum::extract::State((pool, throttle)): axum::extract::State<(
+        PgPool,
+        Arc<owt_auth::throttle::Throttle>,
+    )>,
+    session: Session<Data>,
+    axum::Form(f): axum::Form<Login>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let ip = std::net::IpAddr::from([203, 0, 113, 7]);
+    match session::password_sign_in(&pool, &throttle, &session, ip, &f.login, &f.password).await {
+        Ok(account) => format!("in as {}", account.username).into_response(),
+        Err(refused) => (refused.status(), refused.to_string()).into_response(),
+    }
+}
+
+#[tokio::test]
+async fn a_password_sign_in_is_throttled_checked_stamped_and_signed_in() {
+    let db = db!();
+    let sessions = sessions();
+    let ada = store::create(
+        &db.pool,
+        new("ada", "ada@example.com", Some("correct horse battery")),
+    )
+    .await
+    .unwrap();
+    let throttle = Arc::new(owt_auth::throttle::Throttle::new(
+        owt_auth::throttle::Budgets {
+            sign_ins_per_account: 3,
+            ..owt_auth::throttle::Budgets::default()
+        },
+    ));
+    let form = Router::new().route(
+        "/in",
+        post(password_handler).with_state((db.pool.clone(), throttle)),
+    );
+    let client = owt_test::Client::new(app(&db, &sessions, form));
+    assert_eq!(last_sign_in(&db, ada.id).await, None);
+
+    // A wrong password: 422, nobody signed in, nothing stamped.
+    let r = client
+        .post_form("/in", &[("login", "ada"), ("password", "wrong")])
+        .await;
+    assert_eq!(r.status, 422);
+    assert!(r.text().contains("do not match"), "{}", r.text());
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    assert_eq!(last_sign_in(&db, ada.id).await, None);
+
+    // The right one, by email in another case: signed in and stamped.
+    let r = client
+        .post_form(
+            "/in",
+            &[
+                ("login", "ADA@example.com"),
+                ("password", "correct horse battery"),
+            ],
+        )
+        .await;
+    assert_eq!(r.text(), "in as ada");
+    assert_eq!(client.get("/whoami").await.text(), "ada");
+    assert!(last_sign_in(&db, ada.id).await.is_some());
+
+    // The budget is per name as typed, case aside: two more tries at `ada` spend
+    // its three a minute, and the next is refused unchecked, even with the right
+    // password.
+    for _ in 0..2 {
+        let r = client
+            .post_form("/in", &[("login", "ada"), ("password", "wrong again")])
+            .await;
+        assert_eq!(r.status, 422);
+    }
+    let r = client
+        .post_form(
+            "/in",
+            &[("login", "Ada"), ("password", "correct horse battery")],
+        )
+        .await;
+    assert_eq!(r.status, 429);
+    assert!(r.text().contains("Too many attempts"));
+    assert_eq!(session::SignInRefused::RETRY_AFTER, Duration::from_secs(60));
+
+    // A deactivated account is a mismatch like any other.
+    let bob = store::create(&db.pool, new("bob", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    store::set_active(&db.pool, bob.id, false).await.unwrap();
+    let r = client
+        .post_form(
+            "/in",
+            &[("login", "bob"), ("password", "correct horse battery")],
+        )
+        .await;
+    assert_eq!(r.status, 422);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn every_way_in_stamps_the_last_sign_in() {
+    let db = db!();
+    // A local identity, created and then known.
+    let desk = match identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("desk"))
+        .await
+        .unwrap()
+    {
+        identities::Arrival::Created(a) => a,
+        other => panic!("{other:?}"),
+    };
+    assert!(last_sign_in(&db, desk.id).await.is_some());
+    sqlx::query("UPDATE accounts SET last_sign_in = NULL")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    identities::arrive_as(&db.pool, "kiosk", "desk-1", None)
+        .await
+        .unwrap();
+    assert!(last_sign_in(&db, desk.id).await.is_some());
+
+    // A provider's identity.
+    let provider = sso("https://id.example.com");
+    let arrival = identities::arrive(
+        &db.pool,
+        &provider,
+        &identity("u-1", None, false),
+        identities::Welcome {
+            create: true,
+            record_email: false,
+        },
+    )
+    .await
+    .unwrap();
+    let identities::Arrival::Created(ada) = arrival else {
+        panic!("{arrival:?}")
+    };
+    assert!(last_sign_in(&db, ada.id).await.is_some());
+
+    // A sign-in link.
+    let bob = store::create(&db.pool, new("bob", "", None)).await.unwrap();
+    let link = links::mint(&db.pool, bob.id, Duration::from_secs(900), "test")
+        .await
+        .unwrap();
+    assert_eq!(last_sign_in(&db, bob.id).await, None);
+    links::redeem(&db.pool, &link.token, "203.0.113.9")
+        .await
+        .unwrap();
+    assert!(last_sign_in(&db, bob.id).await.is_some());
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_sign_up_hears_every_problem_at_once() {
+    let db = db!();
+    store::create(&db.pool, new("paypal", "pal@example.com", None))
+        .await
+        .unwrap();
+    let all = store::problems(&db.pool, &new("pay@pal", "no-at-sign", Some("short")))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            all.as_slice(),
+            [
+                owt_accounts::Refused::Username,
+                owt_accounts::Refused::Email,
+                owt_accounts::Refused::Password(_)
+            ]
+        ),
+        "{all:?}"
+    );
+    let taken = store::problems(&db.pool, &new("PayPal", "Pal@Example.com", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        taken,
+        [
+            owt_accounts::Refused::UsernameTaken("paypal".into()),
+            owt_accounts::Refused::EmailTaken("pal@example.com".into())
+        ]
+    );
+    let alike = store::problems(&db.pool, &new("paypa1", "", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        alike,
+        [owt_accounts::Refused::UsernameLookalike("paypa1".into())]
+    );
+    let fine = new("grace", "grace@example.com", Some("correct horse battery"));
+    assert_eq!(store::problems(&db.pool, &fine).await.unwrap(), []);
+    store::create(&db.pool, fine).await.unwrap();
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn an_arrival_waiting_on_an_unlink_does_not_link_again() {
+    let db = db!();
+    let provider = sso("https://id.example.com");
+    let open = identities::Welcome {
+        create: true,
+        record_email: false,
+    };
+    let who = identity("u-1", None, false);
+    let identities::Arrival::Created(ada) = identities::arrive(&db.pool, &provider, &who, open)
+        .await
+        .unwrap()
+    else {
+        panic!("created")
+    };
+    store::set_password(&db.pool, &ada, "correct horse battery")
+        .await
+        .unwrap();
+    // Staff unlink it, holding the account as `unlink` does, while it signs in.
+    let mut unlink = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(ada.id)
+        .execute(&mut *unlink)
+        .await
+        .unwrap();
+    let pool = db.pool.clone();
+    let (p, w) = (provider.clone(), who.clone());
+    let arriving =
+        tokio::spawn(async move { identities::arrive(&pool, &p, &w, open).await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!arriving.is_finished(), "the arrival waits on the account");
+    sqlx::query("DELETE FROM account_identities WHERE account_id = $1")
+        .bind(ada.id)
+        .execute(&mut *unlink)
+        .await
+        .unwrap();
+    unlink.commit().await.unwrap();
+    assert_eq!(arriving.await.unwrap(), identities::Arrival::Unknown);
+    assert!(
+        identities::list(&db.pool, ada.id).await.unwrap().is_empty(),
+        "not linked again"
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn an_arrival_waiting_on_a_retirement_reaches_nothing() {
+    let db = db!();
+    let identities::Arrival::Created(desk) =
+        identities::arrive_as(&db.pool, "kiosk", "desk-1", Some("desk"))
+            .await
+            .unwrap()
+    else {
+        panic!("created")
+    };
+    let mut retire = db.pool.begin().await.unwrap();
+    assert_eq!(
+        identities::forget_as(&mut *retire, "kiosk", "desk-1")
+            .await
+            .unwrap(),
+        Some(desk.id)
+    );
+    let pool = db.pool.clone();
+    let arriving = tokio::spawn(async move {
+        identities::arrive_as(&pool, "kiosk", "desk-1", None)
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    retire.commit().await.unwrap();
+    assert_eq!(arriving.await.unwrap(), identities::Arrival::Unknown);
+    db.drop().await;
+}
