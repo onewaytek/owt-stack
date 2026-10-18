@@ -44,6 +44,7 @@ use owt_web::session::{Session, SessionData};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::admin::Body;
 use crate::identities::{self, Arrival, Welcome};
 use crate::session::Signed as SignedData;
 use crate::{Account, Maybe, Refused, Signed, session};
@@ -538,6 +539,7 @@ struct Inner {
     connect_within: Duration,
     on_arrival: Option<Hook<Arrived>>,
     on_connect: Option<Hook<Connected>>,
+    views: Drawn,
 }
 
 impl fmt::Debug for SocialSignIn {
@@ -571,6 +573,7 @@ impl SocialSignIn {
             connect_within: Duration::from_secs(15 * 60),
             on_arrival: None,
             on_connect: None,
+            views: Drawn(Arc::new(Tailwind)),
         }))
     }
 
@@ -579,6 +582,14 @@ impl SocialSignIn {
         // what it was made with, and this one takes the change.
         f(Arc::make_mut(&mut self.0));
         self
+    }
+
+    /// The markup of [`Buttons`] and [`Connections`], instead of the [`Tailwind`]
+    /// forms: an app with a design of its own draws them from their view models.
+    #[must_use]
+    pub fn views(self, views: impl Views) -> Self {
+        let views = Drawn(Arc::new(views));
+        self.edit(|i| i.views = views)
     }
 
     /// The app's sign-in page: failures of a sign-in land here with `?social=`.
@@ -684,6 +695,7 @@ impl SocialSignIn {
             next,
             connect: false,
             words: ButtonWords::ENGLISH,
+            views: self.0.views.clone(),
         }
     }
 
@@ -731,6 +743,7 @@ impl SocialSignIn {
             rows,
             items,
             words: ConnectionWords::ENGLISH,
+            views: self.0.views.clone(),
         })
     }
 }
@@ -771,22 +784,172 @@ fn named(pattern: &str, provider: &str) -> String {
     pattern.replace("{provider}", provider)
 }
 
-/// The sign-in buttons: `{{ buttons }}` on the sign-in page.
+/// The markup of [`Buttons`] and [`Connections`], for an app with a design of its
+/// own ([`SocialSignIn::views`]): each method answers from a view model, and both
+/// default to the [`Tailwind`] forms. A provider's form posts to
+/// [`Button::action`], with `next` when [`ButtonsView::next`] is not empty and
+/// `connect=1` when [`ButtonsView::connect`] is set (every button in
+/// [`ConnectionsView::buttons`] connects); a removal posts nothing to
+/// [`Linked::remove`]. The routes check what is posted, whoever drew the form.
+///
+/// ```
+/// use owt_accounts::admin::Body;
+/// use owt_accounts::social::{ButtonsView, Views};
+///
+/// #[derive(askama::Template)]
+/// #[template(source = r#"{% for b in v.buttons %}<form method="post" action="{{ b.action }}">
+/// {% if !v.next.is_empty() %}<input type="hidden" name="next" value="{{ v.next }}">{% endif %}
+/// {% if v.connect %}<input type="hidden" name="connect" value="1">{% endif %}
+/// <button class="btn">{{ b.label }}</button></form>{% endfor %}"#, ext = "html")]
+/// struct Mine<'a, 'b> { v: &'a ButtonsView<'b> }
+///
+/// struct Design;
+///
+/// impl Views for Design {
+///     fn buttons(&self, view: &ButtonsView<'_>) -> owt_web::Result<Body> {
+///         Body::render(&Mine { v: view })
+///     }
+/// }
+/// ```
+pub trait Views: Send + Sync + 'static {
+    /// One form per provider.
+    ///
+    /// # Errors
+    ///
+    /// When the app's template does not render.
+    fn buttons(&self, view: &ButtonsView<'_>) -> owt_web::Result<Body> {
+        Body::render(&ButtonsHtml { v: view })
+    }
+
+    /// The account's connections, each with a removal form, then a form connecting
+    /// each provider not yet connected.
+    ///
+    /// # Errors
+    ///
+    /// When the app's template does not render.
+    fn connections(&self, view: &ConnectionsView<'_>) -> owt_web::Result<Body> {
+        Body::render(&ConnectionsHtml { v: view })
+    }
+}
+
+/// The buttons and the connections table in `owt-*` classes from
+/// `tailwind/owt.css`: what [`SocialSignIn`] draws unless given other [`Views`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tailwind;
+
+impl Views for Tailwind {}
+
+/// The app's [`Views`], as [`Buttons`] and [`Connections`] carry them.
+#[derive(Clone)]
+struct Drawn(Arc<dyn Views>);
+
+impl fmt::Debug for Drawn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Views")
+    }
+}
+
+/// A provider's button.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Button {
+    /// Where its form posts.
+    pub action: String,
+    /// The provider's name: `Google`.
+    pub provider: &'static str,
+    /// What it says, in the page's words: `Continue with Google`.
+    pub label: String,
+}
+
+/// The sign-in buttons, or the connect buttons.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ButtonsView<'a> {
+    /// One per provider; none when no provider is configured.
+    pub buttons: Vec<Button>,
+    /// Where the sign-in lands, posted as `next` when not empty.
+    pub next: &'a str,
+    /// They connect a provider to the signed-in account: each form posts `connect=1`.
+    pub connect: bool,
+    /// The words the labels are written in ([`Buttons::words`]).
+    pub words: ButtonWords<'a>,
+}
+
+/// A connected identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Linked {
+    /// Where its removal form posts.
+    pub remove: String,
+    /// The provider's name.
+    pub provider: String,
+    /// The account at the provider, as it calls it: an email or a username, which its
+    /// owner chose.
+    pub label: String,
+}
+
+/// An account's connections and what it could still connect.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ConnectionsView<'a> {
+    /// The connections, by provider.
+    pub connections: Vec<Linked>,
+    /// A connect button per provider not yet connected (each posts `connect=1`).
+    pub buttons: Vec<Button>,
+    /// The words the table and the buttons are written in ([`Connections::words`]).
+    pub words: ConnectionWords<'a>,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"{% if !v.buttons.is_empty() %}<div class="owt-actions">{% for b in v.buttons %}<form method="post" action="{{ b.action }}">{% if !v.next.is_empty() %}<input type="hidden" name="next" value="{{ v.next }}">{% endif %}{% if v.connect %}<input type="hidden" name="connect" value="1">{% endif %}<button class="owt-button owt-button-secondary" type="submit">{{ b.label }}</button></form>{% endfor %}</div>
+{% endif %}"#,
+    ext = "html"
+)]
+struct ButtonsHtml<'a, 'b> {
+    v: &'a ButtonsView<'b>,
+}
+
+#[derive(Template)]
+#[template(
+    source = r#"{% if v.connections.is_empty() %}<p class="owt-hint">{{ v.words.none }}</p>
+{% else %}<table class="owt-table"><thead><tr><th scope="col">{{ v.words.provider }}</th><th scope="col">{{ v.words.account }}</th><th scope="col"><span class="owt-sr">{{ v.words.actions }}</span></th></tr></thead><tbody>
+{% for r in v.connections %}<tr><td>{{ r.provider }}</td><td>{{ r.label }}</td><td><form method="post" action="{{ r.remove }}"><button class="owt-button owt-button-quiet" type="submit">{{ v.words.remove }}</button></form></td></tr>
+{% endfor %}</tbody></table>
+{% endif %}{% if !v.buttons.is_empty() %}<div class="owt-actions">{% for b in v.buttons %}<form method="post" action="{{ b.action }}"><input type="hidden" name="connect" value="1"><button class="owt-button owt-button-secondary" type="submit">{{ b.label }}</button></form>{% endfor %}</div>
+{% endif %}"#,
+    ext = "html"
+)]
+struct ConnectionsHtml<'a, 'b> {
+    v: &'a ConnectionsView<'b>,
+}
+
+/// The buttons of `items`, labelled with `pattern`.
+fn labelled(items: &[ButtonItem], pattern: &str) -> Vec<Button> {
+    items
+        .iter()
+        .map(|b| Button {
+            action: b.action.clone(),
+            provider: b.name,
+            label: named(pattern, b.name),
+        })
+        .collect()
+}
+
+/// The sign-in buttons: `{{ buttons }}` on the sign-in page, drawn by the app's
+/// [`Views`] ([`Tailwind`]'s unless set):
 ///
 /// ```html
 /// <div class="owt-actions"><form method="post" action="/auth/google/start"><input type="hidden" name="next" value="/games"><button class="owt-button owt-button-secondary" type="submit">Continue with Google</button></form></div>
 /// ```
 #[derive(Template, Clone, Debug)]
-#[template(
-    source = r#"{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}">{% if !next.is_empty() %}<input type="hidden" name="next" value="{{ next }}">{% endif %}{% if connect %}<input type="hidden" name="connect" value="1">{% endif %}<button class="owt-button owt-button-secondary" type="submit">{% if connect %}{{ crate::social::named(words.connect, b.name) }}{% else %}{{ crate::social::named(words.continue_with, b.name) }}{% endif %}</button></form>{% endfor %}</div>
-{% endif %}"#,
-    ext = "html"
-)]
+#[template(source = "{{ self.drawn()? }}", ext = "html")]
 pub struct Buttons<'a> {
     items: Vec<ButtonItem>,
     next: &'a str,
     connect: bool,
     words: ButtonWords<'a>,
+    views: Drawn,
 }
 impl HtmlSafe for Buttons<'_> {}
 
@@ -796,6 +959,26 @@ impl<'a> Buttons<'a> {
     pub fn words(mut self, words: ButtonWords<'a>) -> Self {
         self.words = words;
         self
+    }
+
+    /// What the buttons show, for an app's own template.
+    #[must_use]
+    pub fn view(&self) -> ButtonsView<'a> {
+        let pattern = if self.connect {
+            self.words.connect
+        } else {
+            self.words.continue_with
+        };
+        ButtonsView {
+            buttons: labelled(&self.items, pattern),
+            next: self.next,
+            connect: self.connect,
+            words: self.words,
+        }
+    }
+
+    fn drawn(&self) -> owt_web::Result<Body> {
+        self.views.0.buttons(&self.view())
     }
 }
 
@@ -845,21 +1028,15 @@ impl Default for ConnectionWords<'_> {
 }
 
 /// An account's connections, each with a Remove button, then a Connect button per
-/// provider not yet connected: `{{ connections }}` on the settings page.
+/// provider not yet connected: `{{ connections }}` on the settings page, drawn by
+/// the app's [`Views`] ([`Tailwind`]'s unless set).
 #[derive(Template, Clone, Debug)]
-#[template(
-    source = r#"{% if rows.is_empty() %}<p class="owt-hint">{{ words.none }}</p>
-{% else %}<table class="owt-table"><thead><tr><th scope="col">{{ words.provider }}</th><th scope="col">{{ words.account }}</th><th scope="col"><span class="owt-sr">{{ words.actions }}</span></th></tr></thead><tbody>
-{% for r in rows %}<tr><td>{{ r.provider }}</td><td>{{ r.label }}</td><td><form method="post" action="{{ r.remove }}"><button class="owt-button owt-button-quiet" type="submit">{{ words.remove }}</button></form></td></tr>
-{% endfor %}</tbody></table>
-{% endif %}{% if !items.is_empty() %}<div class="owt-actions">{% for b in items %}<form method="post" action="{{ b.action }}"><input type="hidden" name="connect" value="1"><button class="owt-button owt-button-secondary" type="submit">{{ crate::social::named(words.connect, b.name) }}</button></form>{% endfor %}</div>
-{% endif %}"#,
-    ext = "html"
-)]
+#[template(source = "{{ self.drawn()? }}", ext = "html")]
 pub struct Connections<'a> {
     rows: Vec<ConnectionRow>,
     items: Vec<ButtonItem>,
     words: ConnectionWords<'a>,
+    views: Drawn,
 }
 impl HtmlSafe for Connections<'_> {}
 
@@ -869,6 +1046,28 @@ impl<'a> Connections<'a> {
     pub fn words(mut self, words: ConnectionWords<'a>) -> Self {
         self.words = words;
         self
+    }
+
+    /// What the table and the buttons show, for an app's own template.
+    #[must_use]
+    pub fn view(&self) -> ConnectionsView<'a> {
+        ConnectionsView {
+            connections: self
+                .rows
+                .iter()
+                .map(|r| Linked {
+                    remove: r.remove.clone(),
+                    provider: r.provider.clone(),
+                    label: r.label.clone(),
+                })
+                .collect(),
+            buttons: labelled(&self.items, self.words.connect),
+            words: self.words,
+        }
+    }
+
+    fn drawn(&self) -> owt_web::Result<Body> {
+        self.views.0.connections(&self.view())
     }
 }
 
@@ -1329,6 +1528,7 @@ mod tests {
             next: "",
             connect: false,
             words: ButtonWords::ENGLISH,
+            views: Drawn(Arc::new(Tailwind)),
         };
         assert!(
             english
@@ -1351,6 +1551,7 @@ mod tests {
             rows: Vec::new(),
             items: vec![item()],
             words: ConnectionWords::ENGLISH,
+            views: Drawn(Arc::new(Tailwind)),
         };
         let html = none.clone().render().unwrap();
         assert!(html.contains("No sign-in connections yet.") && html.contains(">Connect Google<"));
@@ -1382,6 +1583,65 @@ mod tests {
             assert!(html.contains(words), "{words}: {html}");
         }
         assert!(!html.contains("Remove") && !html.contains("Provider"));
+    }
+
+    #[test]
+    fn an_apps_views_draw_the_buttons_and_connections() {
+        struct Marked;
+        impl Views for Marked {
+            fn buttons(&self, view: &ButtonsView<'_>) -> owt_web::Result<Body> {
+                let b = &view.buttons[0];
+                Ok(Body(format!(
+                    "<b data-next=\"{}\">{} {} {}</b>",
+                    view.next, b.action, b.provider, b.label
+                )))
+            }
+        }
+        #[derive(Template)]
+        #[template(source = "<main>{{ b }}</main>", ext = "html")]
+        struct Page<'a> {
+            b: Buttons<'a>,
+        }
+        let item = ButtonItem {
+            action: "/auth/google/start".into(),
+            name: "Google",
+        };
+        let buttons = Buttons {
+            items: vec![item.clone()],
+            next: "/games",
+            connect: false,
+            words: ButtonWords::ENGLISH,
+            views: Drawn(Arc::new(Marked)),
+        };
+        assert_eq!(
+            buttons.render().unwrap(),
+            "<b data-next=\"/games\">/auth/google/start Google Continue with Google</b>"
+        );
+        // Embedded in an app's page, the body is not escaped again.
+        assert!(
+            Page { b: buttons }
+                .render()
+                .unwrap()
+                .starts_with("<main><b data-next")
+        );
+
+        // Connections the app does not draw stay Tailwind's, and a label is text.
+        let connections = Connections {
+            rows: vec![ConnectionRow {
+                remove: "/auth/connections/1/remove".into(),
+                provider: "Google".into(),
+                label: "<ada>".into(),
+            }],
+            items: vec![item],
+            words: ConnectionWords::ENGLISH,
+            views: Drawn(Arc::new(Marked)),
+        };
+        let view = connections.view();
+        assert_eq!(view.connections[0].label, "<ada>");
+        assert_eq!(view.buttons[0].label, "Connect Google");
+        let html = connections.render().unwrap();
+        assert!(html.contains("<td>&#60;ada&#62;</td>"), "{html}");
+        assert!(!html.contains("<ada>"), "{html}");
     }
 
     #[test]

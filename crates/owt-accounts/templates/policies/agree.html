@@ -1,19 +1,20 @@
 <section class="owt-document">
 <header>
-<h1>{% if self.first_time() %}Before you continue{% else %}We have updated our policies{% endif %}</h1>
-<p>Please read {% if docs.len() == 1 %}this{% else %}these{% endif %} and agree to continue.</p>
+<h1>{% if v.first_time %}{{ v.words.first_time }}{% else %}{{ v.words.updated }}{% endif %}</h1>
+<p>{% if v.asked.len() == 1 %}{{ v.words.read_one }}{% else %}{{ v.words.read_many }}{% endif %}</p>
 </header>
-{% if let Some(e) = error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
-{% endif %}{% for d in docs %}{% let v = d.version %}<section class="owt-section">
-<h2><a href="/{{ v.kind }}" target="_blank" rel="noopener">{{ v.title }}</a></h2>
-<p class="owt-hint">Version {{ v.number() }}, last updated {{ v.effective_date }}</p>
-{% if let Some(previous) = d.previous %}<p>You last agreed to <a href="/{{ v.kind }}/v/{{ previous }}" target="_blank" rel="noopener">version {{ previous }}</a>.</p>
-{% if !v.summary.is_empty() %}<p><strong>What changed:</strong> {{ v.summary }}</p>
+{% if let Some(e) = v.error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endif %}{% for a in v.asked %}<section class="owt-section">
+<h2><a href="{{ a.href }}" target="_blank" rel="noopener">{{ a.version.title }}</a></h2>
+<p class="owt-hint">{{ crate::policies::sentence(v.words.version_dated, crate::policies::numbered(v.words.version, a.version.number()), a.date.as_str()) }}</p>
+{% if let Some(p) = a.previous %}{% let (before, after) = crate::policies::around(v.words.last_agreed, p.date.as_str()) %}<p>{{ before }}<a href="{{ p.href }}" target="_blank" rel="noopener">{{ crate::policies::numbered(v.words.version_in_sentence, p.number) }}</a>{{ after }}</p>
+{% if !a.version.summary.is_empty() %}<p><strong>{{ v.words.what_changed }}</strong> {{ a.version.summary }}</p>
 {% endif %}{% endif %}</section>
-{% endfor %}<form class="owt-form" method="post" action="{{ action }}">
-<input type="hidden" name="next" value="{{ next }}">
-{% for d in docs %}<input type="hidden" name="version" value="{{ d.version.id }}">
-{% endfor %}<label class="owt-check"><input type="checkbox" name="agree" value="yes" required><span>{{ agreement }}</span></label>
-<div class="owt-actions"><button class="owt-button" type="submit">Agree and continue</button></div>
+{% endfor %}<form class="owt-form" method="post" action="{{ v.action }}">
+<input type="hidden" name="next" value="{{ v.next }}">
+{% for a in v.asked %}<input type="hidden" name="version" value="{{ a.version.id }}">
+{% endfor %}<label class="owt-check"><input type="checkbox" name="agree" value="yes" required><span>{{ v.agreement }}</span></label>
+<div class="owt-actions"><button class="owt-button" type="submit">{{ v.words.agree }}</button></div>
 </form>
-</section>
+{% if let Some(out) = v.sign_out %}<form method="post" action="{{ out }}"><button class="owt-button owt-button-quiet" type="submit">{{ v.words.sign_out }}</button></form>
+{% endif %}</section>

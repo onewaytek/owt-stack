@@ -1280,9 +1280,11 @@ layout as for the admin. The tables come from `0004_owt_accounts_policies.sql`
   An older version stays on record (at `/{slug}/v/{n}`) while it is somebody's
   latest acceptance. `policies::prune` removes the rest; run it on a schedule, or
   from the staff pages.
-- **Where:** each document at `/{slug}`, the page that asks at `/agree`
-  (`agree_at`), and the staff pages wherever `admin` puts them. They carry only
-  `owt-*` classes and refuse a cross-origin `POST` themselves.
+- **Where:** each document at `/{slug}` (or below a prefix, `documents_at`), the
+  page that asks at `/agree` (`agree_at`), and the staff pages wherever `admin`
+  puts them. They carry only `owt-*` classes and refuse a cross-origin `POST`
+  themselves. With `sign_out`, the page that asks also offers a button posting to the
+  app's sign-out route, for someone who would rather not agree.
 
 ```rust,no_run
 # fn demo(pool: sqlx::PgPool, accounts: owt_accounts::Accounts) {
@@ -1337,6 +1339,46 @@ let removed = policies::prune(&pool).await?; // nightly: versions nobody holds
 Each replica keeps the current versions for 30 seconds (`refresh`). A version
 published from the staff pages is asked for at once on that replica, and on others
 within that time.
+
+**Their words and markup** are the app's to give. `policies::Words` holds every word of
+the pages everyone reads (a document and the page that asks), English unless the app
+passes its own to `words`, built from `Words::ENGLISH` with struct update syntax; a
+sentence's `{n}`, `{date}` and `{version}` go wherever the language puts them, and a
+linked `{version}` stays a link. `dates` formats the `YYYY-MM-DD` dates those pages
+show. An app with a design of its own implements `policies::Views`: each method
+(`document`, `agree`, `admin_list`, `admin_form`) gets the page's view model, with
+its URLs worked out and its words, and answers the body its `Chrome` wraps. The
+methods default to the Tailwind pages (`policies::Tailwind`), so it overrides only
+what it draws, and the staff pages stay in English unless it draws them. With the
+`test-util` feature, each view model has an `example()` for the app's tests of its
+templates.
+
+```rust,no_run
+# fn demo(policies: owt_accounts::policies::Policies) {
+use axum::http::request::Parts;
+use owt_accounts::admin::Body;
+use owt_accounts::policies::{DocumentView, Views, Words};
+
+#[derive(askama::Template)]
+#[template(source = r#"<article class="prose"><h1>{{ v.version.title }}</h1>
+<p>{{ v.date }}</p>{{ v.body }}</article>"#, ext = "html")]
+struct Doc<'a, 'b> { v: &'a DocumentView<'b> }
+
+struct Mine;
+impl Views for Mine {
+    fn document(&self, _: &Parts, view: &DocumentView<'_>) -> owt_web::Result<Body> {
+        Body::render(&Doc { v: view }) // an .html template: it escapes the title
+    }
+}
+
+let _policies = policies
+    .views(Mine)
+    .documents_at("/legal") // /legal/terms, /legal/terms/v/2
+    .sign_out("/logout") // "Sign out instead" on the page that asks
+    .words(Words { agree: "Accepter et continuer", ..Words::ENGLISH })
+    .dates(|d: &str| d.split('-').rev().collect::<Vec<_>>().join("/")); // 01/10/2026
+# }
+```
 
 ### Sign-in with a provider
 
@@ -1582,6 +1624,37 @@ fn mensaje(code: &str) -> Option<&'static str> {
 }
 let _missing: Vec<_> = CODES.iter().filter(|c| mensaje(c).is_none()).collect();
 # Ok(()) }
+```
+
+**An app with a design of its own** draws the buttons and the table itself:
+`SocialSignIn::views` takes a `social::Views` whose `buttons` and `connections`
+answer from a view model (`ButtonsView`, `ConnectionsView`: each form's action, the
+provider's name, its label in the page's words, `next`, whether it connects), and
+`{{ buttons }}` and `{{ connections }}` then print the app's markup. Both default to
+the Tailwind forms (`social::Tailwind`). `Buttons::view` and `Connections::view`
+hand the same view model to a template that draws them in place. Either way the
+routes check what is posted.
+
+```rust,no_run
+# fn demo(social: owt_accounts::social::SocialSignIn) {
+use owt_accounts::admin::Body;
+use owt_accounts::social::{ButtonsView, Views};
+
+#[derive(askama::Template)]
+#[template(source = r#"{% for b in v.buttons %}<form method="post" action="{{ b.action }}">
+{% if !v.next.is_empty() %}<input type="hidden" name="next" value="{{ v.next }}">{% endif %}
+<button class="btn btn-{{ b.provider|lower }}">{{ b.label }}</button></form>{% endfor %}"#, ext = "html")]
+struct Providers<'a, 'b> { v: &'a ButtonsView<'b> }
+
+struct Mine;
+impl Views for Mine {
+    fn buttons(&self, view: &ButtonsView<'_>) -> owt_web::Result<Body> {
+        Body::render(&Providers { v: view })
+    }
+}
+let social = social.views(Mine);
+let _sign_in = social.buttons("/games"); // `{{ buttons }}` draws Mine's forms
+# }
 ```
 
 **The app's own code at each arrival:** `on_arrival` runs after the account is found
