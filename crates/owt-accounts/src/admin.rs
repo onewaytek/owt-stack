@@ -664,7 +664,11 @@ impl Notice {
             "unlinked" => {
                 Self::success("Sign-in connection removed, and the account signed out everywhere.")
             }
-            "last-way-in" => Self::error(Refused::LastWayIn.to_string()),
+            // Its own words: staff read this about someone else's account, and a
+            // password is refused while password sign-in is off.
+            "last-way-in" => Self::error(
+                "That is this account's only way in, so it cannot be removed. Set a password (with password sign-in on), or add a connection first.",
+            ),
             "password-sign-in-on" => Self::success(
                 "Password sign-in is on. The account has no password until one is set.",
             ),
