@@ -46,6 +46,14 @@ parameters:
   - name: PORT
     description: The port the binary listens on.
     value: "8000"
+  # How long the router waits for the app's response (haproxy's server timeout): 30s
+  # is the router's own default unless the cluster's IngressController sets another.
+  # Longer for a slow export or upload; an SSE stream sends something more often than
+  # this. A number without a unit is milliseconds, and a value the router does not
+  # parse is ignored without a word, so give the unit (apply.sh refuses one without).
+  - name: ROUTE_TIMEOUT
+    description: The Route's haproxy.router.openshift.io/timeout, with its unit (30s, 2m).
+    value: 30s
   - name: REPLICAS
     value: "1"
   # The default is for a new app. An app whose cluster already exists passes the
@@ -262,6 +270,7 @@ objects:
         # The router's own HSTS, so responses the app never sees (the router's 503
         # page) carry it too. Matches owt_web::headers::HSTS.
         haproxy.router.openshift.io/hsts_header: max-age=31536000
+        haproxy.router.openshift.io/timeout: ${ROUTE_TIMEOUT}
     spec:
       # No host: the router assigns <name>-<namespace>.<apps domain>.
       to: {kind: Service, name: "${NAME}"}

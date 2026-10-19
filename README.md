@@ -2852,8 +2852,19 @@ the pod for reuse longer than the app's default 30-second keep-alive (its
 "Wiring an app" does, or requests on a connection the app has just closed fail with
 an occasional 502. Each rollout also cuts the app's SSE streams after the 20-second
 drain; their clients reconnect to the new pods ("Bounds" under "Wiring an app").
-The router also cuts a response that sends nothing for 30 s (its `timeout server`),
-so a quiet SSE stream sends `sse::HEARTBEAT` more often than that.
+The router also cuts a response that sends nothing for `ROUTE_TIMEOUT` (its
+`timeout server`, set by the Route's `haproxy.router.openshift.io/timeout`; default
+`30s`, the router's own), so a quiet SSE stream sends `sse::HEARTBEAT` more often
+than that. An app with a slow export or upload sets a longer one in `params.env`
+(`ROUTE_TIMEOUT=2m`, always with a unit, `us`, `ms`, `s`, `m`, `h` or `d`: the router
+reads a bare number as milliseconds and ignores, without a word, a value it cannot
+parse, so `apply.sh` refuses one without a unit) rather than annotating the Route by
+hand, outside the template. The first apply after copying the template sets the
+annotation: an app that annotated its Route by hand puts that value in `params.env`
+first, or the diff shows it reset to `30s`; and on a cluster whose IngressController
+sets `tuningOptions.serverTimeout`, `30s` replaces that default for this Route, so
+pass the cluster's value ("Upgrading from 0.8"). (An upgraded WebSocket answers to
+the router's `timeout tunnel` instead, an hour by default.)
 
 **Backups come with it.** The database takes a volume snapshot nightly
 (`BACKUP_SCHEDULE`, CNPG's six-field cron, seconds first) and once at first apply.
@@ -3131,6 +3142,15 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+
+## Upgrading from 0.8
+
+- `app.yaml` sets the Route's `haproxy.router.openshift.io/timeout` from
+  `ROUTE_TIMEOUT` (default `30s`). Before the first apply with the new template, copy
+  any timeout the live Route carries into `params.env`, or the apply resets it:
+  `oc get route myapp -o jsonpath='{.metadata.annotations.haproxy\.router\.openshift\.io/timeout}'`
+  prints it (nothing when unset). On a cluster whose IngressController sets
+  `tuningOptions.serverTimeout`, pass that value instead of taking the default.
 
 ## Upgrading from 0.7
 
