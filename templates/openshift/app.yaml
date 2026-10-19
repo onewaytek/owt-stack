@@ -86,6 +86,11 @@ parameters:
     value: lvms-vg1
   - name: MEMORY_LIMIT
     value: 512Mi
+  # The log filter. It is set here, so it wins over a RUST_LOG in <name>-env: an app
+  # keeps a narrower one (info,myapp=debug,sqlx=warn) in params.env.
+  - name: RUST_LOG
+    description: The log filter (info, or info,myapp=debug); never empty.
+    value: info
   - name: METRICS_NAMESPACE
     description: The namespace whose Prometheus scrapes the metrics port.
     value: openshift-user-workload-monitoring
@@ -211,7 +216,7 @@ objects:
                 - name: REDIS_URL
                   valueFrom:
                     secretKeyRef: {name: "${NAME}-redis", key: url, optional: true}
-                - {name: RUST_LOG, value: "info"}
+                - {name: RUST_LOG, value: "${RUST_LOG}"}
               volumeMounts:
                 - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
                 - {name: tmp, mountPath: /tmp}

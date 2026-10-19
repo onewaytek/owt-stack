@@ -24,7 +24,8 @@
 # (`oc process --parameters` says which), so one file holds the whole deploy's
 # configuration, and the apply that upgrades Postgres in place cannot mistype it. A
 # name two templates declare means one thing in both (NAME, NAMESPACE, CHANNEL,
-# DB_SUFFIX); a job's own MEMORY_LIMIT goes in its jobs/<JOB>.env:
+# DB_SUFFIX, RUST_LOG); a job's own MEMORY_LIMIT or RUST_LOG goes in its
+# jobs/<JOB>.env:
 #
 #   app.yaml         always
 #   redis.yaml       when present

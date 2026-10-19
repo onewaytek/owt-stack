@@ -2738,7 +2738,10 @@ oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
 **The app's environment** (`SESSION_SECRET`, a provider's credentials, its own
 tuning) lives in a Secret named `myapp-env`, which the Deployment reads whole. It is
 optional: until it exists, the app starts without it. A variable the template sets
-(`DATABASE_URL`, `PGSSLMODE`, `BIND_ADDR`, `RUST_LOG`, …) wins over the Secret's. A
+(`DATABASE_URL`, `PGSSLMODE`, `BIND_ADDR`, `RUST_LOG`, …) wins over the Secret's;
+`RUST_LOG` is the template's `RUST_LOG` parameter (default `info`), so a narrower
+filter goes in `params.env` (`RUST_LOG=info,myapp=debug`), or in a task's
+`jobs/<JOB>.env` for that task alone. A
 Secret's change reaches pods only when they start, so restart after one:
 
 ```sh
