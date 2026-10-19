@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.8.1](https://github.com/onewaytek/owt-stack/compare/v0.8.0...v0.8.1) (2026-10-19)
+
+
+### Features
+
+* **runtime:** PoolConfig::connect retries an unreachable database for a minute ([#187](https://github.com/onewaytek/owt-stack/issues/187)) ([0863746](https://github.com/onewaytek/owt-stack/commit/0863746b1cab202cf437ae06ecd5588bf0dc27d0))
+* **templates:** RUST_LOG is a parameter of app.yaml and cronjob.yaml ([#181](https://github.com/onewaytek/owt-stack/issues/181)) ([b1c2605](https://github.com/onewaytek/owt-stack/commit/b1c2605a4891f769f5b16833fdb9e2a65d779270))
+* **templates:** the Route's timeout is a parameter of app.yaml ([#182](https://github.com/onewaytek/owt-stack/issues/182)) ([acb0b1e](https://github.com/onewaytek/owt-stack/commit/acb0b1e52d7a02beca78f0aed8c7db0aa5aa1b36))
+* **test:** owt_test::Client::get_page loads a page as a browser does ([#188](https://github.com/onewaytek/owt-stack/issues/188)) ([2ab36bd](https://github.com/onewaytek/owt-stack/commit/2ab36bd318511789b02dcc43f1ed7bcdd8e22c3b))
+* **web:** ClientIp accepts MockConnectInfo, and owt_test::Client supplies a peer ([#186](https://github.com/onewaytek/owt-stack/issues/186)) ([8738334](https://github.com/onewaytek/owt-stack/commit/8738334eca5ebdecd28d924d74b1982a05f5af8e)), closes [#157](https://github.com/onewaytek/owt-stack/issues/157)
+* **web:** ClientIp logs at debug how it chose an address ([#185](https://github.com/onewaytek/owt-stack/issues/185)) ([7588508](https://github.com/onewaytek/owt-stack/commit/7588508296f946aab01532a45dada37c77e6b826)), closes [#160](https://github.com/onewaytek/owt-stack/issues/160)
+* **web:** Sessions::from_env keeps a key purpose of any shape ([#184](https://github.com/onewaytek/owt-stack/issues/184)) ([464b25e](https://github.com/onewaytek/owt-stack/commit/464b25e3ebb7a2b3792b3526b7adc5c6094f0f27)), closes [#155](https://github.com/onewaytek/owt-stack/issues/155)
+
+
+### Bug Fixes
+
+* **ci:** a commit subject may start with an upper-case code identifier ([#176](https://github.com/onewaytek/owt-stack/issues/176)) ([9a6a33a](https://github.com/onewaytek/owt-stack/commit/9a6a33a343ac798825e149924b506c6377dab626)), closes [#162](https://github.com/onewaytek/owt-stack/issues/162)
+* **ci:** requeue-rc compares the run's attempt as well as its status ([#179](https://github.com/onewaytek/owt-stack/issues/179)) ([8a09a28](https://github.com/onewaytek/owt-stack/commit/8a09a28fd20916e95f591c9eafaae29ac0f17b6f)), closes [#120](https://github.com/onewaytek/owt-stack/issues/120)
+* **templates:** dependabot ignores the stylesheet's git-tag dependency ([#174](https://github.com/onewaytek/owt-stack/issues/174)) ([6587e10](https://github.com/onewaytek/owt-stack/commit/6587e100c2c9cb67bb2666b130cad97fd28ffa08)), closes [#164](https://github.com/onewaytek/owt-stack/issues/164)
+* **templates:** redis.yaml's egress policy omits the empty egress list ([#178](https://github.com/onewaytek/owt-stack/issues/178)) ([8fea82b](https://github.com/onewaytek/owt-stack/commit/8fea82bfecc46a906d23b1591ff721a0321d7f27)), closes [#177](https://github.com/onewaytek/owt-stack/issues/177)
+* **templates:** the template's check migrates before anything compiles queries ([#175](https://github.com/onewaytek/owt-stack/issues/175)) ([3f1b156](https://github.com/onewaytek/owt-stack/commit/3f1b1560f26023adf1408c3c170d9ed0bf879b3c)), closes [#156](https://github.com/onewaytek/owt-stack/issues/156)
+
 ## [0.8.0](https://github.com/onewaytek/owt-stack/compare/v0.7.0...v0.8.0) (2026-10-19)
 
 
