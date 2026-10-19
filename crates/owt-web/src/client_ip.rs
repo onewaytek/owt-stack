@@ -27,8 +27,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use axum::extract::{ConnectInfo, FromRequestParts};
-use axum::http::HeaderMap;
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue};
 
 /// Where the client's address is. A source may be added without a breaking release (the
 /// `Forwarded` header, say), so a `match` on it ends with a `_` arm.
@@ -133,6 +133,15 @@ impl Source {
         Ok(Self::Peer)
     }
 
+    /// The header values this source reads, in order: none for the peer.
+    fn weighed<'h>(&self, headers: &'h HeaderMap) -> Vec<&'h HeaderValue> {
+        match self {
+            Self::Peer => Vec::new(),
+            Self::Header(name) => headers.get_all(name.as_str()).iter().collect(),
+            Self::ForwardedFor { .. } => headers.get_all("x-forwarded-for").iter().collect(),
+        }
+    }
+
     /// The client's address for a request with these headers from this peer.
     #[must_use]
     pub fn client_ip(&self, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
@@ -175,6 +184,11 @@ pub struct ClientIp(pub IpAddr);
 impl ClientIp {
     /// The client's address for `parts`, as the extractor reads it; `None` when it
     /// cannot say (no peer, and no header the source believes).
+    ///
+    /// Each call logs a `debug` event (target `owt_web::client_ip`) naming the source,
+    /// the header values it weighed, the peer and the address chosen: what an app
+    /// confirms its `CLIENT_IP` setting against real proxies with. The values are the
+    /// client's to forge, so they appear quoted, and only at `debug`.
     #[must_use]
     pub fn of(parts: &Parts) -> Option<IpAddr> {
         let peer = parts
@@ -185,11 +199,19 @@ impl ClientIp {
         // A stand-in peer no header parses to tells "the header answered" apart.
         let unspecified = IpAddr::from([0, 0, 0, 0]);
         let found = source.client_ip(&parts.headers, peer.unwrap_or(unspecified));
-        if found == unspecified {
+        let chosen = if found == unspecified {
             peer
         } else {
             Some(found)
-        }
+        };
+        tracing::debug!(
+            source = %source,
+            weighed = ?source.weighed(&parts.headers),
+            peer = ?peer,
+            chosen = ?chosen,
+            "client address"
+        );
+        chosen
     }
 }
 
@@ -210,8 +232,6 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
-
     use super::*;
 
     const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 128, 0, 2));
@@ -384,5 +404,42 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(e, crate::Error::Internal(_)), "{e:?}");
+    }
+
+    #[test]
+    fn the_choice_is_logged_at_debug() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let p = parts(
+                Some(Source::ForwardedFor { proxies: 1 }),
+                Some(PEER),
+                &["1.1.1.1, 203.0.113.9", "198.51.100.7"],
+            );
+            assert_eq!(ClientIp::of(&p), Some(ip("198.51.100.7")));
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("DEBUG"), "{out}");
+        assert!(out.contains("source=forwarded-for:1"), "{out}");
+        assert!(out.contains("1.1.1.1, 203.0.113.9"), "{out}");
+        assert!(out.contains(&format!("peer=Some({PEER})")), "{out}");
+        assert!(out.contains("chosen=Some(198.51.100.7)"), "{out}");
     }
 }
