@@ -376,7 +376,7 @@ jobs:
             fi
             # A symlink would let one entry write through another; the push job refuses
             # them, so say which here.
-            links_in="$(find "$f" -type l -print)"
+            links_in="$(find "$f" \( -name .git -o -name node_modules -o -name target \) -prune -o -type l -print)"
             if [ -n "$links_in" ]; then
               echo "::error::files: symlinks are not packed (copy the file instead): $links_in"; exit 1
             fi
@@ -532,7 +532,9 @@ jobs:
           # symlink its target. A name holding " -> " would confuse the split, so names
           # are read again on their own and must match.
           mapfile -t names < <(tar -tf "$layer")
-          mapfile -t lines < <(tar --numeric-owner -tvf "$layer")
+          # With extended attributes and ACLs shown: an entry carrying either (a file
+          # capability is a setuid of its own) lists with a `*` or `+` after its mode.
+          mapfile -t lines < <(tar --xattrs --xattrs-include='*' --acls --numeric-owner -tvf "$layer")
           [ "${#names[@]}" = "${#lines[@]}" ] || fail "unreadable listing"
           declare -A seen=()
           for i in "${!names[@]}"; do
@@ -544,6 +546,9 @@ jobs:
               fail "'$name' is not a plain relative path"; continue
             fi
             # A symlink's own mode means nothing (it is always 0777).
+            if [[ "$perms" == *[*+] ]]; then
+              fail "'$name' carries extended attributes or ACLs ($perms)"
+            fi
             if [[ "$perms" =~ [sStT] ]] || { [ "$type" != l ] && [[ "${perms:5:1}${perms:8:1}" == *w* ]]; }; then
               fail "'$name' has setuid, setgid, sticky or group/other write ($perms)"
             fi
