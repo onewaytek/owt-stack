@@ -207,8 +207,8 @@ impl ClientIp {
         tracing::debug!(
             source = %source,
             weighed = ?source.weighed(&parts.headers),
-            peer = ?peer,
-            chosen = ?chosen,
+            peer = peer.map(tracing::field::display),
+            chosen = chosen.map(tracing::field::display),
             "client address"
         );
         chosen
@@ -431,15 +431,19 @@ mod tests {
             let p = parts(
                 Some(Source::ForwardedFor { proxies: 1 }),
                 Some(PEER),
-                &["1.1.1.1, 203.0.113.9", "198.51.100.7"],
+                &["1.1.1.1, \"x\", 203.0.113.9", "198.51.100.7"],
             );
             assert_eq!(ClientIp::of(&p), Some(ip("198.51.100.7")));
         });
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert!(out.contains("DEBUG"), "{out}");
         assert!(out.contains("source=forwarded-for:1"), "{out}");
-        assert!(out.contains("1.1.1.1, 203.0.113.9"), "{out}");
-        assert!(out.contains(&format!("peer=Some({PEER})")), "{out}");
-        assert!(out.contains("chosen=Some(198.51.100.7)"), "{out}");
+        // Quoted, with the client's own quote escaped: a value cannot pass for a field.
+        assert!(
+            out.contains(r#"["1.1.1.1, \"x\", 203.0.113.9", "198.51.100.7"]"#),
+            "{out}"
+        );
+        assert!(out.contains(&format!("peer={PEER}")), "{out}");
+        assert!(out.contains("chosen=198.51.100.7"), "{out}");
     }
 }
