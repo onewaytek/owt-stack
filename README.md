@@ -3118,11 +3118,12 @@ grep -A3 '"node_modules/@onewaytek/owt-stack"' package-lock.json   # resolved: â
 ```
 
 Editing the tag in `package.json` and running `npm install` keeps the old commit in
-`package-lock.json`, and so does `npm install -D github:onewaytek/owt-stack#vX.Y.Z`
-when the package is already locked: the stylesheet stays at the old release while
-the manifest names the new one. The lock's `resolved` URL ends in the commit that
-was installed; check it against the tag's (`git ls-remote
-https://github.com/onewaytek/owt-stack vX.Y.Z`).
+`package-lock.json`: the stylesheet stays at the old release while the manifest names
+the new one. An app has also seen the unnamed form (`npm install -D
+github:onewaytek/owt-stack#vX.Y.Z`) leave a locked dependency where it was, so name
+the package, and check either way: the lock's `resolved` URL ends in the commit that
+was installed, to compare with the tag's (`git ls-remote
+https://github.com/onewaytek/owt-stack vX.Y.Z`; for an annotated tag, the `^{}` line).
 Dependabot leaves this dependency alone (`templates/dependabot.yml` ignores it), so
 this command, run when the app adopts a release, is the only thing that moves it.
 
