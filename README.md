@@ -2716,16 +2716,20 @@ entry, which wins over the Secret, still sets the value. Take the steps in this
 order, so that no pod starts without a value:
 
 ```sh
-oc set env deployment/myapp --list          # 1. the patched entries, as they stand
-oc create secret generic myapp-env \        # 2. the Secret, from those values: only
-  --from-literal=SESSION_SECRET='…' \       #    the app's own, never one the template
-  --from-literal=PUBLIC_BASE_URL='…'        #    sets (DATABASE_URL, RUST_LOG, …)
-deploy/openshift/apply.sh --apply           # 3. envFrom on the live Deployment; the
-                                            #    explicit entries still win: no change
-oc set env deployment/myapp \               # 4. every moved entry off, in one command:
-  SESSION_SECRET- PUBLIC_BASE_URL-          #    one rollout, after which the Secret answers
-oc set env deployment/myapp --list          # 5. only the template's entries are left
-deploy/openshift/apply.sh                   # 6. and the diff is clean
+# 1. The patched entries, as they stand.
+oc set env deployment/myapp --list
+# 2. The Secret, from those values: only the app's own, never one the template sets
+#    (DATABASE_URL, RUST_LOG, ...).
+oc create secret generic myapp-env \
+  --from-literal=SESSION_SECRET='...' \
+  --from-literal=PUBLIC_BASE_URL='...'
+# 3. envFrom on the live Deployment. The explicit entries still win: no value changes.
+deploy/openshift/apply.sh --apply
+# 4. Every moved entry off, in one command: one rollout, after which the Secret answers.
+oc set env deployment/myapp SESSION_SECRET- PUBLIC_BASE_URL-
+# 5. Only the template's entries are left, and the diff is clean.
+oc set env deployment/myapp --list
+deploy/openshift/apply.sh
 ```
 
 Step 3 rolls the pods once and step 4 once more; `oc rollout pause deployment/myapp`
