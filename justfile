@@ -11,7 +11,7 @@ default:
 # when REDIS_URL is set.
 #
 # Everything that must pass before a commit.
-check: fmt lint features test audit templates
+check: fmt lint features test audit templates ci-config
 
 # Formatting, checked rather than applied.
 fmt:
@@ -38,3 +38,8 @@ audit:
 # The deploy script against a stand-in `oc` (bash only; no cluster, no Rust).
 templates:
     bash templates/openshift/apply-test.sh
+
+# The commitlint rules conventional-commits.yml writes for an app without its own are
+# commitlint.config.mjs, byte for byte.
+ci-config:
+    diff -u commitlint.config.mjs <(sed -n "/<<'JS'$/,/^ *JS$/p" .github/workflows/conventional-commits.yml | sed '1d;$d' | sed 's/^          //')
