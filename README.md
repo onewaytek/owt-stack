@@ -625,6 +625,10 @@ an `Extension`, serve with `into_make_service_with_connect_info::<SocketAddr>()`
 a handler takes `ClientIp`; without the peer and a header to read, it answers 500
 rather than key every client alike. `Policies::client_ip` takes its own copy: pass
 it the same source (`.client_ip(source.clone())`), so the two never disagree.
+To confirm a setting against the real proxies, raise the filter to
+`RUST_LOG=info,owt_web::client_ip=debug`: each extraction logs the source, the header
+values it weighed (quoted, being the client's to forge), the peer and the address
+chosen.
 
 ```rust,no_run
 # async fn demo() -> anyhow::Result<()> {
