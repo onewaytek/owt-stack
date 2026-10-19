@@ -3,6 +3,15 @@
 ## [0.8.1](https://github.com/onewaytek/owt-stack/compare/v0.8.0...v0.8.1) (2026-10-19)
 
 
+### Behaviour changes
+
+Nothing an app must change, but three things behave differently:
+
+* **runtime:** `PoolConfig::connect` waits for an unreachable database instead of failing at once: it retries network errors, a timed-out attempt and Postgres starting or stopping, with backoff, for `db::STARTUP_PATIENCE` (60 s; about two minutes in the worst case with `acquire_timeout`), inside the template's five-minute startup probe. A refused password, a missing database or a certificate that does not verify still fails at once. `PoolConfig::connect_within(url, Duration::ZERO)` keeps the single attempt.
+* **test:** `owt_test::Client` sends every request from a fixed peer, `owt_test::PEER` (192.0.2.1:40000), as axum's `MockConnectInfo`. A handler taking `ConnectInfo<SocketAddr>` or `ClientIp` that answered 500 under the client now answers; a test that asserted that 500 uses `Client::with_peer(None)`. A router's own `MockConnectInfo` or `Extension(ConnectInfo(..))` layer still decides.
+* **templates:** the first apply of the new `app.yaml` sets the Route's `haproxy.router.openshift.io/timeout` to `ROUTE_TIMEOUT` (default `30s`): copy a timeout set on the Route by hand into `params.env` first, with its unit (`apply.sh` refuses one without). An app that copies the template `justfile` takes its `migrate` recipe, which refuses a shared `postgres` or `template1` database outside CI.
+
+
 ### Features
 
 * **runtime:** PoolConfig::connect retries an unreachable database for a minute ([#187](https://github.com/onewaytek/owt-stack/issues/187)) ([0863746](https://github.com/onewaytek/owt-stack/commit/0863746b1cab202cf437ae06ecd5588bf0dc27d0))
