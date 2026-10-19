@@ -2713,6 +2713,33 @@ oc set data secret/myapp-env PUBLIC_BASE_URL=https://myapp.example   # later cha
 oc rollout restart deployment/myapp
 ```
 
+**Moving from `oc set env` to `myapp-env`.** An entry added to the Deployment with
+`oc set env` lives outside the template, and `apply.sh` applies client-side, so the
+entry is in neither its diff nor its apply: the diff comes out clean while the stale
+entry, which wins over the Secret, still sets the value. Take the steps in this
+order, so that no pod starts without a value:
+
+```sh
+# 1. The patched entries, as they stand.
+oc set env deployment/myapp --list
+# 2. The Secret, from those values: only the app's own, never one the template sets
+#    (DATABASE_URL, RUST_LOG, ...).
+oc create secret generic myapp-env \
+  --from-literal=SESSION_SECRET='...' \
+  --from-literal=PUBLIC_BASE_URL='...'
+# 3. envFrom on the live Deployment. The explicit entries still win: no value changes.
+deploy/openshift/apply.sh --apply
+# 4. Every moved entry off, in one command: one rollout, after which the Secret answers.
+oc set env deployment/myapp SESSION_SECRET- PUBLIC_BASE_URL-
+# 5. Only the template's entries are left, and the diff is clean.
+oc set env deployment/myapp --list
+deploy/openshift/apply.sh
+```
+
+Step 3 rolls the pods once and step 4 once more; `oc rollout pause deployment/myapp`
+before step 3 and `oc rollout resume deployment/myapp` after step 4 make them one.
+Removing the entries before step 3 starts pods with neither.
+
 **Redis** is a template of its own, for an app that uses the cache, the bus across
 replicas or leases. It runs as compose does: nothing on disk, `MAXMEMORY` (128mb)
 with `MAXMEMORY_POLICY` (`allkeys-lru`), one pod replaced rather than surged so the
@@ -3209,7 +3236,9 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - The OpenShift template's Deployment reads `myapp-env` whole and `REDIS_URL` from
   `myapp-redis`'s `url`, each only if it exists, so the next apply rolls the pods once
   and changes nothing else. An app whose environment was patched onto the Deployment
-  (`oc set env`) moves it into `myapp-env`, and its hand-made Redis and CronJobs onto
+  (`oc set env`) moves it into `myapp-env` in the order "Moving from `oc set env` to
+  `myapp-env`" gives (the Secret, then the apply, then the entries off: an entry left
+  behind silently wins over the Secret), and its hand-made Redis and CronJobs onto
   `redis.yaml` and `cronjob.yaml` ("Commands, CI, releases and deployment"). Check
   first that no Secret of either name already holds something else.
 
