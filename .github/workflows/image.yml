@@ -24,8 +24,8 @@ name: Image
 #   Dockerfile. The `build` job compiles the binary in a Rust job container (through
 #   sccache when the app passes SCCACHE_REDIS_PASSWORD), builds the static assets
 #   with npm, and packs one layer: /usr/local/bin/server (root, 0755), any names
-#   linked to it, the work directory (root, 0755) and the listed files under it
-#   (owned by `files-owner`). That job runs the app's code (build scripts, npm
+#   linked to it, the work directory (0755, owned by `workdir-owner`) and the listed
+#   files under it (owned by `files-owner`). That job runs the app's code (build scripts, npm
 #   scripts) and holds only a read token. The `push` job runs none of the app's code:
 #   it checks the layer (only those paths; files, directories and symlinks; no setuid,
 #   setgid or sticky bit), checks the base image (the tools operations rely on, and a
@@ -124,6 +124,12 @@ on:
         description: The work directory (WORKDIR).
         type: string
         default: /app
+      workdir-owner:
+        description: >-
+          uid:gid of the work directory itself. A Dockerfile's WORKDIR makes it as the
+          user current at that line, which in the template is core-runtime's 65532.
+        type: string
+        default: "65532:65532"
       user:
         description: The user the image runs as (USER).
         type: string
@@ -306,31 +312,33 @@ jobs:
           FILES: ${{ inputs.files }}
           OWNER: ${{ inputs.files-owner }}
           WORKDIR: ${{ inputs.workdir }}
+          WORKDIR_OWNER: ${{ inputs.workdir-owner }}
         shell: bash
         run: |
           set -euo pipefail
           if ! [[ "$WORKDIR" =~ ^(/[A-Za-z0-9._-]+)+$ ]] || [[ "$WORKDIR" =~ (^|/)\.\.?(/|$) ]]; then
             echo "::error::workdir must be an absolute path without . or .. ('$WORKDIR')"; exit 1
           fi
-          if ! [[ "$OWNER" =~ ^[0-9]+:[0-9]+$ ]]; then
-            echo "::error::files-owner must be a numeric uid:gid ('$OWNER')"; exit 1
-          fi
+          for o in "$OWNER" "$WORKDIR_OWNER"; do
+            if ! [[ "$o" =~ ^[0-9]+:[0-9]+$ ]]; then
+              echo "::error::files-owner and workdir-owner are numeric uid:gid ('$o')"; exit 1
+            fi
+          done
           wd="${WORKDIR#/}"
           stage="$RUNNER_TEMP/image-root"
           out="$RUNNER_TEMP/image-layer"
           rm -rf "$stage" "$out"
           mkdir -p "$stage/usr/local/bin" "$stage/$wd" "$out"
           install -m 0755 "target/release/$BIN" "$stage/usr/local/bin/server"
-          entries=(usr/local/bin/server)
+          links=()
           for l in $LINKS; do
             if ! [[ "$l" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$l" = server ] || [ "$l" = . ] || [ "$l" = .. ]; then
               echo "::error::bin-links: '$l' is not a file name"; exit 1
             fi
             ln -s server "$stage/usr/local/bin/$l"
-            entries+=("usr/local/bin/$l")
+            links+=("usr/local/bin/$l")
           done
           chmod 0755 "$stage/$wd"
-          entries+=("$wd")
           files=()
           for f in $FILES; do
             f="${f%/}"
@@ -345,11 +353,20 @@ jobs:
           # The checkout belongs to another uid than the job container's user.
           epoch="$(git -c safe.directory="$PWD" log -1 --format=%ct)"
           common=(--format=posix --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
-            --sort=name --mtime="@${epoch}" --numeric-owner --mode=go-w,u-s,g-s,-t)
-          tar -C "$stage" "${common[@]}" --owner=0 --group=0 --no-recursion \
-            -cf "$out/layer.tar" "${entries[@]}"
+            --sort=name --mtime="@${epoch}" --numeric-owner)
+          mode=(--mode=go-w,u-s,g-s,-t)
+          # The binary and its links are root's; a symlink keeps its own mode (0777).
+          tar -C "$stage" "${common[@]}" "${mode[@]}" --owner=0 --group=0 --no-recursion \
+            -cf "$out/layer.tar" usr/local/bin/server
+          if [ "${#links[@]}" -gt 0 ]; then
+            tar -C "$stage" "${common[@]}" --owner=0 --group=0 --no-recursion \
+              -rf "$out/layer.tar" "${links[@]}"
+          fi
+          # A Dockerfile's WORKDIR is made by the user current at that point: the base's.
+          tar -C "$stage" "${common[@]}" "${mode[@]}" --owner="${WORKDIR_OWNER%%:*}" --group="${WORKDIR_OWNER##*:}" \
+            --no-recursion -rf "$out/layer.tar" "$wd"
           if [ "${#files[@]}" -gt 0 ]; then
-            tar "${common[@]}" --owner="${OWNER%%:*}" --group="${OWNER##*:}" \
+            tar "${common[@]}" "${mode[@]}" --owner="${OWNER%%:*}" --group="${OWNER##*:}" \
               --exclude-vcs --exclude=node_modules --exclude=target \
               --exclude=.env --exclude='.env.*' --exclude='*.pem' --exclude='*.key' \
               --exclude=.npmrc --exclude=.netrc --exclude=.git-credentials \

@@ -76,7 +76,8 @@ RUN timeout 5 env >/dev/null
 LABEL org.opencontainers.image.version=$VERSION
 WORKDIR /app
 COPY --from=build /app/server /usr/local/bin/server
-COPY --from=css /app/static ./static
+# Owned as image.yml's crane builder packs it (files-owner), the directory included.
+COPY --from=css --chown=65532:0 /app/static ./static
 ENV BIND_ADDR=0.0.0.0:${PORT}
 EXPOSE ${PORT}
 # core-runtime's non-root user; /etc/passwd has no name for it.

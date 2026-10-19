@@ -2586,7 +2586,7 @@ makes what `templates/Dockerfile`'s runtime stage makes. Its `build` job compile
 default `mirror.gcr.io/library/rust:1-trixie`; through sccache when the app passes
 the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
-(root, 0755), and the `files` under it, owned by `files-owner`. The `push` job runs
+(0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The `push` job runs
 none of the app's code and alone holds `packages: write`: it checks the layer's
 paths and modes, checks that the base has `base-requires` and a glibc at least as
 new as the binary needs, then with
@@ -2610,6 +2610,7 @@ the template's:
 | `base-image` | `registry.access.redhat.com/hi/core-runtime:2` | the runtime `FROM` (a digest is used as given) |
 | `base-requires` | `/usr/bin/sh /usr/bin/env /usr/bin/timeout` | `RUN timeout 5 env` |
 | `workdir` / `user` | `/app` / `65532` | `WORKDIR` / `USER` |
+| `workdir-owner` | `65532:65532` | `WORKDIR` made as core-runtime's user |
 | `port` | `8000` (empty: neither) | `ENV BIND_ADDR=0.0.0.0:<port>`, `EXPOSE <port>` |
 | `entrypoint` / `cmd` | `["/usr/local/bin/server"]` / `[]` | `ENTRYPOINT` / `CMD` (JSON arrays) |
 | `env` / `labels` | none | more `ENV` / `LABEL` lines, `KEY=VALUE` each |
