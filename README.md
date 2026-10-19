@@ -3466,7 +3466,12 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 `cargo test`; check the YAML, CSS and shell examples by eye.
 
 **Commits and pull request titles follow [Conventional Commits](https://www.conventionalcommits.org)**
-(`feat(web): …`, `fix(auth): …`, `docs: …`), checked on every pull request. Scopes
+(`feat(web): …`, `fix(auth): …`, `docs: …`), checked on every pull request. A subject
+starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
+`ClientIp`, `Sessions::from_env`, or anything in backticks), so
+`fix(deploy): PUBLIC_URL comes only from the params file` passes and
+`fix(web): Drop the cache` does not; an app without a commitlint configuration of
+its own is checked by the same rules (`commitlint.config.mjs`). Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
 `accounts`, `change`, `tailwind`, `deps`, `release` (release-please and its configuration).
 

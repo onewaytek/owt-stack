@@ -1,7 +1,32 @@
 // Commit messages and pull request titles follow Conventional Commits, which
 // release-please reads to choose the next version and write the changelog.
+//
+// A subject starts lower-case ("fix(web): drop the …"), unless its first word is a
+// code identifier: a word with a capital, a digit, an underscore or `::` after its
+// first letter (`PUBLIC_URL`, `URL`, `ClientIp`, `S3`, `Sessions::from_env`), or a
+// word in backticks. So
+// "fix(deploy): PUBLIC_URL comes only from the params file" passes and
+// "fix(web): Drop the …" does not. conventional-commits.yml writes the same rules
+// for an app without a configuration of its own; the two copies stay identical.
+const identifier = /^(`[^`]+`|[A-Za-z][\w:]*([A-Z0-9_]|::)[\w:]*)$/;
 export default {
   extends: ["@commitlint/config-conventional"],
+  plugins: [
+    {
+      rules: {
+        "subject-first-word": ({ subject }) => {
+          const word = (subject ?? "").split(/\s/)[0].replace(/[,;:.]$/, "");
+          const ok = !/^[A-Z]/.test(word) || identifier.test(word);
+          return [ok, "subject must start lower-case, unless its first word is a code identifier"];
+        },
+      },
+    },
+  ],
+  rules: {
+    // The default also forbids sentence-case, which a leading identifier looks like.
+    "subject-case": [2, "never", ["start-case", "pascal-case", "upper-case"]],
+    "subject-first-word": [2, "always"],
+  },
   // Dependabot's bodies quote release notes, whose lines run past the length limit.
   // Its headers ("fix(deps): bump ...") are generated, and the title check sees them.
   ignores: [(message) => message.includes("Signed-off-by: dependabot[bot]")],
