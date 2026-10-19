@@ -340,7 +340,8 @@ jobs:
             fi
             files+=("$f")
           done
-          epoch="$(git log -1 --format=%ct)"
+          # The checkout belongs to another uid than the job container's user.
+          epoch="$(git -c safe.directory="$PWD" log -1 --format=%ct)"
           common=(--format=posix --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
             --sort=name --mtime="@${epoch}" --numeric-owner --mode=go-w)
           tar -C "$stage" "${common[@]}" --owner=0 --group=0 --no-recursion \
