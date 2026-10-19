@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/onewaytek/owt-stack/compare/v0.7.0...v0.8.0) (2026-10-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ci:** image.yml needs `bin` (the Cargo binary) unless the call sets `builder: docker`, and builds on RUNS_ON (the ARC scale set by default). A template-shaped app adds `bin` (and `port` when not 8000) and passes the SCCACHE_REDIS_PASSWORD secret by name; an app with its own runtime stage maps it onto the inputs or keeps `builder: docker`. The image is a single linux/amd64 manifest without a build attestation, and carries the base's name and digest as labels.
+* **ci:** release.yml's release job, promote-rc.yml, publish-rc.yml, requeue-rc.yml and conventional-commits.yml run on the arc-openshift-k8s scale set unless the `RUNS_ON` variable names other runners (a fork's pull request is checked GitHub-hosted). The release job runs only for a push or a workflow_dispatch, and promote-rc.yml, publish-rc.yml and requeue-rc.yml only for a push, a workflow_dispatch, a schedule or a same-repository pull_request; a caller on pull_request_target, workflow_run or another event moves to one of those. An app's `version-command` now runs in the ARC runner pod, which has git, curl, jq, tar, perl, Node and uv but no cargo or gh: install what it needs in the command, or set `RUNS_ON` to `"ubuntu-latest"`.
+
+### Features
+
+* **ci:** image.yml builds daemonless on the ARC scale set with crane ([#168](https://github.com/onewaytek/owt-stack/issues/168)) ([c0b116d](https://github.com/onewaytek/owt-stack/commit/c0b116d027957ee89456b3a506b2163f4c32ea78))
+* **ci:** the release flow's light jobs run on the ARC scale set ([#166](https://github.com/onewaytek/owt-stack/issues/166)) ([e6e7dd5](https://github.com/onewaytek/owt-stack/commit/e6e7dd533730c6e1a237f96edb03c110adeb031e))
+
 ## [0.7.0](https://github.com/onewaytek/owt-stack/compare/v0.6.1...v0.7.0) (2026-10-18)
 
 
