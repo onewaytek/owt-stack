@@ -2302,11 +2302,12 @@ migrations to `DATABASE_URL`, before clippy, rustdoc and the tests compile the
 committed query metadata with it. So point `DATABASE_URL` at a database of the app's
 own (`just db`'s, or a scratch one on a shared server, `createdb myapp_check`), never
 at one another app migrates: outside CI, the recipe refuses a server's shared
-`postgres` or `template1` database. An app that copied the template earlier takes the new `migrate`
-recipe and `check`'s order, or its `doc` step fails on an unmigrated database. App-specific
-recipes go below the template's `---- app recipes ----` line. The compose ports and database name come from the
-app's `.env` (`POSTGRES_PORT`, `POSTGRES_DB`, ...), so two apps' stacks can run side
-by side.
+`postgres` or `template1` database, and a URL that names none (the user's name is
+then the database). An app that copied the template earlier takes the new `migrate`
+recipe and `check`'s order, or its `doc` step fails on an unmigrated database.
+App-specific recipes go below the template's `---- app recipes ----` line. The
+compose ports and database name come from the app's `.env` (`POSTGRES_PORT`,
+`POSTGRES_DB`, ...), so two apps' stacks can run side by side.
 
 **CI:** call the reusable check workflow with the app's gate. It runs on ARC, with
 Postgres and Redis as services, installs `just` and `cargo-audit` (and `sqlx-cli`

@@ -39,8 +39,14 @@ migrate:
         echo "migrate: DATABASE_URL is not set; nothing migrated (just db sets one up)" >&2
         exit 0
     fi
-    name="${DATABASE_URL##*/}"
-    name="${name%%\?*}"
+    # The database: `dbname=` in the query, else the path after the host; none means
+    # the user's name, which on a shared server is as shared as `postgres`.
+    url=$DATABASE_URL query=
+    case $url in *\?*) query=${url#*\?} url=${url%%\?*} ;; esac
+    rest=${url#*://}
+    name=
+    case $rest in */*) name=${rest#*/} ;; esac
+    if [[ "&$query" =~ \&dbname=([^\&]*) ]]; then name=${BASH_REMATCH[1]}; fi
     if [ -z "${CI:-}" ]; then
         case "$name" in
             postgres | template1 | "")
@@ -86,8 +92,7 @@ lint:
 doc:
     RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo doc --no-deps --document-private-items
 
-# The committed .sqlx/ matches the queries, against DATABASE_URL's schema (skipped
-# for an app without one).
+# The committed .sqlx/ (if the app has one) matches the queries in DATABASE_URL's schema.
 sqlx-check: migrate
     if [ -d .sqlx ]; then SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
 
