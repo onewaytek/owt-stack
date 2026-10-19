@@ -3110,9 +3110,19 @@ the exporter's port to Prometheus alone.
 @source "../templates";
 ```
 
-Move to a release with `npm install -D github:onewaytek/owt-stack#vX.Y.Z`: editing the
-tag in `package.json` and running `npm install` keeps the old commit in
-`package-lock.json`, and the stylesheet stays at the old release.
+Move to a release with the package named in the command:
+
+```sh
+npm install -D @onewaytek/owt-stack@github:onewaytek/owt-stack#vX.Y.Z
+grep -A3 '"node_modules/@onewaytek/owt-stack"' package-lock.json   # resolved: …#<the tag's commit>
+```
+
+Editing the tag in `package.json` and running `npm install` keeps the old commit in
+`package-lock.json`, and so does `npm install -D github:onewaytek/owt-stack#vX.Y.Z`
+when the package is already locked: the stylesheet stays at the old release while
+the manifest names the new one. The lock's `resolved` URL ends in the commit that
+was installed; check it against the tag's (`git ls-remote
+https://github.com/onewaytek/owt-stack vX.Y.Z`).
 Dependabot leaves this dependency alone (`templates/dependabot.yml` ignores it), so
 this command, run when the app adopts a release, is the only thing that moves it.
 
@@ -3303,8 +3313,9 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - `owt_accounts::social::Connections` has a lifetime, `Connections<'a>`, for the words
   it draws with: a field or return type naming it becomes `Connections<'static>`.
 - Move the npm stylesheet package with
-  `npm install -D github:onewaytek/owt-stack#v0.6.0`, not by editing the tag in
-  `package.json`: a plain `npm install` keeps the old commit in `package-lock.json`.
+  `npm install -D @onewaytek/owt-stack@github:onewaytek/owt-stack#v0.6.0`, not by
+  editing the tag in `package.json`, and check the lock's `resolved` commit (see
+  **Tailwind:**): a plain `npm install` keeps the old commit in `package-lock.json`.
 - **Re-applying the OpenShift template:** pass `-p POSTGRES_MAJOR=<the major the
   cluster runs>`, and keep compose and CI's `postgres-major` on it. The default, 18,
   upgrades an older cluster in place (or is refused before CNPG 1.26). Moving to a

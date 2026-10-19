@@ -34,8 +34,8 @@ updates:
     commit-message: {prefix: fix, include: scope}
     # The stylesheet's `github:onewaytek/owt-stack#vX.Y.Z` is a git dependency, whose
     # tags Dependabot does not order as versions: it proposes moving to an older tag.
-    # The app moves it with `npm install -D github:onewaytek/owt-stack#vX.Y.Z` when it
-    # adopts a release, together with the crates' tags.
+    # The app moves it when it adopts a release, with
+    # `npm install -D @onewaytek/owt-stack@github:onewaytek/owt-stack#vX.Y.Z`.
     ignore:
       - dependency-name: "@onewaytek/owt-stack"
     groups:
