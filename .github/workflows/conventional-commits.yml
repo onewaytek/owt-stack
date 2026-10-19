@@ -96,10 +96,10 @@ jobs:
           // A subject starts lower-case ("fix(web): drop the …"), unless its first word is a
           // code identifier: a word with a capital, a digit, an underscore or `::` after its
           // first letter (`PUBLIC_URL`, `URL`, `ClientIp`, `S3`, `Sessions::from_env`), or a
-          // word in backticks. So
-          // "fix(deploy): PUBLIC_URL comes only from the params file" passes and
-          // "fix(web): Drop the …" does not. conventional-commits.yml writes the same rules
-          // for an app without a configuration of its own; the two copies stay identical.
+          // word in backticks. So "fix(deploy): PUBLIC_URL comes only from the params file"
+          // passes, and "fix(web): Drop the …" and a subject of several words in capitals do
+          // not. conventional-commits.yml writes the same rules for an app without a
+          // configuration of its own; the two copies stay identical.
           const identifier = /^(`[^`]+`|[A-Za-z][\w:]*([A-Z0-9_]|::)[\w:]*)$/;
           export default {
             extends: ["@commitlint/config-conventional"],
@@ -107,9 +107,16 @@ jobs:
               {
                 rules: {
                   "subject-first-word": ({ subject }) => {
-                    const word = (subject ?? "").split(/\s/)[0].replace(/[,;:.]$/, "");
-                    const ok = !/^[A-Z]/.test(word) || identifier.test(word);
-                    return [ok, "subject must start lower-case, unless its first word is a code identifier"];
+                    const text = subject ?? "";
+                    const word = text.split(/\s/)[0].replace(/[,;:.]$/, "");
+                    if (/^[A-Z]/.test(word) && !identifier.test(word)) {
+                      return [false, "subject must start lower-case, unless its first word is a code identifier"];
+                    }
+                    // An identifier may open it, but the rest is prose: some lower case.
+                    if (/\s/.test(text.trim()) && !/[a-z]/.test(text)) {
+                      return [false, "subject must not be all capitals"];
+                    }
+                    return [true];
                   },
                 },
               },
