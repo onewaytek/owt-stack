@@ -21,7 +21,7 @@ Outside the crates:
 | `.github/workflows/release-please.yml` | this repository's releases: versions and the changelog by release-please |
 | `.github/workflows/conventional-commits.yml` | Conventional Commits checked on every pull request, here and, as a reusable workflow, in an app: the title and every commit, with one commitlint and one configuration |
 | `.github/workflows/release.yml` | reusable releases from conventional commits: stable on `main`, prereleases on `rc`, optional version write-back and changelog |
-| `.github/workflows/image.yml` | reusable image build for a released tag, pushed to ghcr with the channel's floating tags |
+| `.github/workflows/image.yml` | reusable image build for a released tag, daemonless on ARC (or the Dockerfile, GitHub-hosted), pushed to ghcr with the channel's floating tags |
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease, or into `rc-candidate` for checking first |
 | `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
 | `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
@@ -2338,7 +2338,8 @@ what `rustc` reports about itself rather than the binary's hash, so a job's code
 store an object under a registry crate's real key for every other job to read. Give
 the secret to the repositories whose code may run on the scale set at all (the same
 judgement `RUNS_ON` makes), and keep a public repository, whose pull requests anyone
-can open, on GitHub-hosted runners with `sccache-redis: ""`.
+can open, on GitHub-hosted runners with `sccache-redis: ""`. `image.yml` takes the
+same secret and `sccache-redis` input for its release build.
 
 A developer machine can use the
 same Redis; its paths differ from the runners', so its entries are its own (its
@@ -2375,8 +2376,9 @@ jobs:
 **What a reusable workflow is given is what it can leak.** A reusable workflow runs
 inside the app's job, so pass it the secrets it declares, by name, and never
 `secrets: inherit`, which hands it every secret the app holds; the same for
-`release.yml`, `image.yml`, `promote-rc.yml`, `publish-rc.yml` and `requeue-rc.yml`
-below, which declare none and need only their job's token. And pin each `uses:` by
+`release.yml`, `promote-rc.yml`, `publish-rc.yml` and `requeue-rc.yml` below, which
+declare none and need only their job's token, and `image.yml`, which declares the
+sccache secret as `rust-ci.yml` does. And pin each `uses:` by
 commit rather than by tag, with the tag in a comment
 (`uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit> # vX.Y.Z`): GitHub
 resolves a tag on every run, and a tag can be moved, while a commit cannot; Dependabot
@@ -2446,7 +2448,8 @@ jobs:
     if: needs.release.outputs.version != ''
     permissions: {contents: read, packages: write}
     uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.7.0
-    with: {version: "${{ needs.release.outputs.version }}"}   # needs only its own token
+    with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
+    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
 
 - **An app whose code reads its version** writes it into its files with the release:
@@ -2485,7 +2488,8 @@ jobs:
     image:
       permissions: {contents: read, packages: write}
       uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.7.0
-      with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}"}
+      with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
+      secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   ```
 - **The rc channel** (optional): on each same-repository PR into `main`, once its
   checks pass, merge the PR into `rc` and cut a prerelease. After each stable
@@ -2575,18 +2579,87 @@ jobs:
 ```
 <!-- x-release-please-end -->
 
-Image builds run on GitHub-hosted runners: the ARC runners have no Docker daemon.
+**Image:** `image.yml` builds the image on the ARC scale set (`RUNS_ON`, as the checks)
+with no Docker daemon and no privileges, from inputs rather than a Dockerfile, and
+makes what `templates/Dockerfile`'s runtime stage makes. Its `build` job compiles
+`cargo build --release --locked --bin <bin>` in the work directory (`/app`, where the
+Dockerfile builds too, so a path baked in with `env!("CARGO_MANIFEST_DIR")` holds in
+the image) in a Rust job container (`container`,
+default `mirror.gcr.io/library/rust:1-trixie`; through sccache when the app passes
+the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
+`/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
+(0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The `push` job runs
+none of the app's code and alone holds `packages: write`: it checks the layer's
+paths and modes, checks that the base has `base-requires` and a glibc at least as
+new as the binary needs, then with
+[crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) (pinned
+by version and SHA-256) appends the layer to the base pinned by its linux/amd64
+digest, sets the configuration, pushes by digest, reads the version label back and
+only then tags. The image carries `org.opencontainers.image.version` and the base's
+`org.opencontainers.image.base.name` and `.base.digest` as labels (and as manifest
+annotations). A template-shaped app needs no input beyond `bin`; the defaults are
+the template's:
 
-**Image:** copy `templates/Dockerfile` (and `templates/dockerignore` as
-`.dockerignore`) and set `BIN` and `PORT`. The build fetches owt-stack like any other
-git dependency; no secret is mounted. Every stage starts from a Red Hat Hummingbird
-image on `registry.access.redhat.com` (`hi/nodejs:22`, `hi/rust:1`,
-`hi/core-runtime:2`), which needs no login. The runtime runs as uid 65532 and keeps
-`sh` and coreutils for `oc exec`; the build fails if `sh`, `timeout` or `env` stop
-running. The names are fully qualified, so a local `podman build` works without a
-registry prompt. An app on the earlier distroless template moves by copying the
-template again; one with its own runtime stage changes `FROM` and `USER nonroot`
-(to `USER 65532`).
+| input | default | the Dockerfile's |
+| --- | --- | --- |
+| `bin` | (required) | `ARG BIN` |
+| `bin-links` | none | names linked to `server` in `/usr/local/bin` |
+| `cargo-args` | none | extra `cargo build` arguments |
+| `assets-script` | `css:build` (empty: no npm) | `ARG CSS_SCRIPT` |
+| `node-version` / `node-version-file` | `22` / none | the assets stage's `hi/nodejs` |
+| `files` | `static` | `COPY` into the work directory |
+| `files-owner` | `65532:0` | `--chown` |
+| `base-image` | `registry.access.redhat.com/hi/core-runtime:2` | the runtime `FROM` (a digest is used as given) |
+| `base-requires` | `/usr/bin/sh /usr/bin/env /usr/bin/timeout` | `RUN timeout 5 env` |
+| `workdir` / `user` | `/app` / `65532` | `WORKDIR` / `USER` |
+| `workdir-owner` | `65532:65532` | `WORKDIR` made as core-runtime's user |
+| `port` | `8000` (empty: neither) | `ENV BIND_ADDR=0.0.0.0:<port>`, `EXPOSE <port>` |
+| `entrypoint` / `cmd` | `["/usr/local/bin/server"]` / `[]` | `ENTRYPOINT` / `CMD` (JSON arrays) |
+| `env` / `labels` | none | more `ENV` / `LABEL` lines, `KEY=VALUE` each |
+
+Files are taken from the checkout after the assets build, less what
+`templates/dockerignore` keeps out of a context (`.git`, `node_modules`, `target`,
+`.env*`, `*.pem`, `*.key`, `.npmrc`, `.netrc`, `.git-credentials`, cargo
+credentials). A symlink among them fails the build (the push job takes only files
+and directories under the work directory, so no entry can write through a link
+elsewhere in the image); hard links are packed as files. The push job also checks
+that the tag still names the commit the build job checked out. The release build
+reads and writes the same sccache as the checks, so it trusts every repository given
+the secret as they do ("Who to give the secret to"); `sccache-redis: ""` builds a
+release uncached. An app with more than one runtime directory lists them, and one whose
+binary has a second name links it:
+
+```yaml
+    with:
+      version: ${{ needs.release.outputs.version }}
+      bin: myapp
+      bin-links: myapp           # /usr/local/bin/myapp -> server
+      assets-script: build:prod
+      node-version-file: .nvmrc
+      files: data static_compiled
+      cmd: '["serve"]'
+      labels: |
+        environment=production
+```
+
+The binary is built in Debian's Rust image, not Hummingbird's (which has no `tar`
+for the setup actions), so the push job checks the newest `GLIBC_` version the
+binary needs against the base's libc and fails rather than push an image that
+would not start. A test build of a released tag goes to a tag of its own with
+`tag: arc-test` (never `latest`, `rc` or a version). `builder: docker` builds the
+app's `dockerfile` with BuildKit on a GitHub-hosted runner instead, for an image the
+inputs cannot describe; it bills GitHub-hosted minutes to a private app.
+
+**The Dockerfile** stays for local builds and `builder: docker`: copy
+`templates/Dockerfile` (and `templates/dockerignore` as `.dockerignore`) and set
+`BIN` and `PORT`. The build fetches owt-stack like any other git dependency; no
+secret is mounted. Every stage starts from a Red Hat Hummingbird image on
+`registry.access.redhat.com` (`hi/nodejs:22`, `hi/rust:1`, `hi/core-runtime:2`),
+which needs no login. The runtime runs as uid 65532 and keeps `sh` and coreutils for
+`oc exec`; the build fails if `sh`, `timeout` or `env` stop running. The names are
+fully qualified, so a local `podman build` works without a registry prompt. An app
+on the earlier distroless template moves by copying the template again; one with its
+own runtime stage changes `FROM` and `USER nonroot` (to `USER 65532`).
 
 **OpenShift:** the app keeps its copies of the templates in `deploy/openshift/`, with
 `apply.sh` beside them and its parameters in `params.env`, one `KEY=VALUE` a line
@@ -3013,6 +3086,16 @@ The router example under "Wiring an app" composes the layers; beyond it:
   the app sets `RUNS_ON` to `"ubuntu-latest"`. An app that sets
   `RUNS_ON` keeps those jobs on its runners too, and a public repository keeps
   `RUNS_ON` at `"ubuntu-latest"`.
+- **Breaking:** `image.yml` builds daemonlessly on the ARC scale set by default
+  (`builder: crane`), from inputs instead of the Dockerfile. A template-shaped app
+  adds `bin: <its BIN>` (and `port` when its `PORT` is not 8000) to both calls of
+  `image.yml` (`release.yml`'s image job and its own `image.yml`), and passes
+  `secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}` there
+  for a cached build. An app with its own runtime stage maps it onto the inputs (see
+  "Image"), or keeps its Dockerfile with `builder: docker`, on GitHub-hosted minutes.
+  The image is one manifest for linux/amd64, with no build attestation, and its
+  labels add `org.opencontainers.image.base.name` and `.base.digest`. The
+  Dockerfile stays for local builds.
 - **Breaking** for an unusual caller only: the jobs whose token can write run only
   for the repository's own events. A release runs for a `push` or a
   `workflow_dispatch`; `promote-rc.yml`, `publish-rc.yml` and `requeue-rc.yml` for a

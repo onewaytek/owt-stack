@@ -1,20 +1,46 @@
 name: Image
 
-# Reusable: build a released tag's image on a GitHub-hosted runner and push it to
-# ghcr. The ARC runners keep the checks; they are rootless with no Docker daemon.
-# The cluster pulls from ghcr: an ImageStream follows a floating tag and the
-# Deployment's image trigger rolls out each new digest
-# (templates/openshift/app.yaml).
+# Reusable: build a released tag's image and push it to ghcr. The cluster pulls from
+# ghcr: an ImageStream follows a floating tag and the Deployment's image trigger
+# rolls out each new digest (templates/openshift/app.yaml).
 #
 # Tags pushed for version X.Y.Z:
 #   - always X.Y.Z;
 #   - with floating-tags, a stable release also moves X.Y and latest (and X from
-#     1.0), and a prerelease (X.Y.Z-rc.N) moves rc.
+#     1.0), and a prerelease (X.Y.Z-rc.N) moves rc;
+#   - with `tag` set, that one tag and nothing else (a test build).
 #
 # Call it after release.yml (see there), or from the app's own workflow_dispatch to
 # rebuild an existing tag. Rebuilding an old tag with floating-tags would drag
 # latest or rc back to it: leave floating-tags off unless it is the newest release
 # in its channel.
+#
+# Two builders:
+#
+# - `crane` (the default) builds on the arc-openshift-k8s ARC scale set (override
+#   with the RUNS_ON repository or organization variable, a JSON string such as
+#   '"ubuntu-latest"'), with no Docker daemon and no privileges. It produces what
+#   templates/Dockerfile's runtime stage produces, from inputs instead of a
+#   Dockerfile. The `build` job builds the static assets with npm, compiles the
+#   binary in a Rust job container in the work directory, as the Dockerfile does
+#   (through sccache when the app passes SCCACHE_REDIS_PASSWORD), and packs one
+#   layer: /usr/local/bin/server (root, 0755), any names linked to it, the work
+#   directory (0755, owned by `workdir-owner`) and the listed files under it (owned
+#   by `files-owner`). That job runs the app's code (build scripts, npm scripts) and
+#   holds only a read token. The `push` job runs none of the app's code:
+#   it checks the layer (only those paths; files, directories and symlinks; no setuid,
+#   setgid or sticky bit), checks the base image (the tools operations rely on, and a
+#   glibc at least as new as the binary needs), and with crane appends the layer to
+#   the base pinned by digest and sets the configuration, pushes by digest, reads the
+#   pushed configuration back and only then tags it. A tag never names a half-made
+#   image.
+#
+# - `docker` builds the app's Dockerfile with BuildKit on a GitHub-hosted runner, for
+#   an image the inputs cannot describe. The ARC runners have no Docker daemon.
+#
+# The jobs run only for the repository's own events: a push, a dispatch, a schedule
+# or a pull request from a branch of the repository. A fork's pull request,
+# `pull_request_target` and `workflow_run` start nothing here.
 
 on:
   workflow_call:
@@ -27,25 +53,668 @@ on:
         description: Also move the channel's floating tags.
         type: boolean
         default: true
+      tag:
+        description: >-
+          Push this one tag instead of the version's (a test build of a released tag,
+          say `arc-test`); floating-tags is then ignored. Never `latest`, `rc` or a
+          version.
+        type: string
+        default: ""
+      builder:
+        description: "`crane` (daemonless, on RUNS_ON) or `docker` (the Dockerfile, GitHub-hosted)."
+        type: string
+        default: crane
+      # crane
+      bin:
+        description: The Cargo binary to build (`cargo build --bin`); installed as /usr/local/bin/server.
+        type: string
+        default: ""
+      bin-links:
+        description: Other names in /usr/local/bin for the same binary (symlinks to server), space-separated.
+        type: string
+        default: ""
+      cargo-args:
+        description: Extra arguments for `cargo build --release --locked --bin <bin>` (features, say).
+        type: string
+        default: ""
+      container:
+        description: >-
+          The Rust job container. It needs bash, git, curl and tar; the push job checks
+          that the base image's glibc is at least the one the binary links against.
+        type: string
+        default: mirror.gcr.io/library/rust:1-trixie
+      sccache-redis:
+        description: As in rust-ci.yml; empty for no sccache.
+        type: string
+        default: redis://sccache-redis.sccache.svc:6379
+      assets-script:
+        description: npm script that writes the static assets (after `npm ci`); empty for no npm.
+        type: string
+        default: css:build
+      node-version:
+        description: Node for the assets, when node-version-file is empty.
+        type: string
+        default: "22"
+      node-version-file:
+        description: File naming the Node version for the assets (.nvmrc, say).
+        type: string
+        default: ""
+      files:
+        description: >-
+          Paths in the repository, after the assets are built, copied into the work
+          directory under the same names (`static` becomes /app/static), space- or
+          newline-separated.
+        type: string
+        default: static
+      files-owner:
+        description: uid:gid of the copied files.
+        type: string
+        default: "65532:0"
+      base-image:
+        description: >-
+          The runtime base. A tag is resolved once to its linux/amd64 digest; a digest
+          is used as given. Either way the digest is recorded in the
+          org.opencontainers.image.base.digest label.
+        type: string
+        default: registry.access.redhat.com/hi/core-runtime:2
+      base-requires:
+        description: Paths the base image must have, space-separated (the tools `oc exec` and hooks run).
+        type: string
+        default: /usr/bin/sh /usr/bin/env /usr/bin/timeout
+      workdir:
+        description: The work directory (WORKDIR).
+        type: string
+        default: /app
+      workdir-owner:
+        description: >-
+          uid:gid of the work directory itself. A Dockerfile's WORKDIR makes it as the
+          user current at that line, which in the template is core-runtime's 65532.
+        type: string
+        default: "65532:65532"
+      user:
+        description: The user the image runs as (USER).
+        type: string
+        default: "65532"
+      port:
+        description: The port the binary binds; sets BIND_ADDR=0.0.0.0:<port> and exposes <port>/tcp. Empty for neither.
+        type: string
+        default: "8000"
+      entrypoint:
+        description: The entrypoint, as a JSON array.
+        type: string
+        default: '["/usr/local/bin/server"]'
+      cmd:
+        description: The command (arguments to the entrypoint), as a JSON array; empty for none.
+        type: string
+        default: "[]"
+      env:
+        description: KEY=VALUE lines added to the image's environment (after BIND_ADDR).
+        type: string
+        default: ""
+      labels:
+        description: >-
+          KEY=VALUE lines added as labels. org.opencontainers.image.version (the
+          version) and the base's name and digest are always set.
+        type: string
+        default: ""
+      # docker
       context:
-        description: The build context.
+        description: The build context (builder docker).
         type: string
         default: .
       dockerfile:
-        description: The Dockerfile, relative to the repository root.
+        description: The Dockerfile, relative to the repository root (builder docker).
         type: string
         default: Dockerfile
+    secrets:
+      SCCACHE_REDIS_PASSWORD:
+        description: "As in rust-ci.yml; passed by name, never with `secrets: inherit`."
+        required: false
     outputs:
       digest:
         description: The pushed image's digest.
-        value: ${{ jobs.image.outputs.digest }}
+        value: ${{ jobs.push.outputs.digest || jobs.docker.outputs.digest }}
 
 permissions:
   contents: read
 
+env:
+  # go-containerregistry's release archive for linux/amd64, checked against this
+  # SHA-256 before crane runs.
+  CRANE_VERSION: "0.22.1"
+  CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+
 jobs:
-  image:
-    if: ${{ github.repository_owner == 'onewaytek' }}
+  build:
+    if: >-
+      ${{ inputs.builder == 'crane' && github.repository_owner == 'onewaytek'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    container: ${{ inputs.container }}
+    permissions:
+      contents: read
+    outputs:
+      # Recorded by the checkout, before any of the app's code runs.
+      commit: ${{ steps.checkout.outputs.commit }}
+    env:
+      RAW_VERSION: ${{ inputs.version }}
+      CARGO_TERM_COLOR: always
+      SQLX_OFFLINE: "true"
+    steps:
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RAW_VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "not a release version: '${RAW_VERSION}' (expected e.g. 0.2.0 or v0.2.0-rc.1)" >&2
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+      # The ref is qualified: checkout prefers a branch to a tag of the same short name.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
+        with:
+          ref: refs/tags/v${{ env.VERSION }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ inputs.assets-script != '' }}
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+      # As the Dockerfile's assets stage: `npm ci`, then the app's script.
+      - name: Static assets
+        if: ${{ inputs.assets-script != '' }}
+        env:
+          SCRIPT: ${{ inputs.assets-script }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run "$SCRIPT"
+      # The Dockerfile builds in its work directory (/app), and a binary can bake that
+      # path in (`env!("CARGO_MANIFEST_DIR")` naming its static files, say). So the
+      # build happens there too, from a copy of the checkout with the assets built,
+      # and the files are packed from it.
+      - name: Build directory
+        env:
+          WORKDIR: ${{ inputs.workdir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$WORKDIR" =~ ^(/[A-Za-z0-9._-]+)+$ ]] || [[ "$WORKDIR" =~ (^|/)\.\.?(/|$) ]]; then
+            echo "::error::workdir must be an absolute path without . or .. ('$WORKDIR')"; exit 1
+          fi
+          if [ -e "$WORKDIR" ] && [ -n "$(ls -A "$WORKDIR")" ]; then
+            echo "::error::$WORKDIR is not empty in the job container"; exit 1
+          fi
+          mkdir -p "$WORKDIR" || { echo "::error::the job container's user cannot make $WORKDIR"; exit 1; }
+          # The checkout belongs to another uid than the job container's user.
+          echo "SOURCE_EPOCH=$(git -c safe.directory="$PWD" log -1 --format=%ct)" >> "$GITHUB_ENV"
+          tar --exclude=./.git --exclude=./node_modules -cf - . | tar -C "$WORKDIR" -xf -
+      # sccache as in rust-ci.yml (see there for the trust model): the password reaches
+      # the sccache server alone, and an unusable Redis means an uncached build.
+      - name: Is sccache configured
+        id: sccache
+        env:
+          PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+          ENDPOINT: ${{ inputs.sccache-redis }}
+        shell: bash
+        run: |
+          if [ -n "$ENDPOINT" ] && [ -n "$PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No sccache-redis endpoint or no SCCACHE_REDIS_PASSWORD secret: compiling without sccache"
+          fi
+      - name: Install sccache
+        if: ${{ steps.sccache.outputs.enabled == 'true' }}
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        with:
+          tool: sccache@0.18.0
+          fallback: none
+      - name: Start sccache
+        if: ${{ steps.sccache.outputs.enabled == 'true' }}
+        env:
+          PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+          ENDPOINT: ${{ inputs.sccache-redis }}
+        shell: bash
+        run: |
+          if [[ "$PASSWORD" == *[[:cntrl:]]* ]]; then
+            echo "::warning::SCCACHE_REDIS_PASSWORD holds a control character (a newline, say): compiling without sccache"
+            exit 0
+          fi
+          conf="$RUNNER_TEMP/sccache.toml"
+          pw=${PASSWORD//\\/\\\\}
+          pw=${pw//\"/\\\"}
+          (
+            umask 077
+            printf '[cache.redis]\nendpoint = "%s"\npassword = "%s"\nexpiration = 2592000\n' \
+              "$ENDPOINT" "$pw" > "$conf"
+          )
+          if env -u PASSWORD SCCACHE_CONF="$conf" SCCACHE_IDLE_TIMEOUT=0 sccache --start-server; then
+            rm -f "$conf"
+            {
+              echo "RUSTC_WRAPPER=sccache"
+              echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
+            } >> "$GITHUB_ENV"
+          else
+            rm -f "$conf"
+            sccache --stop-server > /dev/null 2>&1 || true
+            echo "::warning::sccache could not use the Redis at $ENDPOINT (above): compiling without it"
+          fi
+      - name: Build the binary
+        working-directory: ${{ inputs.workdir }}
+        env:
+          BIN: ${{ inputs.bin }}
+          CARGO_ARGS: ${{ inputs.cargo-args }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$BIN" ]; then
+            echo "::error::the crane builder needs \`bin\`, the Cargo binary to build"
+            exit 1
+          fi
+          # Unquoted on purpose: several arguments.
+          cargo build --release --locked --bin "$BIN" $CARGO_ARGS
+      - name: sccache statistics
+        if: ${{ always() && env.RUSTC_WRAPPER == 'sccache' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          stats=$(sccache --show-stats 2>&1) || true
+          { echo '### sccache'; echo '```'; echo "$stats"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "$stats" | grep -E 'Cache (hits|misses|errors)|Compile requests executed' || true
+      # One layer, by name: the binary, its links, the work directory and the listed
+      # files, nothing else from the checkout. Credentials-shaped names (the ones
+      # templates/dockerignore keeps out of a Docker context) are left out of the files.
+      # Times are the commit's and entries sorted, so the same inputs pack the same.
+      # No entry keeps group or other write, setuid, setgid or sticky: the runner's
+      # work volume makes its directories setgid.
+      - name: Pack the layer
+        working-directory: ${{ inputs.workdir }}
+        env:
+          BIN: ${{ inputs.bin }}
+          LINKS: ${{ inputs.bin-links }}
+          FILES: ${{ inputs.files }}
+          OWNER: ${{ inputs.files-owner }}
+          WORKDIR: ${{ inputs.workdir }}
+          WORKDIR_OWNER: ${{ inputs.workdir-owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The lists are words, never patterns.
+          set -f
+          for o in "$OWNER" "$WORKDIR_OWNER"; do
+            if ! [[ "$o" =~ ^[0-9]+:[0-9]+$ ]]; then
+              echo "::error::files-owner and workdir-owner are numeric uid:gid ('$o')"; exit 1
+            fi
+          done
+          wd="${WORKDIR#/}"
+          stage="$RUNNER_TEMP/image-root"
+          out="$RUNNER_TEMP/image-layer"
+          rm -rf "$stage" "$out"
+          mkdir -p "$stage/usr/local/bin" "$stage/$wd" "$out"
+          install -m 0755 "target/release/$BIN" "$stage/usr/local/bin/server"
+          links=()
+          for l in $LINKS; do
+            if ! [[ "$l" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$l" = server ] || [ "$l" = . ] || [ "$l" = .. ]; then
+              echo "::error::bin-links: '$l' is not a file name"; exit 1
+            fi
+            ln -s server "$stage/usr/local/bin/$l"
+            links+=("usr/local/bin/$l")
+          done
+          chmod 0755 "$stage/$wd"
+          files=()
+          for f in $FILES; do
+            f="${f%/}"
+            if [ -z "$f" ] || [[ "$f" == /* ]] || [[ "$f" =~ (^|/)\.\.?(/|$) ]]; then
+              echo "::error::files: '$f' is not a path inside the repository"; exit 1
+            fi
+            if [ ! -e "$f" ]; then
+              echo "::error::files: '$f' does not exist after the assets are built"; exit 1
+            fi
+            # A symlink would let one entry write through another; the push job refuses
+            # them, so say which here.
+            links_in="$(find "$f" \( -name .git -o -name node_modules -o -name target \) -prune -o -type l -print)"
+            if [ -n "$links_in" ]; then
+              echo "::error::files: symlinks are not packed (copy the file instead): $links_in"; exit 1
+            fi
+            files+=("$f")
+          done
+          epoch="$SOURCE_EPOCH"
+          common=(--format=posix --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
+            --sort=name --mtime="@${epoch}" --numeric-owner)
+          mode=(--mode=go-w,u-s,g-s,-t)
+          # The binary and its links are root's; a symlink keeps its own mode (0777).
+          tar -C "$stage" "${common[@]}" "${mode[@]}" --owner=0 --group=0 --no-recursion \
+            -cf "$out/layer.tar" usr/local/bin/server
+          if [ "${#links[@]}" -gt 0 ]; then
+            tar -C "$stage" "${common[@]}" --owner=0 --group=0 --no-recursion \
+              -rf "$out/layer.tar" "${links[@]}"
+          fi
+          # A Dockerfile's WORKDIR is made by the user current at that point: the base's.
+          tar -C "$stage" "${common[@]}" "${mode[@]}" --owner="${WORKDIR_OWNER%%:*}" --group="${WORKDIR_OWNER##*:}" \
+            --no-recursion -rf "$out/layer.tar" "$wd"
+          if [ "${#files[@]}" -gt 0 ]; then
+            tar "${common[@]}" "${mode[@]}" --owner="${OWNER%%:*}" --group="${OWNER##*:}" \
+              --hard-dereference --exclude-vcs --exclude=node_modules --exclude=target \
+              --exclude=.env --exclude='.env.*' --exclude='*.pem' --exclude='*.key' \
+              --exclude=.npmrc --exclude=.netrc --exclude=.git-credentials \
+              --exclude=.cargo/credentials --exclude=.cargo/credentials.toml \
+              --transform="s,^,${wd}/,S" -rf "$out/layer.tar" "${files[@]}"
+          fi
+          echo "layer: $(stat -c %s "$out/layer.tar") bytes, $(tar -tf "$out/layer.tar" | wc -l) entries"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-layer
+          path: ${{ runner.temp }}/image-layer/layer.tar
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
+  push:
+    needs: build
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      RAW_VERSION: ${{ inputs.version }}
+      FLOATING: ${{ inputs.floating-tags }}
+      TEST_TAG: ${{ inputs.tag }}
+    steps:
+      # The channel comes from the version's shape, not from a second input that
+      # could disagree with it.
+      - name: Resolve version and tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RAW_VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "not a release version: '${RAW_VERSION}'" >&2
+            exit 1
+          fi
+          if [[ "$VERSION" == *-rc.* ]]; then CHANNEL=rc; else CHANNEL=stable; fi
+          # ghcr rejects uppercase paths.
+          REPO="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          if [ -n "$TEST_TAG" ]; then
+            if ! [[ "$TEST_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] \
+              || [[ "$TEST_TAG" =~ ^(latest|rc|[0-9]+(\.[0-9]+){0,2}(-rc\.[0-9]+)?)$ ]]; then
+              echo "tag: '$TEST_TAG' is not a test tag (never latest, rc or a version)" >&2
+              exit 1
+            fi
+            tags=("$TEST_TAG")
+          else
+            tags=("$VERSION")
+            if [ "$FLOATING" = true ]; then
+              if [ "$CHANNEL" = rc ]; then
+                tags+=(rc)
+              else
+                IFS=. read -r major minor _ <<<"$VERSION"
+                tags+=("${major}.${minor}" latest)
+                [ "$major" = 0 ] || tags+=("${major}")
+              fi
+            fi
+          fi
+          {
+            echo "VERSION=${VERSION}"
+            echo "CHANNEL=${CHANNEL}"
+            echo "REPO=${REPO}"
+            echo "TAGS=${tags[*]}"
+          } >> "$GITHUB_ENV"
+          for t in "${tags[@]}"; do echo "tag ${REPO}:${t}"; done
+      # A stable image (X.Y, latest) is what production follows: its tag must be on
+      # main, which only reviewed changes reach. Asked of the API, so this job needs no
+      # checkout.
+      # The tag still names the commit the build job checked out (it could have moved
+      # since), and a stable one is on main.
+      - name: The tag names the built commit
+        env:
+          TOKEN: ${{ github.token }}
+          BUILT: ${{ needs.build.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api() {
+            curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/$1"
+          }
+          ref="$(api "git/ref/tags/v${VERSION}")"
+          sha="$(jq -r .object.sha <<<"$ref")"
+          if [ "$(jq -r .object.type <<<"$ref")" = tag ]; then
+            sha="$(api "git/tags/${sha}" | jq -r .object.sha)"
+          fi
+          if [ -z "$BUILT" ] || [ "$sha" != "$BUILT" ]; then
+            echo "v${VERSION} names ${sha}, and the build job built '${BUILT}'" >&2
+            exit 1
+          fi
+          [ "$CHANNEL" = stable ] || exit 0
+          behind="$(api "compare/${sha}...refs/heads/main" | jq -r .behind_by)"
+          if [ "$behind" != 0 ]; then
+            echo "v${VERSION} (${sha}) is not on main: refusing to build a stable image of it" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-layer
+          path: ${{ runner.temp }}/image-layer
+      - name: Install crane
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/crane"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/crane.tar.gz" \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  $dir/crane.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/crane.tar.gz" -C "$dir" crane
+          rm "$dir/crane.tar.gz"
+          echo "$dir" >> "$GITHUB_PATH"
+      # The build job ran the app's code; this job trusts its layer only as far as this
+      # check: the paths packed, nothing that is not a file, directory or symlink, and
+      # no setuid, setgid or sticky bit.
+      - name: Check the layer
+        env:
+          WORKDIR: ${{ inputs.workdir }}
+          LINKS: ${{ inputs.bin-links }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -f
+          layer="$RUNNER_TEMP/image-layer/layer.tar"
+          wd="${WORKDIR#/}"
+          bad=0
+          fail() { echo "::error::layer: $*"; bad=1; }
+          # One line per entry: type, then the name (GNU tar's escaped form), and for a
+          # symlink its target. A name holding " -> " would confuse the split, so names
+          # are read again on their own and must match.
+          mapfile -t names < <(tar -tf "$layer")
+          # With extended attributes and ACLs shown: an entry carrying either (a file
+          # capability is a setuid of its own) lists with a `*` or `+` after its mode.
+          mapfile -t lines < <(tar --xattrs --xattrs-include='*' --acls --numeric-owner -tvf "$layer")
+          [ "${#names[@]}" = "${#lines[@]}" ] || fail "unreadable listing"
+          declare -A seen=()
+          for i in "${!names[@]}"; do
+            name="${names[$i]%/}"
+            perms="${lines[$i]%% *}"
+            type="${perms:0:1}"
+            seen[$name]="$type"
+            if [[ "$name" == /* ]] || [[ "$name" =~ (^|/)\.\.?(/|$) ]] || [ -z "$name" ]; then
+              fail "'$name' is not a plain relative path"; continue
+            fi
+            # A symlink's own mode means nothing (it is always 0777).
+            if [[ "$perms" == *[*+] ]]; then
+              fail "'$name' carries extended attributes or ACLs ($perms)"
+            fi
+            if [[ "$perms" =~ [sStT] ]] || { [ "$type" != l ] && [[ "${perms:5:1}${perms:8:1}" == *w* ]]; }; then
+              fail "'$name' has setuid, setgid, sticky or group/other write ($perms)"
+            fi
+            case "$name" in
+              usr/local/bin/server)
+                [ "$type" = - ] || fail "usr/local/bin/server is not a regular file" ;;
+              usr/local/bin/*)
+                ok=0
+                for l in $LINKS; do [ "$name" = "usr/local/bin/$l" ] && ok=1; done
+                [ "$ok" = 1 ] || { fail "'$name' is not a declared bin-link"; continue; }
+                [ "$type" = l ] && [[ "${lines[$i]}" == *" $name -> server" ]] \
+                  || fail "'$name' is not a symlink to server" ;;
+              "$wd")
+                [ "$type" = d ] || fail "the work directory is not a directory" ;;
+              "$wd"/*)
+                # Files and directories only: a symlink here could let a later entry
+                # write through it, anywhere in the image.
+                [ "$type" = - ] || [ "$type" = d ] || fail "'$name' is not a regular file or directory" ;;
+              *)
+                fail "'$name' is not a path image.yml packs" ;;
+            esac
+          done
+          [ "${seen[usr/local/bin/server]:-}" = - ] || fail "no usr/local/bin/server"
+          [ "$bad" = 0 ]
+          tar --numeric-owner -tvf "$layer" | head -n 200
+      - name: Check the base image
+        id: base
+        env:
+          BASE: ${{ inputs.base-image }}
+          REQUIRES: ${{ inputs.base-requires }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${BASE%@*}"
+          # A tag after the last slash, if any.
+          if [[ "${name##*/}" == *:* ]]; then name="${name%:*}"; fi
+          digest="$(crane digest --platform linux/amd64 "$BASE")"
+          ref="${name}@${digest}"
+          echo "base ${BASE} is ${ref} for linux/amd64"
+          fs="$RUNNER_TEMP/base"
+          mkdir -p "$fs"
+          crane export --platform linux/amd64 "$ref" "$fs/fs.tar"
+          tar -tf "$fs/fs.tar" | sed 's,^\./,,' > "$fs/list"
+          missing=0
+          for p in $REQUIRES; do
+            grep -qxF "${p#/}" "$fs/list" || { echo "::error::the base image has no $p"; missing=1; }
+          done
+          [ "$missing" = 0 ]
+          # glibc: the newest symbol version the binary needs against the newest the
+          # base's libc defines. A static binary needs none.
+          need="$(tar -xOf "$RUNNER_TEMP/image-layer/layer.tar" usr/local/bin/server | { grep -ao 'GLIBC_2\.[0-9]*' || true; } | sort -uV | tail -n1)"
+          if [ -n "$need" ]; then
+            libc="$(grep -E '(^|/)libc\.so\.6$' "$fs/list" | head -n1 || true)"
+            [ -n "$libc" ] || { echo "::error::the binary links glibc ($need) and the base image has no libc.so.6"; exit 1; }
+            have="$(tar -xOf "$fs/fs.tar" "$libc" | { grep -ao 'GLIBC_2\.[0-9]*' || true; } | sort -uV | tail -n1)"
+            if [ -z "$have" ] || [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1)" != "$have" ]; then
+              echo "::error::the binary needs $need and the base image's glibc is ${have:-unknown}"
+              exit 1
+            fi
+            echo "glibc: the binary needs $need, the base has $have"
+          fi
+          rm -rf "$fs"
+          {
+            echo "name=${name}"
+            echo "digest=${digest}"
+            echo "ref=${ref}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Push
+        id: push
+        env:
+          TOKEN: ${{ github.token }}
+          BASE_NAME: ${{ steps.base.outputs.name }}
+          BASE_DIGEST: ${{ steps.base.outputs.digest }}
+          BASE_REF: ${{ steps.base.outputs.ref }}
+          ENTRYPOINT: ${{ inputs.entrypoint }}
+          CMD: ${{ inputs.cmd }}
+          IMAGE_USER: ${{ inputs.user }}
+          WORKDIR: ${{ inputs.workdir }}
+          PORT: ${{ inputs.port }}
+          IMAGE_ENV: ${{ inputs.env }}
+          IMAGE_LABELS: ${{ inputs.labels }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # crane reads a list flag's value as CSV, so each element is quoted; crane
+          # does not unescape a quote inside one, so none may hold a double quote.
+          csv() {
+            if [[ "$1" == *'"'* ]]; then echo "::error::no double quote in an entrypoint, cmd or label: $1" >&2; exit 1; fi
+            printf '"%s"' "$1"
+          }
+          args=(--append "$RUNNER_TEMP/image-layer/layer.tar" --repo "$REPO" -w "$WORKDIR")
+          if [ -n "$IMAGE_USER" ]; then args+=(-u "$IMAGE_USER"); fi
+          n="$(jq -er 'if type == "array" and length > 0 and all(type == "string") then length else error("") end' <<<"$ENTRYPOINT")" \
+            || { echo "::error::entrypoint must be a non-empty JSON array of strings"; exit 1; }
+          for ((i = 0; i < n; i++)); do args+=(--entrypoint "$(csv "$(jq -r ".[$i]" <<<"$ENTRYPOINT")")"); done
+          # Setting the entrypoint clears the base's cmd, as a Dockerfile's ENTRYPOINT does.
+          if [ -n "$CMD" ]; then
+            n="$(jq -er 'if type == "array" and all(type == "string") then length else error("") end' <<<"$CMD")" \
+              || { echo "::error::cmd must be a JSON array of strings"; exit 1; }
+            for ((i = 0; i < n; i++)); do args+=(--cmd "$(csv "$(jq -r ".[$i]" <<<"$CMD")")"); done
+          fi
+          if [ -n "$PORT" ]; then
+            [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "::error::port must be a number ('$PORT')"; exit 1; }
+            args+=(-e "BIND_ADDR=0.0.0.0:${PORT}" --exposed-ports "${PORT}/tcp")
+          fi
+          while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || { echo "::error::env: '${line%%=*}' is not KEY=VALUE"; exit 1; }
+            args+=(-e "$line")
+          done <<<"$IMAGE_ENV"
+          while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            [[ "$line" =~ ^[A-Za-z0-9._/-]+= ]] || { echo "::error::labels: '${line%%=*}' is not KEY=VALUE"; exit 1; }
+            args+=(-l "$(csv "$line")")
+          done <<<"$IMAGE_LABELS"
+          for kv in "org.opencontainers.image.version=${VERSION}" \
+            "org.opencontainers.image.base.name=${BASE_NAME}" \
+            "org.opencontainers.image.base.digest=${BASE_DIGEST}"; do
+            args+=(-l "$(csv "$kv")")
+          done
+          args+=(-a "$(csv "org.opencontainers.image.base.name=${BASE_NAME}")"
+            -a "$(csv "org.opencontainers.image.base.digest=${BASE_DIGEST}")")
+
+          # The token goes to crane's own configuration, in this job's temporary
+          # directory, and is removed however the step ends.
+          export DOCKER_CONFIG="$RUNNER_TEMP/crane-auth"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          mkdir -p "$DOCKER_CONFIG"
+          printf '%s' "$TOKEN" | crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          unset TOKEN
+
+          pushed="$(crane mutate "$BASE_REF" "${args[@]}")"
+          digest="${pushed##*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::crane printed no digest ('$pushed')"; exit 1; }
+          # What was pushed is what was meant, before any tag names it.
+          got="$(crane config "${REPO}@${digest}" | jq -r '.config.Labels["org.opencontainers.image.version"]')"
+          [ "$got" = "$VERSION" ] || { echo "::error::the pushed image says version '$got'"; exit 1; }
+          for t in $TAGS; do crane tag "${REPO}@${digest}" "$t"; done
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          crane config "${REPO}@${digest}" | jq '.config | {Entrypoint, Cmd, Env, User, WorkingDir, ExposedPorts}'
+          echo "pushed ${REPO}@${digest} as: ${TAGS}"
+
+  # Says why when nothing would run, rather than succeed with no image.
+  refused:
+    if: >-
+      ${{ !((inputs.builder == 'crane' || inputs.builder == 'docker') && github.repository_owner == 'onewaytek'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))) }}
+    # Never the scale set: this may be a fork's event.
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Nothing is built
+        env:
+          BUILDER: ${{ inputs.builder }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "::error::no image: builder is '${BUILDER}' (crane or docker), and the jobs run only for this organization's own push, workflow_dispatch, schedule or same-repository pull_request (this is ${EVENT})"
+          exit 1
+
+  docker:
+    if: >-
+      ${{ inputs.builder == 'docker' && github.repository_owner == 'onewaytek'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
+    # BuildKit needs a Docker daemon, which the ARC runners do not have.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,9 +724,8 @@ jobs:
     env:
       RAW_VERSION: ${{ inputs.version }}
       FLOATING: ${{ inputs.floating-tags }}
+      TEST_TAG: ${{ inputs.tag }}
     steps:
-      # The channel comes from the version's shape, not from a second input that
-      # could disagree with it.
       - name: Resolve version
         run: |
           set -euo pipefail
@@ -107,14 +775,23 @@ jobs:
           set -euo pipefail
           # ghcr rejects uppercase paths.
           REPO="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
-          tags=("${REPO}:${VERSION}")
-          if [ "$FLOATING" = true ]; then
-            if [ "$CHANNEL" = rc ]; then
-              tags+=("${REPO}:rc")
-            else
-              IFS=. read -r major minor _ <<<"$VERSION"
-              tags+=("${REPO}:${major}.${minor}" "${REPO}:latest")
-              [ "$major" = 0 ] || tags+=("${REPO}:${major}")
+          if [ -n "$TEST_TAG" ]; then
+            if ! [[ "$TEST_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] \
+              || [[ "$TEST_TAG" =~ ^(latest|rc|[0-9]+(\.[0-9]+){0,2}(-rc\.[0-9]+)?)$ ]]; then
+              echo "tag: '$TEST_TAG' is not a test tag (never latest, rc or a version)" >&2
+              exit 1
+            fi
+            tags=("${REPO}:${TEST_TAG}")
+          else
+            tags=("${REPO}:${VERSION}")
+            if [ "$FLOATING" = true ]; then
+              if [ "$CHANNEL" = rc ]; then
+                tags+=("${REPO}:rc")
+              else
+                IFS=. read -r major minor _ <<<"$VERSION"
+                tags+=("${REPO}:${major}.${minor}" "${REPO}:latest")
+                [ "$major" = 0 ] || tags+=("${REPO}:${major}")
+              fi
             fi
           fi
           { echo "list<<EOF"; printf '%s\n' "${tags[@]}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
