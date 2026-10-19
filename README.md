@@ -2401,13 +2401,17 @@ follow, so build on those rather than naming a host.
 The release flow's light jobs follow the same `RUNS_ON`: `release.yml`'s release job,
 `promote-rc.yml`, `publish-rc.yml`, `requeue-rc.yml` and `conventional-commits.yml`.
 They assume nothing on the runner but git (Node and uv come from their setup
-actions), so they run in the runner pod itself, with no job container. A pull
-request from a fork never reaches the scale set: `rust-ci.yml` skips it, and
-`conventional-commits.yml` checks it on GitHub-hosted runners instead. The jobs whose
+actions), so they run in the runner pod itself, with no job container. A fork's
+`pull_request` never reaches the scale set: `rust-ci.yml` skips it, and
+`conventional-commits.yml` checks it (and any repository outside the organization)
+on GitHub-hosted runners instead. The jobs whose
 token can write (the release, a promotion, a publish, a requeue) also refuse every
 event but the repository's own: a push or a dispatch for a release; a push, a
 dispatch, a schedule or a same-repository pull request for the rc jobs. A
 `pull_request_target`, `workflow_run` or `issue_comment` caller runs none of them.
+An app's `version-command` runs in that runner pod too, which has git, curl, jq,
+tar, Node and (with `uv: true`) uv, but no cargo and no gh: a command that needs
+more installs it itself, or the app runs its releases GitHub-hosted with `RUNS_ON`.
 
 **Releasing an app:** this is how an *app* releases, with semantic-release through the
 reusable `release.yml`. owt-stack releases itself differently, with release-please
@@ -3003,7 +3007,10 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - `release.yml`'s release job, `promote-rc.yml`, `publish-rc.yml`, `requeue-rc.yml`
   and `conventional-commits.yml` run on the `arc-openshift-k8s` scale set unless
   `RUNS_ON` names other runners, as `rust-ci.yml` does; a private app stops paying
-  GitHub-hosted minutes for them. Nothing in the call changes. An app that sets
+  GitHub-hosted minutes for them. Nothing in the call changes, with one exception:
+  a `version-command` runs in the ARC runner pod, which has no cargo and no gh (git,
+  curl, jq, tar, Node and uv are there); such a command installs what it needs, or
+  the app sets `RUNS_ON` to `"ubuntu-latest"`. An app that sets
   `RUNS_ON` keeps those jobs on its runners too, and a public repository keeps
   `RUNS_ON` at `"ubuntu-latest"`.
 - **Breaking** for an unusual caller only: the jobs whose token can write run only

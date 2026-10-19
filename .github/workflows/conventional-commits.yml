@@ -40,8 +40,9 @@ permissions: {}
 
 jobs:
   title:
-    # A fork's pull request (or no pull request at all) runs GitHub-hosted.
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}
+    # A fork's pull request (or no pull request at all), and any repository outside
+    # the organization that owns the scale set, runs GitHub-hosted.
+    runs-on: ${{ fromJSON(github.repository_owner == 'onewaytek' && github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}
     permissions:
       pull-requests: read
     steps:
@@ -53,8 +54,9 @@ jobs:
           validateSingleCommit: true
 
   commits:
-    # A fork's pull request (or no pull request at all) runs GitHub-hosted.
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}
+    # A fork's pull request (or no pull request at all), and any repository outside
+    # the organization that owns the scale set, runs GitHub-hosted.
+    runs-on: ${{ fromJSON(github.repository_owner == 'onewaytek' && github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}
     permissions:
       contents: read
     steps:
