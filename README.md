@@ -2278,9 +2278,13 @@ set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
 and `templates/dependabot.yml` as `.github/dependabot.yml`, so the app's action and
 workflow pins, crates and npm packages move by weekly `fix(deps)` pull requests, each
 a patch release once merged, instead of by hand at the next adoption (Dependabot
-follows a git dependency pinned to a version tag, the crates' `tag = "vX.Y.Z"` and the
-stylesheet's `#vX.Y.Z`; an app's first weekly pull request shows it). Every app then
-answers to the same commands:
+follows a git dependency pinned to a version tag, such as the crates' `tag = "vX.Y.Z"`;
+an app's first weekly pull request shows it). The template ignores one npm package, the
+stylesheet's `github:onewaytek/owt-stack#vX.Y.Z`: Dependabot does not order a git
+dependency's tags as versions and proposes moving it to an older tag, so the app moves
+it with `npm install -D` when it adopts a release (**Tailwind:** below).
+An app that copied the template earlier adds the same `ignore` entry to its npm
+ecosystem before it resumes Dependabot. Every app then answers to the same commands:
 
 ```sh
 just setup        # npm ci, sqlx-cli and cargo-audit at CI's versions
@@ -3007,6 +3011,8 @@ the exporter's port to Prometheus alone.
 Move to a release with `npm install -D github:onewaytek/owt-stack#vX.Y.Z`: editing the
 tag in `package.json` and running `npm install` keeps the old commit in
 `package-lock.json`, and the stylesheet stays at the old release.
+Dependabot leaves this dependency alone (`templates/dependabot.yml` ignores it), so
+this command, run when the app adopts a release, is the only thing that moves it.
 
 ## Decisions
 
