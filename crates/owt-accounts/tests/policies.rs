@@ -209,21 +209,6 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// `GET uri` as a browser navigates to a page: it says so, and asks for HTML. The
-/// client's plain `get` sends neither, as a non-browser client (or a fetch) does,
-/// and the gate leaves those alone.
-async fn navigate(client: &owt_test::Client, uri: &str) -> owt_test::Response {
-    client
-        .send(
-            Request::get(uri)
-                .header("sec-fetch-dest", "document")
-                .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-}
-
 /// The test app, and a client signed in as `ada`, who has agreed to nothing.
 async fn signed_in(db: &Db) -> (owt_test::Client, store::Account, Sessions<Data>) {
     let sessions = sessions();
@@ -273,7 +258,7 @@ async fn the_gate_sends_signed_in_page_loads_to_the_page_that_asks() {
 
     // Signed in: every document load goes to the page that asks first, as a
     // browser asks for one (naming the destination, or just text/html)...
-    let r = navigate(&client, "/whoami?x=1").await;
+    let r = client.get_page("/whoami?x=1").await;
     assert_eq!(r.status, 303);
     assert_eq!(r.location(), Some("/agree?next=%2Fwhoami%3Fx%3D1"));
     // An older browser names no destination but asks for HTML.
@@ -448,7 +433,7 @@ async fn a_new_version_asks_again_and_old_ones_stay_while_held() {
 
     let v2 = published(&db, "terms", "Terms", "Second.", "Clearer wording.").await;
     assert_eq!(v2.version, Some(2));
-    assert_eq!(navigate(&client, "/whoami").await.status, 303);
+    assert_eq!(client.get_page("/whoami").await.status, 303);
     assert_eq!(
         client.get("/whoami").await.status,
         200,
@@ -626,7 +611,7 @@ async fn a_draft_is_private_checked_and_fixed_once_published() {
     );
 
     // Staff are asked too, though not on the staff pages.
-    assert_eq!(navigate(&client, "/whoami").await.status, 303);
+    assert_eq!(client.get_page("/whoami").await.status, 303);
     assert_eq!(client.get("/staff/policies").await.status, 200);
     db.drop().await;
 }
@@ -722,7 +707,7 @@ async fn an_app_draws_the_pages_at_its_paths_in_its_words() {
     published(&db, "terms", "Terms <1>", "First.", "").await;
 
     // The app's own page, at the prefix; nothing at the root.
-    let r = navigate(&client, "/legal/terms").await;
+    let r = client.get_page("/legal/terms").await;
     assert_eq!(r.status, 200, "a document is never gated");
     assert!(
         r.text()
@@ -734,7 +719,7 @@ async fn an_app_draws_the_pages_at_its_paths_in_its_words() {
     assert_eq!(client.get("/legal/terms/v/1").await.status, 200);
 
     // The page that asks stays Tailwind's, with the paths, the dates and the words.
-    let r = navigate(&client, "/whoami").await;
+    let r = client.get_page("/whoami").await;
     assert_eq!(r.location(), Some("/agree?next=%2Fwhoami"));
     let html = client.get("/agree").await.text();
     assert!(

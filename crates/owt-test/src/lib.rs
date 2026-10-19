@@ -182,16 +182,19 @@ impl Client {
             .await
     }
 
-    /// `GET uri` as a browser loads a page: `Sec-Fetch-Dest: document`,
-    /// `Sec-Fetch-Mode: navigate` and `Accept: text/html`. What tells a page load
-    /// from a fetch or an image (`owt_accounts`'s policy gate sends only page loads
-    /// to its page), so a test of such a gate loads pages with this.
+    /// `GET uri` as a browser loads a page the user asked for: `Sec-Fetch-Dest:
+    /// document`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Site: none`,
+    /// `Sec-Fetch-User: ?1` and a browser's `Accept`. A page load is what
+    /// `owt_accounts`'s policy gate interrupts, and what tells a page from a fetch or an
+    /// image, so a test of such a gate loads pages with this.
     pub async fn get_page(&self, uri: &str) -> Response {
         self.send(
             Request::get(uri)
                 .header("sec-fetch-dest", "document")
                 .header("sec-fetch-mode", "navigate")
-                .header(header::ACCEPT, "text/html,application/xhtml+xml")
+                .header("sec-fetch-site", "none")
+                .header("sec-fetch-user", "?1")
+                .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -308,20 +311,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_page_load_says_it_is_one() {
-        let dest = |h: HeaderMap| async move {
-            format!(
-                "{:?} {:?}",
-                h.get("sec-fetch-dest")
-                    .map(|v| v.to_str().unwrap().to_owned()),
-                h.get(header::ACCEPT)
-                    .map(|v| v.to_str().unwrap().to_owned())
-            )
+        let seen = |h: HeaderMap| async move {
+            [
+                "sec-fetch-dest",
+                "sec-fetch-mode",
+                "sec-fetch-site",
+                "sec-fetch-user",
+                "accept",
+            ]
+            .map(|n| h.get(n).map_or("-", |v| v.to_str().unwrap()).to_owned())
+            .join(" | ")
         };
-        let client = Client::new(Router::new().route("/", get(dest)));
-        assert_eq!(client.get("/").await.text(), "None None");
+        let client = Client::new(Router::new().route("/", get(seen)));
+        assert_eq!(client.get("/").await.text(), "- | - | - | - | -");
         assert_eq!(
             client.get_page("/").await.text(),
-            "Some(\"document\") Some(\"text/html,application/xhtml+xml\")"
+            "document | navigate | none | ?1 | text/html,application/xhtml+xml,*/*;q=0.8"
         );
     }
 
