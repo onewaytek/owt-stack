@@ -2525,9 +2525,11 @@ jobs:
   A run that failed its checks is left alone, and so is one already on
   its fifth attempt (`max-attempts`). Run it after each promotion, so one hands on to
   the next, and on a schedule, for when none follows. The scheduled one sits outside
-  the group, so both can pick the same run: the run's status is read before the
-  re-run and again if GitHub refuses it, and a run that is going again is logged and
-  passes, whatever the refusal's wording. Any other refusal of a run (one over a
+  the group, so both can pick the same run: the run's status and attempt are read
+  before the re-run and again if GitHub refuses it, and a run that is going again, or
+  whose attempt moved since the list was read (re-run by the other and finished
+  again), is logged and passes, whatever the refusal's wording; a run deleted in
+  between is skipped. Any other refusal of a run (one over a
   month old, say) is a warning, and the next PR is tried; a refusal for want of
   `actions: write` fails the job once every PR is walked. It sees waiting *runs*, not
   waiting jobs, so put the `promote-rc` concurrency group on the workflow, as below:

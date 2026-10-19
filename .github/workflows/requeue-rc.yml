@@ -179,18 +179,33 @@ jobs:
               }
 
               // The scheduled requeue runs outside the promote-rc group, so it can pick
-              // the run the in-group one has just re-run. The run's own status says so,
+              // the run the in-group one has just re-run. The run itself says so,
               // whatever wording GitHub refuses a second re-run with: one that is not
-              // completed is going again, which is what was wanted. It is read before
-              // the re-run and, since the other requeue can get in between, again on a
-              // refusal.
+              // completed is going again, which is what was wanted, and one whose
+              // attempt has moved since the list was read was re-run and has finished
+              // again, so re-running it now would be a second re-run for one loss. It
+              // is read before the re-run and, since the other requeue can get in
+              // between, again on a refusal. The answer is empty when the run is as
+              // listed, else what changed.
               const goingAgain = async () => {
                 const { data } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id });
-                return data.status === "completed" ? "" : data.status;
+                if (data.status !== "completed") return `is ${data.status} again`;
+                if (data.run_attempt !== run.run_attempt) {
+                  return `moved from attempt ${run.run_attempt} to ${data.run_attempt}`;
+                }
+                return "";
               };
-              const status = await goingAgain();
-              if (status) {
-                core.info(`#${pr.number}: run ${run.id} is ${status} again; another requeue got there first`);
+              let moved;
+              try {
+                moved = await goingAgain();
+              } catch (e) {
+                // Deleted since the list was read: nothing to re-run.
+                if (e.status !== 404) throw e;
+                core.info(`#${pr.number}: run ${run.id} is gone; leaving it`);
+                continue;
+              }
+              if (moved) {
+                core.info(`#${pr.number}: run ${run.id} ${moved}; another requeue got there first`);
                 return;
               }
 
@@ -211,7 +226,7 @@ jobs:
                   core.warning(`#${pr.number}: run ${run.id} could not be read again (${read.message})`);
                 }
                 if (now || /already running/i.test(why)) {
-                  core.info(`#${pr.number}: run ${run.id} is ${now || "already running"}; another requeue got there first`);
+                  core.info(`#${pr.number}: run ${run.id} ${now || "is already running"}; another requeue got there first`);
                   return;
                 }
                 // Any other refusal is about this run (one created over a month ago, say)
