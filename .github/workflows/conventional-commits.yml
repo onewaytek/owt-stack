@@ -5,7 +5,13 @@ name: Conventional Commits
 # the pull request title, which a squash merge uses as the commit, and every commit,
 # which a merge commit keeps. commitlint reads the pull request's commitlint
 # configuration, which is JavaScript and runs: so this job holds no secrets and only
-# a read token, and runs on GitHub-hosted runners, where a fork's code may run.
+# a read token.
+#
+# A pull request from a branch of the repository itself runs on the arc-openshift-k8s
+# ARC scale set, as rust-ci.yml's checks do (override with the RUNS_ON repository or
+# organization variable, a JSON string such as '"ubuntu-latest"'). A fork's pull
+# request is checked too, but on GitHub-hosted runners: its code never runs on the
+# scale set. Node comes from setup-node; nothing else is assumed installed.
 #
 # Reusable too: an app whose release.yml derives its version from its commits calls
 # it from its pull-request workflow, so the same rules, commitlint and versions check
@@ -34,7 +40,9 @@ permissions: {}
 
 jobs:
   title:
-    runs-on: ubuntu-latest
+    # A fork's pull request (or no pull request at all), and any repository outside
+    # the organization that owns the scale set, runs GitHub-hosted.
+    runs-on: ${{ fromJSON(github.repository_owner == 'onewaytek' && github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}
     permissions:
       pull-requests: read
     steps:
@@ -46,7 +54,9 @@ jobs:
           validateSingleCommit: true
 
   commits:
-    runs-on: ubuntu-latest
+    # A fork's pull request (or no pull request at all), and any repository outside
+    # the organization that owns the scale set, runs GitHub-hosted.
+    runs-on: ${{ fromJSON(github.repository_owner == 'onewaytek' && github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}
     permissions:
       contents: read
     steps:

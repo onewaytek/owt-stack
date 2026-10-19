@@ -14,8 +14,9 @@ name: Rust CI
 #
 # Runs on the arc-openshift-k8s ARC scale set (override with the RUNS_ON
 # repository or organization variable, a JSON string such as '"ubuntu-latest"').
-# Image builds and releases do not belong here: the ARC runners are rootless with no
-# Docker daemon, so they run on GitHub-hosted runners in the app's own workflow.
+# So do the release flow's light jobs (release.yml, promote-rc.yml, publish-rc.yml,
+# requeue-rc.yml, conventional-commits.yml). Image builds do not: the ARC runners are
+# rootless with no Docker daemon, so image.yml runs on GitHub-hosted runners.
 #
 # This repository is public, so any repository may call this workflow; the ARC scale
 # set it runs on belongs to the onewaytek organization, so a caller elsewhere sets

@@ -44,6 +44,14 @@ name: Requeue rc promotions
 #       permissions: {actions: write, contents: read, pull-requests: read}
 #       uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@vX.Y.Z
 #       with: {workflow: pr.yml}
+#
+# Runs on the arc-openshift-k8s ARC scale set, as rust-ci.yml does (override with the
+# RUNS_ON repository or organization variable, a JSON string such as
+# '"ubuntu-latest"'); it needs only git and the runner's own Node, which runs the
+# github-script steps. Its token can write, so it runs only for the repository's own
+# events: a push, a dispatch, a schedule, or a pull request from a branch of the
+# repository itself. A fork's pull request, `pull_request_target` and `workflow_run`
+# start nothing here, so neither the scale set nor the token is reachable from a fork.
 
 on:
   workflow_call:
@@ -66,8 +74,11 @@ permissions:
 
 jobs:
   requeue:
-    if: ${{ github.repository_owner == 'onewaytek' }}
-    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.repository_owner == 'onewaytek'
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
       actions: write
       contents: read

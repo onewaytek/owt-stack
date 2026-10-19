@@ -35,6 +35,14 @@ name: App release (reusable)
 #
 # The tooling is pinned here, not in the app's package.json, so every app releases
 # with the same semantic-release and the app needs no Node dependency to do it.
+#
+# Runs on the arc-openshift-k8s ARC scale set, as rust-ci.yml does (override with the
+# RUNS_ON repository or organization variable, a JSON string such as
+# '"ubuntu-latest"'). It needs nothing installed there but git: Node comes from
+# setup-node and uv from setup-uv. An app's version-command runs there too, so it
+# finds no cargo and no gh (see the input). The job holds a token that can push tags, so it
+# runs only for the repository's own pushes and dispatches: no pull request, and no
+# event a fork can start, reaches it.
 
 on:
   workflow_call:
@@ -45,8 +53,10 @@ on:
           e.g. `uv version "$VERSION" && uv lock`. It runs in bash on main only, with
           GITHUB_TOKEN unset, but as a child of the process holding it, which it
           could read (/proc/$PPID/environ): only code main has reviewed, and
-          dependencies the app trusts, belong in it. Empty: the version lives only
-          in the tag.
+          dependencies the app trusts, belong in it. On the ARC runners it finds git,
+          curl, jq, tar, Node and (with `uv`) uv, but no cargo and no gh: an app
+          whose command needs more installs it in the command, or runs the release
+          GitHub-hosted (RUNS_ON). Empty: the version lives only in the tag.
         type: string
         default: ""
       version-files:
@@ -80,9 +90,13 @@ jobs:
     concurrency:
       group: release-${{ github.repository }}-${{ github.ref_name }}
       cancel-in-progress: false
-    # A push to a fork's main is not a release of ours.
-    if: ${{ github.repository_owner == 'onewaytek' && (github.ref_name == 'main' || github.ref_name == 'rc') }}
-    runs-on: ubuntu-latest
+    # A push to a fork's main is not a release of ours, and only a push or a dispatch
+    # (both need write access to the repository) releases.
+    if: >-
+      ${{ github.repository_owner == 'onewaytek'
+      && (github.ref_name == 'main' || github.ref_name == 'rc')
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
       contents: write
       issues: write
