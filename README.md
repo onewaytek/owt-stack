@@ -178,12 +178,14 @@ on.
 (`db::STARTUP_PATIENCE`), with a warning each time, so a pod that starts while the
 database is fenced for a nightly offline snapshot, or switching over, waits rather
 than crash-restarting; a refused password, a missing database or a certificate that
-does not verify fails at once. `connect_within(url, patience)` sets another bound
-(`Duration::ZERO` tries once). It also warns at start when the database is not on this machine and
-its TLS is not verified (`db::unverified_tls(&options)` asks the same of any
-`PgConnectOptions`): give the pod `PGSSLMODE=verify-full` and `PGSSLROOTCERT`
-(the OpenShift template does), since sqlx's default (`prefer`) neither requires TLS
-nor checks the server.
+does not verify fails at once. Each attempt also waits out `acquire_timeout` (30 s)
+for a refused connection, so the worst case is about two minutes, inside the
+template's five-minute startup probe. `connect_within(url, patience)` sets another
+bound (`Duration::ZERO` tries once). It also warns at start when the database is not
+on this machine and its TLS is not verified (`db::unverified_tls(&options)` asks the
+same of any `PgConnectOptions`): give the pod `PGSSLMODE=verify-full` and
+`PGSSLROOTCERT` (the OpenShift template does), since sqlx's default (`prefer`)
+neither requires TLS nor checks the server.
 
 The router composes the layers. Order matters: a layer added later wraps the ones
 before it, so cross-origin refusal runs before the session is opened, and the outer

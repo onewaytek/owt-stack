@@ -117,6 +117,7 @@ async fn connect_waits_for_a_database_that_comes_up() {
     );
     let started = Instant::now();
     let pool = config
+        .clone()
         .connect_within(&via, Duration::from_secs(20))
         .await
         .expect("connected once the forwarder listened");
@@ -128,24 +129,27 @@ async fn connect_waits_for_a_database_that_comes_up() {
     assert_eq!(one, 1);
     pool.close().await;
 
-    // A wrong password fails at once, whatever the patience.
+    // A wrong password is the server's refusal, never retried. The acquire timeout
+    // is long, so a slow SCRAM exchange under load is not a timeout; a retry would
+    // end in the timeout rather than the server's code.
     let wrong = format!(
         "postgres://{}:not-the-password@127.0.0.1:{port}/{}",
         moved.get_username(),
         moved.get_database().unwrap_or("postgres"),
     );
-    let started = Instant::now();
-    assert!(
-        config
-            .connect_within(&wrong, Duration::from_secs(20))
-            .await
-            .is_err()
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "{:?}",
-        started.elapsed()
-    );
+    let patient = owt_runtime::db::PoolConfig {
+        acquire_timeout: Duration::from_secs(10),
+        ..config
+    };
+    let error = patient
+        .connect_within(&wrong, Duration::from_secs(20))
+        .await
+        .unwrap_err();
+    let code = error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .map(|c| c.into_owned());
+    assert_eq!(code.as_deref(), Some("28P01"), "{error}");
     forwarder.abort();
 }
 

@@ -98,8 +98,24 @@ pub const STARTUP_PATIENCE: Duration = Duration::from_secs(60);
 /// Whether `error` says the database could not be reached, rather than that it
 /// refused this client: worth another attempt.
 fn unreachable(error: &sqlx::Error) -> bool {
+    use std::io::ErrorKind as K;
     match error {
-        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut => true,
+        // The network's errors only: rustls reports a certificate that does not
+        // verify as `InvalidData`, which no retry changes.
+        sqlx::Error::Io(e) => matches!(
+            e.kind(),
+            K::ConnectionRefused
+                | K::ConnectionReset
+                | K::ConnectionAborted
+                | K::NotConnected
+                | K::BrokenPipe
+                | K::TimedOut
+                | K::UnexpectedEof
+                | K::HostUnreachable
+                | K::NetworkUnreachable
+                | K::AddrNotAvailable
+        ),
+        sqlx::Error::PoolTimedOut => true,
         // Class 08, connection exception; 57P01-57P03, the server shutting down or
         // starting up.
         sqlx::Error::Database(db) => db
@@ -169,6 +185,20 @@ pub async fn migrate_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_certificate_that_does_not_verify_is_not_unreachable() {
+        use std::io::{Error, ErrorKind};
+        let io = |kind| sqlx::Error::Io(Error::new(kind, "x"));
+        assert!(
+            !unreachable(&io(ErrorKind::InvalidData)),
+            "rustls's InvalidCertificate"
+        );
+        assert!(!unreachable(&sqlx::Error::Configuration("x".into())));
+        assert!(unreachable(&io(ErrorKind::ConnectionRefused)));
+        assert!(unreachable(&io(ErrorKind::HostUnreachable)));
+        assert!(unreachable(&sqlx::Error::PoolTimedOut));
+    }
 
     #[tokio::test]
     async fn an_unreachable_database_is_tried_until_patience_runs_out() {
