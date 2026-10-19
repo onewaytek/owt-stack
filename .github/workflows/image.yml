@@ -297,6 +297,8 @@ jobs:
       # files, nothing else from the checkout. Credentials-shaped names (the ones
       # templates/dockerignore keeps out of a Docker context) are left out of the files.
       # Times are the commit's and entries sorted, so the same inputs pack the same.
+      # No entry keeps group or other write, setuid, setgid or sticky: the runner's
+      # work volume makes its directories setgid.
       - name: Pack the layer
         env:
           BIN: ${{ inputs.bin }}
@@ -343,7 +345,7 @@ jobs:
           # The checkout belongs to another uid than the job container's user.
           epoch="$(git -c safe.directory="$PWD" log -1 --format=%ct)"
           common=(--format=posix --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
-            --sort=name --mtime="@${epoch}" --numeric-owner --mode=go-w)
+            --sort=name --mtime="@${epoch}" --numeric-owner --mode=go-w,u-s,g-s,-t)
           tar -C "$stage" "${common[@]}" --owner=0 --group=0 --no-recursion \
             -cf "$out/layer.tar" "${entries[@]}"
           if [ "${#files[@]}" -gt 0 ]; then
