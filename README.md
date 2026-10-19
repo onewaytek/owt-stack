@@ -2822,6 +2822,28 @@ oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
   -p IMAGE=ghcr.io/onewaytek/myapp -p POSTGRES_MAJOR=16 | oc diff -f -
 ```
 
+**`DATABASE_URL` is the `uri` key of `myapp-db-app`** (`myapp-<DB_SUFFIX>-app`), in
+the Deployment and in every `cronjob.yaml` task. CloudNativePG creates that Secret,
+`uri` included, only when the Cluster's bootstrap (`initdb`, `recovery` or
+`pg_basebackup`) names no `secret:` of its own, as the template's `initdb` and the
+restore under "Restoring" below do. A Cluster made elsewhere with `secret:` gets no
+`myapp-db-app` from CNPG: the pods fail to start with `secret "myapp-db-app" not
+found`, or, when the app's own Secret has that name, with `couldn't find key uri in
+Secret`. So before adopting the template for an existing Cluster, check: an empty first
+answer means CNPG's own Secret, and the second then shows its `uri`, password masked.
+
+```sh
+oc get cluster.postgresql.cnpg.io myapp-db -o jsonpath='{.spec.bootstrap.*.secret.name}'; echo
+oc get secret myapp-db-app -o jsonpath='{.data.uri}' | base64 -d | sed 's/:[^:@]*@/:***@/'; echo
+```
+
+With a `secret:`, give the pods a Secret named `myapp-db-app` whose `uri` is in the
+form CNPG writes, `postgresql://myapp:<password>@myapp-db-rw.<namespace>:5432/myapp`
+(the password percent-encoded, no `sslmode`, which `PGSSLMODE` supplies). When the
+password changes, change `uri` in the same edit: CNPG applies a new `password` from
+the Secret named in `secret:` to the database's owner at once, but never rewrites
+`uri`.
+
 The Route sends traffic through the router (HAProxy), which keeps idle connections to
 the pod for reuse longer than the app's default 30-second keep-alive (its
 `timeout http-keep-alive` is 300 s). Serve with a `header_read_timeout` above that, as
