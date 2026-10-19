@@ -2287,7 +2287,7 @@ use owt_test::{Client, fragment, golden::{Golden, Normalizer}};
 # async fn main() {
 let app = Router::new().route("/", get(|| async { "<main id=\"m\"><p>Hi</p></main>" }));
 let browser = Client::new(app); // carries cookies between requests
-let page = browser.get("/").await;
+let page = browser.get_page("/").await; // a page load: Sec-Fetch-Dest: document
 assert_eq!(page.status, 200);
 
 // A page and its fragment render one region alike.
@@ -2305,6 +2305,11 @@ golden.check(); // a Golden dropped unchecked fails the test
 # }
 # }
 ```
+
+`Client::get_page` loads a page as a browser does (`Sec-Fetch-Dest: document`,
+`Sec-Fetch-Mode: navigate`, `Accept: text/html`), which is what the accounts' policy
+gate interrupts: test a gate, or anything else that tells page loads from fetches,
+with it. `Client::get` sends no fetch metadata, as a non-browser client.
 
 A `Client`'s requests come from a fixed peer, `owt_test::PEER` (`192.0.2.1:40000`),
 as axum's `MockConnectInfo` gives it, so a handler taking `ConnectInfo<SocketAddr>` or
