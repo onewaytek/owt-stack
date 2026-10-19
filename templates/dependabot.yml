@@ -2,8 +2,7 @@
 # request for each dependency that moved: the actions and reusable workflows the
 # app's workflows pin by commit (`uses: …@<commit> # vX.Y.Z`: it moves the commit and
 # rewrites the comment with it, so a pin never goes stale and never floats), the crates
-# in Cargo.lock, and the npm packages, the stylesheet's
-# `github:onewaytek/owt-stack#vX.Y.Z` among them. Each is a `fix(deps):` commit, which
+# in Cargo.lock, and the npm packages. Each is a `fix(deps):` commit, which
 # release.yml turns into a patch release; minor and patch updates of one ecosystem
 # come grouped in one pull request.
 #
@@ -33,6 +32,12 @@ updates:
     directory: /
     schedule: {interval: weekly}
     commit-message: {prefix: fix, include: scope}
+    # The stylesheet's `github:onewaytek/owt-stack#vX.Y.Z` is a git dependency, whose
+    # tags Dependabot does not order as versions: it proposes moving to an older tag.
+    # The app moves it with `npm install -D github:onewaytek/owt-stack#vX.Y.Z` when it
+    # adopts a release, together with the crates' tags.
+    ignore:
+      - dependency-name: "@onewaytek/owt-stack"
     groups:
       patch-and-minor:
         update-types: [minor, patch]
