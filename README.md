@@ -655,7 +655,9 @@ and the leftmost entry is never believed. `header:NAME` is for one proxy that se
 the header itself and that nothing can bypass. Add the source to every request as
 an `Extension`, serve with `into_make_service_with_connect_info::<SocketAddr>()`, and
 a handler takes `ClientIp`; without the peer and a header to read, it answers 500
-rather than key every client alike. `Policies::client_ip` takes its own copy: pass
+rather than key every client alike. A router tested in-process takes its peer from
+axum's `MockConnectInfo<SocketAddr>` layer, as axum's own `ConnectInfo` does, and
+`owt_test::Client` supplies one by default. `Policies::client_ip` takes its own copy: pass
 it the same source (`.client_ip(source.clone())`), so the two never disagree.
 To confirm a setting against the real proxies, raise the filter to
 `RUST_LOG=info,owt_web::client_ip=debug`: each extraction logs the source, the header
@@ -2303,6 +2305,15 @@ golden.check(); // a Golden dropped unchecked fails the test
 # }
 # }
 ```
+
+A `Client`'s requests come from a fixed peer, `owt_test::PEER` (`192.0.2.1:40000`),
+as axum's `MockConnectInfo` gives it, so a handler taking `ConnectInfo<SocketAddr>` or
+`ClientIp` (and code reading `owt_web::client_ip::peer`) answers in-process without a
+peer extension of the app's own; code that reads `Extension<ConnectInfo<SocketAddr>>`
+or the `ConnectInfo` extension directly sees none;
+`Client::with_peer(Some(addr))` picks another, `with_peer(None)` none. A
+`MockConnectInfo` or `Extension(ConnectInfo(..))` layer on the router still decides,
+so an app that adds one keeps its address.
 
 `owt_test::Server::spawn(router)` serves on an ephemeral port for WebSocket and SSE
 tests. Test requests carry no `Origin`, so cross-origin protection lets them through;
