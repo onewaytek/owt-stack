@@ -268,12 +268,44 @@ the handler and write `<script nonce="{{ nonce }}">`.
   key must open nothing.
 
   `Sessions::from_env("myapp", cookie, max_age, secure)` does the usual: the secret
-  from `SESSION_SECRET` (required), the purpose `myapp/` plus `SESSION_PURPOSE`, else
+  from `SESSION_SECRET` (required), the purpose `SESSION_KEY_PURPOSE` when it is set
+  (the whole purpose, taken exactly), else `myapp/` plus `SESSION_PURPOSE`, else
   `POD_NAMESPACE`, else `local` (`session::purpose_from`); `local` is for
-  development, and in a pod (`KUBERNETES_SERVICE_HOST` set) without either variable
-  it is an error. An app moving onto it from
-  a purpose of its own sets `SESSION_PURPOSE` to what followed its `myapp/`, or
-  everyone is signed out once. `Sessions::from_vars` reads a map instead, for tests.
+  development, and in a pod (`KUBERNETES_SERVICE_HOST` set) without any of the three
+  variables it is an error. `Sessions::from_vars` reads a map instead, for tests.
+
+  **Moving onto `from_env` without signing anyone out.** The key must stay the one
+  the app derives today, so first read the purpose actually in effect, from the live
+  configuration rather than the code's defaults: an app whose unset purpose meant
+  `myapp/development` changes key once `POD_NAMESPACE` reaches its pods, because
+  `from_env` reads that next. Then keep it: an old purpose `myapp/<rest>` is
+  `SESSION_PURPOSE=<rest>`, and one of another shape (`myapp https://myapp.example`)
+  is `SESSION_KEY_PURPOSE` set to the whole of it. `SESSION_KEY_PURPOSE` replaces the
+  `myapp/` and the environment both, so it is only for reproducing a key that
+  already exists, set per environment (each environment's own `myapp-env`), never in
+  configuration two environments share: there, with a copied secret, it would make
+  their keys one. When the purpose must change
+  anyway, open the old key's sessions for one `max_age` and drop it after: assert it
+  in a test with `Sessions::opens`, which seals a session under a key and reports
+  whether these sessions open it.
+
+  ```rust
+  # fn main() -> anyhow::Result<()> {
+  use owt_web::session::{Sessions, key_for};
+  # #[derive(Clone, Default, serde::Serialize, serde::Deserialize)] struct SessionData;
+  # let secret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==".to_owned();
+  # let vars = |name: &str| match name {
+  #     "SESSION_SECRET" => Some(secret.clone()),
+  #     "POD_NAMESPACE" => Some("myapp-prod".to_owned()),
+  #     _ => None,
+  # };
+  let max_age = std::time::Duration::from_secs(14 * 86_400);
+  let old = key_for(&secret, "myapp https://myapp.example")?;
+  let sessions = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, vars)?
+      .also_open_with(old.clone()); // for one max_age after the change, then removed
+  assert!(sessions.opens(&old));
+  # Ok(()) }
+  ```
 
   ```rust,no_run
   # fn main() -> anyhow::Result<()> {
@@ -3239,7 +3271,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   that reads a header by default sets `CLIENT_IP=header:NAME`); nothing reads a raw
   `X-Forwarded-For` any more.
 - `Sessions::from_env` replaces the app's own `SESSION_SECRET` and purpose code;
-  keep the purpose with `SESSION_PURPOSE` (see "Session key").
+  keep the purpose with `SESSION_PURPOSE`, or `SESSION_KEY_PURPOSE` for one of
+  another shape (see "Moving onto `from_env`" under "Session key").
 - `redis.yaml`'s image and memory-limit parameters are `REDIS_IMAGE` and
   `REDIS_MEMORY_LIMIT` (they were `IMAGE` and `MEMORY_LIMIT`), apart from `app.yaml`'s,
   so one `params.env` serves every template through `deploy/openshift/apply.sh`. An

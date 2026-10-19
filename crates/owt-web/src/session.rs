@@ -80,11 +80,7 @@ pub fn key_from_base64(secret: &str) -> anyhow::Result<Key> {
 /// character is refused rather than trimmed, since `myapp/prod\n` (a stray newline
 /// in a `ConfigMap`) would be another key, splitting replicas or signing everyone out.
 pub fn key_for(secret: &str, purpose: &str) -> anyhow::Result<Key> {
-    anyhow::ensure!(!purpose.is_empty(), "a session key's purpose is empty");
-    anyhow::ensure!(
-        purpose.trim() == purpose && !purpose.chars().any(char::is_control),
-        "a session key's purpose has surrounding whitespace or a control character: {purpose:?}"
-    );
+    check_purpose(purpose)?;
     let master = secret_bytes(secret)?;
     let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(b"owt-web session key v1"), &master);
     let mut key = [0u8; 64];
@@ -93,14 +89,32 @@ pub fn key_for(secret: &str, purpose: &str) -> anyhow::Result<Key> {
     Ok(Key::from(&key))
 }
 
-/// The purpose [`Sessions::from_env`] derives its key for: `{app}/` and then
-/// `SESSION_PURPOSE`, else the namespace the pod runs in (`POD_NAMESPACE`, which the
-/// downward API sets), else `local`. `var` reads a variable; a blank one counts as
-/// unset. Changing the purpose signs everyone out: an app moving onto this from a
-/// purpose of its own sets `SESSION_PURPOSE` to what followed its `app/`.
+/// A purpose [`key_for`] takes: not empty, without surrounding whitespace or a
+/// control character.
+fn check_purpose(purpose: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!purpose.is_empty(), "a session key's purpose is empty");
+    anyhow::ensure!(
+        purpose.trim() == purpose && !purpose.chars().any(char::is_control),
+        "a session key's purpose has surrounding whitespace or a control character: {purpose:?}"
+    );
+    Ok(())
+}
+
+/// The purpose [`Sessions::from_env`] derives its key for: `SESSION_KEY_PURPOSE`, the
+/// whole purpose, when it is set; else `{app}/` and then `SESSION_PURPOSE`, else the
+/// namespace the pod runs in (`POD_NAMESPACE`, which the downward API sets), else
+/// `local`. `var` reads a variable; a blank one counts as unset.
+///
+/// Changing the purpose signs everyone out. An app moving onto this from a purpose of
+/// its own keeps it: `SESSION_PURPOSE` set to what followed its `app/`, or
+/// `SESSION_KEY_PURPOSE` set to the whole purpose when it has another shape. The
+/// whole purpose is taken exactly, as [`key_for`] takes it.
 #[must_use]
 pub fn purpose_from(app: &str, var: impl Fn(&str) -> Option<String>) -> String {
     let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+    if let Some(purpose) = set("SESSION_KEY_PURPOSE") {
+        return purpose;
+    }
     let environment = set("SESSION_PURPOSE")
         .or_else(|| set("POD_NAMESPACE"))
         .unwrap_or_else(|| "local".into());
@@ -261,7 +275,8 @@ impl<T: SessionData> Sessions<T> {
     ///
     /// `SESSION_SECRET` is unset or not a secret [`key_for`] takes, the purpose is not
     /// one it takes, or the app runs in a pod (`KUBERNETES_SERVICE_HOST` is set) and
-    /// neither `SESSION_PURPOSE` nor `POD_NAMESPACE` is: `local` is for development.
+    /// none of `SESSION_KEY_PURPOSE`, `SESSION_PURPOSE` and `POD_NAMESPACE` is: `local`
+    /// is for development.
     /// The error names the variable, never the secret.
     pub fn from_env(
         app: &str,
@@ -294,12 +309,21 @@ impl<T: SessionData> Sessions<T> {
         // `local` is for development: in a pod it would make every environment's
         // purpose one, and a secret copied between them one key again.
         anyhow::ensure!(
-            set("SESSION_PURPOSE").is_some()
+            set("SESSION_KEY_PURPOSE").is_some()
+                || set("SESSION_PURPOSE").is_some()
                 || set("POD_NAMESPACE").is_some()
                 || set("KUBERNETES_SERVICE_HOST").is_none(),
-            "set SESSION_PURPOSE or POD_NAMESPACE: in a pod the session key's purpose is not `{app}/local`"
+            "set SESSION_PURPOSE, SESSION_KEY_PURPOSE or POD_NAMESPACE: in a pod the session key's purpose is not `{app}/local`"
         );
-        let key = key_for(&secret, &purpose_from(app, &var))
+        let purpose = purpose_from(app, &var);
+        check_purpose(&purpose).map_err(|e| {
+            let from = ["SESSION_KEY_PURPOSE", "SESSION_PURPOSE", "POD_NAMESPACE"]
+                .into_iter()
+                .find(|name| set(name).is_some())
+                .unwrap_or("the app's name");
+            anyhow::anyhow!("the session key's purpose, from {from}: {e}")
+        })?;
+        let key = key_for(&secret, &purpose)
             .map_err(|e| anyhow::anyhow!("the session key from SESSION_SECRET: {e}"))?;
         Ok(Self::new(key, cookie, max_age, secure))
     }
@@ -344,6 +368,22 @@ impl<T: SessionData> Sessions<T> {
     #[must_use]
     pub fn cookie_name(&self) -> &str {
         &self.inner.cookie
+    }
+
+    /// Whether these sessions open one sealed with `key` under the same cookie name
+    /// and lifetimes: what an app's test asserts before it changes the key's purpose
+    /// or secret, so that the change, with [`also_open_with`](Self::also_open_with),
+    /// signs no one out.
+    #[must_use]
+    pub fn opens(&self, key: &Key) -> bool {
+        let mut config = (*self.inner).clone();
+        config.key = key.clone();
+        config.old_keys.clear();
+        let other = Self {
+            inner: Arc::new(config),
+            validator: None,
+        };
+        self.unseal(&other.seal(&new_id(), &T::default())).is_some()
     }
 
     /// The cookie value for a session with `id` and `data`, beginning now and
@@ -685,6 +725,75 @@ mod env_tests {
             "myapp/ns",
             "blank is unset"
         );
+        assert_eq!(
+            p(&[
+                ("SESSION_KEY_PURPOSE", "myapp https://myapp.example"),
+                ("SESSION_PURPOSE", "production"),
+                ("POD_NAMESPACE", "ns")
+            ]),
+            "myapp https://myapp.example",
+            "the whole purpose wins, taken as it is"
+        );
+        assert_eq!(
+            p(&[
+                ("SESSION_KEY_PURPOSE", " "),
+                ("SESSION_PURPOSE", "production")
+            ]),
+            "myapp/production",
+            "blank is unset"
+        );
+    }
+
+    #[test]
+    fn a_whole_purpose_keeps_an_apps_existing_key() {
+        let s = secret();
+        let age = Duration::from_secs(60);
+        let old = "myapp https://myapp.example";
+        let existing = Sessions::<D>::new(key_for(&s, old).unwrap(), "s", age, true);
+        let sealed = existing.seal("id", &D { n: 3 });
+        let adopted: Sessions<D> = Sessions::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[
+                ("SESSION_SECRET", &s),
+                ("SESSION_KEY_PURPOSE", old),
+                ("KUBERNETES_SERVICE_HOST", "10.0.0.1"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(adopted.unseal(&sealed), Some(("id".to_owned(), D { n: 3 })));
+        assert!(adopted.opens(&key_for(&s, old).unwrap()));
+
+        let surrounded = Sessions::<D>::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[("SESSION_SECRET", &s), ("SESSION_KEY_PURPOSE", "myapp/x\n")]),
+        )
+        .err()
+        .expect("refused, not trimmed");
+        assert!(surrounded.to_string().contains("control"), "{surrounded}");
+        assert!(
+            surrounded.to_string().contains("from SESSION_KEY_PURPOSE"),
+            "names the variable, not the secret: {surrounded}"
+        );
+    }
+
+    #[test]
+    fn opens_tells_whether_a_purpose_change_keeps_sessions() {
+        let s = secret();
+        let age = Duration::from_secs(60);
+        let (old, new) = (
+            key_for(&s, "myapp/production").unwrap(),
+            key_for(&s, "myapp/myapp-prod").unwrap(),
+        );
+        let moved = Sessions::<D>::new(new.clone(), "s", age, true);
+        assert!(moved.opens(&new));
+        assert!(!moved.opens(&old), "a new purpose alone signs everyone out");
+        assert!(moved.also_open_with(old.clone()).opens(&old));
     }
 
     #[test]
