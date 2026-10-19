@@ -2421,7 +2421,7 @@ event but the repository's own: a push or a dispatch for a release; a push, a
 dispatch, a schedule or a same-repository pull request for the rc jobs. A
 `pull_request_target`, `workflow_run` or `issue_comment` caller runs none of them.
 An app's `version-command` runs in that runner pod too, which has git, curl, jq,
-tar, Node and (with `uv: true`) uv, but no cargo and no gh: a command that needs
+tar, perl, Node and (with `uv: true`) uv, but no cargo and no gh: a command that needs
 more installs it itself, or the app runs its releases GitHub-hosted with `RUNS_ON`.
 
 **Releasing an app:** this is how an *app* releases, with semantic-release through the
@@ -2652,6 +2652,34 @@ binary has a second name links it:
       labels: |
         environment=production
 ```
+
+**Comparing a crane-built image** with the one the Dockerfile made, when adopting
+`builder: crane`, needs no read access to ghcr. A GitHub App token without the
+`packages` permission is refused there (`crane config` answers `DENIED`), but the
+cluster already pulls the app's images, and two things show the whole image:
+
+- Its configuration (entrypoint, user, environment, labels): a non-persisting import
+  in the app's namespace, which the cluster answers from the registry with that
+  namespace's ghcr pull secret and stores nothing. It needs `create` on
+  `imagestreamimports` there, which the `edit` role has. An empty answer is a failed
+  import: the reason is in `.status.images[0].status.message`.
+
+  ```sh
+  oc create -o jsonpath='{.status.images[0].image.dockerImageMetadata.Config}' -f - <<'YAML'
+  apiVersion: image.openshift.io/v1
+  kind: ImageStreamImport
+  metadata: {name: myapp-inspect}
+  spec:
+    import: false
+    images:
+      - from: {kind: DockerImage, name: ghcr.io/onewaytek/myapp:v1.2.3}
+  YAML
+  ```
+
+- Its files: the build job's `image-layer` artifact is the exact layer pushed
+  (`gh run download <run-id> --repo <the app's repository> -n image-layer && tar -tvf
+  layer.tar` lists paths, owners and modes, with `actions: read` there). It is kept
+  for a day.
 
 The binary is built in Debian's Rust image, not Hummingbird's (which has no `tar`
 for the setup actions), so the push job checks the newest `GLIBC_` version the
@@ -3164,7 +3192,7 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `RUNS_ON` names other runners, as `rust-ci.yml` does; a private app stops paying
   GitHub-hosted minutes for them. Nothing in the call changes, with one exception:
   a `version-command` runs in the ARC runner pod, which has no cargo and no gh (git,
-  curl, jq, tar, Node and uv are there); such a command installs what it needs, or
+  curl, jq, tar, perl, Node and uv are there); such a command installs what it needs, or
   the app sets `RUNS_ON` to `"ubuntu-latest"`. An app that sets
   `RUNS_ON` keeps those jobs on its runners too, and a public repository keeps
   `RUNS_ON` at `"ubuntu-latest"`.
