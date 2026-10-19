@@ -138,6 +138,9 @@ objects:
 
   # Redis connects to nothing: no replication, no persistence, no DNS to look up.
   # A compromised Redis (or a pod that reached it) opens no connection from here.
+  # `policyTypes: [Egress]` with no `egress` key denies all egress. An empty
+  # `egress: []` means the same, but the API server drops it, so `oc diff` would
+  # report a change on every apply.
   - apiVersion: networking.k8s.io/v1
     kind: NetworkPolicy
     metadata:
@@ -148,4 +151,3 @@ objects:
       podSelector:
         matchLabels: {app: "${NAME}-redis"}
       policyTypes: [Egress]
-      egress: []
