@@ -35,6 +35,13 @@ name: App release (reusable)
 #
 # The tooling is pinned here, not in the app's package.json, so every app releases
 # with the same semantic-release and the app needs no Node dependency to do it.
+#
+# Runs on the arc-openshift-k8s ARC scale set, as rust-ci.yml does (override with the
+# RUNS_ON repository or organization variable, a JSON string such as
+# '"ubuntu-latest"'). It needs nothing installed there but git: Node comes from
+# setup-node and uv from setup-uv. The job holds a token that can push tags, so it
+# runs only for the repository's own pushes and dispatches: no pull request, and no
+# event a fork can start, reaches it.
 
 on:
   workflow_call:
@@ -80,9 +87,13 @@ jobs:
     concurrency:
       group: release-${{ github.repository }}-${{ github.ref_name }}
       cancel-in-progress: false
-    # A push to a fork's main is not a release of ours.
-    if: ${{ github.repository_owner == 'onewaytek' && (github.ref_name == 'main' || github.ref_name == 'rc') }}
-    runs-on: ubuntu-latest
+    # A push to a fork's main is not a release of ours, and only a push or a dispatch
+    # (both need write access to the repository) releases.
+    if: >-
+      ${{ github.repository_owner == 'onewaytek'
+      && (github.ref_name == 'main' || github.ref_name == 'rc')
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
       contents: write
       issues: write

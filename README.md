@@ -2398,6 +2398,17 @@ that out, warns, and compiles without sccache). Off ARC the services are at thei
 names (`postgres`, `redis`) rather than localhost; `DATABASE_URL` and `REDIS_URL`
 follow, so build on those rather than naming a host.
 
+The release flow's light jobs follow the same `RUNS_ON`: `release.yml`'s release job,
+`promote-rc.yml`, `publish-rc.yml`, `requeue-rc.yml` and `conventional-commits.yml`.
+They assume nothing on the runner but git (Node and uv come from their setup
+actions), so they run in the runner pod itself, with no job container. A pull
+request from a fork never reaches the scale set: `rust-ci.yml` skips it, and
+`conventional-commits.yml` checks it on GitHub-hosted runners instead. The jobs whose
+token can write (the release, a promotion, a publish, a requeue) also refuse every
+event but the repository's own: a push or a dispatch for a release; a push, a
+dispatch, a schedule or a same-repository pull request for the rc jobs. A
+`pull_request_target`, `workflow_run` or `issue_comment` caller runs none of them.
+
 **Releasing an app:** this is how an *app* releases, with semantic-release through the
 reusable `release.yml`. owt-stack releases itself differently, with release-please
 (see "Working on owt-stack"). Conventional commits decide an app's version: `feat` is
@@ -2986,6 +2997,21 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+
+## Upgrading from 0.7
+
+- `release.yml`'s release job, `promote-rc.yml`, `publish-rc.yml`, `requeue-rc.yml`
+  and `conventional-commits.yml` run on the `arc-openshift-k8s` scale set unless
+  `RUNS_ON` names other runners, as `rust-ci.yml` does; a private app stops paying
+  GitHub-hosted minutes for them. Nothing in the call changes. An app that sets
+  `RUNS_ON` keeps those jobs on its runners too, and a public repository keeps
+  `RUNS_ON` at `"ubuntu-latest"`.
+- **Breaking** for an unusual caller only: the jobs whose token can write run only
+  for the repository's own events. A release runs for a `push` or a
+  `workflow_dispatch`; `promote-rc.yml`, `publish-rc.yml` and `requeue-rc.yml` for a
+  `push`, a `workflow_dispatch`, a `schedule` or a `pull_request` from a branch of
+  the repository. A call from `pull_request_target`, `workflow_run` or any other
+  event is skipped: move it to one of those.
 
 ## Upgrading from 0.6
 
