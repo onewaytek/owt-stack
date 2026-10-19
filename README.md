@@ -2658,9 +2658,11 @@ binary has a second name links it:
 `packages` permission is refused there (`crane config` answers `DENIED`), but the
 cluster already pulls the app's images, and two things show the whole image:
 
-- Its configuration (entrypoint, user, environment, labels): a non-persisting import,
-  which the cluster answers from the registry with its own pull secret and stores
-  nothing.
+- Its configuration (entrypoint, user, environment, labels): a non-persisting import
+  in the app's namespace, which the cluster answers from the registry with that
+  namespace's ghcr pull secret and stores nothing. It needs `create` on
+  `imagestreamimports` there, which the `edit` role has. An empty answer is a failed
+  import: the reason is in `.status.images[0].status.message`.
 
   ```sh
   oc create -o jsonpath='{.status.images[0].image.dockerImageMetadata.Config}' -f - <<'YAML'
@@ -2675,8 +2677,9 @@ cluster already pulls the app's images, and two things show the whole image:
   ```
 
 - Its files: the build job's `image-layer` artifact is the exact layer pushed
-  (`gh run download <run-id> -n image-layer && tar -tvf layer.tar` lists paths,
-  owners and modes). It is kept for a day.
+  (`gh run download <run-id> --repo <the app's repository> -n image-layer && tar -tvf
+  layer.tar` lists paths, owners and modes, with `actions: read` there). It is kept
+  for a day.
 
 The binary is built in Debian's Rust image, not Hummingbird's (which has no `tar`
 for the setup actions), so the push job checks the newest `GLIBC_` version the
