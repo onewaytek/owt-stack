@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   release-please:
-    # A release touches no cluster: GitHub-hosted, like image builds.
+    # This repository is public, so its minutes are free: GitHub-hosted.
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -24,9 +24,12 @@
 # Copy templates/dockerignore beside it as .dockerignore: both `COPY . .` steps take
 # the whole build context.
 #
-# Built on GitHub-hosted runners and pushed to ghcr; the cluster pulls it through an
-# ImageStream (see templates/openshift/app.yaml). The ARC runners are rootless with no
-# Docker daemon, so they run checks, never this.
+# For local builds, and for image.yml's `builder: docker` on a GitHub-hosted runner.
+# CI builds the same runtime image without this file: image.yml's default builder
+# packs the binary and the static files into one layer on the ARC runners (rootless,
+# no Docker daemon) and appends it to core-runtime with crane, so keep its inputs
+# (bin, port, files, ...) in step with the ARGs and the runtime stage below. The
+# cluster pulls the image from ghcr through an ImageStream (templates/openshift/app.yaml).
 
 # The binary's name (the Cargo package's `[[bin]]`, usually the package name).
 ARG BIN=app
