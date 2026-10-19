@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.7.0](https://github.com/onewaytek/owt-stack/compare/v0.6.1...v0.7.0) (2026-10-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* `owt_accounts::session::Data` has a `flashes: Vec<Flash>` field (serialized as `f`, absent when empty, so sealed cookies read both ways) and is no longer `Copy`: a struct literal adds `..Data::default()`, and a copy becomes a clone. An app whose own session type only added flashes uses `session::Data` or `social::Data`, which implement `HasFlashes`.
+* **templates:** `redis.yaml`'s `IMAGE` and `MEMORY_LIMIT` parameters are `REDIS_IMAGE` and `REDIS_MEMORY_LIMIT`, apart from `app.yaml`'s, so one `params.env` serves every template through `deploy/openshift/apply.sh`; an apply that passed `-p IMAGE=` or `-p MEMORY_LIMIT=` to `redis.yaml` passes the new names (the defaults are unchanged). Keep the templates in `deploy/openshift/` with `apply.sh` and `params.env`, and drop the app's own process or apply script where the template's does the same.
+* Every public enum that can grow is `#[non_exhaustive]`: a `match` in an app on `owt_web::Error`, `owt_web::client_ip::Source`, `owt_web::ui::Kind` (an Askama `{% match %}` included), `owt_accounts::Refused`, `owt_accounts::Error`, `owt_accounts::password::Problem`, `owt_accounts::identities::Arrival`, `owt_accounts::identities::RekeyError`, `owt_accounts::social::ConfigError`, `owt_auth::jwt::Error` or `owt_change::ConfigError` ends with a `_` arm, and `owt_web::ui::Item` is read by its fields, never built or destructured as a whole. Constructing and matching the variants by name is unchanged. A variant added later comes without a breaking release.
+* **ci:** `rust-ci.yml` compiles through sccache over a shared Redis instead of a cargo cache volume at `/cache`. To use it, an app passes the one secret by name on its call of `rust-ci.yml` (`secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}`), never `secrets: inherit`, which would hand the reusable workflow every secret the app holds. A workflow of the app's own that calls the one calling `rust-ci.yml` may use `secrets: inherit`, being the app's code. The app makes a secret `SCCACHE_REDIS_PASSWORD` visible to the repository: an organization secret, or a repository secret for a private repository on GitHub Free. An app on GitHub-hosted runners (`RUNS_ON`) passes `sccache-redis: ""`. Pin the reusable workflows by commit, with the tag in a comment, and let Dependabot's `github-actions` ecosystem move the pin. Remove the `/cache` volume mount from the runner pod template. Without the secret the checks pass, uncached.
+
+### Features
+
+* **accounts:** admin::Words, the admin's words in the app's language ([#141](https://github.com/onewaytek/owt-stack/issues/141)) ([b086b73](https://github.com/onewaytek/owt-stack/commit/b086b732ac973dacc9246772279cd6fb07e91abe))
+* **accounts:** an app's chrome may await (AsyncChrome), for the admin and the policy pages ([#131](https://github.com/onewaytek/owt-stack/issues/131)) ([04b8d39](https://github.com/onewaytek/owt-stack/commit/04b8d39bf98d35444c4b8ef68461574b15abed60))
+* **accounts:** example view models for an app's tests of its own admin templates ([#132](https://github.com/onewaytek/owt-stack/issues/132)) ([5b8ad40](https://github.com/onewaytek/owt-stack/commit/5b8ad408c87d63a40fe8bbe0a2599031b897d65b))
+* **accounts:** password_sign_in, store::problems, and last_sign_in on every way in ([#143](https://github.com/onewaytek/owt-stack/issues/143)) ([4fb3da7](https://github.com/onewaytek/owt-stack/commit/4fb3da7c49a9f0aed076e877df47be81686f021a))
+* **accounts:** policies::Views and social::Views, the pages an app draws itself ([#142](https://github.com/onewaytek/owt-stack/issues/142)) ([43a5fb7](https://github.com/onewaytek/owt-stack/commit/43a5fb71e662a69f677199f49b54630c8c3864ea))
+* **ci:** compiled dependencies from sccache over a shared Redis, not a cache volume ([#116](https://github.com/onewaytek/owt-stack/issues/116)) ([94ec486](https://github.com/onewaytek/owt-stack/commit/94ec48674f971d0356d0e311b9cf6731fbd3425e))
+* **ci:** conventional-commits.yml is callable from an app's pull-request workflow ([#137](https://github.com/onewaytek/owt-stack/issues/137)) ([c0b22d5](https://github.com/onewaytek/owt-stack/commit/c0b22d57ca7cd8cb7e2eb114e1c230dc6df34b65))
+* every public enum that can grow is non_exhaustive ([#126](https://github.com/onewaytek/owt-stack/issues/126)) ([2477a68](https://github.com/onewaytek/owt-stack/commit/2477a682dccae6ed0482662e92253d4eb5ebc291))
+* Sessions::from_env, and flash messages in session::Data ([#144](https://github.com/onewaytek/owt-stack/issues/144)) ([c333375](https://github.com/onewaytek/owt-stack/commit/c333375e13b507fdf7c8038bb946bc51eb9e6ce5))
+* **templates:** apply.sh renders every template from the app's params.env ([#139](https://github.com/onewaytek/owt-stack/issues/139)) ([f545c04](https://github.com/onewaytek/owt-stack/commit/f545c04016ba71989f3cbb6dac32973b0d06ef0a))
+* **templates:** dependabot.yml for an app ([#138](https://github.com/onewaytek/owt-stack/issues/138)) ([ea52b64](https://github.com/onewaytek/owt-stack/commit/ea52b6435cbbbfb6e6e62d57dcef971e097254bd))
+* **templates:** egress.yaml bounds where an app's pods may connect; Redis connects to nothing ([#135](https://github.com/onewaytek/owt-stack/issues/135)) ([d32b5ff](https://github.com/onewaytek/owt-stack/commit/d32b5ffa397626b5d79e99bbbfcaa283eda84a64))
+* **test:** Normalizer::asset_versions, and two adoption notes ([#130](https://github.com/onewaytek/owt-stack/issues/130)) ([b835dac](https://github.com/onewaytek/owt-stack/commit/b835dac5bc4953b9393779c90d11e6d45f9ed546))
+* **web:** the ClientIp extractor, and Source::from_env ([#145](https://github.com/onewaytek/owt-stack/issues/145)) ([7d90c5b](https://github.com/onewaytek/owt-stack/commit/7d90c5b5a852d4301ce39c461406ca0a99b83587))
+
+
+### Bug Fixes
+
+* **accounts:** a boosted navigation is a page load for the policy gate ([#136](https://github.com/onewaytek/owt-stack/issues/136)) ([937c498](https://github.com/onewaytek/owt-stack/commit/937c4986a388ba5b695db4ce1e438263171b1683))
+* **accounts:** every admin and policies response is no-store, the refusals included ([#128](https://github.com/onewaytek/owt-stack/issues/128)) ([88a84e8](https://github.com/onewaytek/owt-stack/commit/88a84e821975b0c82db5835b3b4627869548072e))
+* **accounts:** LastWayIn reads neutrally, and the admin's notice has words of its own ([#127](https://github.com/onewaytek/owt-stack/issues/127)) ([4040282](https://github.com/onewaytek/owt-stack/commit/40402821c1178c44b88e8083b9ba7f365d9e85ad))
+* **accounts:** the admin and the policy pages hand the chrome the page's own URI ([#129](https://github.com/onewaytek/owt-stack/issues/129)) ([98b941b](https://github.com/onewaytek/owt-stack/commit/98b941b6b2dd83cb0a6d48fe5e9ee5ac8f9249ff))
+* **accounts:** the policy gate sends only document loads to the page that asks ([#133](https://github.com/onewaytek/owt-stack/issues/133)) ([23b8111](https://github.com/onewaytek/owt-stack/commit/23b811173c44a76e8ca5de030c1f840d716a2177))
+* **change:** the change-request routes refuse a cross-origin POST themselves ([#124](https://github.com/onewaytek/owt-stack/issues/124)) ([5ffe22c](https://github.com/onewaytek/owt-stack/commit/5ffe22c19ac124c35a60e0a8dd2dcac6e7ece860))
+
 ## [0.6.1](https://github.com/onewaytek/owt-stack/compare/v0.6.0...v0.6.1) (2026-10-17)
 
 
