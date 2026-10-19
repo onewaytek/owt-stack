@@ -68,10 +68,10 @@ jobs:
         with:
           node-version: "24"
       # The configuration: the repository's own where it has one, else the rules
-      # this repository checks itself by (commitlint.config.mjs here, byte for byte;
-      # `just ci-config` compares the two), written outside the checkout. Dependabot's commits are passed over either way: their
-      # bodies quote release notes whose lines run past the length limit, and their
-      # headers are generated.
+      # this repository checks itself by (commitlint.config.mjs here, byte for
+      # byte; `just ci-config` compares the two), written outside the checkout.
+      # Dependabot's commits are passed over either way: their bodies quote release
+      # notes whose lines run past the length limit, and their headers are generated.
       - name: commitlint
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -115,8 +115,10 @@ jobs:
               },
             ],
             rules: {
-              // The default also forbids sentence-case, which a leading identifier looks like.
-              "subject-case": [2, "never", ["start-case", "pascal-case", "upper-case"]],
+              // The default forbids sentence, start, pascal and upper case, which a subject
+              // that starts with (or is) an identifier looks like. `subject-first-word`
+              // decides instead: a capital opens a subject only as part of an identifier.
+              "subject-case": [0],
               "subject-first-word": [2, "always"],
             },
             // Dependabot's bodies quote release notes, whose lines run past the length limit.

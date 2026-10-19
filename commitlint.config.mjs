@@ -23,8 +23,10 @@ export default {
     },
   ],
   rules: {
-    // The default also forbids sentence-case, which a leading identifier looks like.
-    "subject-case": [2, "never", ["start-case", "pascal-case", "upper-case"]],
+    // The default forbids sentence, start, pascal and upper case, which a subject
+    // that starts with (or is) an identifier looks like. `subject-first-word`
+    // decides instead: a capital opens a subject only as part of an identifier.
+    "subject-case": [0],
     "subject-first-word": [2, "always"],
   },
   // Dependabot's bodies quote release notes, whose lines run past the length limit.
