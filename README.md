@@ -174,7 +174,12 @@ on.
   stream asks for it again on `open`. A stop does not close a WebSocket: its
   handler ends it, or the process exiting does.
 
-`PoolConfig::connect` warns at start when the database is not on this machine and
+`PoolConfig::connect` keeps trying an unreachable database for a minute
+(`db::STARTUP_PATIENCE`), with a warning each time, so a pod that starts while the
+database is fenced for a nightly offline snapshot, or switching over, waits rather
+than crash-restarting; a refused password, a missing database or a certificate that
+does not verify fails at once. `connect_within(url, patience)` sets another bound
+(`Duration::ZERO` tries once). It also warns at start when the database is not on this machine and
 its TLS is not verified (`db::unverified_tls(&options)` asks the same of any
 `PgConnectOptions`): give the pod `PGSSLMODE=verify-full` and `PGSSLROOTCERT`
 (the OpenShift template does), since sqlx's default (`prefer`) neither requires TLS
@@ -2874,7 +2879,8 @@ which these clusters don't have. With one instance (`DB_INSTANCES=1`, the defaul
 the app sees that pause: requests needing the database fail for a few seconds each
 night, and once at the first apply, when the immediate backup overlaps the rollout
 that same apply starts (apply outside busy hours, or expect a few errors then). The
-choices: accept the pause; run two instances (`-p DB_INSTANCES=2`: CNPG snapshots the
+choices: accept the pause (a pod starting during it waits, since `PoolConfig::connect`
+retries for a minute); run two instances (`-p DB_INSTANCES=2`: CNPG snapshots the
 standby and the primary keeps serving, for twice the space in the volume group, and
 no help with a drain: on a single node the standby goes down with the primary); or
 take online backups (`BACKUP_ONLINE=true`), only once the cluster has a WAL archive

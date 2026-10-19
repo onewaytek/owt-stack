@@ -36,12 +36,40 @@ impl PoolConfig {
             .acquire_timeout(self.acquire_timeout)
     }
 
-    /// Connect to `url` now: startup fails if the database is unreachable. Warns
-    /// when the connection's TLS is not verified (see [`unverified_tls`]).
+    /// Connect to `url` now, as [`connect_within`](Self::connect_within) does with
+    /// [`STARTUP_PATIENCE`]: startup survives a database that is unreachable for a
+    /// minute (an offline backup's fence, a switchover) and fails after that.
     pub async fn connect(&self, url: &str) -> sqlx::Result<PgPool> {
+        self.connect_within(url, STARTUP_PATIENCE).await
+    }
+
+    /// Connect to `url` now, trying again while the database is unreachable until
+    /// `patience` has passed since the first attempt; [`Duration::ZERO`] tries once.
+    /// Unreachable is a network error, a connection attempt that timed out, or
+    /// Postgres refusing connections while it starts or stops; each retry logs a
+    /// warning. Anything else (a refused password, a database that does not exist, a
+    /// certificate that does not verify) fails at once, as it would on every
+    /// attempt. Each attempt also retries a refused connection within
+    /// `acquire_timeout`, so the last can end that long after `patience`. Warns when
+    /// the connection's TLS is not verified (see [`unverified_tls`]).
+    pub async fn connect_within(&self, url: &str, patience: Duration) -> sqlx::Result<PgPool> {
         let opts: PgConnectOptions = url.parse()?;
         warn_if_unverified(&opts);
-        self.options().connect_with(opts).await
+        let deadline = tokio::time::Instant::now() + patience;
+        let mut wait = Duration::from_millis(500);
+        loop {
+            match self.options().connect_with(opts.clone()).await {
+                Ok(pool) => return Ok(pool),
+                Err(error)
+                    if unreachable(&error) && tokio::time::Instant::now() + wait < deadline =>
+                {
+                    tracing::warn!(%error, retry_in = ?wait, "the database is unreachable; trying again");
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(Duration::from_secs(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// A pool that connects on first use: startup survives a slow database. Warns
@@ -59,6 +87,25 @@ impl PoolConfig {
     pub fn reserve_beside(&self, pool: &PgPool) -> PgPool {
         let opts: PgConnectOptions = (*pool.connect_options()).clone();
         self.options().connect_lazy_with(opts)
+    }
+}
+
+/// How long [`PoolConfig::connect`] keeps trying an unreachable database at start: an
+/// offline snapshot's fence lasts seconds, and the `OpenShift` template's startup
+/// probe allows five minutes.
+pub const STARTUP_PATIENCE: Duration = Duration::from_secs(60);
+
+/// Whether `error` says the database could not be reached, rather than that it
+/// refused this client: worth another attempt.
+fn unreachable(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut => true,
+        // Class 08, connection exception; 57P01-57P03, the server shutting down or
+        // starting up.
+        sqlx::Error::Database(db) => db
+            .code()
+            .is_some_and(|c| c.starts_with("08") || matches!(&*c, "57P01" | "57P02" | "57P03")),
+        _ => false,
     }
 }
 
@@ -122,6 +169,38 @@ pub async fn migrate_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_unreachable_database_is_tried_until_patience_runs_out() {
+        // Port 1 on loopback refuses at once; sqlx retries that within its acquire
+        // timeout, so keep that short.
+        let config = PoolConfig {
+            acquire_timeout: Duration::from_millis(100),
+            ..PoolConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let error = config
+            .connect_within(
+                "postgres://u:p@127.0.0.1:1/app",
+                Duration::from_millis(1_200),
+            )
+            .await
+            .unwrap_err();
+        let took = started.elapsed();
+        assert!(unreachable(&error), "{error}");
+        assert!(took >= Duration::from_millis(500), "retried: {took:?}");
+        assert!(took < Duration::from_secs(5), "bounded: {took:?}");
+
+        let started = std::time::Instant::now();
+        config
+            .connect_within("postgres://u:p@127.0.0.1:1/app", Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "zero tries once"
+        );
+    }
 
     #[test]
     fn only_verify_full_counts_as_verified_off_this_machine() {

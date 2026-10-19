@@ -72,3 +72,86 @@ async fn a_failed_migration_leaves_no_lock_held() {
         .await
         .unwrap();
 }
+
+/// A database that becomes reachable while `connect` waits is connected to; one that
+/// refuses the password is not retried.
+#[tokio::test]
+async fn connect_waits_for_a_database_that_comes_up() {
+    use std::time::{Duration, Instant};
+    let Some(url) = owt_runtime::env::var("DATABASE_URL") else {
+        return;
+    };
+    let opts: PgConnectOptions = url.parse().unwrap();
+    let upstream = format!("{}:{}", opts.get_host(), opts.get_port());
+    // A port nothing listens on yet; a forwarder to the real server opens on it later.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let forwarder = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            });
+        }
+    });
+    let config = owt_runtime::db::PoolConfig {
+        max: 1,
+        min: 0,
+        acquire_timeout: Duration::from_millis(200),
+    };
+    let moved = opts.clone().host("127.0.0.1").port(port);
+    let via = format!(
+        "postgres://{}:{}@127.0.0.1:{port}/{}",
+        moved.get_username(),
+        url_password(&url),
+        moved.get_database().unwrap_or("postgres"),
+    );
+    let started = Instant::now();
+    let pool = config
+        .connect_within(&via, Duration::from_secs(20))
+        .await
+        .expect("connected once the forwarder listened");
+    assert!(started.elapsed() >= Duration::from_millis(1_000));
+    let one: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(one, 1);
+    pool.close().await;
+
+    // A wrong password fails at once, whatever the patience.
+    let wrong = format!(
+        "postgres://{}:not-the-password@127.0.0.1:{port}/{}",
+        moved.get_username(),
+        moved.get_database().unwrap_or("postgres"),
+    );
+    let started = Instant::now();
+    assert!(
+        config
+            .connect_within(&wrong, Duration::from_secs(20))
+            .await
+            .is_err()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    forwarder.abort();
+}
+
+/// The password in a `postgres://user:password@…` URL ("" when there is none).
+fn url_password(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let userinfo = rest.split_once('@').map_or("", |(u, _)| u);
+    userinfo.split_once(':').map_or("", |(_, p)| p).to_owned()
+}
