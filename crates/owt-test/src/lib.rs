@@ -175,10 +175,30 @@ impl Client {
         }
     }
 
-    /// `GET uri`.
+    /// `GET uri`, with no fetch metadata: as a non-browser client, or a test that
+    /// does not care what the request is for.
     pub async fn get(&self, uri: &str) -> Response {
         self.send(Request::get(uri).body(Body::empty()).unwrap())
             .await
+    }
+
+    /// `GET uri` as a browser loads a page the user asked for: `Sec-Fetch-Dest:
+    /// document`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Site: none`,
+    /// `Sec-Fetch-User: ?1` and a browser's `Accept`. A page load is what
+    /// `owt_accounts`'s policy gate interrupts, and what tells a page from a fetch or an
+    /// image, so a test of such a gate loads pages with this.
+    pub async fn get_page(&self, uri: &str) -> Response {
+        self.send(
+            Request::get(uri)
+                .header("sec-fetch-dest", "document")
+                .header("sec-fetch-mode", "navigate")
+                .header("sec-fetch-site", "none")
+                .header("sec-fetch-user", "?1")
+                .header(header::ACCEPT, "text/html,application/xhtml+xml,*/*;q=0.8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
     }
 
     /// `GET uri` as htmx sends it (`HX-Request: true`).
@@ -287,6 +307,27 @@ mod tests {
         // No peer: axum's extractor refuses, as behind no socket.
         let res = Client::new(app).with_peer(None).get("/").await;
         assert_eq!(res.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn a_page_load_says_it_is_one() {
+        let seen = |h: HeaderMap| async move {
+            [
+                "sec-fetch-dest",
+                "sec-fetch-mode",
+                "sec-fetch-site",
+                "sec-fetch-user",
+                "accept",
+            ]
+            .map(|n| h.get(n).map_or("-", |v| v.to_str().unwrap()).to_owned())
+            .join(" | ")
+        };
+        let client = Client::new(Router::new().route("/", get(seen)));
+        assert_eq!(client.get("/").await.text(), "- | - | - | - | -");
+        assert_eq!(
+            client.get_page("/").await.text(),
+            "document | navigate | none | ?1 | text/html,application/xhtml+xml,*/*;q=0.8"
+        );
     }
 
     fn app() -> Router {
