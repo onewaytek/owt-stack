@@ -3,8 +3,8 @@
 #
 # `just check` is the gate: run it before every commit, and CI runs the same
 # command (rust-ci.yml's `check-command: just check`), so the list of checks can't
-# drift between the two. Its .sqlx check migrates DATABASE_URL first: `just db`
-# gives it a database of this app's own.
+# drift between the two. It migrates DATABASE_URL first, before anything compiles
+# the `query!` macros against it: `just db` gives it a database of this app's own.
 
 set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
@@ -20,8 +20,40 @@ setup:
     cargo install cargo-audit@0.22.2 --locked
 
 # Start Postgres and Redis (compose.yaml) and apply the migrations.
-db:
+db: && migrate
     {{ compose }} up -d --wait
+
+# DATABASE_URL must be a database of this app's own (`just db`'s, or a scratch one on
+# a shared server): outside CI, the recipe refuses a server's shared `postgres` or
+# `template1` database, which every app pointed at the server's default would migrate.
+# In CI (`CI` set) the server is the job's own service, whatever its database's name.
+# Without DATABASE_URL there is nothing to migrate, and the steps that need a schema
+# fail on their own.
+#
+# Apply the migrations to DATABASE_URL (nothing for an app without migrations/).
+migrate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -d migrations ] || exit 0
+    if [ -z "${DATABASE_URL:-}" ]; then
+        echo "migrate: DATABASE_URL is not set; nothing migrated (just db sets one up)" >&2
+        exit 0
+    fi
+    # The database: `dbname=` in the query, else the path after the host; none means
+    # the user's name, which on a shared server is as shared as `postgres`.
+    url=$DATABASE_URL query=
+    case $url in *\?*) query=${url#*\?} url=${url%%\?*} ;; esac
+    rest=${url#*://}
+    name=
+    case $rest in */*) name=${rest#*/} ;; esac
+    if [[ "&$query" =~ \&dbname=([^\&]*) ]]; then name=${BASH_REMATCH[1]}; fi
+    if [ -z "${CI:-}" ]; then
+        case "$name" in
+            postgres | template1 | "")
+                echo "error: DATABASE_URL names the server's shared database ('$name'); give this app a database of its own" >&2
+                exit 1 ;;
+        esac
+    fi
     sqlx migrate run
 
 # Stop them (the data stays in the volume).
@@ -42,8 +74,11 @@ dev: css
     trap 'kill $watcher 2>/dev/null' EXIT
     cargo run
 
+# The migrations come first: `lint`, `doc` and `test` compile the `query!` macros,
+# which read DATABASE_URL's schema unless SQLX_OFFLINE is set.
+#
 # Everything that must pass before a commit.
-check: fmt lint doc sqlx-check audit test
+check: migrate fmt lint doc sqlx-check audit test
 
 # Formatting, checked rather than applied: the gate must not change files.
 fmt:
@@ -57,11 +92,9 @@ lint:
 doc:
     RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo doc --no-deps --document-private-items
 
-# The committed .sqlx/ matches the queries (skipped for an app without one). The
-# check needs the schema, so DATABASE_URL is migrated first: give it a database of
-# this app's own (`just db`'s, or a scratch one), never one another app migrates.
-sqlx-check:
-    if [ -d .sqlx ]; then sqlx migrate run && SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
+# The committed .sqlx/ (if the app has one) matches the queries in DATABASE_URL's schema.
+sqlx-check: migrate
+    if [ -d .sqlx ]; then SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
 
 # No advisories against Cargo.lock (ignored ones are in .cargo/audit.toml, with why).
 audit:
