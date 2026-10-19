@@ -13,6 +13,10 @@
 //! Requests carry no `Origin` and no `Sec-Fetch-Site`, so cross-origin protection
 //! treats them as a non-browser client and lets them through; set the headers on a
 //! request to test the protection itself.
+//!
+//! A [`Client`]'s requests come from [`PEER`], as axum's `MockConnectInfo` layer
+//! gives them, so a handler taking `ConnectInfo<SocketAddr>` or `owt_web`'s
+//! `ClientIp` answers in-process as it does behind a socket.
 
 #![expect(
     clippy::missing_panics_doc,
@@ -29,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
+use axum::extract::connect_info::{ConnectInfo, MockConnectInfo};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -70,21 +75,40 @@ impl Response {
     }
 }
 
+/// The peer a [`Client`]'s requests come from unless it was given another:
+/// `192.0.2.1:40000`, in TEST-NET-1 (RFC 5737), which no real client has.
+pub const PEER: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+    40_000,
+);
+
 /// Requests into a router, with a cookie jar. Clones share the jar.
 #[derive(Clone)]
 pub struct Client {
     app: Router,
     jar: Arc<Mutex<BTreeMap<String, String>>>,
+    peer: Option<SocketAddr>,
 }
 
 impl Client {
-    /// A client of `app` with an empty jar.
+    /// A client of `app` with an empty jar, whose requests come from [`PEER`].
     #[must_use]
     pub fn new(app: Router) -> Self {
         Self {
             app,
             jar: Arc::default(),
+            peer: Some(PEER),
         }
+    }
+
+    /// Requests come from `peer` (`None`: from no peer at all, as a bare `oneshot`
+    /// sends them). The peer rides as axum's `MockConnectInfo`, so the router's own
+    /// `MockConnectInfo` layer, an `Extension(ConnectInfo(..))` layer, or a request
+    /// carrying either, still decides.
+    #[must_use]
+    pub fn with_peer(mut self, peer: Option<SocketAddr>) -> Self {
+        self.peer = peer;
+        self
     }
 
     /// Set a cookie as if a response had.
@@ -106,9 +130,17 @@ impl Client {
         self.jar.lock().unwrap().clear();
     }
 
-    /// Send `req` with the jar's cookies (unless it carries its own), and keep the
-    /// cookies the response sets.
+    /// Send `req` with the jar's cookies (unless it carries its own) from the client's
+    /// peer (unless it carries one), and keep the cookies the response sets.
     pub async fn send(&self, mut req: Request<Body>) -> Response {
+        if let Some(peer) = self.peer {
+            let ext = req.extensions();
+            if ext.get::<ConnectInfo<SocketAddr>>().is_none()
+                && ext.get::<MockConnectInfo<SocketAddr>>().is_none()
+            {
+                req.extensions_mut().insert(MockConnectInfo(peer));
+            }
+        }
         if !req.headers().contains_key(header::COOKIE) {
             let jar = self.jar.lock().unwrap();
             if !jar.is_empty() {
@@ -226,6 +258,36 @@ mod tests {
     use axum::routing::{get, post};
 
     use super::*;
+
+    #[tokio::test]
+    async fn requests_come_from_a_fixed_peer() {
+        let app = Router::new().route(
+            "/",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        );
+        assert_eq!(
+            Client::new(app.clone()).get("/").await.text(),
+            PEER.to_string()
+        );
+        let other: SocketAddr = "198.51.100.4:1".parse().unwrap();
+        assert_eq!(
+            Client::new(app.clone())
+                .with_peer(Some(other))
+                .get("/")
+                .await
+                .text(),
+            other.to_string()
+        );
+        // The router's own layer decides.
+        let layered = app.clone().layer(MockConnectInfo(other));
+        assert_eq!(
+            Client::new(layered).get("/").await.text(),
+            other.to_string()
+        );
+        // No peer: axum's extractor refuses, as behind no socket.
+        let res = Client::new(app).with_peer(None).get("/").await;
+        assert_eq!(res.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     fn app() -> Router {
         Router::new()

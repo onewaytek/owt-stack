@@ -26,6 +26,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
+use axum::extract::connect_info::MockConnectInfo;
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue};
@@ -174,8 +175,9 @@ impl Source {
 /// The client's address, as the request's [`Source`] says to read it: the extractor.
 ///
 /// The `Source` is the request's `Extension` (the [`Peer`](Source::Peer) when none
-/// was added) and the peer is axum's `ConnectInfo<SocketAddr>`. Without that (an app
-/// served without `into_make_service_with_connect_info`, or a test client), a header
+/// was added) and the peer is axum's `ConnectInfo<SocketAddr>`, or the address of a
+/// `MockConnectInfo<SocketAddr>` layer in a test. Without either (an app served
+/// without `into_make_service_with_connect_info`, or a bare `oneshot`), a header
 /// the source names still answers, and otherwise the request fails with a 500 and a
 /// logged error: guessing would key every client's rate limit alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,10 +193,18 @@ impl ClientIp {
     /// client's to forge, so they appear quoted, and only at `debug`.
     #[must_use]
     pub fn of(parts: &Parts) -> Option<IpAddr> {
+        // axum's own `ConnectInfo` extractor falls back to `MockConnectInfo` the same
+        // way, so a router tested with that layer has a peer here too.
         let peer = parts
             .extensions
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|c| c.0.ip());
+            .map(|c| c.0.ip())
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<MockConnectInfo<SocketAddr>>()
+                    .map(|m| m.0.ip())
+            });
         let source = parts.extensions.get::<Source>().unwrap_or(&Source::Peer);
         // A stand-in peer no header parses to tells "the header answered" apart.
         let unspecified = IpAddr::from([0, 0, 0, 0]);
@@ -404,6 +414,27 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(e, crate::Error::Internal(_)), "{e:?}");
+    }
+
+    #[tokio::test]
+    async fn a_mock_connect_info_layer_is_the_peer() {
+        use axum::{Router, routing::get};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/",
+                get(|ClientIp(ip): ClientIp| async move { ip.to_string() }),
+            )
+            .layer(MockConnectInfo(SocketAddr::new(PEER, 40_000)));
+        let res = app
+            .oneshot(axum::http::Request::new(axum::body::Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap();
+        assert_eq!(body.to_bytes(), PEER.to_string());
     }
 
     #[test]
