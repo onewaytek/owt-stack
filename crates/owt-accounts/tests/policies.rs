@@ -382,6 +382,15 @@ async fn agreeing_records_the_versions_shown_and_nothing_else() {
         )
         .await;
     assert_eq!((r.status.as_u16(), r.location()), (303, Some("/whoami")));
+    let ips: Vec<Option<String>> = sqlx::query_scalar("SELECT ip FROM policy_acceptance_events")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ips,
+        [Some("192.0.2.1".to_owned()), Some("192.0.2.1".to_owned())],
+        "the test client's peer, as ClientIp reads it"
+    );
     let events: Vec<(String, i32, String, Option<String>)> = sqlx::query_as(
         "SELECT kind, version, content_sha256, user_agent FROM policy_acceptance_events ORDER BY kind",
     )

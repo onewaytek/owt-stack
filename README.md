@@ -2276,7 +2276,9 @@ golden.check(); // a Golden dropped unchecked fails the test
 
 A `Client`'s requests come from a fixed peer, `owt_test::PEER` (`192.0.2.1:40000`),
 as axum's `MockConnectInfo` gives it, so a handler taking `ConnectInfo<SocketAddr>` or
-`ClientIp` answers in-process without a peer extension of the app's own;
+`ClientIp` (and code reading `owt_web::client_ip::peer`) answers in-process without a
+peer extension of the app's own; code that reads `Extension<ConnectInfo<SocketAddr>>`
+or the `ConnectInfo` extension directly sees none;
 `Client::with_peer(Some(addr))` picks another, `with_peer(None)` none. A
 `MockConnectInfo` or `Extension(ConnectInfo(..))` layer on the router still decides,
 so an app that adds one keeps its address.

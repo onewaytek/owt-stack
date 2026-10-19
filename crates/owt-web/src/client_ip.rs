@@ -172,6 +172,24 @@ impl Source {
     }
 }
 
+/// The socket's peer: axum's `ConnectInfo<SocketAddr>`, else the address of a
+/// `MockConnectInfo<SocketAddr>` layer, in the order axum's own `ConnectInfo` extractor
+/// reads them. What [`ClientIp`] weighs the headers against; code that needs the peer
+/// itself reads it here, so it agrees with `ClientIp` under a test client too.
+#[must_use]
+pub fn peer(parts: &Parts) -> Option<SocketAddr> {
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0)
+        .or_else(|| {
+            parts
+                .extensions
+                .get::<MockConnectInfo<SocketAddr>>()
+                .map(|m| m.0)
+        })
+}
+
 /// The client's address, as the request's [`Source`] says to read it: the extractor.
 ///
 /// The `Source` is the request's `Extension` (the [`Peer`](Source::Peer) when none
@@ -193,18 +211,7 @@ impl ClientIp {
     /// client's to forge, so they appear quoted, and only at `debug`.
     #[must_use]
     pub fn of(parts: &Parts) -> Option<IpAddr> {
-        // axum's own `ConnectInfo` extractor falls back to `MockConnectInfo` the same
-        // way, so a router tested with that layer has a peer here too.
-        let peer = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|c| c.0.ip())
-            .or_else(|| {
-                parts
-                    .extensions
-                    .get::<MockConnectInfo<SocketAddr>>()
-                    .map(|m| m.0.ip())
-            });
+        let peer = peer(parts).map(|p| p.ip());
         let source = parts.extensions.get::<Source>().unwrap_or(&Source::Peer);
         // A stand-in peer no header parses to tells "the header answered" apart.
         let unspecified = IpAddr::from([0, 0, 0, 0]);

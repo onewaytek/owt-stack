@@ -22,16 +22,13 @@
 //! design of its own draws them with [`Views`], in its [`Words`].
 
 use std::fmt;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{
-    ConnectInfo, Form, FromRequestParts, OriginalUri, Path, Query, Request, State,
-};
+use axum::extract::{Form, FromRequestParts, OriginalUri, Path, Query, Request, State};
 use axum::http::request::Parts;
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
@@ -1650,10 +1647,10 @@ async fn agree(
             },
         );
     }
-    let ip = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| {
+    let ip = owt_web::client_ip::peer(&parts).map(|peer| {
         this.0
             .client_ip
-            .client_ip(&parts.headers, c.0.ip())
+            .client_ip(&parts.headers, peer.ip())
             .to_string()
     });
     let user_agent = parts
