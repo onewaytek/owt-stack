@@ -2582,7 +2582,9 @@ jobs:
 **Image:** `image.yml` builds the image on the ARC scale set (`RUNS_ON`, as the checks)
 with no Docker daemon and no privileges, from inputs rather than a Dockerfile, and
 makes what `templates/Dockerfile`'s runtime stage makes. Its `build` job compiles
-`cargo build --release --locked --bin <bin>` in a Rust job container (`container`,
+`cargo build --release --locked --bin <bin>` in the work directory (`/app`, where the
+Dockerfile builds too, so a path baked in with `env!("CARGO_MANIFEST_DIR")` holds in
+the image) in a Rust job container (`container`,
 default `mirror.gcr.io/library/rust:1-trixie`; through sccache when the app passes
 the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory

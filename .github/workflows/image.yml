@@ -21,12 +21,13 @@ name: Image
 #   with the RUNS_ON repository or organization variable, a JSON string such as
 #   '"ubuntu-latest"'), with no Docker daemon and no privileges. It produces what
 #   templates/Dockerfile's runtime stage produces, from inputs instead of a
-#   Dockerfile. The `build` job compiles the binary in a Rust job container (through
-#   sccache when the app passes SCCACHE_REDIS_PASSWORD), builds the static assets
-#   with npm, and packs one layer: /usr/local/bin/server (root, 0755), any names
-#   linked to it, the work directory (0755, owned by `workdir-owner`) and the listed
-#   files under it (owned by `files-owner`). That job runs the app's code (build scripts, npm
-#   scripts) and holds only a read token. The `push` job runs none of the app's code:
+#   Dockerfile. The `build` job builds the static assets with npm, compiles the
+#   binary in a Rust job container in the work directory, as the Dockerfile does
+#   (through sccache when the app passes SCCACHE_REDIS_PASSWORD), and packs one
+#   layer: /usr/local/bin/server (root, 0755), any names linked to it, the work
+#   directory (0755, owned by `workdir-owner`) and the listed files under it (owned
+#   by `files-owner`). That job runs the app's code (build scripts, npm scripts) and
+#   holds only a read token. The `push` job runs none of the app's code:
 #   it checks the layer (only those paths; files, directories and symlinks; no setuid,
 #   setgid or sticky bit), checks the base image (the tools operations rely on, and a
 #   glibc at least as new as the binary needs), and with crane appends the layer to
@@ -228,6 +229,26 @@ jobs:
           set -euo pipefail
           npm ci --no-audit --no-fund
           npm run "$SCRIPT"
+      # The Dockerfile builds in its work directory (/app), and a binary can bake that
+      # path in (`env!("CARGO_MANIFEST_DIR")` naming its static files, say). So the
+      # build happens there too, from a copy of the checkout with the assets built,
+      # and the files are packed from it.
+      - name: Build directory
+        env:
+          WORKDIR: ${{ inputs.workdir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$WORKDIR" =~ ^(/[A-Za-z0-9._-]+)+$ ]] || [[ "$WORKDIR" =~ (^|/)\.\.?(/|$) ]]; then
+            echo "::error::workdir must be an absolute path without . or .. ('$WORKDIR')"; exit 1
+          fi
+          if [ -e "$WORKDIR" ] && [ -n "$(ls -A "$WORKDIR")" ]; then
+            echo "::error::$WORKDIR is not empty in the job container"; exit 1
+          fi
+          mkdir -p "$WORKDIR" || { echo "::error::the job container's user cannot make $WORKDIR"; exit 1; }
+          # The checkout belongs to another uid than the job container's user.
+          echo "SOURCE_EPOCH=$(git -c safe.directory="$PWD" log -1 --format=%ct)" >> "$GITHUB_ENV"
+          tar --exclude=./.git --exclude=./node_modules -cf - . | tar -C "$WORKDIR" -xf -
       # sccache as in rust-ci.yml (see there for the trust model): the password reaches
       # the sccache server alone, and an unusable Redis means an uncached build.
       - name: Is sccache configured
@@ -279,6 +300,7 @@ jobs:
             echo "::warning::sccache could not use the Redis at $ENDPOINT (above): compiling without it"
           fi
       - name: Build the binary
+        working-directory: ${{ inputs.workdir }}
         env:
           BIN: ${{ inputs.bin }}
           CARGO_ARGS: ${{ inputs.cargo-args }}
@@ -306,6 +328,7 @@ jobs:
       # No entry keeps group or other write, setuid, setgid or sticky: the runner's
       # work volume makes its directories setgid.
       - name: Pack the layer
+        working-directory: ${{ inputs.workdir }}
         env:
           BIN: ${{ inputs.bin }}
           LINKS: ${{ inputs.bin-links }}
@@ -316,9 +339,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! [[ "$WORKDIR" =~ ^(/[A-Za-z0-9._-]+)+$ ]] || [[ "$WORKDIR" =~ (^|/)\.\.?(/|$) ]]; then
-            echo "::error::workdir must be an absolute path without . or .. ('$WORKDIR')"; exit 1
-          fi
           for o in "$OWNER" "$WORKDIR_OWNER"; do
             if ! [[ "$o" =~ ^[0-9]+:[0-9]+$ ]]; then
               echo "::error::files-owner and workdir-owner are numeric uid:gid ('$o')"; exit 1
@@ -350,8 +370,7 @@ jobs:
             fi
             files+=("$f")
           done
-          # The checkout belongs to another uid than the job container's user.
-          epoch="$(git -c safe.directory="$PWD" log -1 --format=%ct)"
+          epoch="$SOURCE_EPOCH"
           common=(--format=posix --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime
             --sort=name --mtime="@${epoch}" --numeric-owner)
           mode=(--mode=go-w,u-s,g-s,-t)
