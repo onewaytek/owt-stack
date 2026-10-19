@@ -2620,7 +2620,13 @@ the template's:
 Files are taken from the checkout after the assets build, less what
 `templates/dockerignore` keeps out of a context (`.git`, `node_modules`, `target`,
 `.env*`, `*.pem`, `*.key`, `.npmrc`, `.netrc`, `.git-credentials`, cargo
-credentials). An app with more than one runtime directory lists them, and one whose
+credentials). A symlink among them fails the build (the push job takes only files
+and directories under the work directory, so no entry can write through a link
+elsewhere in the image); hard links are packed as files. The push job also checks
+that the tag still names the commit the build job checked out. The release build
+reads and writes the same sccache as the checks, so it trusts every repository given
+the secret as they do ("Who to give the secret to"); `sccache-redis: ""` builds a
+release uncached. An app with more than one runtime directory lists them, and one whose
 binary has a second name links it:
 
 ```yaml
