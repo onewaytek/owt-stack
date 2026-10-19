@@ -3123,7 +3123,8 @@ the new one. An app has also seen the unnamed form (`npm install -D
 github:onewaytek/owt-stack#vX.Y.Z`) leave a locked dependency where it was, so name
 the package, and check either way: the lock's `resolved` URL ends in the commit that
 was installed, to compare with the tag's (`git ls-remote
-https://github.com/onewaytek/owt-stack vX.Y.Z`; for an annotated tag, the `^{}` line).
+https://github.com/onewaytek/owt-stack vX.Y.Z 'vX.Y.Z^{}'`: the `^{}` line if there is
+one, otherwise the only line).
 Dependabot leaves this dependency alone (`templates/dependabot.yml` ignores it), so
 this command, run when the app adopts a release, is the only thing that moves it.
 
