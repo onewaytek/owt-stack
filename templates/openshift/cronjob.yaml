@@ -48,6 +48,7 @@ parameters:
     value: 256Mi
   # The log filter, as given to app.yaml unless the task's jobs/<JOB>.env says otherwise.
   - name: RUST_LOG
+    description: The log filter, as given to app.yaml unless the job's file sets its own.
     value: info
 objects:
   - apiVersion: batch/v1
