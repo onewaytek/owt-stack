@@ -280,7 +280,11 @@ the handler and write `<script nonce="{{ nonce }}">`.
   `myapp/development` changes key once `POD_NAMESPACE` reaches its pods, because
   `from_env` reads that next. Then keep it: an old purpose `myapp/<rest>` is
   `SESSION_PURPOSE=<rest>`, and one of another shape (`myapp https://myapp.example`)
-  is `SESSION_KEY_PURPOSE` set to the whole of it. When the purpose must change
+  is `SESSION_KEY_PURPOSE` set to the whole of it. `SESSION_KEY_PURPOSE` replaces the
+  `myapp/` and the environment both, so it is only for reproducing a key that
+  already exists, set per environment (each environment's own `myapp-env`), never in
+  configuration two environments share: there, with a copied secret, it would make
+  their keys one. When the purpose must change
   anyway, open the old key's sessions for one `max_age` and drop it after: assert it
   in a test with `Sessions::opens`, which seals a session under a key and reports
   whether these sessions open it.
@@ -3227,7 +3231,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   that reads a header by default sets `CLIENT_IP=header:NAME`); nothing reads a raw
   `X-Forwarded-For` any more.
 - `Sessions::from_env` replaces the app's own `SESSION_SECRET` and purpose code;
-  keep the purpose with `SESSION_PURPOSE` (see "Session key").
+  keep the purpose with `SESSION_PURPOSE`, or `SESSION_KEY_PURPOSE` for one of
+  another shape (see "Moving onto `from_env`" under "Session key").
 - `redis.yaml`'s image and memory-limit parameters are `REDIS_IMAGE` and
   `REDIS_MEMORY_LIMIT` (they were `IMAGE` and `MEMORY_LIMIT`), apart from `app.yaml`'s,
   so one `params.env` serves every template through `deploy/openshift/apply.sh`. An

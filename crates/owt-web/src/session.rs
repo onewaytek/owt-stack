@@ -80,17 +80,24 @@ pub fn key_from_base64(secret: &str) -> anyhow::Result<Key> {
 /// character is refused rather than trimmed, since `myapp/prod\n` (a stray newline
 /// in a `ConfigMap`) would be another key, splitting replicas or signing everyone out.
 pub fn key_for(secret: &str, purpose: &str) -> anyhow::Result<Key> {
-    anyhow::ensure!(!purpose.is_empty(), "a session key's purpose is empty");
-    anyhow::ensure!(
-        purpose.trim() == purpose && !purpose.chars().any(char::is_control),
-        "a session key's purpose has surrounding whitespace or a control character: {purpose:?}"
-    );
+    check_purpose(purpose)?;
     let master = secret_bytes(secret)?;
     let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(b"owt-web session key v1"), &master);
     let mut key = [0u8; 64];
     hkdf.expand(purpose.as_bytes(), &mut key)
         .map_err(|_| anyhow::anyhow!("HKDF-SHA256 refused a 64-byte key"))?;
     Ok(Key::from(&key))
+}
+
+/// A purpose [`key_for`] takes: not empty, without surrounding whitespace or a
+/// control character.
+fn check_purpose(purpose: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(!purpose.is_empty(), "a session key's purpose is empty");
+    anyhow::ensure!(
+        purpose.trim() == purpose && !purpose.chars().any(char::is_control),
+        "a session key's purpose has surrounding whitespace or a control character: {purpose:?}"
+    );
+    Ok(())
 }
 
 /// The purpose [`Sessions::from_env`] derives its key for: `SESSION_KEY_PURPOSE`, the
@@ -308,7 +315,15 @@ impl<T: SessionData> Sessions<T> {
                 || set("KUBERNETES_SERVICE_HOST").is_none(),
             "set SESSION_PURPOSE, SESSION_KEY_PURPOSE or POD_NAMESPACE: in a pod the session key's purpose is not `{app}/local`"
         );
-        let key = key_for(&secret, &purpose_from(app, &var))
+        let purpose = purpose_from(app, &var);
+        check_purpose(&purpose).map_err(|e| {
+            let from = ["SESSION_KEY_PURPOSE", "SESSION_PURPOSE", "POD_NAMESPACE"]
+                .into_iter()
+                .find(|name| set(name).is_some())
+                .unwrap_or("the app's name");
+            anyhow::anyhow!("the session key's purpose, from {from}: {e}")
+        })?;
+        let key = key_for(&secret, &purpose)
             .map_err(|e| anyhow::anyhow!("the session key from SESSION_SECRET: {e}"))?;
         Ok(Self::new(key, cookie, max_age, secure))
     }
@@ -761,6 +776,10 @@ mod env_tests {
         .err()
         .expect("refused, not trimmed");
         assert!(surrounded.to_string().contains("control"), "{surrounded}");
+        assert!(
+            surrounded.to_string().contains("from SESSION_KEY_PURPOSE"),
+            "names the variable, not the secret: {surrounded}"
+        );
     }
 
     #[test]
