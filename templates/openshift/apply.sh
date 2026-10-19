@@ -139,6 +139,13 @@ run() {
 
 read_env "$params"
 need "$params" NAME NAMESPACE
+# The router reads ROUTE_TIMEOUT as an haproxy duration: a bare number is
+# milliseconds (300 would fail nearly every request), and a value it cannot parse
+# is ignored without a word. So a value without a unit is refused here.
+if [ "${given[ROUTE_TIMEOUT]+set}" ] && ! [[ ${given[ROUTE_TIMEOUT]} =~ ^[1-9][0-9]*(us|ms|s|m|h|d)$ ]]; then
+  echo "$params: ROUTE_TIMEOUT=${given[ROUTE_TIMEOUT]} is not a number with a unit (us, ms, s, m, h or d: 30s, 2m)" >&2
+  exit 2
+fi
 
 run "$here/app.yaml" "app.yaml"
 [ -f "$here/redis.yaml" ] && run "$here/redis.yaml" "redis.yaml"

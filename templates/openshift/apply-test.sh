@@ -151,6 +151,16 @@ grep -q "oc process failed on app.yaml" "$work/err" || fail "names the failed re
 grep -q "^oc diff" "$log" && fail "a failed render was diffed"
 cp "$work/good.env" "$work/deploy/params.env"
 rc=0; run --force || rc=$?; [ "$rc" -eq 2 ] || fail "an unknown flag exits 2"
+for bad in 300 30S 2.5m 0s; do
+  { cat "$work/good.env"; echo "ROUTE_TIMEOUT=$bad"; } >"$work/deploy/params.env"
+  rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "ROUTE_TIMEOUT=$bad exits 2 (got $rc)"
+  grep -q "ROUTE_TIMEOUT=$bad is not a number with a unit" "$work/err" || fail "names ROUTE_TIMEOUT=$bad"
+  grep -q "^oc process" "$log" && fail "ROUTE_TIMEOUT=$bad rendered something"
+done
+{ cat "$work/good.env"; echo "ROUTE_TIMEOUT=300s"; } >"$work/deploy/params.env"
+rc=0; run || rc=$?; [ "$rc" -eq 1 ] || fail "ROUTE_TIMEOUT=300s is taken (got $rc)"
+logged "ROUTE_TIMEOUT=300s" || fail "ROUTE_TIMEOUT reaches app.yaml"
+cp "$work/good.env" "$work/deploy/params.env"
 
 # 7. One pair of quotes comes off a value; what is inside (spaces, `=`, `$`, a
 #    quote of the other kind) is taken as written.
