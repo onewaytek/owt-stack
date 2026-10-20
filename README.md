@@ -7,7 +7,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 |---|---|
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
-| `owt-auth` | sign-in throttling by address and account; Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
+| `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
@@ -710,6 +710,71 @@ ignore = [
     # only verifies signatures, a public-key operation.
     "RUSTSEC-2023-0071",
 ]
+```
+
+### Anonymous forms
+
+A form anyone can post (a contact form, a public intake) is a free write into the
+app's database or an operator's inbox. `owt_auth::bots::Guard` decides each post:
+
+- over its address's budget: `Verdict::TooMany`, answer 429;
+- the honeypot filled: `Verdict::Pretend`, answer **exactly as for a person** (same
+  redirect, same thanks) and store or send nothing, so a bot learns nothing to adapt to;
+- Turnstile on and the token missing, refused or unverifiable (Cloudflare down fails
+  closed): `Verdict::Failed`, show the form again; this is a person's expired token as
+  often as a bot, so it is not pretended away;
+- otherwise `Verdict::Accept`.
+
+The budget is checked first and the honeypot before Turnstile, so a flood costs a
+lookup and a bot costs no Cloudflare request. Give the guard a `Throttle` of its own with
+form-sized budgets (`attempts_per_address` a few a minute), so forms and sign-ins do not
+spend each other's. Turnstile is configured by `TURNSTILE_SITE_KEY` and
+`TURNSTILE_SECRET_KEY`: neither set is off (a honeypot and a budget), one without the
+other fails at start, as does an HTTP client that cannot be built. Verification calls
+`challenges.cloudflare.com` over TLS, so the runtime image needs CA certificates (the
+templates' images have them). `Turnstile::expect_hostname("app.example")` also refuses
+a token Cloudflare issued for another site.
+
+Pick the honeypot's field name so browsers will not autofill it: not `website`,
+`email`, `phone` or `name`, which password managers fill for people, and a person
+who trips the honeypot is silently dropped. `Honeypot::new("company_url")`, say.
+
+`Verdict::Failed` is a person's problem to fix: render the form again with their input
+kept and a message such as "The check did not complete; please try again", and a fresh
+widget (a token is single use). Do not say the post was received.
+
+```rust,no_run
+use std::sync::Arc;
+use owt_auth::bots::{Guard, Honeypot, Turnstile, Verdict};
+use owt_auth::throttle::{Budgets, Throttle};
+use owt_web::client_ip::ClientIp;
+
+#[derive(serde::Deserialize)]
+struct Contact {
+    message: String,
+    #[serde(default)] company_url: String, // the honeypot's field
+    #[serde(default, rename = "cf-turnstile-response")] token: String,
+}
+
+# async fn demo(ClientIp(ip): ClientIp, form: Contact) -> anyhow::Result<()> {
+// Once, at start; keep it in the app's state.
+let guard = Guard::new(
+    Honeypot::new("company_url"),
+    Turnstile::from_env()?,
+    Arc::new(Throttle::new(Budgets { attempts_per_address: 5, ..Budgets::default() })),
+);
+// In the form's template: `guard.honeypot().markup()` (safe to emit unescaped) and,
+// when `guard.turnstile()` is `Some(t)`, Turnstile's widget with `t.site_key()`.
+
+match guard.check(ip, &form.company_url, &form.token).await {
+    Verdict::Accept => { /* store or send `form.message`, then redirect */ }
+    Verdict::Pretend => { /* the same redirect, nothing stored or sent */ }
+    Verdict::TooMany => { /* 429 */ }
+    _ => { /* render the form again: "please try the check again" */ }
+}
+# let _ = form.message;
+# Ok(())
+# }
 ```
 
 ### Accounts
@@ -3241,6 +3306,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
   refused sign-in checks no password), keyed on `client_ip::Source::client_ip`
   (configured for the proxies actually in front of the app), and
   `redirect::local_or` on `?next=` before redirecting to it (see "Authentication").
+- Anonymous forms: `owt_auth::bots::Guard` (see "Anonymous forms"); a form anyone can
+  post, with no budget, is a free write into the database or an inbox.
 - OAuth: use `owt_accounts::social` rather than hand-written handlers (see "Sign-in
   with a provider"); it uses `oauth::http_client()`, and `Client::complete` checks the
   state and the provider itself. An app that needs the person's tokens uses

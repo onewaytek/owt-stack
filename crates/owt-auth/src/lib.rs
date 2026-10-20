@@ -2,6 +2,8 @@
 //!
 //! * [`password`]: Argon2id hashing off the async runtime, a bounded number at once.
 //! * [`throttle`]: budgets for sign-in attempts, by address and by account.
+//! * [`bots`]: a guard for anonymous forms: a honeypot, Turnstile, and a budget per
+//!   address, answering bots as if they were people.
 //! * [`oauth`]: the authorization-code flow (with PKCE where the provider supports
 //!   it) for signing people in with Google, Discord, Twitch or any OIDC provider.
 //! * [`jwt`]: bearer tokens an identity provider issued, verified locally against
@@ -10,6 +12,7 @@
 //!
 //! What a session remembers and how an account is stored stay with the app.
 
+pub mod bots;
 #[cfg(feature = "jwt")]
 pub mod jwt;
 pub mod oauth;
