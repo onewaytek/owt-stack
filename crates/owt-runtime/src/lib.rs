@@ -1,4 +1,4 @@
-//! Process plumbing the onewaytek apps share.
+//! Process plumbing apps on owt-stack share.
 //!
 //! * [`env`]: configuration from the environment. A variable that is present but does
 //!   not parse is an error at startup, never a silent fall back to the default.

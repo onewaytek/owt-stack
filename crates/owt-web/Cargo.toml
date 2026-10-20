@@ -1,6 +1,6 @@
 [package]
 name = "owt-web"
-description = "The HTTP layer the onewaytek apps share: errors, cross-origin protection, sealed cookie sessions, fingerprinted assets, response headers, htmx, SSE."
+description = "The HTTP layer apps on owt-stack share: errors, cross-origin protection, sealed cookie sessions, fingerprinted assets, response headers, htmx, SSE."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,4 +1,4 @@
-//! Test harness for apps built on owt-stack.
+//! Test harness for apps on owt-stack.
 //!
 //! * [`Client`]: requests straight into a [`Router`] (no socket), carrying cookies from
 //!   one response to the next as a browser would.

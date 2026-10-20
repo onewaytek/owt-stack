@@ -345,13 +345,14 @@ impl Jobs {
     /// idle-session timeout, a failover, a network reset), Postgres releases the lock
     /// and another replica may take it at its next tick; so the connection is checked
     /// every [`LOCK_CHECK`] (the lock seen held, within the check's own deadline), and
-    /// a run whose check fails is aborted (at its next `.await`) and counted as
-    /// failed, rather than left running beside the new holder. The guarantee has a
-    /// window: up to two checks may pass between the lock's loss and the abort, and a
-    /// statement the run already sent may still commit. Make overlapping work
-    /// idempotent, or guard its writes (a fencing token), where that matters. A task
-    /// must tolerate being stopped part-way, as it would a crash. Session advisory locks need a direct connection: a transaction-mode
-    /// pooler (`PgBouncer`) gives no such guarantee at all.
+    /// a run whose check fails is aborted (at its next `.await`) and counted as failed,
+    /// rather than left running beside the new holder. The guarantee has a window: up
+    /// to two checks may pass between the lock's loss and the abort, and a statement
+    /// the run already sent may still commit. Make overlapping work idempotent, or
+    /// guard its writes (a fencing token), where that matters. A task must tolerate
+    /// being stopped part-way, as it would a crash. Session advisory locks need a
+    /// direct connection: a transaction-mode pooler (`PgBouncer`) gives no such
+    /// guarantee at all.
     pub fn singleton<F, Fut>(
         &self,
         name: &'static str,

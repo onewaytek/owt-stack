@@ -1,6 +1,6 @@
 [package]
 name = "owt-accounts"
-description = "Accounts and sign-in flows the onewaytek apps share: the accounts table and its migration, credentials with a decoy check and rehash, sessions revoked by epoch, the signed-in extractors, linked provider identities, one-time sign-in links, roles, the staff accounts admin, sign-in with a provider, and which version of each site policy an account accepted."
+description = "Accounts and sign-in flows apps on owt-stack share: the accounts table and its migration, credentials with a decoy check and rehash, sessions revoked by epoch, the signed-in extractors, linked provider identities, one-time sign-in links, roles, the staff accounts admin, sign-in with a provider, and which version of each site policy an account accepted."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
