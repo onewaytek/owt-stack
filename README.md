@@ -2687,6 +2687,14 @@ the template's:
 | `entrypoint` / `cmd` | `["/usr/local/bin/server"]` / `[]` | `ENTRYPOINT` / `CMD` (JSON arrays) |
 | `env` / `labels` | none | more `ENV` / `LABEL` lines, `KEY=VALUE` each |
 
+The two builders make equivalent images, not byte-identical ones. The binary differs in
+bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
+image and the Dockerfile in Hummingbird's. The template Dockerfile owns `/app/static`
+as `65532:0`, as `files-owner` does; an app whose Dockerfile is an older copy
+(`COPY --from=css /app/static ./static`, no `--chown`) has it owned `0:0`, and recopies
+the template's line to match. Compare the two by layout (paths, owners, modes,
+configuration), not by digest.
+
 Files are taken from the checkout after the assets build, less what
 `templates/dockerignore` keeps out of a context (`.git`, `node_modules`, `target`,
 `.env*`, `*.pem`, `*.key`, `.npmrc`, `.netrc`, `.git-credentials`, cargo
