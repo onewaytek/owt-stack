@@ -351,6 +351,18 @@ pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<
     .await?)
 }
 
+/// The active account with this id, its `last_sign_in` stamped: for a way in that
+/// has checked a credential of its own (`session::password_gate`).
+pub(crate) async fn open_active(pool: &PgPool, id: i64) -> sqlx::Result<Option<Account>> {
+    sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
+        "UPDATE accounts SET last_sign_in = now() WHERE id = $1 AND is_active
+         RETURNING {COLUMNS}"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// The active account with this id.
 pub async fn by_id(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<Option<Account>> {
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(

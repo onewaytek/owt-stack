@@ -144,7 +144,8 @@ impl SignInRefused {
 ///
 /// # Errors
 ///
-/// [`SignInRefused`]: throttled, a mismatch, or a fault.
+/// [`SignInRefused`]: throttled, a mismatch (a `login` with a control character
+/// inside it, after trimming, included: it is refused before the throttle is charged), or a fault.
 pub async fn password_sign_in<T: Signed>(
     pool: &PgPool,
     throttle: &Throttle,
@@ -153,11 +154,76 @@ pub async fn password_sign_in<T: Signed>(
     login: &str,
     password: &str,
 ) -> Result<Account, SignInRefused> {
+    // No username or email has a control character, so none can match; refused before
+    // the throttle is charged, so a login cannot spell the key of another budget
+    // (the gate's, [`password_gate`]).
+    // Trimmed first, as the key and the lookup are: a pasted `ada\n` still signs in.
+    if login.trim().chars().any(char::is_control) {
+        return Err(SignInRefused::Mismatch);
+    }
     if !throttle.sign_in(ip, login) {
         return Err(SignInRefused::Throttled);
     }
     let account = store::authenticate(pool, login, password)
         .await?
+        .ok_or(SignInRefused::Mismatch)?;
+    sign_in(session, &account);
+    Ok(account)
+}
+
+/// The deployment-wide password a gate checks against, and the account it opens.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate<'a> {
+    /// The expected password's Argon2 hash (an environment variable, say), as
+    /// `owt_auth::password::hash` writes it. Not what was typed.
+    pub hash: &'a str,
+    /// The id of the account a match signs in: active, and it needs no password of
+    /// its own (password sign-in may be off).
+    pub account: i64,
+}
+
+/// The password gate: one password for the whole deployment, checked against `gate`'s
+/// hash, opening the fixed account it names.
+///
+/// It is [`password_sign_in`] with the stored hash given rather than looked up.
+/// `throttle` is charged for a sign-in to this account from `ip` (the same budgets
+/// as for a login, under a key that no login can spell: [`password_sign_in`] refuses
+/// control characters), the password gets one full Argon2 check
+/// ([`owt_auth::password::verify_or_decoy`]: a hash that is no usable Argon2 string
+/// still costs a full check and opens nothing), and a match stamps the account's
+/// `last_sign_in` and signs `session` in ([`sign_in`]). The hash is not rehashed: it
+/// is not stored here. A deactivated or missing account is a
+/// [`SignInRefused::Mismatch`], as a wrong password is.
+///
+/// **Give the gate a [`Throttle`] of its own**, with a larger `sign_ins_per_account`,
+/// and do not use it for ordinary logins (the larger budget would loosen them too).
+/// Everyone shares the one account, so its budget is shared by every client: with the
+/// default five a minute, a client that fails six times a minute locks the gate for
+/// all. The per-address budgets then do the limiting.
+///
+/// # Errors
+///
+/// [`SignInRefused`]: throttled, a mismatch, or a fault.
+pub async fn password_gate<T: Signed>(
+    pool: &PgPool,
+    throttle: &Throttle,
+    session: &Session<T>,
+    ip: IpAddr,
+    password: &str,
+    gate: Gate<'_>,
+) -> Result<Account, SignInRefused> {
+    // A NUL that no login through `password_sign_in` carries: the key is the gate's
+    // alone there. Code that charges the throttle with strings of its own keeps
+    // them clear of it.
+    if !throttle.sign_in(ip, &format!("\0gate\0{}", gate.account)) {
+        return Err(SignInRefused::Throttled);
+    }
+    if !owt_auth::password::verify_or_decoy(password, Some(gate.hash)).await {
+        return Err(SignInRefused::Mismatch);
+    }
+    let account = store::open_active(pool, gate.account)
+        .await
+        .map_err(crate::Error::from)?
         .ok_or(SignInRefused::Mismatch)?;
     sign_in(session, &account);
     Ok(account)

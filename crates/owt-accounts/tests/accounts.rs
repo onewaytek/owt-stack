@@ -727,6 +727,230 @@ async fn signing_in_cycles_the_id_and_signing_out_empties_the_session() {
     db.drop().await;
 }
 
+type GateState = (PgPool, Arc<owt_auth::throttle::Throttle>, String, i64);
+
+async fn gate_handler(
+    axum::extract::State((pool, throttle, hash, account)): axum::extract::State<GateState>,
+    session: Session<Data>,
+    axum::Form(form): axum::Form<std::collections::HashMap<String, String>>,
+) -> (axum::http::StatusCode, String) {
+    let ip = std::net::IpAddr::from([10, 0, 0, 1]);
+    match session::password_gate(
+        &pool,
+        &throttle,
+        &session,
+        ip,
+        &form["password"],
+        session::Gate {
+            hash: &hash,
+            account,
+        },
+    )
+    .await
+    {
+        Ok(account) => (axum::http::StatusCode::OK, account.username),
+        Err(refused) => (refused.status(), refused.to_string()),
+    }
+}
+
+#[tokio::test]
+async fn the_password_gate_opens_a_fixed_account_with_the_deployments_hash() {
+    let db = db!();
+    let sessions = sessions();
+    // An account no password opens: the gate's password is not its own.
+    let desk = store::create(&db.pool, new("desk", "", None))
+        .await
+        .unwrap();
+    store::set_password_sign_in(&db.pool, desk.id, false)
+        .await
+        .unwrap();
+    let hash = owt_auth::password::hash("the shared passphrase")
+        .await
+        .unwrap();
+    let budgets = owt_auth::throttle::Budgets {
+        attempts_per_address: 100,
+        sign_ins_per_address: 100,
+        sign_ins_per_account: 3,
+    };
+    let throttle = Arc::new(owt_auth::throttle::Throttle::new(budgets));
+    let state = (db.pool.clone(), throttle, hash.clone(), desk.id);
+    let gate = Router::new().route("/gate", post(gate_handler).with_state(state));
+    let client = owt_test::Client::new(app(&db, &sessions, gate));
+    let stamped = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT last_sign_in IS NOT NULL FROM accounts WHERE username = 'desk'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert!(!stamped(db.pool.clone()).await);
+
+    // A wrong password signs nobody in and stamps nothing.
+    let wrong = client
+        .post_form("/gate", &[("password", "not it at all")])
+        .await;
+    assert_eq!(wrong.status, 422);
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    assert!(!stamped(db.pool.clone()).await);
+
+    // The right one opens the fixed account and stamps it.
+    let right = client
+        .post_form("/gate", &[("password", "the shared passphrase")])
+        .await;
+    assert_eq!(right.status, 200);
+    assert_eq!(right.text(), "desk");
+    assert_eq!(client.get("/whoami").await.text(), "desk");
+    assert!(stamped(db.pool.clone()).await);
+
+    // The account's budget is three a minute: two used, the third passes, the fourth
+    // is refused unchecked, even with the right password.
+    let third = client
+        .post_form("/gate", &[("password", "the shared passphrase")])
+        .await;
+    assert_eq!(third.status, 200);
+    let spent = client
+        .post_form("/gate", &[("password", "the shared passphrase")])
+        .await;
+    assert_eq!(spent.status, 429);
+    db.drop().await;
+}
+
+async fn login_handler(
+    axum::extract::State((pool, throttle, _, _)): axum::extract::State<GateState>,
+    session: Session<Data>,
+    axum::Form(form): axum::Form<std::collections::HashMap<String, String>>,
+) -> axum::http::StatusCode {
+    let ip = std::net::IpAddr::from([10, 0, 0, 1]);
+    match session::password_sign_in(
+        &pool,
+        &throttle,
+        &session,
+        ip,
+        &form["login"],
+        form.get("password").map_or("whatever", String::as_str),
+    )
+    .await
+    {
+        Ok(_) => axum::http::StatusCode::OK,
+        Err(refused) => refused.status(),
+    }
+}
+
+#[tokio::test]
+async fn a_login_cannot_spend_the_gates_budget() {
+    let db = db!();
+    let sessions = sessions();
+    let desk = store::create(&db.pool, new("desk", "", None))
+        .await
+        .unwrap();
+    let hash = owt_auth::password::hash("the shared passphrase")
+        .await
+        .unwrap();
+    let budgets = owt_auth::throttle::Budgets {
+        attempts_per_address: 100,
+        sign_ins_per_address: 100,
+        sign_ins_per_account: 1,
+    };
+    let throttle = Arc::new(owt_auth::throttle::Throttle::new(budgets));
+    let state = (db.pool.clone(), throttle, hash, desk.id);
+    let routes = Router::new()
+        .route("/gate", post(gate_handler))
+        .route("/login", post(login_handler))
+        .with_state(state);
+    let client = owt_test::Client::new(app(&db, &sessions, routes));
+    // The key the gate charges, typed as a login: refused as a mismatch, charging
+    // nothing, however often.
+    let forged = format!("\0gate\0{}", desk.id);
+    for _ in 0..3 {
+        let sent = client.post_form("/login", &[("login", &forged)]).await;
+        assert_eq!(sent.status, 422);
+    }
+    // An ordinary login does spend its own budget (one a minute here).
+    assert_eq!(
+        client
+            .post_form("/login", &[("login", "nobody")])
+            .await
+            .status,
+        422
+    );
+    assert_eq!(
+        client
+            .post_form("/login", &[("login", "nobody")])
+            .await
+            .status,
+        429
+    );
+    // A pasted login with its line ending still signs in.
+    store::create(&db.pool, new("ada", "", Some("correct horse battery")))
+        .await
+        .unwrap();
+    let pasted = client
+        .post_form(
+            "/login",
+            &[("login", "ada\n"), ("password", "correct horse battery")],
+        )
+        .await;
+    assert_eq!(pasted.status, 200);
+    // So the gate's budget is whole.
+    let right = client
+        .post_form("/gate", &[("password", "the shared passphrase")])
+        .await;
+    assert_eq!(right.status, 200);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn the_password_gate_refuses_a_deactivated_account_and_an_unusable_hash() {
+    let db = db!();
+    let sessions = sessions();
+    let desk = store::create(&db.pool, new("desk", "", None))
+        .await
+        .unwrap();
+    let hash = owt_auth::password::hash("the shared passphrase")
+        .await
+        .unwrap();
+    let throttle = Arc::new(owt_auth::throttle::Throttle::default());
+    let router = |hash: &str, account: i64| {
+        let state = (db.pool.clone(), throttle.clone(), hash.to_owned(), account);
+        owt_test::Client::new(app(
+            &db,
+            &sessions,
+            Router::new().route("/gate", post(gate_handler).with_state(state)),
+        ))
+    };
+    let form = [("password", "the shared passphrase")];
+    // No hash that opens anything: empty, legacy, damaged.
+    for bad in ["", "plaintext", "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA"] {
+        let client = router(bad, desk.id);
+        assert_eq!(
+            client.post_form("/gate", &form).await.status,
+            422,
+            "{bad:?}"
+        );
+    }
+    // A missing account.
+    assert_eq!(
+        router(&hash, desk.id + 1000)
+            .post_form("/gate", &form)
+            .await
+            .status,
+        422
+    );
+    store::set_active(&db.pool, desk.id, false).await.unwrap();
+    assert_eq!(
+        router(&hash, desk.id)
+            .post_form("/gate", &form)
+            .await
+            .status,
+        422
+    );
+    store::set_active(&db.pool, desk.id, true).await.unwrap();
+    let client = router(&hash, desk.id);
+    assert_eq!(client.post_form("/gate", &form).await.status, 200);
+    db.drop().await;
+}
+
 fn identity(uid: &str, email: Option<&str>, verified: bool) -> oauth::Identity {
     oauth::Identity {
         uid: uid.into(),
