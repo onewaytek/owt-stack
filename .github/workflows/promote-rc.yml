@@ -7,7 +7,7 @@ name: Promote to rc
 #   promote:
 #     needs: [ci]
 #     permissions: {contents: write, actions: write, pull-requests: write}
-#     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@vX.Y.Z  # the release the app uses
+#     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # vX.Y.Z, the release the app uses
 #     with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}"}
 #
 #   # release.yml, after a stable release on main:
@@ -15,7 +15,7 @@ name: Promote to rc
 #     needs: release
 #     if: github.ref_name == 'main'
 #     permissions: {contents: write, actions: write, pull-requests: write}
-#     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@vX.Y.Z  # the release the app uses
+#     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # vX.Y.Z, the release the app uses
 #     with: {source: main}
 #
 # The merge retries on a non-fast-forward, so concurrent promotions serialize
@@ -63,17 +63,17 @@ name: Promote to rc
 #   jobs:
 #     candidate:
 #       permissions: {contents: write, actions: write, pull-requests: write}
-#       uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@vX.Y.Z
+#       uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # vX.Y.Z
 #       with: {source: "${{ inputs.source }}", candidate: true}
 #     check:
 #       needs: candidate
 #       if: needs.candidate.outputs.changed == 'true'
-#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@vX.Y.Z
+#       uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # vX.Y.Z
 #       with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as in the app's CI
 #     publish:
 #       needs: [candidate, check]
 #       permissions: {contents: write, actions: write}
-#       uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@vX.Y.Z
+#       uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # vX.Y.Z
 #       with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
 #
 # Runs on the arc-openshift-k8s ARC scale set, as rust-ci.yml does (override with the

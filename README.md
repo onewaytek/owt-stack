@@ -2789,7 +2789,7 @@ and `rustc-wrapper = "sccache"` under `[build]` in `~/.cargo/config.toml`.
 ```yaml
 jobs:
   checks:
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.8.1
     with:
       check-command: just check
       database: myapp        # empty for no Postgres
@@ -2872,12 +2872,12 @@ jobs:
   release:
     needs: ci
     permissions: {contents: write, issues: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/release.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # v0.8.1
   image:
     needs: release
     if: needs.release.outputs.version != ''
     permissions: {contents: read, packages: write}
-    uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.8.1
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
@@ -2917,7 +2917,7 @@ jobs:
   jobs:
     image:
       permissions: {contents: read, packages: write}
-      uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.8.1
+      uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.8.1
       with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   ```
@@ -3014,31 +3014,31 @@ jobs:
     secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
     permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
-    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@v0.8.1  # and "commits / commits"
+    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.8.1, and "commits / commits"
     # with: {title: false}   # an app that checks titles another way: only "commits / commits" runs (the skipped
     # "commits / title" counts as passing for a required check)
   candidate:
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.8.1
     with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}", candidate: true}
   check-rc:
     needs: candidate
     if: needs.candidate.outputs.changed == 'true'
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.8.1
     with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   promote:
     needs: [candidate, check-rc]
     permissions: {contents: write, actions: write}
-    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.8.1
     with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
   requeue:
     needs: promote
     if: always() && github.event.pull_request.head.repo.full_name == github.repository
     permissions: {actions: write, contents: read, pull-requests: read}
-    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # v0.8.1
     with: {workflow: pr.yml}  # this file
 # in requeue-rc.yml, on {schedule: [{cron: "*/30 * * * *"}], workflow_dispatch: {}}:
 # the requeue job above, without its needs and if
@@ -3047,7 +3047,7 @@ jobs:
     needs: release
     if: github.ref_name == 'main'
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.8.1
     with: {source: main}
 ```
 <!-- x-release-please-end -->
@@ -3212,7 +3212,7 @@ jobs:
     # A fork's pull request is not built here (image-check.yml refuses it too).
     if: github.event.pull_request.head.repo.full_name == github.repository
     permissions: {contents: read}
-    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.8.1
     with: {bin: myapp}   # as the release's image job
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
@@ -3780,14 +3780,13 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `migrations::assert_installed` is gone. An app that copied `ALL` into its
   `migrations/` moves over in one release, without re-running anything:
 
-  1. At start the app awaits `owt_accounts::migrations::start(&pool, || its
-     migrator)`: `migrations::run(&pool)`, then the app's migrator, then
-     `migrations::complete`, which the app already awaited after its migrator. On the
-     first start `run` finds the copies in `_sqlx_migrations` by checksum (whatever
-     versions and names the app gave them), records them in `_owt_accounts_migrations`
-     as applied without running them, and runs any entry the app had not copied yet.
-     Replicas starting together take its advisory lock in turn; the second finds
-     nothing to do.
+  1. At start the app awaits `owt_accounts::migrations::start(&pool, || its migrator)`
+     in place of its migrator and `complete`: `migrations::run(&pool)`, then the app's
+     migrator, then `migrations::complete`. On the first start `run` finds the copies in
+     `_sqlx_migrations` by checksum (whatever versions and names the app gave them),
+     records them in `_owt_accounts_migrations` as applied without running them, and
+     runs any entry the app had not copied yet. Replicas starting together take its
+     advisory lock in turn; the second finds nothing to do.
   2. The app deletes its copies from `migrations/`: every file whose text is one of
      `ALL` (`0001_owt_accounts.sql`, `0006_owt_accounts_roles.sql`, and so on), and
      the test that called `assert_installed`.
@@ -3798,13 +3797,14 @@ The router example under "Wiring an app" composes the layers; beyond it:
      during the rollout, and a rollback works. Once no running binary carries the
      copies, `owt_accounts::migrations::forget_copies(&pool)` may delete them and the
      app may drop `set_ignore_missing`; leaving them is harmless.
-  4. An app whose own migrations must partly run before the library's (one that
-     renamed an `accounts` of its own out of the way) runs its migrator to that
-     version first with `owt_runtime::db::migrate_locked_to`, then `migrations::run`,
-     then `migrate_locked`, then `migrations::complete`, in place of `start`. A database built from nothing then runs the app's
-     migrations after all of the library's (or after the split), not interleaved with
-     them as the copies were: run CI, or `just migrate` on an empty database, before
-     deploying, since that order is new for every app.
+  4. An app whose own migrations must partly run before the library's (one that renamed
+     an `accounts` of its own out of the way) runs its migrator to that version first
+     with `owt_runtime::db::migrate_locked_to`, then `migrations::run`, then
+     `migrate_locked`, then `migrations::complete`, in place of `start`. A database
+     built from nothing then runs the app's migrations after all of the library's (or
+     after the split), not interleaved with them as the copies were: run CI, or `just
+     migrate` on an empty database, before deploying, since that order is new for every
+     app.
   5. The app's binary takes a `migrate` subcommand that runs the start's sequence and
      exits; the justfile's `migrate_command` and `rust-ci.yml`'s `migrate-command`
      run it (`SQLX_OFFLINE=true cargo run --locked -- migrate`), because a database
@@ -3841,7 +3841,7 @@ The router example under "Wiring an app" composes the layers; beyond it:
 - `owt_test::Client` sends every request from the peer `owt_test::PEER`, so a handler
   taking `ConnectInfo<SocketAddr>` or `ClientIp` answers under it; a test that
   asserted the 500 from a missing peer uses `Client::with_peer(None)`.
-  `PoolConfig::connect` waits up to a minute for an unreachable database;
+- `PoolConfig::connect` waits up to a minute for an unreachable database;
   `connect_within(url, Duration::ZERO)` tries once.
 - `app.yaml` sets the Route's `haproxy.router.openshift.io/timeout` from
   `ROUTE_TIMEOUT` (default `30s`). Before the first apply with the new template, copy
