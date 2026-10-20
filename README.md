@@ -242,13 +242,8 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
         .apply(routes)
         .layer(from_fn_with_state(sessions, Sessions::<SessionData>::layer))
         .layer(from_fn_with_state(cross_origin, CrossOrigin::layer));
-    Router::new()
-        .nest(
-            "/static",
-            Router::new()
-                .fallback_service(tower_http::services::ServeDir::new(assets.dir()))
-                .layer(from_fn_with_state(assets.clone(), Assets::cache_policy)),
-        )
+    // `/static`, outside the session: immutable for a fingerprinted URL, `no-cache` else.
+    assets.mount(Router::new())
         .merge(pages)
         .layer(from_fn_with_state(csp, Csp::layer))
         .layer(from_fn(headers::private_by_default))
@@ -389,9 +384,26 @@ the handler and write `<script nonce="{{ nonce }}">`.
       .context("CSRF_TRUSTED_ORIGINS")?;
   # Ok(()) }
   ```
-- **Static URLs:** `Assets::new("static", "/static").watch(cfg!(debug_assertions))`;
-  templates call a function that returns `assets.url("css/app.css")`, which carries
-  the content hash and is served `immutable`.
+- **Static URLs:** `Assets::new("static", "/static").watch(cfg!(debug_assertions))`,
+  served by `assets.mount(router)` (or `assets.service()`, nested where the app
+  likes): a request whose `?v=` is the file's current hash is `immutable`, any other
+  is `no-cache`, a missing file included. Templates call a function that returns
+  `assets.url("css/app.css")`, which carries the content hash. The macro
+  `owt_web::static_assets!("static", "/static")` defines both in one module:
+  `assets()` (the `Assets`, rehashing on every call in a debug build) and
+  `url(path)`.
+
+  ```rust,no_run
+  mod assets {
+      owt_web::static_assets!("static", "/static");
+  }
+  # fn main() {
+  let app = assets::assets().mount(axum::Router::new());
+  # let _: axum::Router = app;
+  let stylesheet = assets::url("css/app.css"); // /static/css/app.css?v=<hash>
+  # let _ = stylesheet;
+  # }
+  ```
 - **Metrics:** `owt_runtime::metrics::install(&[], describe)` once, the
   `metrics::http` layer with an `HttpTimer("myapp_http_request_seconds")` on the routed
   router, and `metrics::serve` on its own listener (port 9464 in the OpenShift
