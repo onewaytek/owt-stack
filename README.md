@@ -251,6 +251,56 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
 }
 ```
 
+**The same stack as a builder.** `owt_web::stack::Stack` applies these layers, and the
+rest of the order the prose above implies, in the one correct order, so an app does not
+re-derive it (axum runs the layers in the reverse of the order they are written, and a
+mistake is silent). Innermost first: `Limits`; the metrics timer, outside the limits so
+a timed-out request is recorded as the 503 it is; a marked `NotFound` fallback; the
+error pages; the account loader; the session layer, which seals nothing for a 5xx;
+`CrossOrigin`; then, around the routes and `/static` together, `Csp` (so error pages
+and refusals carry the nonce and the policy), the default cache policy, the security
+headers and, when asked, `noindex`. `/static` sits beside the routes, outside the
+session and the error pages, and so outside `Limits` and the timer: a static request
+has no deadline of its own and is absent from the duration metric. The session
+validator and the account loader also run outside the `Limits` deadline. Only the
+sessions are required. The account loader and
+the timer are closures over the router because `owt-accounts` depends on `owt-web`
+(and the timer lives in `owt-runtime`); `with_state` goes before `apply`.
+
+```rust,no_run
+use axum::{Router, middleware::from_fn_with_state, response::Html};
+use owt_accounts::{Accounts, session};
+use owt_runtime::metrics::{self, HttpTimer};
+use owt_web::{assets::Assets, csrf::CrossOrigin, headers::Csp, limits::Limits};
+use owt_web::{session::Sessions, stack::Stack};
+
+fn router(
+    routes: Router,
+    sessions: Sessions<session::Data>,
+    assets: Assets,
+    cross_origin: CrossOrigin,
+    pool: sqlx::PgPool,
+) -> Router {
+    Stack::new(sessions)
+        .limits(Limits::default())
+        .cross_origin(cross_origin)
+        .csp(Csp::new().report_only(true))
+        .timer(|r| r.layer(from_fn_with_state(HttpTimer("myapp_http_request_seconds"), metrics::http)))
+        .accounts(move |r| {
+            r.layer(from_fn_with_state(Accounts::new(pool, "/login"), Accounts::load::<session::Data>))
+        })
+        .error_pages(|status| Some(Html(format!("<h1>{status}</h1>"))))
+        .assets(assets)
+        .noindex(false) // true on staging hostnames
+        .apply(routes)
+}
+```
+
+`no_store_by_default()` swaps `headers::private_by_default` (HTML only) for
+`headers::no_store_by_default` (every response); `apply` installs the marked
+`NotFound` fallback, **replacing** a fallback the routes already have (a sign-in
+redirect, a catch-all page); `keep_fallback()` leaves the router's own.
+
 Templates put the request's nonce on inline scripts: take `owt_web::headers::Nonce` in
 the handler and write `<script nonce="{{ nonce }}">`.
 
