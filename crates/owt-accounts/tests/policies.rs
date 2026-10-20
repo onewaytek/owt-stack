@@ -17,8 +17,6 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use sqlx::postgres::PgConnectOptions;
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
 struct Db {
     pool: PgPool,
     schema: String,
@@ -44,7 +42,7 @@ impl Db {
             .connect_with(opts.options([("search_path", schema.as_str())]))
             .await
             .unwrap();
-        MIGRATOR.run(&pool).await.unwrap();
+        owt_accounts::migrations::run(&pool).await.unwrap();
         Some(Self {
             pool,
             schema,

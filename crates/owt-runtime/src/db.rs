@@ -159,12 +159,36 @@ pub async fn migrate_locked(
     migrator: &Migrator,
     lock_id: i64,
 ) -> anyhow::Result<()> {
+    locked(pool, migrator, None, lock_id).await
+}
+
+/// [`migrate_locked`], applying `migrator`'s migrations up to and including version
+/// `target` only. For an app whose own migrations must partly run before a library's
+/// (one that renames a table of its own out of the way of the library's), and the
+/// rest after.
+pub async fn migrate_locked_to(
+    pool: &PgPool,
+    migrator: &Migrator,
+    target: i64,
+    lock_id: i64,
+) -> anyhow::Result<()> {
+    locked(pool, migrator, Some(target), lock_id).await
+}
+
+async fn locked(
+    pool: &PgPool,
+    migrator: &Migrator,
+    target: Option<i64>,
+    lock_id: i64,
+) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(lock_id)
         .execute(&mut *conn)
         .await?;
-    let result = migrator.run(&mut *conn).await;
+    // On the connection itself, not through `Acquire`, so the future is `Send` for any
+    // lifetime and a start can be spawned.
+    let result = migrator.run_direct(target, &mut *conn, false).await;
     let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(lock_id)
         .execute(&mut *conn)

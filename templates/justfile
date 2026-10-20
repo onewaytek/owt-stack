@@ -54,7 +54,7 @@ migrate:
                 exit 1 ;;
         esac
     fi
-    sqlx migrate run
+    {{ migrate_command }}
 
 # Stop them (the data stays in the volume).
 db-stop:
@@ -107,6 +107,11 @@ test *args:
 # Regenerate .sqlx/ after changing a query.
 prepare:
     cargo sqlx prepare -- --all-targets
+
+# How `migrate` applies the migrations: sqlx's, or, for an app on owt-accounts' own
+# ledger, the app's binary, which runs the library's migrations before its own
+# (`SQLX_OFFLINE=true cargo run --locked -- migrate`; the README's "Tables").
+migrate_command := "sqlx migrate run"
 
 # docker compose where Docker is, podman compose otherwise.
 compose := `if docker compose version >/dev/null 2>&1; then echo "docker compose"; else echo "podman compose"; fi`
