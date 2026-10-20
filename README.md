@@ -456,8 +456,14 @@ the handler and write `<script nonce="{{ nonce }}">`.
   ```
 - **Metrics:** `owt_runtime::metrics::install(&[], describe)` once, the
   `metrics::http` layer with an `HttpTimer("myapp_http_request_seconds")` on the routed
-  router, and `metrics::serve` on its own listener (port 9464 in the OpenShift
-  template), never through the Route.
+  router, and the metrics listener on its own port (9464 in the OpenShift template),
+  never through the Route: `metrics::spawn_listener(addr, sample).await?` binds `addr`
+  (so a taken port fails the start), logs it, serves `/metrics` from a task and returns
+  the bound address and the task's handle. It refuses `0.0.0.0`, `::` and `::ffff:0.0.0.0`, so an address
+  from an unset variable cannot expose the endpoint on every interface: pass
+  `127.0.0.1:9464` on a workstation, and in a pod, where the scraper reaches the pod's
+  address, `metrics::spawn_listener_on_all_interfaces(9464, sample)`, which says what it
+  does. `metrics::serve` stays for an app that owns its listener.
 
 ### Handlers, errors and pages
 
@@ -918,11 +924,20 @@ every start and before serving, the app awaits
 to the stored form (in Rust, as sign-in normalizes) and validates the constraints
 the migration added; once done it reads an index and the catalog.
 
+`owt_accounts::migrations::start(&pool, || app_step)` is that sequence once: `run`,
+then the app's step (its migrator, under its own lock), then `complete`. `run` and
+`complete` log what they did; a failure stops the sequence and is returned, its context
+naming the step (`owt-accounts migrations`, `the app's migrations`, `completing the
+accounts tables`), so `main` reports it once (`{err:#}` prints the chain).
+The binary's `migrate` subcommand and its start-up both call it, so the order cannot
+differ between them.
+
 ```rust,no_run
 # async fn start(pool: sqlx::PgPool, app_migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
-owt_accounts::migrations::run(&pool).await?;
-owt_runtime::db::migrate_locked(&pool, app_migrator, 8_531_207).await?; // the app's own
-let done = owt_accounts::migrations::complete(&pool).await?;
+let done = owt_accounts::migrations::start(&pool, || {
+    owt_runtime::db::migrate_locked(&pool, app_migrator, 8_531_207) // the app's own
+})
+.await?;
 for r in &done.renamed {
     eprintln!("account {} is now {:?} (was {:?}): tell its owner", r.id, r.to, r.from);
 }
@@ -933,7 +948,8 @@ for r in &done.renamed {
 An app whose own migrations must partly run first (one that renames an `accounts` of
 its own out of the way, say) runs its migrator to that version, then the library's,
 then the rest: `migrate_locked_to(&pool, &MIGRATOR, <the rename's version>, id)`,
-`migrations::run`, `migrate_locked`. Each is a no-op once applied.
+`migrations::run`, `migrate_locked`, then `migrations::complete`, in place of `start`. Each
+is a no-op once applied.
 
 CI and a developer's `just migrate` create a database from nothing, where the app's
 migrations need the library's tables first, so the app's binary takes a `migrate`

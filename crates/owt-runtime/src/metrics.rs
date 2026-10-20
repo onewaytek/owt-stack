@@ -222,9 +222,129 @@ where
     Ok(())
 }
 
+/// Bind `addr` and serve `/metrics` on it from a task of its own ([`serve`]), returning
+/// the bound address (the port, when `addr` asked for 0) and the task, which runs until
+/// the process ends. Binding happens here, so a port already taken fails the start
+/// instead of the task; the task logs the address it listens on.
+///
+/// `addr` must name an interface: an unspecified address (`0.0.0.0`, `::`, and `::ffff:0.0.0.0`, which binds every IPv4 interface) is refused
+/// with [`InvalidInput`](std::io::ErrorKind::InvalidInput), so an address read from a
+/// default or an unset variable cannot expose the endpoint on every interface. Pass
+/// `127.0.0.1:port` to keep it on the host, or a pod's address to open it to the
+/// scraper; [`spawn_listener_on_all_interfaces`] is the deliberate way to bind them all.
+///
+/// # Errors
+/// The address is unspecified, or cannot be bound.
+///
+/// # Panics
+/// If [`install`] was never called.
+pub async fn spawn_listener<F>(
+    addr: std::net::SocketAddr,
+    sample: F,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>
+where
+    F: Fn() + Clone + Send + Sync + 'static,
+{
+    // `::ffff:0.0.0.0` binds every IPv4 interface too.
+    if addr.ip().to_canonical().is_unspecified() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "the metrics listener was given {addr}, which is every interface: \
+                 name one, or call spawn_listener_on_all_interfaces"
+            ),
+        ));
+    }
+    bind_and_spawn(addr, sample).await
+}
+
+/// [`spawn_listener`] on every IPv4 interface (`0.0.0.0`) at `port`: for a pod, whose
+/// scraper reaches it by the pod's address and is admitted by a `NetworkPolicy` (the
+/// `OpenShift` template's). Named for what it does, so no caller gets it by omission.
+///
+/// # Errors
+/// The port cannot be bound.
+///
+/// # Panics
+/// If [`install`] was never called.
+pub async fn spawn_listener_on_all_interfaces<F>(
+    port: u16,
+    sample: F,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>
+where
+    F: Fn() + Clone + Send + Sync + 'static,
+{
+    bind_and_spawn((std::net::Ipv4Addr::UNSPECIFIED, port).into(), sample).await
+}
+
+async fn bind_and_spawn<F>(
+    addr: std::net::SocketAddr,
+    sample: F,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)>
+where
+    F: Fn() + Clone + Send + Sync + 'static,
+{
+    assert!(
+        HANDLE.get().is_some(),
+        "metrics::install runs before the metrics listener is spawned"
+    );
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        if let Err(e) = serve(listener, sample).await {
+            tracing::error!(error = %e, "the metrics listener stopped");
+        }
+    });
+    Ok((bound, task))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_listener_serves_on_the_address_it_was_given() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        install(&[], || {});
+        let sampled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&sampled);
+        let (addr, task) = spawn_listener("127.0.0.1:0".parse().unwrap(), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+        assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}");
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert_eq!(sampled.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unspecified_address_is_refused_and_a_taken_port_fails_the_start() {
+        install(&[], || {});
+        for addr in ["0.0.0.0:0", "[::]:0", "[::ffff:0.0.0.0]:0"] {
+            let refused = spawn_listener(addr.parse().unwrap(), || {})
+                .await
+                .unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{addr}");
+        }
+        let (taken, task) = spawn_listener("127.0.0.1:0".parse().unwrap(), || {})
+            .await
+            .unwrap();
+        let clash = spawn_listener(taken, || {}).await.unwrap_err();
+        assert_eq!(clash.kind(), std::io::ErrorKind::AddrInUse);
+        task.abort();
+    }
 
     /// Invented methods share one label value: a client cannot mint label sets.
     #[test]
