@@ -9,6 +9,10 @@ fuzz_target!(|next: &str| {
     let Some(ok) = local(next) else { return };
     let base = url::Url::parse("https://this.example/sign-in").unwrap();
     let resolved = base.join(ok).expect("an accepted path resolves");
-    assert_eq!(resolved.host_str(), Some("this.example"), "{next:?} -> {resolved}");
+    assert_eq!(
+        resolved.host_str(),
+        Some("this.example"),
+        "{next:?} -> {resolved}"
+    );
     assert_eq!(resolved.scheme(), "https", "{next:?} -> {resolved}");
 });

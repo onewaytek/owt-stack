@@ -227,9 +227,10 @@ where
 /// the process ends. Binding happens here, so a port already taken fails the start
 /// instead of the task; the task logs the address it listens on.
 ///
-/// `addr` must name an interface: an unspecified address (`0.0.0.0`, `::`, and `::ffff:0.0.0.0`, which binds every IPv4 interface) is refused
-/// with [`InvalidInput`](std::io::ErrorKind::InvalidInput), so an address read from a
-/// default or an unset variable cannot expose the endpoint on every interface. Pass
+/// `addr` must name an interface: an unspecified address (`0.0.0.0`, `::`, and
+/// `::ffff:0.0.0.0`, which binds every IPv4 interface) is refused with
+/// [`InvalidInput`](std::io::ErrorKind::InvalidInput), so an address read from a default
+/// or an unset variable cannot expose the endpoint on every interface. Pass
 /// `127.0.0.1:port` to keep it on the host, or a pod's address to open it to the
 /// scraper; [`spawn_listener_on_all_interfaces`] is the deliberate way to bind them all.
 ///
