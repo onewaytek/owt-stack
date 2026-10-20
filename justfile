@@ -35,9 +35,10 @@ test *args:
 audit:
     cargo audit --deny warnings
 
-# The deploy script against a stand-in `oc` (bash only; no cluster, no Rust).
+# The deploy and environment scripts against a stand-in `oc` (bash only; no cluster, no Rust).
 templates:
     bash templates/openshift/apply-test.sh
+    bash templates/openshift/env-test.sh
 
 # The commitlint rules conventional-commits.yml writes for an app without its own are
 # commitlint.config.mjs, byte for byte.

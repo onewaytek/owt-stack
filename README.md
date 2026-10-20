@@ -35,6 +35,7 @@ Outside the crates:
 | `templates/openshift/egress.yaml` | where the app's pods (or a task's) may connect: its database, its Redis, the cluster's DNS and port 443 of the internet, and nothing else |
 | `templates/openshift/apply.sh` | renders every template present from the app's `params.env` (and `jobs/*.env`), plus an optional `pre-render` hook, `oc diff` by default, `--apply` to apply; `apply-test.sh` proves it against a stand-in `oc` |
 | `templates/openshift/cronjob.yaml` | a scheduled task in the app's image, with the app's database, TLS, environment and NetworkPolicies |
+| `templates/openshift/env.sh` | creates and patches the app's `myapp-env` Secret from an `env.env` of its settings: literals, keys generated once, keys taken from the caller's environment; `env-test.sh` proves it |
 | `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters, and rehearses a Postgres major upgrade |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
 | `tailwind/owt.css` | font stacks, htmx state variants (`htmx-request:opacity-50`), and the `owt-*` classes the shared components and the change-request button use |
@@ -2062,12 +2063,13 @@ let social = social.on_arrival(move |arrived| {
 
 - **OpenShift:** keep the credentials in the app's environment Secret, `myapp-env`
   ("The app's environment" under "Commands, CI, releases and deployment"), with
-  `PUBLIC_BASE_URL` beside them, and restart to read them (`oc set data` changes a
-  Secret that exists; `oc create secret generic myapp-env` makes it):
+  `PUBLIC_BASE_URL` beside them, listed in `env.env` for `env.sh`, which makes the
+  Secret and patches a changed key, and restart to read them:
 
   ```sh
-  oc set data secret/myapp-env \
-    GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... PUBLIC_BASE_URL=https://myapp.example
+  # env.env: GOOGLE_CLIENT_ID=@env, GOOGLE_CLIENT_SECRET=@env, PUBLIC_BASE_URL=https://...
+  read -rs GOOGLE_CLIENT_SECRET && export GOOGLE_CLIENT_SECRET   # not in argv or history
+  deploy/openshift/env.sh --apply
   oc rollout restart deployment/myapp
   ```
 
@@ -3132,8 +3134,8 @@ level=$(oc get configmap myapp-log -o jsonpath='{.data.level}')
 echo "RUST_LOG=info,myapp=$level"
 ```
 
-The script writes no Secret: the app's environment and a Redis password are made by
-hand, as below. `templates/openshift/apply-test.sh` proves the script against a
+The script writes no Secret: the app's environment is `env.sh`'s, below, and a Redis
+password is made by hand. `templates/openshift/apply-test.sh` proves the script against a
 stand-in `oc` (`just templates` runs it here).
 
 The ImageStream polls ghcr for the channel's tag (`rc` or `latest`), and the
@@ -3152,14 +3154,35 @@ optional: until it exists, the app starts without it. A variable the template se
 `RUST_LOG` is the template's `RUST_LOG` parameter (default `info`), so a narrower
 filter goes in `params.env` (`RUST_LOG=info,myapp=debug`), or in a task's
 `jobs/<JOB>.env` for that task alone. A
-Secret's change reaches pods only when they start, so restart after one:
+Secret's change reaches pods only when they start, so restart after one.
+
+`env.sh`, beside `apply.sh`, makes the Secret idempotently from `env.env`, one
+`KEY=VALUE` a line (read as `params.env`'s are), with `NAME` and `NAMESPACE` from
+`params.env`:
 
 ```sh
-oc create secret generic myapp-env \
-  --from-literal=SESSION_SECRET="$(openssl rand 64 | base64 -w0)"
-oc set data secret/myapp-env PUBLIC_BASE_URL=https://myapp.example   # later changes
+# deploy/openshift/env.env, committed: it holds no secret value
+# Written as given; a changed value is patched in.
+PUBLIC_BASE_URL=https://myapp.example
+# 64 random bytes, made once and never regenerated.
+SESSION_SECRET=@generate
+# The caller's $PROVIDER_TOKEN; kept when unset.
+PROVIDER_TOKEN=@env
+```
+
+```sh
+deploy/openshift/env.sh               # what would change (exit 1 when something)
+read -rs PROVIDER_TOKEN && export PROVIDER_TOKEN   # not in argv or shell history
+deploy/openshift/env.sh --apply
 oc rollout restart deployment/myapp
 ```
+
+It reports each key (`created`, `set`, `kept`, `unchanged`) and never a value, which
+reach `oc` in a file rather than on a command line. A key the Secret holds that the
+file does not list (one set by hand with `oc set data`) is left alone. A value with a
+newline is refused, and so is an `@env` key that is neither set (an empty variable
+counts as unset) nor already in the Secret; `@env` reads the exported environment
+only. Two runs at once race, the last patch winning. `templates/openshift/env-test.sh` proves it against a stand-in `oc`.
 
 **Moving from `oc set env` to `myapp-env`.** An entry added to the Deployment with
 `oc set env` lives outside the template, and `apply.sh` applies client-side, so the
@@ -3172,9 +3195,9 @@ order, so that no pod starts without a value:
 oc set env deployment/myapp --list
 # 2. The Secret, from those values: only the app's own, never one the template sets
 #    (DATABASE_URL, RUST_LOG, ...).
-oc create secret generic myapp-env \
-  --from-literal=SESSION_SECRET='...' \
-  --from-literal=PUBLIC_BASE_URL='...'
+#    List them in env.env (a literal, or @env for a secret exported without argv, as
+#    "The app's environment" shows), then make the Secret:
+deploy/openshift/env.sh --apply
 # 3. envFrom on the live Deployment. The explicit entries still win: no value changes.
 deploy/openshift/apply.sh --apply
 # 4. Every moved entry off, in one command: one rollout, after which the Secret answers.

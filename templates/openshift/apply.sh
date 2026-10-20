@@ -37,8 +37,8 @@
 #                    admin grants, and a diff without it is refused
 #
 # Upgrading owt-stack is "copy the templates again, keep params.env". The script
-# never writes a Secret: the app's environment ($NAME-env) and a Redis password are
-# made by hand, as the templates' headers say. PARAMS=path names another params.env.
+# never writes a Secret: the app's environment ($NAME-env) is env.sh's, and a Redis
+# password is made by hand, as the templates' headers say. PARAMS=path names another params.env.
 #
 # An executable `pre-render` beside the script computes parameters params.env cannot
 # hold (a checksum of a ConfigMap, a value derived from the cluster). It runs once,

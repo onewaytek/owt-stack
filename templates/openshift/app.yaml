@@ -20,7 +20,7 @@
 # The app's own environment (SESSION_SECRET, provider credentials, its tuning) lives
 # in a Secret named <NAME>-env, which the Deployment reads whole when it exists:
 #
-#   oc create secret generic myapp-env --from-literal=SESSION_SECRET=...
+#   deploy/openshift/env.sh --apply     (env.sh reads env.env: see the README)
 #
 # Variables set below win over the Secret's. Alongside this template, redis.yaml adds
 # a Redis (the Deployment reads REDIS_URL from <NAME>-redis when it exists), and
