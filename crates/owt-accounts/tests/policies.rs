@@ -122,24 +122,12 @@ fn app_with(db: &Db, sessions: &Sessions<Data>, policies: Policies) -> Router {
 }
 
 fn sessions() -> Sessions<Data> {
-    let key = owt_web::session::key_from_base64(&base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        (0..64u8).collect::<Vec<_>>(),
-    ))
-    .unwrap();
-    Sessions::new(key, "s", Duration::from_secs(3600), false)
-}
-
-fn cookie_for(sessions: &Sessions<Data>, account: &store::Account) -> String {
-    let mut data = Data::default();
-    session::Signed::set_signature(
-        &mut data,
-        Some(session::Signature {
-            account: account.id,
-            epoch: account.session_epoch,
-        }),
-    );
-    sessions.seal(&owt_web::session::new_id(), &data)
+    Sessions::new(
+        owt_test::accounts::test_key(),
+        "s",
+        Duration::from_secs(3600),
+        false,
+    )
 }
 
 async fn account(db: &Db, username: &str, staff: bool) -> store::Account {
@@ -212,8 +200,41 @@ async fn signed_in(db: &Db) -> (owt_test::Client, store::Account, Sessions<Data>
     let sessions = sessions();
     let client = owt_test::Client::new(app(db, &sessions));
     let ada = account(db, "ada", false).await;
-    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    client.sign_in_as(&sessions, &ada);
     (client, ada, sessions)
+}
+
+#[tokio::test]
+async fn a_fixture_account_agrees_to_the_current_versions_and_passes_the_gate() {
+    let db = db!();
+    published(&db, "terms", "Terms of Service", "First.", "").await;
+    let v2 = published(&db, "terms", "Terms of Service", "Second.", "new").await;
+    published(&db, "privacy", "Privacy Notice", "We keep little.", "").await;
+    let sessions = sessions();
+
+    let asked = owt_test::Client::new(app(&db, &sessions));
+    let ada = owt_test::accounts::create(&db.pool, "ada").await;
+    asked.sign_in_as(&sessions, &ada);
+    assert_eq!(
+        asked.get_page("/whoami").await.location(),
+        Some("/agree?next=%2Fwhoami")
+    );
+
+    let agreed = owt_test::Client::new(app(&db, &sessions));
+    let bob = agreed.sign_in_new(&db.pool, &sessions, "bob").await;
+    assert_eq!(agreed.get_page("/whoami").await.text(), "bob");
+    let held: Vec<(String, i32)> = policies::accepted(&db.pool, bob.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| (a.kind, a.version))
+        .collect();
+    assert_eq!(held.len(), 2);
+    assert!(held.contains(&("terms".to_owned(), 2)), "{held:?}");
+    assert!(held.iter().any(|(kind, _)| kind == "privacy"));
+    assert_eq!(v2.number(), 2);
+    assert_eq!(count(&db, "policy_acceptance_events").await, 2);
+    db.drop().await;
 }
 
 #[tokio::test]
@@ -509,7 +530,7 @@ async fn staff(db: &Db) -> (owt_test::Client, store::Account) {
     let sessions = sessions();
     let client = owt_test::Client::new(app(db, &sessions));
     let boss = account(db, "boss", true).await;
-    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    client.sign_in_as(&sessions, &boss);
     (client, boss)
 }
 
@@ -521,7 +542,7 @@ async fn only_staff_reach_the_staff_pages() {
     let r = client.get("/staff/policies").await;
     assert_eq!(r.location(), Some("/login?next=%2Fstaff%2Fpolicies"));
     let ada = account(&db, "ada", false).await;
-    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    client.sign_in_as(&sessions, &ada);
     assert_eq!(client.get("/staff/policies").await.status, 403);
     assert_eq!(
         client
@@ -701,7 +722,7 @@ async fn an_app_draws_the_pages_at_its_paths_in_its_words() {
         });
     let client = owt_test::Client::new(app_with(&db, &sessions, mine));
     let ada = account(&db, "ada", false).await;
-    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    client.sign_in_as(&sessions, &ada);
     published(&db, "terms", "Terms <1>", "First.", "").await;
 
     // The app's own page, at the prefix; nothing at the root.

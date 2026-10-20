@@ -309,12 +309,12 @@ fn app(db: &Db, sessions: &Sessions<Data>, extra: Router) -> Router {
 }
 
 fn sessions() -> Sessions<Data> {
-    let key = owt_web::session::key_from_base64(&base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        (0..64u8).collect::<Vec<_>>(),
-    ))
-    .unwrap();
-    Sessions::new(key, "s", Duration::from_secs(3600), false)
+    Sessions::new(
+        owt_test::accounts::test_key(),
+        "s",
+        Duration::from_secs(3600),
+        false,
+    )
 }
 
 /// A cookie signed in as `account`, sealed as the app would seal it.

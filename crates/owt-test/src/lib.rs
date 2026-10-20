@@ -7,8 +7,13 @@
 //! * [`golden`]: rendered pages compared with snapshots on disk, modulo layout and
 //!   escaping style.
 //! * [`fragment`]: a page and its htmx fragment render one element the same way.
+//! * [`accounts`]: account fixtures, a fixed session key, and a [`Client`] signed in
+//!   without an Argon2 round.
 //! * [`assets`]: the browser fetches nothing from another origin; vendored files match
 //!   their pins.
+//!
+//! Dev-dependency only: [`Client::sign_in_as`] seals a session for any account, so a
+//! production build must not link this crate.
 //!
 //! Requests carry no `Origin` and no `Sec-Fetch-Site`, so cross-origin protection
 //! treats them as a non-browser client and lets them through; set the headers on a
@@ -23,6 +28,7 @@
     reason = "test harness: a panic is a test failure"
 )]
 
+pub mod accounts;
 pub mod assets;
 pub mod fragment;
 pub mod golden;
@@ -123,6 +129,41 @@ impl Client {
     #[must_use]
     pub fn cookie(&self, name: &str) -> Option<String> {
         self.jar.lock().unwrap().get(name).cloned()
+    }
+
+    /// Sign the client in as `account`: the session cookie `sessions` names, sealed as
+    /// [`owt_accounts::session::sign_in`] would set it (a fresh session id, the
+    /// account's id and current epoch), without the password check. Build `sessions`
+    /// as the app does, with [`accounts::test_key`] for the key.
+    pub fn sign_in_as<T: owt_accounts::session::Signed>(
+        &self,
+        sessions: &owt_web::session::Sessions<T>,
+        account: &owt_accounts::Account,
+    ) {
+        let mut data = T::default();
+        data.set_signature(Some(owt_accounts::session::Signature {
+            account: account.id,
+            epoch: account.session_epoch,
+        }));
+        self.set_cookie(
+            sessions.cookie_name(),
+            &sessions.seal(&owt_web::session::new_id(), &data),
+        );
+    }
+
+    /// [`accounts::create`] an account named `username`, have it agree to the current
+    /// policies ([`accounts::agree_to_current`]) and [`sign_in_as`](Self::sign_in_as) it:
+    /// the usual start of a test of a page behind the sign-in and the policy gate.
+    pub async fn sign_in_new<T: owt_accounts::session::Signed>(
+        &self,
+        pool: &sqlx::PgPool,
+        sessions: &owt_web::session::Sessions<T>,
+        username: &str,
+    ) -> owt_accounts::Account {
+        let account = accounts::create(pool, username).await;
+        accounts::agree_to_current(pool, &account).await;
+        self.sign_in_as(sessions, &account);
+        account
     }
 
     /// Forget every cookie.
