@@ -174,4 +174,9 @@ logged 'BACKUP_SCHEDULE=0 0 2 * * *' || fail "a quoted value loses its quotes"
 grep -qF 'CHANNEL=rc "quoted", it'"'"'s' "$log" || fail "what is inside is kept"
 logged 'IMAGE=ghcr.io/example/my$app' || fail "a dollar is literal"
 
+# 9. cronjob.yaml reads the app's Secret, then the task's own, both optional. The
+#    stand-in `oc` renders nothing, so the template's source stands in for its output.
+grep -qF 'secretRef: {name: "${NAME}-env", optional: true}' "$here/cronjob.yaml" || fail "cronjob.yaml reads the app's Secret"
+grep -qF 'secretRef: {name: "${NAME}-${JOB}-env", optional: true}' "$here/cronjob.yaml" || fail "cronjob.yaml reads the task's Secret"
+
 echo "apply.sh: ok"
