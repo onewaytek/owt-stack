@@ -8,4 +8,10 @@ ignore = [
     # owt-auth only verifies signatures, a public-key operation.
     # (The test suite signs with a throwaway key.)
     "RUSTSEC-2023-0071",
+
+    # basic-toml: unmaintained. It arrives through askama_derive, a proc-macro that
+    # reads the crate's own askama.toml at compile time; nothing links it into a
+    # built artifact and it never sees runtime or untrusted input. Lifts when an
+    # askama release drops the dependency.
+    "RUSTSEC-2026-0374",
 ]
