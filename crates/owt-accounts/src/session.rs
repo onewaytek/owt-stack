@@ -156,8 +156,8 @@ pub async fn password_sign_in<T: Signed>(
 ) -> Result<Account, SignInRefused> {
     // No username or email has a control character, so none can match; refused before
     // the throttle is charged, so a login cannot spell the key of another budget
-    // (the gate's, [`password_gate`]).
-    // Trimmed first, as the key and the lookup are: a pasted `ada\n` still signs in.
+    // (the gate's, in `password_gate`). Trimmed first, as the key and the lookup are:
+    // a pasted `ada\n` still signs in.
     if login.trim().chars().any(char::is_control) {
         return Err(SignInRefused::Mismatch);
     }

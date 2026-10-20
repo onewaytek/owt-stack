@@ -1,12 +1,12 @@
 //! Accounts and sign-in, for every app on the stack.
 //!
 //! [`owt_auth`] has the pieces (Argon2 hashing, the sign-in throttle, OAuth, JWT) and
-//! [`owt_web::session`] the sealed cookie. Each app then wrote the same flows over
+//! [`owt_web::session`] the sealed cookie. Every app needs the same flows over
 //! them: an `accounts` table with a session epoch, `authenticate` with the decoy
 //! check and rehash, a sign-in extractor that walls a handler, sign-out everywhere.
-//! This crate is that code, once.
+//! This crate holds those flows once.
 //!
-//! - [`migrations`]: the tables, as a file the app copies into its migrations.
+//! - [`migrations`]: the tables, which the library migrates into a ledger of its own.
 //! - [`store`]: the account rows: create, authenticate, look up, change.
 //! - [`password`]: the rules a new password meets.
 //! - [`session`]: what the cookie carries, signing in and out, the validator.

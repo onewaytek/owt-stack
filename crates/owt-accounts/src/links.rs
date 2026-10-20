@@ -55,7 +55,7 @@ pub async fn mint(
     )
     .bind(digest(&token))
     .bind(account_id)
-    // A century of seconds fits an i64 many times over; the cast is lossless.
+    // At most `MAX_TTL`, so the cast is lossless.
     .bind(ttl.min(MAX_TTL).as_secs().cast_signed())
     .bind(reason)
     .execute(db)

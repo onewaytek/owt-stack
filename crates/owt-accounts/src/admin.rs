@@ -15,8 +15,8 @@
 //!   the list, and its page offers no password.
 //!
 //! What it refuses: taking away your own staff access, deactivating yourself, turning
-//! your own password sign-in off or retiring your own local identity, a
-//! change by someone who stopped being staff after their request began, unlinking an
+//! your own password sign-in off or retiring your own local identity, a change by
+//! someone who stopped being staff after their request began, unlinking an
 //! account's only way in, and every refusal the [`store`] makes (a taken email, say).
 //! Each change runs in a transaction that first locks the acting member of staff's
 //! row and the account's, in id order, and checks the actor is still active staff in
@@ -24,8 +24,8 @@
 //! the second is refused, so staff never reach zero this way.
 //!
 //! A password or link is shown once, in the answer to the `POST` that made it; every
-//! response here is `no-store` and never framed, a refusal included. Each change is logged at `info` with who made it and what
-//! it changed.
+//! response here is `no-store` and never framed, a refusal included. Each change is
+//! logged at `info` with who made it and what it changed.
 //!
 //! The app supplies its layout through a [`Chrome`] function: the admin renders the
 //! page's body and the app wraps it, as it would any page. The body comes from

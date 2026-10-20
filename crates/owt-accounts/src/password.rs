@@ -81,7 +81,7 @@ pub fn generate(like: &[&str]) -> String {
     const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rng = rand::rng();
     loop {
-        // Uniform over the alphabet (no modulo bias): 20 × log2(56) ≈ 116 bits.
+        // `random_range` is uniform over the alphabet (no modulo bias).
         let password: String = (0..20)
             .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
             .collect();

@@ -8,8 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# `ListView::example`, `NewView::example` and `AccountView::example`: filled-in view
-# models for an app's unit tests of its own `admin::Views` templates, and
+# `example` on the view models of `admin::Views` and `policies::Views`: filled-in view
+# models for an app's unit tests of its own templates, and
 # `policies::agree_to_current` for fixtures (`owt-test` enables it).
 test-util = []
 # `cli::AccountCommand`, the operator commands as a clap `Subcommand`: an app nests it
