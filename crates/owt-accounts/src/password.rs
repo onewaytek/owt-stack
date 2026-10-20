@@ -72,6 +72,25 @@ pub fn check(password: &str, like: &[&str]) -> Vec<Problem> {
     problems
 }
 
+/// Twenty letters and digits that pass every rule here, given what the password must
+/// not resemble (`like`, as in [`check`]): drawn again if it happens to contain the
+/// username. About 116 bits, uniform over its alphabet.
+#[must_use]
+pub fn generate(like: &[&str]) -> String {
+    use rand::RngExt;
+    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::rng();
+    loop {
+        // Uniform over the alphabet (no modulo bias): 20 × log2(56) ≈ 116 bits.
+        let password: String = (0..20)
+            .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
+            .collect();
+        if check(&password, like).is_empty() {
+            return password;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +126,15 @@ mod tests {
     fn length_counts_characters_not_bytes() {
         // Eight two-byte characters: long enough.
         assert_eq!(check("ééééééééé", &[]), Vec::<Problem>::new());
+    }
+
+    #[test]
+    fn a_generated_password_passes_the_rules() {
+        for _ in 0..50 {
+            let p = generate(&["ab1", "x@example.com"]);
+            assert_eq!(p.len(), 20);
+            assert!(check(&p, &["ab1", "x@example.com"]).is_empty(), "{p}");
+        }
     }
 
     #[test]
