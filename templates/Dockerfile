@@ -70,6 +70,8 @@ RUN cargo build --release --locked --bin ${BIN} && cp target/release/${BIN} /app
 FROM registry.access.redhat.com/hi/core-runtime:2
 ARG PORT
 ARG VERSION=dev
+# core-runtime runs as uid 65532 from its first instruction, so a RUN here cannot
+# install packages or write outside what 65532 owns: do that in an earlier stage.
 # Runs the shell tools operations rely on, rather than looking them up: a base image
 # that drops one fails the build, not an incident.
 RUN timeout 5 env >/dev/null

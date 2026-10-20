@@ -27,16 +27,19 @@ name: Image
 #   layer: /usr/local/bin/server (root, 0755), any names linked to it, the work
 #   directory (0755, owned by `workdir-owner`) and the listed files under it (owned
 #   by `files-owner`). That job runs the app's code (build scripts, npm scripts) and
-#   holds only a read token. The `push` job runs none of the app's code:
-#   it checks the layer (only those paths; files, directories and symlinks; no setuid,
-#   setgid or sticky bit), checks the base image (the tools operations rely on, and a
-#   glibc at least as new as the binary needs), and with crane appends the layer to
-#   the base pinned by digest and sets the configuration, pushes by digest, reads the
-#   pushed configuration back and only then tags it. A tag never names a half-made
-#   image.
+#   holds only a read token. The `verify` job, also read-only, checks the layer (only
+#   those paths; files, directories and symlinks; no setuid, setgid or sticky bit) and
+#   the base image (the tools operations rely on, and a glibc at least as new as the
+#   binary needs). The `push` job runs none of the app's code: it confirms the layer
+#   is the one verified, and with crane appends it to the base pinned by digest and
+#   sets the configuration, pushes by digest, reads the pushed configuration back and
+#   only then tags it. A tag never names a half-made image.
 #
 # - `docker` builds the app's Dockerfile with BuildKit on a GitHub-hosted runner, for
 #   an image the inputs cannot describe. The ARC runners have no Docker daemon.
+#
+# image-check.yml builds and verifies the same image on a pull request, pushing
+# nothing, for a caller that grants no write permission.
 #
 # The jobs run only for the repository's own events: a push, a dispatch, a schedule
 # or a pull request from a branch of the repository. A fork's pull request,
@@ -79,7 +82,7 @@ on:
         default: ""
       container:
         description: >-
-          The Rust job container. It needs bash, git, curl and tar; the push job checks
+          The Rust job container. It needs bash, git, curl and tar; the verify job checks
           that the base image's glibc is at least the one the binary links against.
         type: string
         default: mirror.gcr.io/library/rust:1-trixie
@@ -374,7 +377,7 @@ jobs:
             if [ ! -e "$f" ]; then
               echo "::error::files: '$f' does not exist after the assets are built"; exit 1
             fi
-            # A symlink would let one entry write through another; the push job refuses
+            # A symlink would let one entry write through another; the verify job refuses
             # them, so say which here.
             links_in="$(find "$f" \( -name .git -o -name node_modules -o -name target \) -prune -o -type l -print)"
             if [ -n "$links_in" ]; then
@@ -413,8 +416,143 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  push:
+  # The layer and the base, checked before anything is pushed. Holds no write
+  # permission. image-check.yml has the same job.
+  verify:
     needs: build
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    permissions:
+      contents: read
+    outputs:
+      layer: ${{ steps.layer.outputs.sha256 }}
+      name: ${{ steps.base.outputs.name }}
+      digest: ${{ steps.base.outputs.digest }}
+      ref: ${{ steps.base.outputs.ref }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-layer
+          path: ${{ runner.temp }}/image-layer
+      - name: Install crane
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/crane"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/crane.tar.gz" \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  $dir/crane.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/crane.tar.gz" -C "$dir" crane
+          rm "$dir/crane.tar.gz"
+          echo "$dir" >> "$GITHUB_PATH"
+      # The build job ran the app's code; this job trusts its layer only as far as this
+      # check: the paths packed, nothing that is not a file, directory or symlink, and
+      # no setuid, setgid or sticky bit.
+      - name: Check the layer
+        id: layer
+        env:
+          WORKDIR: ${{ inputs.workdir }}
+          LINKS: ${{ inputs.bin-links }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -f
+          layer="$RUNNER_TEMP/image-layer/layer.tar"
+          wd="${WORKDIR#/}"
+          bad=0
+          fail() { echo "::error::layer: $*"; bad=1; }
+          # One line per entry: type, then the name (GNU tar's escaped form), and for a
+          # symlink its target. A name holding " -> " would confuse the split, so names
+          # are read again on their own and must match.
+          mapfile -t names < <(tar -tf "$layer")
+          # With extended attributes and ACLs shown: an entry carrying either (a file
+          # capability is a setuid of its own) lists with a `*` or `+` after its mode.
+          mapfile -t lines < <(tar --xattrs --xattrs-include='*' --acls --numeric-owner -tvf "$layer")
+          [ "${#names[@]}" = "${#lines[@]}" ] || fail "unreadable listing"
+          declare -A seen=()
+          for i in "${!names[@]}"; do
+            name="${names[$i]%/}"
+            perms="${lines[$i]%% *}"
+            type="${perms:0:1}"
+            seen[$name]="$type"
+            if [[ "$name" == /* ]] || [[ "$name" =~ (^|/)\.\.?(/|$) ]] || [ -z "$name" ]; then
+              fail "'$name' is not a plain relative path"; continue
+            fi
+            # A symlink's own mode means nothing (it is always 0777).
+            if [[ "$perms" == *[*+] ]]; then
+              fail "'$name' carries extended attributes or ACLs ($perms)"
+            fi
+            if [[ "$perms" =~ [sStT] ]] || { [ "$type" != l ] && [[ "${perms:5:1}${perms:8:1}" == *w* ]]; }; then
+              fail "'$name' has setuid, setgid, sticky or group/other write ($perms)"
+            fi
+            case "$name" in
+              usr/local/bin/server)
+                [ "$type" = - ] || fail "usr/local/bin/server is not a regular file" ;;
+              usr/local/bin/*)
+                ok=0
+                for l in $LINKS; do [ "$name" = "usr/local/bin/$l" ] && ok=1; done
+                [ "$ok" = 1 ] || { fail "'$name' is not a declared bin-link"; continue; }
+                [ "$type" = l ] && [[ "${lines[$i]}" == *" $name -> server" ]] \
+                  || fail "'$name' is not a symlink to server" ;;
+              "$wd")
+                [ "$type" = d ] || fail "the work directory is not a directory" ;;
+              "$wd"/*)
+                # Files and directories only: a symlink here could let a later entry
+                # write through it, anywhere in the image.
+                [ "$type" = - ] || [ "$type" = d ] || fail "'$name' is not a regular file or directory" ;;
+              *)
+                fail "'$name' is not a path image.yml packs" ;;
+            esac
+          done
+          [ "${seen[usr/local/bin/server]:-}" = - ] || fail "no usr/local/bin/server"
+          [ "$bad" = 0 ]
+          tar --numeric-owner -tvf "$layer" | head -n 200
+          echo "sha256=$(sha256sum "$layer" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Check the base image
+        id: base
+        env:
+          BASE: ${{ inputs.base-image }}
+          REQUIRES: ${{ inputs.base-requires }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${BASE%@*}"
+          # A tag after the last slash, if any.
+          if [[ "${name##*/}" == *:* ]]; then name="${name%:*}"; fi
+          digest="$(crane digest --platform linux/amd64 "$BASE")"
+          ref="${name}@${digest}"
+          echo "base ${BASE} is ${ref} for linux/amd64"
+          fs="$RUNNER_TEMP/base"
+          mkdir -p "$fs"
+          crane export --platform linux/amd64 "$ref" "$fs/fs.tar"
+          tar -tf "$fs/fs.tar" | sed 's,^\./,,' > "$fs/list"
+          missing=0
+          for p in $REQUIRES; do
+            grep -qxF "${p#/}" "$fs/list" || { echo "::error::the base image has no $p"; missing=1; }
+          done
+          [ "$missing" = 0 ]
+          # glibc: the newest symbol version the binary needs against the newest the
+          # base's libc defines. A static binary needs none.
+          need="$(tar -xOf "$RUNNER_TEMP/image-layer/layer.tar" usr/local/bin/server | { grep -ao 'GLIBC_2\.[0-9]*' || true; } | sort -uV | tail -n1)"
+          if [ -n "$need" ]; then
+            libc="$(grep -E '(^|/)libc\.so\.6$' "$fs/list" | head -n1 || true)"
+            [ -n "$libc" ] || { echo "::error::the binary links glibc ($need) and the base image has no libc.so.6"; exit 1; }
+            have="$(tar -xOf "$fs/fs.tar" "$libc" | { grep -ao 'GLIBC_2\.[0-9]*' || true; } | sort -uV | tail -n1)"
+            if [ -z "$have" ] || [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1)" != "$have" ]; then
+              echo "::error::the binary needs $need and the base image's glibc is ${have:-unknown}"
+              exit 1
+            fi
+            echo "glibc: the binary needs $need, the base has $have"
+          fi
+          rm -rf "$fs"
+          {
+            echo "name=${name}"
+            echo "digest=${digest}"
+            echo "ref=${ref}"
+          } >> "$GITHUB_OUTPUT"
+
+  push:
+    needs: [build, verify]
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
       contents: read
@@ -513,116 +651,14 @@ jobs:
           tar -xzf "$dir/crane.tar.gz" -C "$dir" crane
           rm "$dir/crane.tar.gz"
           echo "$dir" >> "$GITHUB_PATH"
-      # The build job ran the app's code; this job trusts its layer only as far as this
-      # check: the paths packed, nothing that is not a file, directory or symlink, and
-      # no setuid, setgid or sticky bit.
-      - name: Check the layer
-        env:
-          WORKDIR: ${{ inputs.workdir }}
-          LINKS: ${{ inputs.bin-links }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          set -f
-          layer="$RUNNER_TEMP/image-layer/layer.tar"
-          wd="${WORKDIR#/}"
-          bad=0
-          fail() { echo "::error::layer: $*"; bad=1; }
-          # One line per entry: type, then the name (GNU tar's escaped form), and for a
-          # symlink its target. A name holding " -> " would confuse the split, so names
-          # are read again on their own and must match.
-          mapfile -t names < <(tar -tf "$layer")
-          # With extended attributes and ACLs shown: an entry carrying either (a file
-          # capability is a setuid of its own) lists with a `*` or `+` after its mode.
-          mapfile -t lines < <(tar --xattrs --xattrs-include='*' --acls --numeric-owner -tvf "$layer")
-          [ "${#names[@]}" = "${#lines[@]}" ] || fail "unreadable listing"
-          declare -A seen=()
-          for i in "${!names[@]}"; do
-            name="${names[$i]%/}"
-            perms="${lines[$i]%% *}"
-            type="${perms:0:1}"
-            seen[$name]="$type"
-            if [[ "$name" == /* ]] || [[ "$name" =~ (^|/)\.\.?(/|$) ]] || [ -z "$name" ]; then
-              fail "'$name' is not a plain relative path"; continue
-            fi
-            # A symlink's own mode means nothing (it is always 0777).
-            if [[ "$perms" == *[*+] ]]; then
-              fail "'$name' carries extended attributes or ACLs ($perms)"
-            fi
-            if [[ "$perms" =~ [sStT] ]] || { [ "$type" != l ] && [[ "${perms:5:1}${perms:8:1}" == *w* ]]; }; then
-              fail "'$name' has setuid, setgid, sticky or group/other write ($perms)"
-            fi
-            case "$name" in
-              usr/local/bin/server)
-                [ "$type" = - ] || fail "usr/local/bin/server is not a regular file" ;;
-              usr/local/bin/*)
-                ok=0
-                for l in $LINKS; do [ "$name" = "usr/local/bin/$l" ] && ok=1; done
-                [ "$ok" = 1 ] || { fail "'$name' is not a declared bin-link"; continue; }
-                [ "$type" = l ] && [[ "${lines[$i]}" == *" $name -> server" ]] \
-                  || fail "'$name' is not a symlink to server" ;;
-              "$wd")
-                [ "$type" = d ] || fail "the work directory is not a directory" ;;
-              "$wd"/*)
-                # Files and directories only: a symlink here could let a later entry
-                # write through it, anywhere in the image.
-                [ "$type" = - ] || [ "$type" = d ] || fail "'$name' is not a regular file or directory" ;;
-              *)
-                fail "'$name' is not a path image.yml packs" ;;
-            esac
-          done
-          [ "${seen[usr/local/bin/server]:-}" = - ] || fail "no usr/local/bin/server"
-          [ "$bad" = 0 ]
-          tar --numeric-owner -tvf "$layer" | head -n 200
-      - name: Check the base image
-        id: base
-        env:
-          BASE: ${{ inputs.base-image }}
-          REQUIRES: ${{ inputs.base-requires }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          name="${BASE%@*}"
-          # A tag after the last slash, if any.
-          if [[ "${name##*/}" == *:* ]]; then name="${name%:*}"; fi
-          digest="$(crane digest --platform linux/amd64 "$BASE")"
-          ref="${name}@${digest}"
-          echo "base ${BASE} is ${ref} for linux/amd64"
-          fs="$RUNNER_TEMP/base"
-          mkdir -p "$fs"
-          crane export --platform linux/amd64 "$ref" "$fs/fs.tar"
-          tar -tf "$fs/fs.tar" | sed 's,^\./,,' > "$fs/list"
-          missing=0
-          for p in $REQUIRES; do
-            grep -qxF "${p#/}" "$fs/list" || { echo "::error::the base image has no $p"; missing=1; }
-          done
-          [ "$missing" = 0 ]
-          # glibc: the newest symbol version the binary needs against the newest the
-          # base's libc defines. A static binary needs none.
-          need="$(tar -xOf "$RUNNER_TEMP/image-layer/layer.tar" usr/local/bin/server | { grep -ao 'GLIBC_2\.[0-9]*' || true; } | sort -uV | tail -n1)"
-          if [ -n "$need" ]; then
-            libc="$(grep -E '(^|/)libc\.so\.6$' "$fs/list" | head -n1 || true)"
-            [ -n "$libc" ] || { echo "::error::the binary links glibc ($need) and the base image has no libc.so.6"; exit 1; }
-            have="$(tar -xOf "$fs/fs.tar" "$libc" | { grep -ao 'GLIBC_2\.[0-9]*' || true; } | sort -uV | tail -n1)"
-            if [ -z "$have" ] || [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1)" != "$have" ]; then
-              echo "::error::the binary needs $need and the base image's glibc is ${have:-unknown}"
-              exit 1
-            fi
-            echo "glibc: the binary needs $need, the base has $have"
-          fi
-          rm -rf "$fs"
-          {
-            echo "name=${name}"
-            echo "digest=${digest}"
-            echo "ref=${ref}"
-          } >> "$GITHUB_OUTPUT"
       - name: Push
         id: push
         env:
           TOKEN: ${{ github.token }}
-          BASE_NAME: ${{ steps.base.outputs.name }}
-          BASE_DIGEST: ${{ steps.base.outputs.digest }}
-          BASE_REF: ${{ steps.base.outputs.ref }}
+          BASE_NAME: ${{ needs.verify.outputs.name }}
+          BASE_DIGEST: ${{ needs.verify.outputs.digest }}
+          BASE_REF: ${{ needs.verify.outputs.ref }}
+          CHECKED_LAYER: ${{ needs.verify.outputs.layer }}
           ENTRYPOINT: ${{ inputs.entrypoint }}
           CMD: ${{ inputs.cmd }}
           IMAGE_USER: ${{ inputs.user }}
@@ -633,6 +669,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The layer pushed is the layer verify checked.
+          [ "$(sha256sum "$RUNNER_TEMP/image-layer/layer.tar" | cut -d' ' -f1)" = "$CHECKED_LAYER" ] \
+            || { echo "::error::the layer changed since verify checked it"; exit 1; }
           # crane reads a list flag's value as CSV, so each element is quoted; crane
           # does not unescape a quote inside one, so none may hold a double quote.
           csv() {

@@ -22,6 +22,7 @@ Outside the crates:
 | `.github/workflows/conventional-commits.yml` | Conventional Commits checked on every pull request, here and, as a reusable workflow, in an app: the title and every commit, with one commitlint and one configuration |
 | `.github/workflows/release.yml` | reusable releases from conventional commits: stable on `main`, prereleases on `rc`, optional version write-back and changelog |
 | `.github/workflows/image.yml` | reusable image build for a released tag, daemonless on ARC (or the Dockerfile, GitHub-hosted), pushed to ghcr with the channel's floating tags |
+| `.github/workflows/image-check.yml` | reusable, opt-in: the same image built and verified on a pull request, pushing nothing, for a caller that grants only `contents: read` |
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease, or into `rc-candidate` for checking first |
 | `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
 | `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
@@ -2807,10 +2808,10 @@ the image) in a Rust job container (`container`,
 default `mirror.gcr.io/library/rust:1-trixie`; through sccache when the app passes
 the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
-(0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The `push` job runs
-none of the app's code and alone holds `packages: write`: it checks the layer's
-paths and modes, checks that the base has `base-requires` and a glibc at least as
-new as the binary needs, then with
+(0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The
+read-only `verify` job checks the layer's paths and modes and that the base has
+`base-requires` and a glibc at least as new as the binary needs. The `push` job confirms the layer is the one verified and runs
+none of the app's code and alone holds `packages: write`: with
 [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) (pinned
 by version and SHA-256) appends the layer to the base pinned by its linux/amd64
 digest, sets the configuration, pushes by digest, reads the version label back and
@@ -2898,7 +2899,7 @@ cluster already pulls the app's images, and two things show the whole image:
   for a day.
 
 The binary is built in Debian's Rust image, not Hummingbird's (which has no `tar`
-for the setup actions), so the push job checks the newest `GLIBC_` version the
+for the setup actions), so the verify job checks the newest `GLIBC_` version the
 binary needs against the base's libc and fails rather than push an image that
 would not start. A test build of a released tag goes to a tag of its own with
 `tag: arc-test` (never `latest`, `rc` or a version). `builder: docker` builds the
@@ -2915,6 +2916,67 @@ which needs no login. The runtime runs as uid 65532 and keeps `sh` and coreutils
 fully qualified, so a local `podman build` works without a registry prompt. An app
 on the earlier distroless template moves by copying the template again; one with its
 own runtime stage changes `FROM` and `USER nonroot` (to `USER 65532`).
+`core-runtime` runs non-root from its first step: its default user is 65532 from the
+first instruction, not root until a `USER` line, so a `RUN` in the runtime stage that
+needs root (a package install, a write outside `/app`) fails there. Do that work in an earlier
+stage and `COPY` the result in, with `--chown=65532:0` for what the app writes.
+
+**Checking the image on a pull request** (opt-in): the Dockerfile or the build
+inputs can break only in the image, and without a check that shows after a version is
+tagged, as a release with no image. `image-check.yml` builds the pull request's merge
+commit the way a release does and verifies all but the push: with `builder: crane`
+(the default) the compile, the npm assets, the packed layer, and the base's tools and
+glibc, by the same `build` and `verify` jobs as `image.yml`'s (`just image-check`
+keeps them identical); with `builder: docker` the Dockerfile is built with BuildKit
+and pushed nowhere. It takes `image.yml`'s inputs that shape the build (`bin`,
+`cargo-args`, `files`, `base-image`, ...) and none that shape the push. It is a
+workflow of its own because no job in it writes: the caller grants `contents: read`
+only, which a Dependabot pull request's token can. (A called workflow that asks for
+`packages: write`, as `image.yml`'s `push` does, fails to start for a caller that
+grants less, skipped job or not.) Call it from a workflow of its own with a `paths:`
+filter, so it neither gates every merge nor runs for a change the image does not see:
+
+<!-- x-release-please-start-version -->
+```yaml
+# .github/workflows/image-check.yml
+on:
+  pull_request:
+    # What the image reads: the Dockerfile and its ignore file, the Rust sources and
+    # manifests (every workspace crate), the lockfiles and the asset inputs.
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - crates/**
+      - package.json
+      - package-lock.json
+      - static/**
+      - templates/**
+      - .github/workflows/image-check.yml
+permissions: {}
+jobs:
+  image:
+    # A fork's pull request is not built here (image-check.yml refuses it too).
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions: {contents: read}
+    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@v0.8.1
+    with: {bin: myapp}   # as the release's image job
+    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
+```
+<!-- x-release-please-end -->
+
+The cost is one release build per push to a matching pull request. With `crane` it
+runs on the ARC scale set, which bills no GitHub-hosted minutes (it takes the
+cluster's capacity), and sccache shortens the compile (a Dependabot pull request
+reads Dependabot's secrets, not Actions', so it compiles without it). With
+`builder: docker` it runs on `ubuntu-latest`, so a private app pays minutes for every
+such push, and the build is cold: a pull request restores the Actions cache only from
+its own ref, its base branch and the default branch, and the release builds write
+theirs under tag refs, so none is read (a cold BuildKit build of a Rust app takes
+ten minutes or more). Keep the `paths:` list to the files the image reads, and leave
+the check out of an app whose Dockerfile rarely changes.
 
 **OpenShift:** the app keeps its copies of the templates in `deploy/openshift/`, with
 `apply.sh` beside them and its parameters in `params.env`, one `KEY=VALUE` a line
