@@ -11,7 +11,7 @@ default:
 # when REDIS_URL is set.
 #
 # Everything that must pass before a commit.
-check: fmt lint features test audit templates ci-config image-check
+check: fmt lint features dev-only test audit templates ci-config image-check
 
 # Formatting, checked rather than applied.
 fmt:
@@ -26,6 +26,28 @@ lint:
 features:
     cargo clippy -p owt-change --all-targets --no-default-features --locked -- -D warnings
     cargo clippy -p owt-auth --all-targets --no-default-features --locked -- -D warnings
+
+# owt-test seals a session for any account, and owt-accounts' `test-util` records a
+# policy acceptance for any account id, so no crate of the stack may depend on owt-test, or
+# turn `test-util` on, outside `[dev-dependencies]` (the `readme` crate, which is never
+# shipped, aside). A failing `cargo tree` fails the recipe.
+dev-only:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tree() { cargo tree --workspace --exclude readme --edges normal,build --locked --prefix none "$@"; }
+    users=$(tree -i owt-test)
+    users=$(grep -v '^owt-test ' <<<"$users" || true)
+    if [ -n "$users" ]; then
+        echo "owt-test is a normal or build dependency of:" >&2
+        echo "$users" >&2
+        exit 1
+    fi
+    features=$(tree --exclude owt-test -e features -i owt-accounts)
+    if grep -q 'feature "test-util"' <<<"$features"; then
+        echo "owt-accounts' test-util is enabled outside dev-dependencies:" >&2
+        grep -B1 -A3 'feature "test-util"' <<<"$features" >&2
+        exit 1
+    fi
 
 # The tests, README doctests included; arguments pass through.
 test *args:

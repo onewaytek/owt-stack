@@ -1,6 +1,6 @@
 [package]
 name = "owt-test"
-description = "Test harness for the onewaytek apps: an in-process client with a cookie jar, and the real router on an ephemeral port."
+description = "Test harness for the onewaytek apps: an in-process client with a cookie jar, the real router on an ephemeral port, and account fixtures with a client signed in without Argon2. Dev-dependency only."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,11 +13,14 @@ base64.workspace = true
 cookie.workspace = true
 html-escape.workspace = true
 http-body-util.workspace = true
+owt-accounts = { workspace = true, features = ["test-util"] }
+owt-web.workspace = true
 regex.workspace = true
 scraper.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
 tower.workspace = true
 url.workspace = true

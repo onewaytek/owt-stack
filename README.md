@@ -11,7 +11,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
-| `owt-test` | an in-process client with a cookie jar; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
+| `owt-test` | an in-process client with a cookie jar, signed in as an account without Argon2; account fixtures; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
 
 Outside the crates:
 
@@ -68,7 +68,8 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.8.1" }
 `redis` for leases and leased jobs.
 `owt-change`'s: `accounts` (default) for `owt_accounts::Staff` as its admin.
 `owt-accounts`' `test-util` (off by default, for `[dev-dependencies]`) gives the admin's
-view models an `example()` each, for an app's tests of its own templates.
+view models an `example()` each, for an app's tests of its own templates, and
+`policies::agree_to_current` for fixtures (`owt-test` turns it on).
 `owt-auth`'s: `jwt` (default) for bearer-token verification, which brings `rsa` and an
 audit ignore (see "Authentication").
 
@@ -2585,6 +2586,40 @@ or the `ConnectInfo` extension directly sees none;
 `MockConnectInfo` or `Extension(ConnectInfo(..))` layer on the router still decides,
 so an app that adds one keeps its address.
 
+**Accounts in tests.** Seal the session directly instead of signing in through the form,
+which costs an Argon2 round per test, and keep the helper out of the production crate:
+`owt-test` is a `[dev-dependencies]` entry and nothing else, because
+`Client::sign_in_as` seals a session for any account. `owt_test::accounts::test_key()`
+is a fixed, public session key for the test's `Sessions`; `accounts::create` (and
+`create_staff`, `create_with_password`, the one that hashes) makes an account;
+`Client::sign_in_as(&sessions, &account)` sets the cookie `owt_accounts::session::sign_in`
+would, for any session type that implements `owt_accounts::session::Signed`;
+`accounts::agree_to_current` records the account's agreement to the current version of
+every published policy, so the gate lets it through; and `Client::sign_in_new` does all
+three for a fresh account.
+
+```rust,no_run
+use std::time::Duration;
+use axum::Router;
+use owt_accounts::session::Data;
+use owt_test::{Client, accounts};
+use owt_web::session::Sessions;
+
+# async fn run(app: impl FnOnce(&Sessions<Data>) -> Router, pool: sqlx::PgPool) {
+let sessions = Sessions::<Data>::new(accounts::test_key(), "s", Duration::from_secs(3600), false);
+let client = Client::new(app(&sessions));
+let ada = client.sign_in_new(&pool, &sessions, "ada").await; // signed in, policies agreed
+assert_eq!(client.get_page("/me").await.status, 200);
+# let _ = ada;
+# }
+```
+
+`just dev-only` (part of `just check`) fails if a crate of the workspace depends on
+`owt-test`, or turns on `owt-accounts`' `test-util`, outside `[dev-dependencies]`; an app
+can run `cargo tree --edges normal,build -i owt-test` and `cargo tree --edges
+normal,build -e features -i owt-accounts` (looking for `feature "test-util"`) on its own
+workspace.
+
 `owt_test::Server::spawn(router)` serves on an ephemeral port for WebSocket and SSE
 tests. Test requests carry no `Origin`, so cross-origin protection lets them through;
 set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
@@ -4030,7 +4065,7 @@ and two of them reach further than their names:
 ## Working on owt-stack
 
 `just check` is the gate (fmt, clippy over every crate and feature and over
-`owt-change` and `owt-auth` without their defaults, the tests with the README
+`owt-change` and `owt-auth` without their defaults, `dev-only`, the tests with the README
 doctests, `cargo audit`), and CI runs the same command. The Redis tests run when
 `REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
 `DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL

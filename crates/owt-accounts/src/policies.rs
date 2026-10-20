@@ -272,6 +272,24 @@ pub async fn accept(
     Ok(done.rows_affected())
 }
 
+/// Record that `account_id` accepted the current version of every document (test
+/// fixtures: the policy gate then lets the account through). Returns how many it
+/// recorded. [`accept`] is what a deployment calls.
+///
+/// # Errors
+///
+/// The database.
+#[cfg(feature = "test-util")]
+pub async fn agree_to_current(db: &PgPool, account_id: i64) -> sqlx::Result<u64> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT ON (kind) id FROM policy_versions
+         WHERE published_at IS NOT NULL ORDER BY kind, version DESC",
+    )
+    .fetch_all(db)
+    .await?;
+    accept(db, account_id, &ids, None, Some("owt-test")).await
+}
+
 /// A draft's fields, as typed.
 #[derive(Clone, Copy, Debug)]
 pub struct Draft<'a> {

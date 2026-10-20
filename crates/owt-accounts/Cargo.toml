@@ -9,7 +9,8 @@ publish.workspace = true
 
 [features]
 # `ListView::example`, `NewView::example` and `AccountView::example`: filled-in view
-# models for an app's unit tests of its own `admin::Views` templates.
+# models for an app's unit tests of its own `admin::Views` templates, and
+# `policies::agree_to_current` for fixtures (`owt-test` enables it).
 test-util = []
 
 [dependencies]
@@ -34,6 +35,8 @@ url.workspace = true
 
 [dev-dependencies]
 owt-runtime.workspace = true
+# owt-test depends on this crate, so a unit test under `src/` that used it would link
+# two copies of owt-accounts whose types do not unify: tests that use it live in `tests/`.
 owt-test.workspace = true
 tokio.workspace = true
 tower.workspace = true
