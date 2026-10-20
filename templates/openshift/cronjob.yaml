@@ -15,7 +15,9 @@
 #   to the database and to Redis (redis.yaml); app.yaml's admit the app's pods only.
 # - The env: DATABASE_URL from <NAME>-<DB_SUFFIX>-app, PGSSLMODE=verify-full and
 #   PGSSLROOTCERT at the mounted <NAME>-<DB_SUFFIX>-ca, POD_NAMESPACE, REDIS_URL from
-#   <NAME>-redis, and the rest from <NAME>-env, as the Deployment has them.
+#   <NAME>-redis, and the rest from <NAME>-env, as the Deployment has them; then
+#   <NAME>-<JOB>-env, the task's own, which the web pods never read (a credential
+#   only this task needs). Both Secrets are optional, and a key in the task's wins.
 # - The same image, kept current by the trigger annotation on the CronJob.
 apiVersion: template.openshift.io/v1
 kind: Template
@@ -86,9 +88,11 @@ objects:
                   # Placeholder the trigger resolves (lookupPolicy.local).
                   image: ${NAME}:${CHANNEL}
                   args: ${{ARGS}}
-                  # Optional: the app's own environment, as the Deployment reads it.
+                  # Optional: the app's own environment, as the Deployment reads it,
+                  # then the task's own, whose keys win over the app's.
                   envFrom:
                     - secretRef: {name: "${NAME}-env", optional: true}
+                    - secretRef: {name: "${NAME}-${JOB}-env", optional: true}
                   env:
                     - name: POD_NAMESPACE
                       valueFrom:

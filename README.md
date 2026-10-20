@@ -2892,9 +2892,19 @@ oc process -f templates/openshift/cronjob.yaml -p NAME=myapp -p NAMESPACE=myapp 
 It follows the app's channel through the same image trigger, and has the Deployment's
 database access: `DATABASE_URL` from `myapp-db-app`, `PGSSLMODE=verify-full` with
 `PGSSLROOTCERT` at the mounted `myapp-db-ca`, `POD_NAMESPACE`, `REDIS_URL` and
-`myapp-env`. It takes the same `DB_SUFFIX` as `app.yaml` (default `db`), which names the
-database cluster and those Secrets. Its pods are labelled `app: myapp-<JOB>`, never `app: myapp`, which the
-app's Service sends traffic to. The database's and Redis's NetworkPolicies admit the
+`myapp-env`. A credential only the task needs goes in a Secret of its own,
+`myapp-<JOB>-env` (`myapp-digest-env`), which the task reads after `myapp-env` (its
+keys win) and the web pods never read. It is optional, like `myapp-env`, so a
+misspelt name starts the task without the credential: check
+`oc get secret myapp-digest-env`. Make it from a file, not the command line:
+
+```sh
+oc create secret generic myapp-digest-env --from-env-file=digest-secret.env
+```
+
+The template takes the same `DB_SUFFIX` as `app.yaml` (default `db`), which names the
+database cluster and those Secrets. Its pods are labelled `app: myapp-<JOB>`, never
+`app: myapp`, which the app's Service sends traffic to. The database's and Redis's NetworkPolicies admit the
 app's pods only, so the template brings two more admitting that label (policies add
 up). A worker that runs all the time is the same pod spec in a Deployment, with
 `app.yaml`'s strategy and image trigger (`fieldPath` naming its container), and the
