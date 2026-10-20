@@ -1,7 +1,8 @@
 //! Response-shaping middleware.
 //!
-//! Every function here only *adds* a header a response lacks: a handler that set its
-//! own (a public page's `Cache-Control`, an SSE stream's) is left alone.
+//! The cache and security functions here only *add* a header a response lacks: a
+//! handler that set its own (a public page's `Cache-Control`, an SSE stream's) is left
+//! alone. [`noindex`] overwrites.
 
 use std::sync::Arc;
 

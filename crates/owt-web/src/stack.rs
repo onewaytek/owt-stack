@@ -4,14 +4,14 @@
 //! reverse of the order run, and a mistake in it is silent. [`Stack::apply`] wraps an
 //! app's routes in this order, innermost first:
 //!
-//! 1. the [`Limits`] timeout and body cap, so a timed-out request is a 503 the
+//! 1. the `NotFound` fallback, so an unmatched path is a marked 404;
+//! 2. the [`Limits`] timeout and body cap, so a timed-out request is a 503 the
 //!    layers outside see;
-//! 2. the metrics timer ([`Stack::timer`]), outside the limits so it records the 503;
-//! 3. the `NotFound` fallback, so an unmatched path is a marked 404;
+//! 3. the metrics timer ([`Stack::timer`]), outside the limits so it records the 503;
 //! 4. the error pages ([`Stack::error_pages`]), which draw the marked 404, 500 and 503;
 //! 5. the account loader ([`Stack::accounts`]);
-//! 6. the session layer, which opens the cookie before the loader reads it, and seals
-//!    nothing for a 5xx;
+//! 6. the session layer, which opens the cookie before the loader reads it, and keeps
+//!    the request's session through a 5xx (a sign-out aside);
 //! 7. [`CrossOrigin`], which refuses a foreign request before a session is opened.
 //!
 //! The static files ([`Stack::assets`]) sit beside those routes, outside the session
