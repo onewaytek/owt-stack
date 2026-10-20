@@ -11,7 +11,7 @@ default:
 # when REDIS_URL is set.
 #
 # Everything that must pass before a commit.
-check: fmt lint features test audit templates ci-config
+check: fmt lint features test audit templates ci-config image-check
 
 # Formatting, checked rather than applied.
 fmt:
@@ -43,3 +43,29 @@ templates:
 # commitlint.config.mjs, byte for byte.
 ci-config:
     diff -u commitlint.config.mjs <(sed -n "/<<'JS'$/,/^ *JS$/p" .github/workflows/conventional-commits.yml | sed '1d;$d' | sed 's/^          //')
+
+# image-check.yml's `build` and `verify` jobs are image.yml's: `build` but for the
+# release's version and tag checkout, `verify` byte for byte.
+image-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    job() {
+        local out
+        out="$(awk -v j="  $2:" '$0 == j {on=1; print; next} on && /^  [^ ]/ {exit} on' ".github/workflows/$1")"
+        [ -n "$out" ] || { echo "no job $2 in $1" >&2; exit 1; }
+        printf '%s\n' "$out"
+    }
+    # Without what differs by design: the release's version and its tag checkout (two
+    # steps), the commit output, and image-check.yml's own checkout.
+    build() {
+        job "$1" build | sed -e '/^    outputs:$/,/^      commit:/d' -e '/RAW_VERSION/d' \
+            -e '/^      # The event.s own checkout/,/^          persist-credentials: false$/d' \
+            -e '/^      - name: Resolve version$/,/^          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"$/d' \
+            -e '/^      # The ref is qualified/,/^          persist-credentials: false$/d'
+    }
+    b1="$(build image.yml)"
+    b2="$(build image-check.yml)"
+    v1="$(job image.yml verify)"
+    v2="$(job image-check.yml verify)"
+    diff -u <(printf '%s\n' "$b1") <(printf '%s\n' "$b2")
+    diff -u <(printf '%s\n' "$v1") <(printf '%s\n' "$v2")
