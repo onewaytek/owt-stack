@@ -24,7 +24,8 @@
 //! has run the library's migrations for a while is in the same state as a new one.
 //! What SQL cannot do exactly (normalizing old rows as sign-in does, a username's
 //! lookalike key) [`complete`] does: await it after the migrations run and before
-//! serving, at every start (it does next to nothing once done).
+//! serving, at every start (it does next to nothing once done). [`start`] is the whole
+//! sequence: [`run`], the app's migrator, [`complete`].
 //!
 //! The migrations create their tables under fixed names (`accounts`, `account_roles`,
 //! `policy_versions`, ...) in the schema they run in. An app that already holds one
@@ -362,6 +363,42 @@ pub async fn forget_copies(pool: &PgPool) -> sqlx::Result<Vec<i64>> {
             .await?;
     }
     Ok(versions)
+}
+
+/// The start-up sequence, in the order the tables need: [`run`] (the library's own
+/// migrator), then `app` (the app's migrations, such as
+/// `owt_runtime::db::migrate_locked(&pool, &MIGRATOR, LOCK)`), then [`complete`]. Await
+/// it at every start and before serving; a `migrate` subcommand for CI and
+/// `just migrate` calls the same function. [`run`] and [`complete`] log what they did;
+/// the first failure stops the sequence and is returned, its context naming the step, for
+/// the caller to report once (print it with `{err:#}` for the whole chain).
+///
+/// An app whose own migrations must partly run before the library's (one that renamed
+/// an `accounts` of its own out of the way) cannot be expressed as one step before
+/// [`run`] and one after: it calls `migrate_locked_to`, [`run`], `migrate_locked` and
+/// [`complete`] itself. Through `start`, such an app stops in [`run`], which fails on the
+/// name its own table already holds.
+///
+/// # Errors
+///
+/// The step that failed, named in the error's context: [`MigrationError`] from the
+/// library's migrations, `app`'s own error, or the database from [`complete`].
+pub async fn start<F, Fut, E>(pool: &PgPool, app: F) -> anyhow::Result<Completed>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+    E: Into<anyhow::Error>,
+{
+    use anyhow::Context as _;
+
+    run(pool).await.context("owt-accounts migrations")?;
+    app()
+        .await
+        .map_err(Into::into)
+        .context("the app's migrations")?;
+    complete(pool)
+        .await
+        .context("completing the accounts tables")
 }
 
 /// What [`complete`] changed, for the operator to read (it is logged too). An owner

@@ -417,6 +417,85 @@ async fn futures_join(pools: &[PgPool]) -> Vec<Result<migrations::Migrated, Migr
 }
 
 #[tokio::test]
+async fn start_runs_the_library_then_the_app_then_completes() {
+    let Some(db) = Db::new().await else { return };
+    db.write("0001_notes.sql", APP_TABLE);
+    let app = db.app().await;
+    let started = migrations::start(&db.pool, || {
+        owt_runtime::db::migrate_locked(&db.pool, &app, 8_531_207)
+    })
+    .await
+    .unwrap();
+    assert!(started.validated, "{started:?}");
+    assert_eq!(db.ledger().await.len(), ALL.len());
+    let mut want: Vec<String> = LIBRARY_TABLES.iter().map(|s| (*s).to_owned()).collect();
+    want.push("notes".to_owned());
+    want.sort();
+    assert_eq!(tables(&db.pool).await, want);
+
+    // At every start: a second one changes nothing and still succeeds.
+    migrations::start(&db.pool, || {
+        owt_runtime::db::migrate_locked(&db.pool, &app, 8_531_207)
+    })
+    .await
+    .unwrap();
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn start_stops_at_the_step_that_failed_and_names_it() {
+    let Some(db) = Db::new().await else { return };
+    // The app's step fails: the library's migrations were applied, `complete` was not
+    // reached (an account made before keying stays unkeyed).
+    let err = migrations::start(&db.pool, || async {
+        Err::<(), _>(anyhow::anyhow!("no such file"))
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(err.to_string(), "the app's migrations");
+    assert_eq!(format!("{err:#}"), "the app's migrations: no such file");
+    assert_eq!(db.ledger().await.len(), ALL.len());
+
+    // The library's step fails (a tampered ledger): the app's step never runs.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {LEDGER} SET checksum = '\\x00' WHERE version = 1"
+    )))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let err = migrations::start(&db.pool, || async {
+        ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(err.to_string(), "owt-accounts migrations");
+    assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn start_refuses_an_app_whose_own_accounts_table_is_in_the_way() {
+    let Some(db) = Db::new().await else { return };
+    sqlx::query("CREATE TABLE accounts (id serial PRIMARY KEY, goods int)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let ran = std::sync::atomic::AtomicBool::new(false);
+    let err = migrations::start(&db.pool, || async {
+        ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(err.to_string(), "owt-accounts migrations");
+    assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+    assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    db.drop().await;
+}
+
+#[tokio::test]
 async fn an_app_whose_own_migrations_come_first_runs_them_to_a_version() {
     let Some(db) = Db::new().await else { return };
     // An app with an `accounts` of its own, renamed out of the way before the
