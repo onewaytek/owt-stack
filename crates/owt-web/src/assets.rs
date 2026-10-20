@@ -1,10 +1,11 @@
 //! Fingerprinted static asset URLs, and the service that serves them.
 //!
-//! [`Assets::mount`] serves the directory under its prefix, and templates name a
-//! static file through [`Assets::url`], which appends its content hash (`?v=`). A
-//! request whose `v` matches the file's current hash is served `immutable`; anything else (no `v`, or a hash another replica minted mid-rollout)
-//! is `no-cache`, so a stale file can never be pinned in a browser or at the edge
-//! under a URL that claims to be current.
+//! [`Assets::mount`] serves the directory under its prefix, and templates name a static
+//! file through [`Assets::url`], which appends its content hash (`?v=`). A request
+//! whose `v` matches the file's current hash is served `immutable`; anything else (no
+//! `v`, or a hash another replica minted mid-rollout) is `no-cache`, so a stale file
+//! can never be pinned in a browser or at the edge under a URL that claims to be
+//! current.
 //!
 //! The hash is of the bytes on disk, computed on first use and memoized per existing
 //! file (misses are not stored, so request paths cannot grow the map): the files are
