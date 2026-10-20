@@ -2592,9 +2592,11 @@ jobs:
   Either way the PR is left out of `rc` until it is pushed again, unless
   `requeue-rc.yml` re-runs it. It looks for open PRs whose head isn't in `rc` and
   whose latest promoting run was cancelled or failed at that step, and re-runs the
-  oldest one, one at a time and only while no run is waiting (a re-run is itself a new
-  arrival in the group). A run that succeeded without running "Merge into rc" (an
-  `edited` or `labeled` trigger whose candidate job was skipped) doesn't count, so it
+  oldest one (a person's PR before a bot's; see "Dependabot on the rc channel" below),
+  one at a time and only while no run is waiting (a re-run is itself a new arrival in
+  the group; a waiting run a bot started is the exception). A run that succeeded
+  without running "Merge into rc" (an `edited` or `labeled` trigger whose candidate
+  job was skipped) doesn't count, so it
   can't hide a lost promotion of the same head. A cancelled run always counts, since
   one cancelled before its candidate job ran can't be told from one that would have
   skipped it: a non-promoting one is re-run, succeeds having merged nothing, and the
@@ -2615,6 +2617,29 @@ jobs:
   `actions: write` fails the job once every PR is walked. It sees waiting *runs*, not
   waiting jobs, so put the `promote-rc` concurrency group on the workflow, as below:
   on a job, a re-run can cancel that job while it waits (a later requeue picks it up).
+
+  **Dependabot on the rc channel.** A Dependabot pull request is promoted like any
+  other, and `rc` is where a bump is tried: merged into `rc`, released as a
+  prerelease and deployed wherever the app deploys `rc`, with no review. Review stays
+  required before `main` and production. It reaches `rc` only under these conditions,
+  which are GitHub's for a run Dependabot triggers (it gets a read-only `GITHUB_TOKEN`
+  and only Dependabot secrets, and a re-run keeps both): the `permissions:` the
+  promotion jobs declare (`contents: write`, `actions: write`, as in the example below) raise the
+  token, which is what lets the merge push `rc` and dispatch the release, so the
+  calling jobs must declare them and the repository must not cap the token below
+  them; and every secret the checks and the candidate's checks use (the sccache
+  password, a database URL) must also exist as a *Dependabot* secret, or those steps
+  run without it. Absent either, the bump's promotion fails at "Merge into rc" or
+  checks without its secrets, and the PR waits for a person.
+
+  Dependabot opens its pull requests in bursts, and the group admits one promotion
+  with one waiting, so a burst cancels waiting runs. A person's pull request is not
+  left behind it: `requeue-rc.yml` re-runs every person's lost promotion before any
+  bot's, and a person's re-run may cancel a run *pending* in the group that a bot
+  started (that PR is requeued after every person's); a bot's re-run cancels nothing.
+  A bot is an author or actor whose account type is `Bot`: Dependabot, but also any
+  GitHub App, release-please's pull requests and one an app opens among them. A
+  person's PR waits for the run in progress, not for the bumps behind it.
 
 ```yaml
 # pr.yml
