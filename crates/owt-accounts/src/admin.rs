@@ -1584,21 +1584,9 @@ async fn save(
     Ok(admin.redirect(id, "saved"))
 }
 
-/// Twenty letters and digits: passes every rule in [`crate::password`] unless it
-/// happens to contain the username, when another is drawn.
+/// A password that passes every rule, given the account's names ([`crate::password::generate`]).
 fn generated_password(account: &Account) -> String {
-    use rand::RngExt;
-    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut rng = rand::rng();
-    loop {
-        // Uniform over the alphabet (no modulo bias): 20 × log2(56) ≈ 116 bits.
-        let password: String = (0..20)
-            .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
-            .collect();
-        if crate::password::check(&password, &[&account.username, &account.email]).is_empty() {
-            return password;
-        }
-    }
+    crate::password::generate(&[&account.username, &account.email])
 }
 
 async fn reset_password(

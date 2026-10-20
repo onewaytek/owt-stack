@@ -8,7 +8,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
-| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; sign-in with a provider (routes, configuration, buttons, connections) |
+| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar, signed in as an account without Argon2; account fixtures; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -1361,6 +1361,56 @@ let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Ref
 A refusal (`owt_accounts::Refused`) carries the sentence the person reads; a handler
 matches `Error::Refused` to re-render the form with it, and the `From` into
 `owt_web::Error` answers 422 with the same text.
+
+**Account commands for the operator** (feature `cli`, so clap is built only when asked
+for): `owt_accounts::cli::AccountCommand` is a clap `Subcommand` with `create`,
+`set-password`, `link`, `staff`, `unstaff` and `hash`, the recovery path for an app
+with no staff or a lost password. No password rides in argv: `create` and
+`set-password` read one line from stdin when something is piped and generate a
+password otherwise (`--generate` forces it); `hash` reads one and prints its Argon2
+hash, for a deployment-wide password (`session::password_gate`). A generated password
+and a sign-in link are printed once, to stdout, and logged nowhere; `link` takes
+`--minutes` (60, at most 30 days) and needs the URL of the app's `links::redeem`
+route. `login` is a username or an email; `create --no-password` makes an account
+that a link or a provider opens. The hash begins `$argon2id$…`: quote it with single
+quotes in a shell or env file, and double each `$` in a compose file, or it is expanded
+and opens nothing. A generated password is shown after the account is made; if the
+output fails, the error says the account exists and to set another. The futures are
+`Send` and hold no lock on stdin or stdout across an await. `run_with` takes the input
+and output explicitly, for a test.
+
+```toml
+owt-accounts = { git = "…", tag = "…", features = ["cli"] }
+```
+
+```rust
+use clap::{Parser, Subcommand};
+use owt_accounts::cli::{self, AccountCommand};
+
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Serve,
+    #[command(subcommand)]
+    Account(AccountCommand),
+}
+
+async fn main_with(cli: Cli, pool: sqlx::PgPool) -> anyhow::Result<()> {
+    match cli.command {
+        Command::Serve => Ok(()),
+        Command::Account(command) => {
+            cli::run(command, &pool, |token| format!("https://myapp.example/login/link/{token}")).await
+        }
+    }
+}
+// $ printf '%s\n' "$PASSWORD" | myapp account create ada --email ada@example.com --staff
+// $ myapp account link ada --minutes 15
+```
 
 **More about the viewer on every request** (a display name, a profile flag): implement
 `store::Extra` for a `sqlx::FromRow` type of the app's and install

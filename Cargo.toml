@@ -21,6 +21,7 @@ askama = "0.16"
 axum = { version = "0.8.9", default-features = false }
 axum-htmx = { version = "0.8", default-features = false }
 base64 = "0.23"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 cookie = { version = "0.18", features = ["private", "percent-encode"] }
 futures = "0.3"
 hkdf = "0.13"

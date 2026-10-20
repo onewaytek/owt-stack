@@ -22,6 +22,7 @@
 //! - [`admin`]: the staff pages that find and change accounts.
 //! - [`social`]: sign-in with a provider: the routes, their configuration, the
 //!   buttons and the connections list.
+//! - `cli` (feature `cli`): the operator's account commands as a clap subcommand.
 //! - [`policies`]: the site's policies (terms, privacy notice) with versions, the
 //!   gate that asks each account to agree to the current ones, and their pages.
 //!
@@ -33,6 +34,8 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod identities;
 pub mod layer;
 pub mod links;

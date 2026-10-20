@@ -1046,6 +1046,258 @@ async fn the_page_context_takes_the_flashes_once_and_leaves_them_for_a_full_page
     db.drop().await;
 }
 
+#[cfg(feature = "cli")]
+mod cli {
+    use super::*;
+    use owt_accounts::cli::{AccountCommand, run_with};
+
+    /// Run `command` with `stdin` piped (or not), returning what it printed.
+    async fn exec(db: &Db, command: AccountCommand, stdin: Option<&str>) -> anyhow::Result<String> {
+        let mut out = Vec::new();
+        let mut piped = stdin.map(str::as_bytes);
+        let input = piped
+            .as_mut()
+            .map(|p| p as &mut (dyn std::io::BufRead + Send));
+        let link_url = |token: &str| format!("https://example.test/in/{token}");
+        let running = run_with(command, &db.pool, link_url, input, &mut out);
+        // Sendable, so it holds no lock of stdin or stdout across an await, and
+        // `tokio::spawn` takes it.
+        send(&running);
+        running.await?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    fn send<T: Send>(_: &T) {}
+
+    /// `run` itself, on the process's stdin and stdout, is `Send` too: a held
+    /// `StdinLock` or `StdoutLock` is not.
+    #[allow(dead_code)]
+    fn run_is_send(pool: &PgPool) {
+        let command = AccountCommand::Hash { generate: true };
+        send(&owt_accounts::cli::run(command, pool, |t: &str| {
+            t.to_owned()
+        }));
+    }
+
+    fn create(username: &str) -> AccountCommand {
+        AccountCommand::Create {
+            username: username.to_owned(),
+            email: Some(format!("{username}@example.com")),
+            staff: false,
+            generate: false,
+            no_password: false,
+        }
+    }
+
+    /// The value after `: ` on the line that starts with `what`.
+    fn shown(out: &str, what: &str) -> String {
+        let line = out.lines().find(|l| l.starts_with(what)).unwrap();
+        line.rsplit_once(": ").unwrap().1.to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_password_is_piped_or_generated_never_an_argument() {
+        let db = db!();
+        // A piped password is used and never printed.
+        let out = exec(&db, create("ada"), Some("correct horse battery\n"))
+            .await
+            .unwrap();
+        assert!(!out.contains("correct horse"), "{out}");
+        let ada = store::authenticate(&db.pool, "ada", "correct horse battery")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!ada.is_staff);
+
+        // Nothing piped: generated, printed once, and it opens the account.
+        let out = exec(&db, create("bob"), None).await.unwrap();
+        let generated = shown(&out, "password");
+        assert!(
+            store::authenticate(&db.pool, "bob", &generated)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // An empty stdin is an error, not an account with no password.
+        assert!(exec(&db, create("cy"), Some("\n")).await.is_err());
+        assert!(store::by_username(&db.pool, "cy").await.unwrap().is_none());
+        // A rule broken is the refusal's sentence.
+        let err = exec(&db, create("di"), Some("short\n")).await.unwrap_err();
+        assert!(err.to_string().contains("too short"), "{err}");
+
+        // By email as well as username; the epoch moves, the old password stops.
+        exec(
+            &db,
+            AccountCommand::SetPassword {
+                login: "ADA@example.com".into(),
+                generate: false,
+            },
+            Some("another passphrase\n"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            store::authenticate(&db.pool, "ada", "correct horse battery")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store::authenticate(&db.pool, "ada", "another passphrase")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // `--generate` ignores a piped line.
+        let out = exec(
+            &db,
+            AccountCommand::SetPassword {
+                login: "ada".into(),
+                generate: true,
+            },
+            Some("ignored passphrase\n"),
+        )
+        .await
+        .unwrap();
+        let generated = shown(&out, "password");
+        assert!(
+            store::authenticate(&db.pool, "ada", &generated)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            exec(
+                &db,
+                AccountCommand::SetPassword {
+                    login: "nobody".into(),
+                    generate: true
+                },
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_link_opens_once_and_staff_come_and_go() {
+        let db = db!();
+        let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+        // A link redeems once; the token is in the URL printed.
+        let out = exec(
+            &db,
+            AccountCommand::Link {
+                login: "ada".into(),
+                minutes: 5,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let url = out.lines().last().unwrap();
+        let token = url.strip_prefix("https://example.test/in/").unwrap();
+        assert!(
+            owt_accounts::links::redeem(&db.pool, token, "cli-test")
+                .await
+                .is_ok()
+        );
+        assert!(
+            owt_accounts::links::redeem(&db.pool, token, "cli-test")
+                .await
+                .is_err()
+        );
+
+        // Staff and back.
+        exec(
+            &db,
+            AccountCommand::Staff {
+                login: "ada".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store::by_username(&db.pool, "ada")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_staff
+        );
+        exec(
+            &db,
+            AccountCommand::Unstaff {
+                login: "ada".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !store::by_username(&db.pool, "ada")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_staff
+        );
+
+        // No password: the account is reached by a link or a provider.
+        let none = AccountCommand::Create {
+            username: "kiosk".into(),
+            email: None,
+            staff: true,
+            generate: false,
+            no_password: true,
+        };
+        let out = exec(&db, none, None).await.unwrap();
+        assert!(!out.contains("password"), "{out}");
+        assert!(
+            store::by_username(&db.pool, "kiosk")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_staff
+        );
+        store::set_active(&db.pool, ada.id, false).await.unwrap();
+        let err = exec(
+            &db,
+            AccountCommand::Link {
+                login: "ada".into(),
+                minutes: 5,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("deactivated"), "{err}");
+
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn the_hash_opens_what_it_was_made_from() {
+        let db = db!();
+        let out = exec(
+            &db,
+            AccountCommand::Hash { generate: false },
+            Some("shared passphrase\n"),
+        )
+        .await
+        .unwrap();
+        assert!(owt_auth::password::verify("shared passphrase", out.trim()).await);
+        let out = exec(&db, AccountCommand::Hash { generate: true }, None)
+            .await
+            .unwrap();
+        let secret = shown(&out, "password");
+        assert!(owt_auth::password::verify(&secret, out.lines().last().unwrap()).await);
+        db.drop().await;
+    }
+}
+
 fn identity(uid: &str, email: Option<&str>, verified: bool) -> oauth::Identity {
     oauth::Identity {
         uid: uid.into(),

@@ -12,12 +12,16 @@ publish.workspace = true
 # models for an app's unit tests of its own `admin::Views` templates, and
 # `policies::agree_to_current` for fixtures (`owt-test` enables it).
 test-util = []
+# `cli::AccountCommand`, the operator commands as a clap `Subcommand`: an app nests it
+# in its own `Cli`. Without it clap is not built.
+cli = ["dep:clap"]
 
 [dependencies]
 anyhow.workspace = true
 askama.workspace = true
 axum = { workspace = true, features = ["tokio", "http1", "form", "query", "original-uri"] }
 base64.workspace = true
+clap = { workspace = true, optional = true }
 owt-auth.workspace = true
 owt-web.workspace = true
 pulldown-cmark.workspace = true
