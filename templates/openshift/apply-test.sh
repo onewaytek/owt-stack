@@ -17,8 +17,10 @@ cat >"$work/bin/oc" <<'FAKE'
 #!/usr/bin/env bash
 # Answers the calls apply.sh makes, and logs each one. A rendered document is a line
 # naming the template and the parameters given, so the log shows what was applied.
-# It encodes two things about the real client: `--parameters` prints a header line
-# and then one parameter a line, name first; `diff` exits 1 on a difference.
+# It encodes three things about the real client: `--parameters` prints a header line
+# and then one parameter a line, name first; `--param-file` holds one KEY=VALUE a
+# line, a comma in a value is no list, and `-p` is refused (it would split one);
+# `diff` exits 1 on a difference.
 set -euo pipefail
 printf 'oc %s\n' "$*" >>"$FAKE_LOG"
 case "$*" in
@@ -31,7 +33,11 @@ case "$*" in
     printf 'rendered %s' "$(basename "$4")"
     shift 4
     while [ $# -gt 0 ]; do
-      case "$1" in -p) printf ' %s' "$2"; shift 2 ;; *) shift ;; esac
+      case "$1" in
+        --param-file=*) while IFS= read -r pair; do printf ' %s' "$pair"; done <"${1#--param-file=}"; shift ;;
+        -p|--param) echo "fake: -p reads commas as a list" >&2; exit 1 ;;
+        *) shift ;;
+      esac
     done
     echo
     ;;
@@ -173,6 +179,12 @@ rc=0; run || rc=$?
 logged 'BACKUP_SCHEDULE=0 0 2 * * *' || fail "a quoted value loses its quotes"
 grep -qF 'CHANNEL=rc "quoted", it'"'"'s' "$log" || fail "what is inside is kept"
 logged 'IMAGE=ghcr.io/example/my$app' || fail "a dollar is literal"
+
+# 8. A comma in a value reaches the template whole (a parameter file, not `-p`).
+echo 'RUST_LOG=info,myapp=debug' >>"$work/deploy/params.env"
+rc=0; run || rc=$?
+logged 'RUST_LOG=info,myapp=debug' || fail "a comma in a value is kept"
+grep -qE '^oc process .* (-p|--param) ' "$log" && fail "a parameter passed with -p"
 
 # 9. cronjob.yaml reads the app's Secret, then the task's own, both optional. The
 #    stand-in `oc` renders nothing, so the template's source stands in for its output.

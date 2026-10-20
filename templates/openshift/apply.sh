@@ -63,7 +63,8 @@ command -v oc >/dev/null || { echo "oc is not on the PATH" >&2; exit 2; }
 [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "apply.sh needs bash 4 or later" >&2; exit 2; }
 [ "$monitoring" = no ] || [ -f "$here/monitoring.yaml" ] || { echo "--monitoring: no monitoring.yaml here" >&2; exit 2; }
 rendered=$(mktemp)
-trap 'rm -f "$rendered"' EXIT
+paramfile=$(mktemp)
+trap 'rm -f "$rendered" "$paramfile"' EXIT
 
 # The parameters, in a file's order, later lines winning: `read_env FILE...` fills
 # the associative array `given`.
@@ -99,20 +100,23 @@ need() {
   done
 }
 
-# `-p KEY=VALUE` for each parameter `template` declares that `given` holds; a
-# required one that is missing is left for `oc process` to refuse by name. The
-# names are the first column of `oc process --parameters`, under its header line.
+# `--param-file FILE` for `template`, holding a `KEY=VALUE` line for each parameter
+# it declares that `given` holds; a required one that is missing is left for `oc
+# process` to refuse by name. A file, not `-p`, because `-p` reads a comma in a value
+# (`RUST_LOG=info,myapp=debug`) as a list of parameters. The names are the first
+# column of `oc process --parameters`, under its header line.
 args_for() {
   local template=$1 name names
   names=$(oc process --local -f "$template" --parameters | awk 'NR > 1 { print $1 }') ||
     { echo "oc process --parameters failed on $template" >&2; exit 2; }
-  args=()
+  : >"$paramfile"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     if [ "${given[$name]+set}" ]; then
-      args+=(-p "$name=${given[$name]}")
+      printf '%s=%s\n' "$name" "${given[$name]}" >>"$paramfile"
     fi
   done <<<"$names"
+  args=(--param-file="$paramfile")
 }
 
 status=0
