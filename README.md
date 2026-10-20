@@ -3105,8 +3105,9 @@ then each task's) when present; `cronjob.yaml` once per
 override such as `INTERNET_CIDR` or the task's `MEMORY_LIMIT`) are read over
 `params.env`; `monitoring.yaml` with `--monitoring`, since it needs monitoring-edit
 (see "Monitoring"). One pair of quotes comes off a value (`BACKUP_SCHEDULE="0 0 2 * *
-*"`). A name two templates declare means one thing in both (`NAME`, `NAMESPACE`,
-`CHANNEL`, `DB_SUFFIX`); Redis's image and memory limit are `REDIS_IMAGE` and
+*"`); the parameters reach `oc process` in a `--param-file`, so a comma in a value
+(`RUST_LOG=info,myapp=debug`) is not read as a list. A name two templates declare
+means one thing in both (`NAME`, `NAMESPACE`, `CHANNEL`, `DB_SUFFIX`); Redis's image and memory limit are `REDIS_IMAGE` and
 `REDIS_MEMORY_LIMIT`, apart from the app's. Upgrading owt-stack is: copy the templates
 again, keep `params.env`. Exit status 1 means the diff found changes, 2 a refusal or
 a failed `oc`.
