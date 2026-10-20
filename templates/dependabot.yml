@@ -7,7 +7,12 @@
 # come grouped in one pull request.
 #
 # It opens pull requests and nothing more: the app's checks run on them as on any
-# other, and someone merges them. Security alerts are a repository setting of their
+# other, and someone merges them. An app with an rc channel (README, "Releasing an
+# app") promotes each one into rc once its checks pass and deploys it wherever it
+# deploys rc, without review: rc is where a bump is tried, and review is required
+# before main. That needs the secrets its checks use as Dependabot secrets too, and
+# the promotion jobs' `permissions:` (a Dependabot run's token is read-only without
+# them). Security alerts are a repository setting of their
 # own ("Dependabot alerts"), not this file's. An app with no package.json drops the
 # npm entry, or Dependabot reports a failed job for it each week.
 version: 2
