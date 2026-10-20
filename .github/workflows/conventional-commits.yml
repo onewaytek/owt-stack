@@ -21,6 +21,7 @@ name: Conventional Commits
 #     commits:
 #       permissions: {contents: read, pull-requests: read}
 #       uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # vX.Y.Z
+#       # with: {title: false}   # to skip the title job, when titles are checked another way
 #
 # The caller's event must be a pull request (the title and the commits are its),
 # never `pull_request_target`, whose checkout would run a fork's code with a token
@@ -35,11 +36,22 @@ on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
   workflow_call:
+    inputs:
+      title:
+        description: >-
+          Check the pull request's title. An app that checks titles another way
+          passes false and gets the commit lint alone; the job is then skipped,
+          which a required check treats as passing.
+        type: boolean
+        default: true
 
 permissions: {}
 
 jobs:
   title:
+    # `inputs.title` is empty when this runs on its own pull_request; only an explicit
+    # false from a caller skips the job.
+    if: format('{0}', inputs.title) != 'false'
     # A fork's pull request (or no pull request at all), and any repository outside
     # the organization that owns the scale set, runs GitHub-hosted.
     runs-on: ${{ fromJSON(github.repository_owner == 'onewaytek' && github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}

@@ -2631,6 +2631,8 @@ jobs:
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
     permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
     uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@v0.8.1  # and "commits / commits"
+    # with: {title: false}   # an app that checks titles another way: only "commits / commits" runs (the skipped
+    # "commits / title" counts as passing for a required check)
   candidate:
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
