@@ -16,7 +16,7 @@ name: Promote to rc
 #     if: github.ref_name == 'main'
 #     permissions: {contents: write, actions: write, pull-requests: write}
 #     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@vX.Y.Z  # the release the app uses
-#     with: {source: main, dispatch-release: false}
+#     with: {source: main}
 #
 # The merge retries on a non-fast-forward, so concurrent promotions serialize
 # without losing work. Conflicts resolve toward the incoming side (-X theirs):
@@ -30,6 +30,24 @@ name: Promote to rc
 #
 # A push made with the workflow's own token starts no workflow, so the rc release is
 # started by dispatching the app's release workflow, which a workflow_dispatch may.
+# That holds for the sync after a stable release too (`source: main`), with one
+# condition: the release is dispatched only when the merge changed rc's tree. A merge
+# of main usually changes only the history (rc already carries the squashed pull
+# requests), and a release of identical code is not worth an image and a rollout; a
+# fix committed straight to main changes the tree and is released on rc. The test is
+# the whole tree, so it is looser than "main brought code": `-X theirs` can move rc's
+# tree toward main where an in-flight feature edits the same lines, and an app whose
+# release commits `chore(release)` files back to main (`version-files`, `changelog`)
+# gets a changed tree from every sync. Such a dispatch is harmless: semantic-release
+# finds nothing releasable (`chore`), publishes nothing and builds no image, and costs
+# one run of the release workflow. The rule applies to this direct path only; with
+# `candidate: true`, publish-rc.yml dispatches on every publish.
+#
+# A release run on rc that failed and is re-run after rc moved publishes nothing
+# (semantic-release refuses to release from a commit behind its branch). The next
+# dispatch releases everything since the last tag, the failed run's commits included,
+# but a history-only sync dispatches none, so until the next promotion or tree-changing
+# sync those commits wait.
 #
 # A branch's own checks don't check rc: two branches built beside each other can each
 # pass and still break rc together (two migrations taking one number merge without a
@@ -78,7 +96,10 @@ on:
         type: string
         default: ""
       dispatch-release:
-        description: Start the app's release workflow on rc when rc changed.
+        description: >-
+          Start the app's release workflow on rc when the merge changed rc's tree (not
+          when it only joined histories that already held the same code). Unlike
+          publish-rc.yml's input of the name, which dispatches whenever it runs.
         type: boolean
         default: true
       release-workflow:
@@ -169,7 +190,11 @@ jobs:
               exit 0
             fi
             if git push origin rc; then
-              printf 'changed=true\nsha=%s\nbase=%s\n' "$(git rev-parse HEAD)" "$base" >> "$GITHUB_OUTPUT"
+              # Whether the merge changed the code and not only the history (see the
+              # header); read by "Release rc".
+              content=false
+              [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse "${before}^{tree}")" ] && content=true
+              printf 'changed=true\ncontent=%s\nsha=%s\nbase=%s\n' "$content" "$(git rev-parse HEAD)" "$base" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             echo "push raced another writer (attempt ${attempt}); retrying"
@@ -178,7 +203,7 @@ jobs:
           echo "could not push rc after 5 attempts" >&2
           exit 1
       - name: Release rc
-        if: ${{ inputs.dispatch-release && !inputs.candidate && steps.merge.outputs.changed == 'true' }}
+        if: ${{ inputs.dispatch-release && !inputs.candidate && steps.merge.outputs.changed == 'true' && steps.merge.outputs.content == 'true' }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           WORKFLOW: ${{ inputs.release-workflow }}

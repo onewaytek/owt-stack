@@ -2578,7 +2578,21 @@ jobs:
   ```
 - **The rc channel** (optional): on each same-repository PR into `main`, once its
   checks pass, merge the PR into `rc` and cut a prerelease. After each stable
-  release, merge `main` back into `rc`. A PR's checks run on the PR alone, so two
+  release, merge `main` back into `rc` (`sync-rc`). When the merge changes `rc`'s tree
+  (a fix committed straight to `main`) it also releases `rc`; when it only joins the
+  histories (the usual case: `rc` already carries its PRs, squashed into `main`) it
+  releases nothing. That rule belongs to `sync-rc` as written below; a sync through the
+  candidate flow releases on every publish. The test is the whole tree: `-X theirs`
+  can pull `rc`'s tree toward `main` where an in-flight feature edits the same lines,
+  and an app whose release commits `chore(release)` files back to `main` has a
+  changed tree at every sync. Such a release run publishes nothing (no releasable
+  commit, no image) and costs one run. A release run on `rc` that failed and is
+  re-run after `rc` moved publishes nothing either, since semantic-release will not
+  release from a commit behind its branch. The next release run releases everything
+  since the last tag, the failed run's commits included, but a history-only sync
+  starts none, so those commits wait for the next promotion or tree-changing sync.
+  An app that passed `dispatch-release: false` to `sync-rc` drops it to get the
+  rule. A PR's checks run on the PR alone, so two
   PRs in flight can each pass and break `rc` together: two migrations taking one
   number merge without a conflict. Checking the merge first closes that. The merge
   goes to `rc-candidate`, the app's checks run on it, and `rc` fast-forwards to it
@@ -2662,7 +2676,7 @@ jobs:
     if: github.ref_name == 'main'
     permissions: {contents: write, actions: write, pull-requests: write}
     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.8.1
-    with: {source: main, dispatch-release: false}
+    with: {source: main}
 ```
 <!-- x-release-please-end -->
 
