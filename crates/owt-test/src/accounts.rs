@@ -14,7 +14,6 @@ use sqlx::PgPool;
 /// is public: never use it for a deployment.
 #[must_use]
 pub fn test_key() -> Key {
-    // `0, 1, 2 ... 63`: 64 distinct bytes.
     let bytes: [u8; 64] = std::array::from_fn(|i| u8::try_from(i).expect("below 64"));
     Key::from(&bytes)
 }
