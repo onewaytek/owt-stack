@@ -191,4 +191,59 @@ grep -qE '^oc process .* (-p|--param) ' "$log" && fail "a parameter passed with 
 grep -qF 'secretRef: {name: "${NAME}-env", optional: true}' "$here/cronjob.yaml" || fail "cronjob.yaml reads the app's Secret"
 grep -qF 'secretRef: {name: "${NAME}-${JOB}-env", optional: true}' "$here/cronjob.yaml" || fail "cronjob.yaml reads the task's Secret"
 
+# 10. An executable pre-render beside the script: params.env is its environment, its
+#     stdout joins the parameters over params.env's, and it runs once, before any
+#     render. A failure, a line that is no pair, or a hook that cannot run exits 2.
+cp "$work/good.env" "$work/deploy/params.env"
+cat >"$work/deploy/pre-render" <<'HOOK'
+#!/usr/bin/env bash
+echo "hook ran with NAME=$NAME in $(basename "$PWD")" >&2
+echo "# a comment"
+echo "PORT=9000"
+echo 'BACKUP_SCHEDULE="0 0 3 * * *"'
+echo "RUST_LOG=info,a=b"
+HOOK
+chmod +x "$work/deploy/pre-render"
+rc=0; run || rc=$?
+[ "$rc" -eq 1 ] || fail "diff with a hook (got $rc)"
+grep -q "hook ran with NAME=myapp in deploy" "$work/err" || fail "the hook's environment and directory"
+logged "rendered app.yaml NAME=myapp NAMESPACE=myapp-staging IMAGE=ghcr.io/example/myapp CHANNEL=rc PORT=9000" || fail "the hook's value wins over params.env"
+logged 'BACKUP_SCHEDULE=0 0 3 * * *' || fail "the hook's quoted value loses its quotes"
+logged 'RUST_LOG=info,a=b' || fail "a hook value reaches the template that declares it"
+[ "$(grep -c 'hook ran' "$work/err")" -eq 1 ] || fail "the hook runs once"
+cp "$here/cronjob.yaml" "$work/deploy/"
+printf 'JOB=sweep\nSCHEDULE=* * * * *\nARGS=["x"]\nPORT=7000\n' >"$work/deploy/jobs/sweep.env"
+rc=0; run || rc=$?
+[ "$(grep -c 'hook ran' "$work/err")" -eq 1 ] || fail "the hook runs once with jobs"
+logged 'rendered cronjob.yaml NAME=myapp NAMESPACE=myapp-staging JOB=sweep' || fail "the task renders"
+rm "$work/deploy/jobs/sweep.env" "$work/deploy/cronjob.yaml"
+printf '#!/usr/bin/env bash\necho partial\nexit 4\n' >"$work/deploy/pre-render"
+rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a failing hook exits 2 (got $rc)"
+grep -q "pre-render failed" "$work/err" || fail "names the failed hook"
+grep -q "^oc process" "$log" && fail "rendered after a failed hook"
+printf '#!/usr/bin/env bash\nprintf "PORT=1\\nsecond line\\n"\n' >"$work/deploy/pre-render"
+rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a hook line that is no pair exits 2 (got $rc)"
+grep -q "pre-render: not a KEY=VALUE line: second line" "$work/err" || fail "names the hook's bad line"
+chmod -x "$work/deploy/pre-render"
+rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a hook that is not executable exits 2 (got $rc)"
+grep -q "pre-render is not an executable file" "$work/err" || fail "names the unexecutable hook"
+printf '#!/usr/bin/env bash\nread -r x && echo "PORT=$x"\necho PORT=5\n' >"$work/deploy/pre-render"
+chmod +x "$work/deploy/pre-render"
+echo typed | PATH=$work/bin:$PATH FAKE_LOG=$log bash "$work/deploy/apply.sh" >"$work/out" 2>"$work/err" && rc=0 || rc=$?
+[ "$rc" -eq 2 ] || [ "$rc" -eq 1 ] || fail "a hook reading stdin does not hang (got $rc)"
+grep -q "PORT=typed" "$log" && fail "the hook read apply.sh's stdin"
+for pair in NAME=other NAMESPACE=other NAME=; do
+  printf '#!/usr/bin/env bash\necho %s\n' "$pair" >"$work/deploy/pre-render"
+  rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a hook setting $pair exits 2 (got $rc)"
+  grep -q "NAME and NAMESPACE are params.env's alone" "$work/err" || fail "names the refused $pair"
+  grep -q "^oc process" "$log" && fail "rendered after a hook set $pair"
+done
+printf '#!/usr/bin/env bash\necho NAME=myapp\n' >"$work/deploy/pre-render"
+rc=0; run || rc=$?; [ "$rc" -eq 1 ] || fail "a hook restating NAME is harmless (got $rc)"
+rm "$work/deploy/pre-render"
+ln -s "$work/deploy/missing" "$work/deploy/pre-render"
+rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a dangling pre-render exits 2 (got $rc)"
+grep -q "not an executable file" "$work/err" || fail "names the dangling hook"
+rm "$work/deploy/pre-render"
+
 echo "apply.sh: ok"
