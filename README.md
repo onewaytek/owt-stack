@@ -1004,11 +1004,29 @@ let app: Router = Router::new()
 // real check; an old hash is replaced; `last_sign_in` is stamped), then the session:
 // new id, account and epoch. A refusal's message is the form's error, its status the
 // answer's: 429 throttled (`Retry-After: SignInRefused::RETRY_AFTER`), 422 a mismatch
-// that says neither which part was wrong nor whether the account exists, 500 a fault
+// that says neither which part was wrong nor whether the account exists (also a login
+// with a control character, refused before the throttle is charged), 500 a fault
 // (whose message says only that; log its source).
 let throttle = Throttle::default(); // in the app's state
 match session::password_sign_in(&pool, &throttle, &session, ip, login, given).await {
     Ok(account) => { let _ = account; /* redirect to `next` */ }
+    Err(refused) => { let _ = (refused.status(), refused.to_string()); /* the form again */ }
+}
+// A deployment-wide password (one Argon2 hash in the environment) opening a fixed
+// account, which needs no password of its own: the same refusals, throttle and
+// `last_sign_in` stamp. The account must be active; a wrong password, a hash that
+// opens nothing and a deactivated account all answer `Mismatch`. Everyone shares the
+// one account, so its budget is shared by every client: give the gate a `Throttle` of
+// its own with a larger `sign_ins_per_account` (and not the one ordinary logins use,
+// which it would loosen), and the per-address budgets limit.
+# let (shared_hash, desk) = (String::new(), 1_i64);
+let gate_throttle = Throttle::new(owt_auth::throttle::Budgets {
+    sign_ins_per_account: 1_000,
+    ..Default::default()
+});
+let gate = session::Gate { hash: &shared_hash, account: desk };
+match session::password_gate(&pool, &gate_throttle, &session, ip, given, gate).await {
+    Ok(account) => { let _ = account; /* redirect */ }
     Err(refused) => { let _ = (refused.status(), refused.to_string()); /* the form again */ }
 }
 session::sign_out(&session); // this session
