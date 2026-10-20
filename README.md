@@ -5,7 +5,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 
 | Crate | What an app gets |
 |---|---|
-| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
+| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; sign-in with a provider (routes, configuration, buttons, connections) |
@@ -612,6 +612,43 @@ The fragment's cache policy is a required argument; use `no-store` for anything 
 differs per person. A response that sets the session cookie is `no-store` whatever it
 asked for, so a public fragment never hands one person's session to a cache. Test that page and fragment agree with `owt_test::fragment`
 (below).
+
+### Preference cookies
+
+A language, a theme or a reading mode is a choice from a closed set, kept in an
+unsealed cookie for months. `owt_web::preference::Preference` fixes what goes wrong
+with a hand-written `Set-Cookie`: it is always `Secure`, `SameSite=Lax`, `Path=/`, with
+no `Domain` and a `Max-Age` capped at 400 days (a browser's limit). It reads only a
+value in the allowed set (markup or a smuggled second cookie reads as unset), sets
+only such a value, and refuses an empty or non-cookie-value allowed set, and a name that is not a
+cookie token or that is the session's (with or without `__Host-`), so a preference never shares the session's name.
+Name it `__Host-<name>`.
+
+```rust
+use std::time::Duration;
+use axum::http::{HeaderMap, header};
+use axum::response::{IntoResponse, Redirect};
+use owt_web::preference::Preference;
+
+# fn demo(headers: &HeaderMap) -> Result<(), owt_web::preference::BadName> {
+// Once, at start, with the session's cookie name (`Sessions::cookie_name`).
+let theme = Preference::new(
+    "__Host-theme", &["light", "dark"], Duration::from_secs(365 * 86_400), "__Host-session",
+)?;
+
+// Per request: `None` when unset or not an allowed value.
+let current = theme.read(headers).unwrap_or("light");
+# let _ = current;
+
+// Saving the choice: `set` is `None` for a value outside the set.
+let mut response = Redirect::to("/settings/").into_response();
+if let Some(cookie) = theme.set("dark") {
+    response.headers_mut().append(header::SET_COOKIE, cookie);
+}
+// `theme.clear()` is the `Set-Cookie` that removes it.
+# Ok(())
+# }
+```
 
 ### Caching
 

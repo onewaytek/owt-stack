@@ -21,6 +21,7 @@
 //! | [`fragment`] | htmx fragments at their own URLs: `HX-Push-Url` or `HX-Replace-Url`, `HX-Reselect`, no `Vary` |
 //! | [`sse`] | event framing and the stream response |
 //! | [`stack`] | the layers above in the one correct order, as a builder |
+//! | [`preference`] | a language or theme cookie: read from an allowed set, set `Secure`, apart from the session's |
 //! | [`pager`], [`text`] | page arithmetic; slugs, word truncation, paragraphs, UTC dates, relative times, plurals, `LIKE` escaping |
 
 pub mod assets;
@@ -33,6 +34,7 @@ pub mod fragment;
 pub mod headers;
 pub mod limits;
 pub mod pager;
+pub mod preference;
 pub mod redirect;
 pub mod request;
 pub mod session;
