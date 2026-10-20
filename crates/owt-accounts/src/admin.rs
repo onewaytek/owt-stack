@@ -998,13 +998,6 @@ struct ListQuery {
     page: Option<String>,
 }
 
-/// `%`, `_` and `\` matched as themselves in an `ILIKE` pattern.
-fn like_escaped(term: &str) -> String {
-    term.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 /// The search's rows: a term in the username or email or one of the app's matches
 /// (`$4`), and a filter (`staff`, `inactive`, or a role's name, staff counted when the
 /// role says so).
@@ -1026,7 +1019,7 @@ async fn list(
     info: RequestInfo,
     Query(query): Query<ListQuery>,
 ) -> owt_web::Result<Response> {
-    let term = like_escaped(query.q.trim());
+    let term = owt_web::text::like_escape(query.q.trim());
     let role = admin.roles.iter().find(|r| r.name == query.role);
     let filter = match query.role.as_str() {
         "staff" | "inactive" => query.role.as_str(),
@@ -1864,11 +1857,6 @@ mod tests {
         ] {
             assert!(account.contains(shown), "{shown}: {account}");
         }
-    }
-
-    #[test]
-    fn a_search_term_matches_its_wildcards_literally() {
-        assert_eq!(like_escaped("50%_off\\"), "50\\%\\_off\\\\");
     }
 
     #[test]

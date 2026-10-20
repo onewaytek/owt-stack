@@ -452,6 +452,46 @@ async fn save(session: Session<SessionData>) -> axum::response::Redirect {
 }
 ```
 
+### Text in pages
+
+`owt_web::text` holds the small renderings pages repeat. A moment is a `SystemTime`
+(a `time::OffsetDateTime` or `chrono::DateTime<Utc>` converts with `.into()`); every
+rendering is UTC and rounds down, so two pages show one moment alike.
+
+| function | gives |
+|---|---|
+| `utc_minute(t)`, `iso_date(t)` | `2026-10-20 14:05 UTC`, `2026-10-20` |
+| `ago(t, &words)`, `until(t, &words)` | `5 minutes ago`, `in 2 days`: the largest whole unit (a month is 30 days, a year 365); under a minute, or the wrong way round, is `words.now` |
+| `ago_at(t, now, &words)`, `until_at(..)` | the same from a `now` the caller holds (tests, a page rendered once) |
+| `plural(n, "game", "games")` | the first word for 1, else the second |
+| `like_escape(term)` | `term` with `%`, `_` and `\` literal in a `LIKE`/`ILIKE` pattern |
+| `slugify`, `truncate_words`, `linebreaks` | slugs, word truncation, escaped paragraphs |
+
+`Words::ENGLISH` is the default `Words`; an app in another language builds its own
+(`now`, the `ago` and `until` patterns with `{}` for the span, and a `Unit` for each of
+minute, hour, day, month and year). The functions are plain paths in Askama.
+
+```rust
+use std::time::SystemTime;
+use askama::Template;
+use owt_web::text::{like_escape, Words};
+
+#[derive(Template)]
+#[template(ext = "html", source = r#"
+<time>{{ owt_web::text::utc_minute(self.at) }}</time>
+{{ owt_web::text::ago(self.at, words) }}
+{{ self.n }} {{ owt_web::text::plural(self.n, "game", "games") }}"#)]
+struct Row<'a> { at: SystemTime, n: u64, words: &'a Words<'a> }
+
+# fn pattern(q: &str) -> String {
+// Search with the term's own `%` and `_` taken literally:
+//   WHERE name ILIKE '%' || $1 || '%'
+like_escape(q.trim())
+# }
+```
+
+Pass the escaped term as a bound parameter, never spliced into the SQL.
+
 ### htmx fragments
 
 A fragment lives at a URL of its own, never the page's URL negotiated on
