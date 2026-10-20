@@ -1,6 +1,6 @@
 [package]
 name = "owt-auth"
-description = "Authentication the onewaytek apps share: Argon2id password hashing, sign-in throttling, OAuth 2 sign-in with PKCE, and JWT bearer verification against a JWKS."
+description = "Authentication the onewaytek apps share: Argon2id password hashing, sign-in throttling, a bot guard for anonymous forms, OAuth 2 sign-in with PKCE, and JWT bearer verification against a JWKS."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
