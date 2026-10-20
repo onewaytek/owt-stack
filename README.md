@@ -33,7 +33,7 @@ Outside the crates:
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger and the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone, connecting to nothing |
 | `templates/openshift/egress.yaml` | where the app's pods (or a task's) may connect: its database, its Redis, the cluster's DNS and port 443 of the internet, and nothing else |
-| `templates/openshift/apply.sh` | renders every template present from the app's `params.env` (and `jobs/*.env`), `oc diff` by default, `--apply` to apply; `apply-test.sh` proves it against a stand-in `oc` |
+| `templates/openshift/apply.sh` | renders every template present from the app's `params.env` (and `jobs/*.env`), plus an optional `pre-render` hook, `oc diff` by default, `--apply` to apply; `apply-test.sh` proves it against a stand-in `oc` |
 | `templates/openshift/cronjob.yaml` | a scheduled task in the app's image, with the app's database, TLS, environment and NetworkPolicies |
 | `templates/openshift/restore-drill.sh` | proves a backup restores, on throwaway clusters, and rehearses a Postgres major upgrade |
 | `templates/openshift/monitoring.yaml` | Prometheus scraping for the app's metrics and its Postgres (needs `monitoring-edit`) |
@@ -3111,6 +3111,27 @@ means one thing in both (`NAME`, `NAMESPACE`, `CHANNEL`, `DB_SUFFIX`); Redis's i
 `REDIS_MEMORY_LIMIT`, apart from the app's. Upgrading owt-stack is: copy the templates
 again, keep `params.env`. Exit status 1 means the diff found changes, 2 a refusal or
 a failed `oc`.
+
+A parameter `params.env` cannot hold (a checksum of a ConfigMap, a value derived from
+the cluster) comes from an optional executable `deploy/openshift/pre-render`. It runs
+once, in that directory, in a diff as in an apply, so it only reads; the `params.env`
+parameters are its environment, its stdin is empty, and its stdout is `KEY=VALUE`
+lines (read as `params.env`'s are) that join the parameters over `params.env`'s,
+under a task's own file. `NAME` and `NAMESPACE` stay `params.env`'s: a hook that sets
+either to another value is refused. Its stderr shows, and a failure, a line that is
+no pair, or a `pre-render` that is not an executable file (a dangling link, no x bit)
+exits 2 before anything renders. The output becomes template parameters, applied into
+the cluster's objects and shown in a diff, so it must not hold a secret. Assign
+before echoing: in `echo "K=$(cmd)"` a failing `cmd` is swallowed by `echo`'s status.
+
+```sh
+#!/usr/bin/env bash
+# deploy/openshift/pre-render
+set -euo pipefail
+level=$(oc get configmap myapp-log -o jsonpath='{.data.level}')
+echo "RUST_LOG=info,myapp=$level"
+```
+
 The script writes no Secret: the app's environment and a Redis password are made by
 hand, as below. `templates/openshift/apply-test.sh` proves the script against a
 stand-in `oc` (`just templates` runs it here).

@@ -40,6 +40,14 @@
 # never writes a Secret: the app's environment ($NAME-env) and a Redis password are
 # made by hand, as the templates' headers say. PARAMS=path names another params.env.
 #
+# An executable `pre-render` beside the script computes parameters params.env cannot
+# hold (a checksum of a ConfigMap, a value derived from the cluster). It runs once,
+# in this directory, in diff and apply alike, so it only reads; the parameters from
+# params.env are its environment. Its stdout is KEY=VALUE lines, read as params.env's
+# are and over them (a job's file still wins; NAME and NAMESPACE stay params.env's,
+# and a hook that changes one is refused); its stdin is empty, its stderr shows, and
+# a failure stops the run before anything renders.
+#
 # Exit status: 0 when nothing would change (or everything applied), 1 when a diff
 # found changes, 2 for a refusal (a bad params.env, a missing NAME) or a failed oc.
 # `oc diff` on a cluster the objects are not on yet shows every object as new.
@@ -67,7 +75,7 @@ paramfile=$(mktemp)
 trap 'rm -f "$rendered" "$paramfile"' EXIT
 
 # The parameters, in a file's order, later lines winning: `read_env FILE...` fills
-# the associative array `given`.
+# the associative array `given`; `read_label`, when set, names the file in a refusal.
 declare -A given=()
 read_env() {
   local file line key value
@@ -84,7 +92,7 @@ read_env() {
         fi
         given[$key]=$value
       else
-        echo "$file: not a KEY=VALUE line: $line" >&2
+        echo "${read_label:-$file}: not a KEY=VALUE line: $line" >&2
         exit 2
       fi
     done <"$file"
@@ -144,6 +152,20 @@ run() {
 
 read_env "$params"
 need "$params" NAME NAMESPACE
+hook=$here/pre-render
+if [ -e "$hook" ] || [ -L "$hook" ]; then
+  [ -x "$hook" ] || { echo "$hook is not an executable file (a dangling link, or no x bit)" >&2; exit 2; }
+  hook_env=()
+  for k in "${!given[@]}"; do hook_env+=("$k=${given[$k]}"); done
+  (cd "$here" && env "${hook_env[@]}" "$hook" </dev/null) >"$rendered" ||
+    { echo "$hook failed" >&2; exit 2; }
+  app_name=${given[NAME]} app_namespace=${given[NAMESPACE]}
+  read_label=$hook read_env "$rendered"
+  if [ "${given[NAME]}" != "$app_name" ] || [ "${given[NAMESPACE]}" != "$app_namespace" ]; then
+    echo "$hook: NAME and NAMESPACE are params.env's alone, and the hook sets one of them" >&2
+    exit 2
+  fi
+fi
 # The router reads ROUTE_TIMEOUT as an haproxy duration: a bare number is
 # milliseconds (300 would fail nearly every request), and a value it cannot parse
 # is ignored without a word. So a value without a unit is refused here.
