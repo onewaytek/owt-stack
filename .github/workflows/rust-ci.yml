@@ -86,6 +86,14 @@ on:
           decides those.
         type: string
         default: ""
+      migrate-command:
+        description: >-
+          How the database is migrated before the checks, instead of `sqlx migrate
+          run` from migrations/: an app whose migrations need a library's tables first
+          (owt-accounts migrates its own) runs its binary's migrate subcommand, e.g.
+          `SQLX_OFFLINE=true cargo run --locked -- migrate`. Empty for sqlx's.
+        type: string
+        default: ""
       node-version-file:
         description: File naming the Node version for the stylesheet job; empty for 22.
         type: string
@@ -385,8 +393,13 @@ jobs:
       - name: Migrate
         if: ${{ inputs.check-command != '' && inputs.database != '' }}
         # A library's tests can want a database without having migrations of their own.
+        env:
+          MIGRATE: ${{ inputs.migrate-command }}
         shell: bash
-        run: if [ -d migrations ]; then sqlx migrate run; else echo "no migrations/ to apply"; fi
+        run: |
+          if [ -n "$MIGRATE" ]; then eval "$MIGRATE"
+          elif [ -d migrations ]; then sqlx migrate run
+          else echo "no migrations/ to apply"; fi
       - name: The app's gate
         if: ${{ inputs.check-command != '' }}
         env:
@@ -408,9 +421,12 @@ jobs:
         run: cargo audit --deny warnings
       - name: sqlx metadata is current
         if: ${{ inputs.check-command == '' && steps.sqlx-cli.outputs.needed == 'true' }}
+        env:
+          MIGRATE: ${{ inputs.migrate-command }}
         shell: bash
         run: |
-          if [ -d migrations ]; then cargo sqlx migrate run; fi
+          if [ -n "$MIGRATE" ]; then eval "$MIGRATE"
+          elif [ -d migrations ]; then cargo sqlx migrate run; fi
           if [ -d .sqlx ]; then SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
       - run: cargo clippy --all-targets --locked -- -D warnings
         if: ${{ inputs.check-command == '' }}

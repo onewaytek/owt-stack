@@ -725,32 +725,35 @@ It builds `owt-auth` without the `jwt` feature, so an app on it has neither
 `jsonwebtoken` nor `rsa`, and needs no audit ignore, unless the app turns `jwt` on
 itself (an `owt-auth` dependency with default features does; see above).
 
-**Tables:** write each of `owt_accounts::migrations::ALL`, in order, to the app's
-`migrations/`. A new app writes them first (`0001_owt_accounts.sql`,
-`0002_owt_accounts_roles.sql`, `0003_owt_accounts_constraints.sql`,
-`0004_owt_accounts_policies.sql`, `0005_owt_accounts_local.sql`), since its
-tables reference `accounts(id)`. An app that has migrations of its own gives a newly
-released entry its next unused version (`0007_owt_accounts_roles.sql` after its
-`0006_…`), never a number already applied: sqlx refuses a file whose version it ran
-with other contents. A test calls
-`owt_accounts::migrations::assert_installed("migrations")`, which matches the files
-by content, not name, so an edited or missing copy fails the build. sqlx keeps one
-ledger per database, which is why the library does not run a migrator of its own. A
-shipped migration never changes (sqlx would refuse the re-copied file at deploy, its
-checksum differing from the applied one): a later release appends a new entry to
-`ALL`, and a test here pins each file's SHA-256. A migration moves the rows
-already there along with the schema, so a database that has run the library for years
-ends in the state a new one starts in. The constraints hold what the library assumes
-(names in stored form, Argon2 hashes or none, no hash where password sign-in is off,
-links of 30 days at most, non-empty subjects), so a row written around it (an import, a console) cannot be one it would
-misread. After the migrations run, at every start and before serving, the app awaits
+**Tables:** the library migrates its own tables. At every start, before the app's
+own migrator (its tables reference `accounts(id)`), the app awaits
+`owt_accounts::migrations::run(&pool)`. It applies `owt_accounts::migrations::ALL`
+with a sqlx migrator whose ledger is a table of its own, `_owt_accounts_migrations`,
+beside the app's `_sqlx_migrations` in the same schema, under an advisory lock of its
+own (`migrations::LOCK_ID`) held on one connection, so replicas starting together
+migrate once. The app's `migrations/` holds none of the library's files, its
+`sqlx migrate run` never touches the library's tables, and a release that adds a
+table changes nothing the app writes. Calling `run` again changes nothing; it
+returns what it adopted and applied, and logs it.
+
+A shipped migration never changes: every database that ran it records its checksum,
+and sqlx refuses to start against a recorded migration whose text differs (an
+error, `MigrationError::Migrate(VersionMismatch)`). A later release appends a new
+entry to `ALL`, and a test here pins each file's SHA-256. A migration moves the rows
+already there along with the schema, so a database that has run the library for
+years ends in the state a new one starts in. The constraints hold what the library
+assumes (names in stored form, Argon2 hashes or none, no hash where password sign-in
+is off, links of 30 days at most, non-empty subjects), so a row written around it
+(an import, a console) cannot be one it would misread. After the migrations run, at
+every start and before serving, the app awaits
 `owt_accounts::migrations::complete(&pool)`: it moves rows made before a migration
 to the stored form (in Rust, as sign-in normalizes) and validates the constraints
 the migration added; once done it reads an index and the catalog.
 
 ```rust,no_run
-# async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
-owt_runtime::db::migrate_locked(&pool, migrator, 8_531_207).await?;
+# async fn start(pool: sqlx::PgPool, app_migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
+owt_accounts::migrations::run(&pool).await?;
+owt_runtime::db::migrate_locked(&pool, app_migrator, 8_531_207).await?; // the app's own
 let done = owt_accounts::migrations::complete(&pool).await?;
 for r in &done.renamed {
     eprintln!("account {} is now {:?} (was {:?}): tell its owner", r.id, r.to, r.from);
@@ -758,6 +761,20 @@ for r in &done.renamed {
 // ... then serve.
 # Ok(()) }
 ```
+
+An app whose own migrations must partly run first (one that renames an `accounts` of
+its own out of the way, say) runs its migrator to that version, then the library's,
+then the rest: `migrate_locked_to(&pool, &MIGRATOR, <the rename's version>, id)`,
+`migrations::run`, `migrate_locked`. Each is a no-op once applied.
+
+CI and a developer's `just migrate` create a database from nothing, where the app's
+migrations need the library's tables first, so the app's binary takes a `migrate`
+subcommand that runs this sequence and exits, and both run it instead of `sqlx migrate
+run`: the template justfile's `migrate` recipe runs `SQLX_OFFLINE=true cargo run
+--locked -- migrate` (the offline build needs the committed `.sqlx/`), and
+`rust-ci.yml` takes `migrate-command: SQLX_OFFLINE=true cargo run --locked -- migrate`.
+A test's database is made the same way: `#[sqlx::test(migrations = false)]`, then the
+test awaits that sequence on its pool before anything else.
 
 **Names the migrations take**, in the schema they run in (the first on the
 `search_path`, usually `public`):
@@ -3260,6 +3277,52 @@ The router example under "Wiring an app" composes the layers; beyond it:
   ```
 
 ## Upgrading from 0.8
+
+- **Breaking:** owt-accounts migrates its own tables, in a ledger of its own
+  (`_owt_accounts_migrations`; "Tables" under "Accounts"), and
+  `migrations::assert_installed` is gone. An app that copied `ALL` into its
+  `migrations/` moves over in one release, without re-running anything:
+
+  1. At start, before its own migrator, the app awaits
+     `owt_accounts::migrations::run(&pool)`. On the first start it finds the copies
+     in `_sqlx_migrations` by checksum (whatever versions and names the app gave
+     them), records them in `_owt_accounts_migrations` as applied without running
+     them, and runs any entry the app had not copied yet. Replicas starting together
+     take its advisory lock in turn; the second finds nothing to do.
+  2. The app deletes its copies from `migrations/`: every file whose text is one of
+     `ALL` (`0001_owt_accounts.sql`, `0006_owt_accounts_roles.sql`, and so on), and
+     the test that called `assert_installed`.
+  3. Its own migrator ignores the versions it no longer has, since their rows stay in
+     `_sqlx_migrations`: `let mut migrator = sqlx::migrate!(); migrator.set_ignore_missing(true);`
+     (and `sqlx migrate run --ignore-missing` by hand). Nothing deletes those rows,
+     so a replica of the previous release, still carrying the copies, keeps starting
+     during the rollout, and a rollback works. Once no running binary carries the
+     copies, `owt_accounts::migrations::forget_copies(&pool)` may delete them and the
+     app may drop `set_ignore_missing`; leaving them is harmless.
+  4. An app whose own migrations must partly run before the library's (one that
+     renamed an `accounts` of its own out of the way) runs its migrator to that
+     version first with `owt_runtime::db::migrate_locked_to`, then `migrations::run`,
+     then `migrate_locked`. A database built from nothing then runs the app's
+     migrations after all of the library's (or after the split), not interleaved with
+     them as the copies were: run CI, or `just migrate` on an empty database, before
+     deploying, since that order is new for every app.
+  5. The app's binary takes a `migrate` subcommand that runs the start's sequence and
+     exits; the justfile's `migrate_command` and `rust-ci.yml`'s `migrate-command`
+     run it (`SQLX_OFFLINE=true cargo run --locked -- migrate`), because a database
+     made by `sqlx migrate run` alone no longer has the library's tables.
+  6. Its tests stop building databases from `migrations/` alone, which no longer
+     makes the library's tables: `#[sqlx::test(migrations = false)]` (in place of
+     `#[sqlx::test]` or `#[sqlx::test(migrator = "myapp::MIGRATOR")]`), and the test
+     first awaits the app's start-up sequence on the pool it is given (its `migrate`
+     function: `migrations::run`, then the app's migrator), so every test runs the
+     order production runs.
+  7. `run` stops the start, naming the row, when a copy differs from its entry
+     (`EditedCopy`: the app edited a copy, so its table is not the library's), is
+     recorded as failed (`FailedCopy`), or skips an earlier entry (`Gap`). Nothing is
+     adopted then; restore the copy's table to the library's, or apply the missing
+     copy, and start again. A copy both edited and renamed is recognised by neither
+     its text nor its name: `run` then applies that entry anew and fails at the first
+     name it already holds, and `migrations::conflicts(&pool)` names them.
 
 - `app.yaml` sets the Route's `haproxy.router.openshift.io/timeout` from
   `ROUTE_TIMEOUT` (default `30s`). Before the first apply with the new template, copy

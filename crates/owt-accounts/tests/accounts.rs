@@ -17,11 +17,6 @@ use owt_web::session::{Session, Sessions};
 use sqlx::PgPool;
 use sqlx::postgres::PgConnectOptions;
 
-/// The crate's migrations as a migrator, for these tests alone. The crate exports
-/// none: sqlx keeps one migration ledger per database, so an app installs the files
-/// through its own migrator (see `owt_accounts::migrations`).
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
 struct Db {
     pool: PgPool,
     schema: String,
@@ -31,8 +26,9 @@ struct Db {
 impl Db {
     async fn fresh() -> Option<Self> {
         let db = Self::empty().await?;
-        MIGRATOR.run(&db.pool).await.unwrap();
-        // As an app does before serving.
+        // As an app does at start: the library's migrations, then before serving,
+        // `complete`.
+        owt_accounts::migrations::run(&db.pool).await.unwrap();
         let done = owt_accounts::migrations::complete(&db.pool).await.unwrap();
         assert!(done.validated, "{done:?}");
         Some(db)
@@ -4626,7 +4622,7 @@ async fn every_name_the_migrations_take_is_checked() {
     let relations: Vec<String> = sqlx::query_scalar(
         "SELECT relname::text FROM pg_class
          WHERE relnamespace = current_schema()::regnamespace
-           AND relname NOT IN ('_sqlx_migrations', '_sqlx_migrations_pkey')
+           AND relname NOT IN ('_owt_accounts_migrations', '_owt_accounts_migrations_pkey')
          ORDER BY 1",
     )
     .fetch_all(&installed.pool)
@@ -4681,7 +4677,7 @@ async fn a_column_the_migrations_add_is_named_when_held() {
     sqlx::raw_sql(
         "DROP TABLE account_local_identities;
          ALTER TABLE accounts DROP COLUMN password_sign_in;
-         DELETE FROM _sqlx_migrations WHERE version = 5;
+         DELETE FROM _owt_accounts_migrations WHERE version = 5;
          ALTER TABLE accounts ADD COLUMN password_sign_in text,
              ADD CONSTRAINT accounts_password_sign_in_hash CHECK (true);",
     )
@@ -4740,15 +4736,10 @@ async fn an_apps_own_accounts_table_is_named_until_renamed() {
         said.contains("accounts is already a table") && said.contains("before owt-accounts"),
         "{said}"
     );
-    // As an app migrates: a bare `MIGRATOR.run` that fails returns before releasing
-    // sqlx's advisory lock (one per database, so every test's), and its pooled
-    // connection would hold it; migrate_locked closes that connection.
-    let lock_id = i64::from(rand::random::<u32>());
-    assert!(
-        owt_runtime::db::migrate_locked(&db.pool, &MIGRATOR, lock_id)
-            .await
-            .is_err()
-    );
+    // The library's migrations fail at the held name. A failed sqlx run returns before
+    // releasing its advisory lock (one per database, so every test's); `run` closes
+    // that connection rather than pooling it, so the lock goes with it.
+    assert!(owt_accounts::migrations::run(&db.pool).await.is_err());
 
     // The rename an app writes before owt-accounts' files: the table and what was
     // named after it.
@@ -4764,7 +4755,7 @@ async fn an_apps_own_accounts_table_is_named_until_renamed() {
     .unwrap();
     let found = owt_accounts::migrations::conflicts(&db.pool).await.unwrap();
     assert!(found.is_empty(), "{found:?}");
-    MIGRATOR.run(&db.pool).await.unwrap();
+    owt_accounts::migrations::run(&db.pool).await.unwrap();
     let found = owt_accounts::migrations::conflicts(&db.pool).await.unwrap();
     assert!(found.is_empty(), "{found:?}");
     db.drop().await;

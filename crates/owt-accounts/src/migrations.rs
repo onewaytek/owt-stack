@@ -1,16 +1,24 @@
-//! The tables, as SQL the app installs.
+//! The tables, migrated by the library itself into a ledger of its own.
 //!
-//! sqlx keeps one ledger of applied migrations per database, so a library cannot run
-//! a migrator of its own beside the app's. Instead the app copies each file here into
-//! its `migrations/` directory, under a version of its choosing (first: the app's
-//! tables reference `accounts`), and a test calls [`assert_installed`] so an edited
-//! or missing copy fails the build rather than the deploy.
+//! [`run`] applies [`ALL`] with a sqlx [`Migrator`] whose ledger is the table
+//! [`LEDGER`] (`_owt_accounts_migrations`), beside the app's `_sqlx_migrations` in the
+//! same schema. The app awaits it at start, under the library's advisory lock and
+//! before its own migrator, since its tables reference `accounts(id)`; its own
+//! `migrations/` holds none of the library's files, and an app's `sqlx migrate run`
+//! never touches the library's tables.
 //!
-//! **A shipped migration is frozen.** sqlx records each applied file's checksum, and
-//! `migrate run` refuses a file whose checksum changed. An app re-copies these files
-//! when it upgrades, so a changed byte here (a comment, even) would fail every app's
-//! next deploy against a database that applied the old text. Every change to the
-//! schema is a new file appended to [`ALL`]; a test pins each file's SHA-256.
+//! An app that holds copies of the files in its `migrations/` has them in
+//! `_sqlx_migrations` under versions of its own. [`run`]
+//! recognises each copy by its checksum (sqlx's SHA-384 of the file, the same bytes
+//! as [`ALL`]'s) and records it in [`LEDGER`] as applied, without running it again;
+//! a copy whose checksum differs, or that failed, is refused by name. The app then
+//! deletes its copies, and its migrator ignores the versions it no longer has (see
+//! the README's upgrade notes, and [`forget_copies`]).
+//!
+//! **A shipped migration is frozen.** sqlx records each applied migration's checksum,
+//! here and in an app that adopted copies, and refuses a migration whose text
+//! changed. Every change to the schema is a new entry appended to [`ALL`]; a test pins
+//! each file's SHA-256.
 //!
 //! A migration moves the rows already there as well as the schema, so an app that
 //! has run the library's migrations for a while is in the same state as a new one.
@@ -22,19 +30,23 @@
 //! `policy_versions`, ...) in the schema they run in. An app that already holds one
 //! renames its own first; [`conflicts`] names each that is held.
 
-use std::path::Path;
+use std::borrow::Cow;
+
+use sqlx::migrate::{MigrateError, Migration as SqlxMigration, MigrationType, Migrator};
+use sqlx::{PgConnection, PgPool, SqlStr};
 
 /// A migration this crate ships.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Migration {
-    /// Its name, for the file the app writes (`<version>_<name>.sql`).
+    /// Its name: the description [`LEDGER`] records, and the file name an app gave its
+    /// copy (`<version>_<name>.sql`).
     pub name: &'static str,
-    /// Its SQL, to copy byte for byte.
+    /// Its SQL.
     pub sql: &'static str,
 }
 
-/// Every migration, in order. Append; never edit a shipped entry (see the module
-/// docs).
+/// Every migration, in order: entry `i` is version `i + 1` in [`LEDGER`]. Append;
+/// never edit a shipped entry (see the module docs).
 pub const ALL: &[Migration] = &[
     Migration {
         name: "owt_accounts",
@@ -57,6 +69,300 @@ pub const ALL: &[Migration] = &[
         sql: include_str!("../migrations/0005_local_identities.sql"),
     },
 ];
+
+/// The table [`run`] records the library's migrations in, in the schema they run in
+/// (the first on the `search_path`), beside the app's `_sqlx_migrations`.
+pub const LEDGER: &str = "_owt_accounts_migrations";
+
+/// The advisory lock [`run`] holds while it adopts and migrates, so replicas starting
+/// together migrate once and the rest wait. Distinct from any lock an app's own
+/// migrator takes (sqlx also takes its database-wide lock inside it).
+pub const LOCK_ID: i64 = 0x6f77_745f_6163_6374;
+
+/// [`ALL`] as a sqlx migrator on [`LEDGER`]: entry `i` is version `i + 1`, described by
+/// its name. [`run`] is the way to apply it; this is for inspecting it.
+#[must_use]
+pub fn migrator() -> Migrator {
+    let migrations = ALL
+        .iter()
+        .zip(1..)
+        .map(|(m, version)| {
+            SqlxMigration::new(
+                version,
+                Cow::Borrowed(m.name),
+                MigrationType::Simple,
+                SqlStr::from_static(m.sql),
+                false,
+            )
+        })
+        .collect();
+    let mut migrator = Migrator::with_migrations(migrations);
+    migrator.dangerous_set_table_name(LEDGER);
+    migrator
+}
+
+/// What [`run`] did, by the names of [`ALL`]'s entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Migrated {
+    /// Entries found applied as the app's copies, and recorded in [`LEDGER`] without
+    /// running them.
+    pub adopted: Vec<&'static str>,
+    /// Entries run now.
+    pub applied: Vec<&'static str>,
+}
+
+/// Why [`run`] stopped. Nothing was adopted or applied by the call that failed, except
+/// migrations sqlx had applied before one failed (each runs in its own transaction).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MigrationError {
+    /// The app's `_sqlx_migrations` holds a copy of an entry under that entry's name
+    /// whose checksum is not the entry's: the copy was edited, so the schema it made
+    /// is not the one the library expects. Nothing is adopted.
+    #[error(
+        "the app's migration {version} ({description:?}) is owt-accounts' `{name}` with other contents: \
+         restore the table it made to the library's, or rename the migration, then retry"
+    )]
+    EditedCopy {
+        /// Its version in `_sqlx_migrations`.
+        version: i64,
+        /// Its description there.
+        description: String,
+        /// The entry of [`ALL`] it is named for.
+        name: &'static str,
+    },
+    /// The app's copy of an entry is recorded as failed (`success = false`).
+    #[error(
+        "the app's migration {version} ({description:?}), owt-accounts' `{name}`, is recorded as failed: \
+         repair it as sqlx's \"dirty\" state, then retry"
+    )]
+    FailedCopy {
+        /// Its version in `_sqlx_migrations`.
+        version: i64,
+        /// Its description there.
+        description: String,
+        /// The entry of [`ALL`] it is a copy of.
+        name: &'static str,
+    },
+    /// The app applied a copy of a later entry without an earlier one, so there is no
+    /// order to adopt in.
+    #[error(
+        "the app applied owt-accounts' `{applied}` but not the earlier `{missing}`: apply the missing copy, \
+         or restore the database, then retry"
+    )]
+    Gap {
+        /// The entry not applied.
+        missing: &'static str,
+        /// A later entry that was.
+        applied: &'static str,
+    },
+    /// sqlx refused or failed a migration, or [`LEDGER`] records one with another
+    /// checksum (`VersionMismatch`, an edited shipped migration) or one this release
+    /// does not have (`VersionMissing`, a database a newer release migrated).
+    #[error("owt-accounts' migrations: {0}")]
+    Migrate(#[from] MigrateError),
+    /// The database.
+    #[error("owt-accounts' migrations: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Apply [`ALL`] to the database, recording them in [`LEDGER`]; await it at every
+/// start, before the app's own migrator and [`complete`]. It holds the advisory lock
+/// [`LOCK_ID`] on one connection throughout, so replicas starting together migrate
+/// once, and the others find nothing to do.
+///
+/// First it adopts the app's copies: an entry not yet in [`LEDGER`] whose exact text
+/// `_sqlx_migrations` records as successfully applied (by sqlx's checksum, under any
+/// version and description) is recorded as applied without running. Copies must
+/// form an unbroken run from the first entry not yet recorded. A row there named as an
+/// entry (`owt_accounts_roles`, as sqlx describes `0006_owt_accounts_roles.sql`)
+/// whose checksum differs, or that failed, stops it with an error naming the row.
+/// Then it runs the entries still missing, in order. The app's `_sqlx_migrations` is
+/// read, never written. Calling it again changes nothing; a run cut short (a pod
+/// killed mid-start) leaves every adopted or applied entry recorded, and the next
+/// resumes from there.
+///
+/// A copy is recognised by its text, or refused by its name; one both edited and
+/// renamed is neither. Copies before it are adopted, and the entry it was is applied
+/// anew and fails at the first name it holds (`relation "accounts" already
+/// exists`); [`conflicts`] names them.
+///
+/// # Errors
+///
+/// [`MigrationError`]: an edited, failed or out-of-order copy, sqlx refusing the
+/// ledger (an edited shipped entry, a newer release's), or the database. The
+/// connection is closed rather than pooled after a failure, so no lock outlives it.
+pub async fn run(pool: &PgPool) -> Result<Migrated, MigrationError> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(LOCK_ID)
+        .execute(&mut *conn)
+        .await?;
+    let result = run_locked(&mut conn).await;
+    let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(LOCK_ID)
+        .execute(&mut *conn)
+        .await;
+    if result.is_err() || unlocked.is_err() {
+        // A failed sqlx run returns before releasing its own advisory lock, and a
+        // failed unlock leaves this one: closing the connection ends both.
+        conn.close_on_drop();
+    }
+    let done = result?;
+    unlocked?;
+    if !done.adopted.is_empty() || !done.applied.is_empty() {
+        tracing::info!(adopted = ?done.adopted, applied = ?done.applied, "owt-accounts migrations");
+    }
+    Ok(done)
+}
+
+/// The versions [`LEDGER`] records, or none when it does not exist yet.
+async fn recorded(conn: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(LEDGER)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT version FROM {LEDGER} WHERE success ORDER BY version"
+    )))
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// The rows of the app's `_sqlx_migrations` (found on the `search_path`, as sqlx finds
+/// it): version, description, success, checksum.
+async fn app_ledger(
+    conn: &mut PgConnection,
+) -> Result<Vec<(i64, String, bool, Vec<u8>)>, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(&mut *conn)
+        .await?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as(
+        "SELECT version, description, success, checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// The entry an app's copy describes, as sqlx describes a file: the name after the
+/// version, underscores as spaces.
+fn named(description: &str) -> Option<(usize, &'static Migration)> {
+    ALL.iter()
+        .enumerate()
+        .find(|(_, m)| m.name.replace('_', " ") == description || m.name == description)
+}
+
+/// The version [`LEDGER`] gives entry `i` of [`ALL`].
+fn version_of(i: usize) -> i64 {
+    i64::try_from(i).map_or(i64::MAX, |i| i + 1)
+}
+
+async fn run_locked(conn: &mut PgConnection) -> Result<Migrated, MigrationError> {
+    let migrator = migrator();
+    let before = recorded(conn).await?;
+    let rows = app_ledger(conn).await?;
+    let pending = |i: usize| !before.contains(&version_of(i));
+
+    // A copy under an entry's name must be that entry, applied.
+    for (version, description, success, checksum) in &rows {
+        let Some((i, m)) = named(description) else {
+            continue;
+        };
+        if !pending(i) {
+            continue;
+        }
+        if !success {
+            return Err(MigrationError::FailedCopy {
+                version: *version,
+                description: description.clone(),
+                name: m.name,
+            });
+        }
+        if checksum[..] != migrator.migrations[i].checksum[..] {
+            return Err(MigrationError::EditedCopy {
+                version: *version,
+                description: description.clone(),
+                name: m.name,
+            });
+        }
+    }
+
+    // The pending entries the app applied as copies, by checksum.
+    let copied: Vec<usize> = (0..ALL.len())
+        .filter(|&i| pending(i))
+        .filter(|&i| {
+            rows.iter()
+                .any(|(_, _, ok, c)| *ok && c[..] == migrator.migrations[i].checksum[..])
+        })
+        .collect();
+    let mut adopted = Vec::new();
+    if let Some(&last) = copied.last() {
+        if let Some(missing) = (0..=last).find(|&i| pending(i) && !copied.contains(&i)) {
+            return Err(MigrationError::Gap {
+                missing: ALL[missing].name,
+                applied: ALL[last].name,
+            });
+        }
+        migrator
+            .run_direct(Some(version_of(last)), &mut *conn, true)
+            .await?;
+        adopted = copied.iter().map(|&i| ALL[i].name).collect();
+    }
+
+    migrator.run_direct(None, &mut *conn, false).await?;
+    let after = recorded(conn).await?;
+    let applied = after
+        .iter()
+        .filter(|v| !before.contains(v))
+        .filter_map(|v| usize::try_from(*v - 1).ok())
+        .filter(|i| !copied.contains(i))
+        .filter_map(|i| ALL.get(i).map(|m| m.name))
+        .collect();
+    Ok(Migrated { adopted, applied })
+}
+
+/// Delete from the app's `_sqlx_migrations` the rows of copies [`LEDGER`] has adopted,
+/// returning their versions. Optional, and only once no running binary still carries
+/// the copies (after a full rollout): a binary that does would see its copies as not
+/// applied and run them again, failing at `CREATE TABLE accounts`. Afterwards the app's
+/// migrator no longer needs `set_ignore_missing(true)` for them. It takes no lock: it
+/// deletes only rows of copies [`LEDGER`] has recorded, so a concurrent [`run`] finds
+/// the same entries recorded either way.
+///
+/// # Errors
+///
+/// The database.
+pub async fn forget_copies(pool: &PgPool) -> sqlx::Result<Vec<i64>> {
+    let mut conn = pool.acquire().await?;
+    let recorded = recorded(&mut conn).await?;
+    let rows = app_ledger(&mut conn).await?;
+    let migrator = migrator();
+    let adopted: Vec<Vec<u8>> = recorded
+        .iter()
+        .filter_map(|v| usize::try_from(*v - 1).ok())
+        .filter_map(|i| migrator.migrations.get(i))
+        .map(|m| m.checksum.to_vec())
+        .collect();
+    let versions: Vec<i64> = rows
+        .iter()
+        .filter(|(_, _, ok, c)| *ok && adopted.contains(c))
+        .map(|(v, ..)| *v)
+        .collect();
+    if !versions.is_empty() {
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = ANY($1)")
+            .bind(&versions)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(versions)
+}
 
 /// What [`complete`] changed, for the operator to read (it is logged too). An owner
 /// whose username was renamed signs in with the new one, or by email or a provider;
@@ -384,59 +690,6 @@ const SHIPPED_SHA256: &[&str] = &[
     "2952542fa9af6f8c1c7ee21987676fd1ed42cb0d18c752b485d4f315f4eccb18",
 ];
 
-/// Each of [`ALL`] is present, unaltered, in the app's migrations directory `dir`;
-/// panics naming the first that is not. Call it from a test.
-///
-/// # Panics
-///
-/// When `dir` cannot be read, or a migration is missing from it or differs.
-///
-/// ```no_run
-/// #[test]
-/// fn the_accounts_migrations_are_installed() {
-///     owt_accounts::migrations::assert_installed("migrations");
-/// }
-/// ```
-pub fn assert_installed(dir: impl AsRef<Path>) {
-    let dir = dir.as_ref();
-    let files: Vec<(String, String)> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|x| x == "sql"))
-        .map(|entry| {
-            let path = entry.path();
-            let body = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-            (path.display().to_string(), body)
-        })
-        .collect();
-    for migration in ALL {
-        let exact = files.iter().any(|(_, body)| body == migration.sql);
-        if exact {
-            continue;
-        }
-        // Name the nearest culprit: a file carrying the first line's marker.
-        let marker = migration.sql.lines().next().unwrap_or_default();
-        let edited = files
-            .iter()
-            .find(|(_, body)| body.lines().next() == Some(marker))
-            .map(|(path, _)| path.as_str());
-        match edited {
-            Some(path) => panic!(
-                "{path} differs from owt-accounts' `{}` migration: copy it again unaltered \
-                 (add columns in a migration of the app's own)",
-                migration.name
-            ),
-            None => panic!(
-                "owt-accounts' `{}` migration is not in {}: write owt_accounts::migrations::ALL[..].sql \
-                 to a file there, under its next unused version (never one already applied)",
-                migration.name,
-                dir.display()
-            ),
-        }
-    }
-}
-
 /// The names each of [`ALL`] gives a relation (table, index, sequence) in the schema
 /// it runs in, by migration. Those Postgres picks itself (a key's index, an identity's
 /// sequence) are here too: when one is held, Postgres picks another silently, and the
@@ -559,13 +812,35 @@ impl std::fmt::Display for Conflict {
     }
 }
 
+/// The checksums of the migrations applied, in the library's ledger or as the app's
+/// copies in its own: sqlx's checksum, the SHA-384 of the text, either way.
+async fn applied_checksums(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Vec<u8>>> {
+    let mut applied = Vec::new();
+    for table in [LEDGER, "_sqlx_migrations"] {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(table)
+            .fetch_one(pool)
+            .await?;
+        if exists {
+            applied.extend(
+                sqlx::query_scalar::<_, Vec<u8>>(sqlx::AssertSqlSafe(format!(
+                    "SELECT checksum FROM {table} WHERE success"
+                )))
+                .fetch_all(pool)
+                .await?,
+            );
+        }
+    }
+    Ok(applied)
+}
+
 /// The names [`ALL`] would take that the database already gives something else, in
 /// the schema the migrations run in (`current_schema()`, the first on the
 /// `search_path`). Empty when there is nothing in the way.
 ///
-/// A migration sqlx's ledger (`_sqlx_migrations`, found on the `search_path` as sqlx
-/// finds it) records as applied, by its checksum, is installed, and what it created
-/// is the library's own; the names of every other migration are checked against the
+/// A migration [`LEDGER`] records as applied, or the app's `_sqlx_migrations` records
+/// as a copy (by its checksum; both found on the `search_path` as sqlx finds them), is
+/// installed, and what it created is the library's own; the names of every other migration are checked against the
 /// tables, indexes, sequences, views, types and functions there, and the columns and
 /// constraints it adds to an existing table (an `accounts.password_sign_in` of the
 /// app's own) against that table's. A held table, index, column or constraint name
@@ -580,30 +855,19 @@ impl std::fmt::Display for Conflict {
 /// The database.
 ///
 /// ```no_run
-/// # async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
-/// if let Err(e) = owt_runtime::db::migrate_locked(&pool, migrator, 8_531_207).await {
+/// # async fn start(pool: sqlx::PgPool) -> anyhow::Result<()> {
+/// if let Err(e) = owt_accounts::migrations::run(&pool).await {
 ///     for clash in owt_accounts::migrations::conflicts(&pool).await? {
 ///         tracing::error!(%clash, "a name owt-accounts needs is taken");
 ///     }
-///     return Err(e);
+///     return Err(e.into());
 /// }
 /// # Ok(()) }
 /// ```
 pub async fn conflicts(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Conflict>> {
     use sha2::{Digest, Sha384};
 
-    let ledger: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-        .fetch_one(pool)
-        .await?;
-    let applied: Vec<Vec<u8>> = if ledger {
-        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE success")
-            .fetch_all(pool)
-            .await?
-    } else {
-        Vec::new()
-    };
-    // sqlx's checksum is the SHA-384 of the file, which assert_installed holds to
-    // ALL's text byte for byte.
+    let applied = applied_checksums(pool).await?;
     let pending = |name: &str| {
         ALL.iter()
             .any(|m| m.name == name && !applied.iter().any(|c| c[..] == Sha384::digest(m.sql)[..]))
@@ -717,44 +981,11 @@ mod tests {
             });
             assert_eq!(
                 &hex, pinned,
-                "the shipped `{}` migration changed. Apps re-copy it and sqlx then refuses \
-                 the file at deploy, so revert the edit and write the change as a new \
-                 migration file (then pin that one)",
+                "the shipped `{}` migration changed. Every database that applied it records \
+                 its checksum, and sqlx then refuses to start, so revert the edit and write \
+                 the change as a new migration file (then pin that one)",
                 migration.name
             );
         }
-    }
-
-    #[test]
-    fn an_exact_copy_passes_and_an_edited_one_is_named() {
-        let dir = std::env::temp_dir().join(format!("owt-accounts-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("0001_owt_accounts.sql");
-        std::fs::write(&file, ALL[0].sql).unwrap();
-        let roles = dir.join("0002_owt_accounts_roles.sql");
-        std::fs::write(&roles, ALL[1].sql).unwrap();
-        let constraints = dir.join("0003_owt_accounts_constraints.sql");
-        std::fs::write(&constraints, ALL[2].sql).unwrap();
-        let policies = dir.join("0004_owt_accounts_policies.sql");
-        std::fs::write(&policies, ALL[3].sql).unwrap();
-        let local = dir.join("0005_owt_accounts_local.sql");
-        std::fs::write(&local, ALL[4].sql).unwrap();
-        assert_installed(&dir);
-        std::fs::write(&file, format!("{}\n-- edited", ALL[0].sql)).unwrap();
-        let err = std::panic::catch_unwind(|| assert_installed(&dir)).unwrap_err();
-        let text = err.downcast_ref::<String>().cloned().unwrap_or_default();
-        assert!(
-            text.contains("differs") && text.contains("0001_owt_accounts.sql"),
-            "{text}"
-        );
-        std::fs::remove_file(&file).unwrap();
-        let err = std::panic::catch_unwind(|| assert_installed(&dir)).unwrap_err();
-        let text = err.downcast_ref::<String>().cloned().unwrap_or_default();
-        assert!(text.contains("is not in"), "{text}");
-        std::fs::remove_file(&roles).unwrap();
-        std::fs::remove_file(&constraints).unwrap();
-        std::fs::remove_file(&policies).unwrap();
-        std::fs::remove_file(&local).unwrap();
-        std::fs::remove_dir(&dir).unwrap();
     }
 }
