@@ -523,6 +523,54 @@ async fn save(session: Session<SessionData>) -> axum::response::Redirect {
 }
 ```
 
+With `owt-accounts`, `owt_accounts::PageCtx` is that context, extracted: the viewer
+(`viewer`, `None` when anonymous; the app's `load_with` read as `extra`), the
+`request`, the `flashes`, the CSP `nonce`. The flashes are taken from the session
+once, as the context is extracted, so a handler that draws the page shows each exactly
+once; a request htmx sent for a fragment takes none (they wait for the next full
+page; a boosted navigation and a history restore are full pages). Extract it once per
+request: a second `PageCtx` finds the session empty, and an extractor after it that
+rejects (a `Form`, say) loses the messages already taken.
+`PageCtx<T>` names the app's session data when it is not `session::Data`; it must be
+`HasFlashes` and the type the session layer holds (another type, or no layer, reads an
+empty session and logs at `debug`). Install the session layer outside `Accounts::load`;
+without either the context reads as anonymous with no messages, and the CSP layer is what
+gives the nonce meaning. `.at("/games/")` is the context for another address (an
+error page's "you are here"); `.bare()` is the context for a fragment drawn within or
+beside the page, without the flashes, so they are shown once. An app with fields of
+its own wraps it and extracts a `PageCtx` first:
+
+```rust
+use axum::extract::FromRequestParts;
+use axum::http::request::Parts;
+use owt_accounts::PageCtx;
+
+pub struct Layout {
+    page: PageCtx,
+    pub theme: &'static str,
+}
+
+impl std::ops::Deref for Layout {
+    type Target = PageCtx;
+    fn deref(&self) -> &PageCtx { &self.page }
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for Layout {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self { page: PageCtx::from_request_parts(parts, state).await?, theme: "light" })
+    }
+}
+
+async fn games(layout: Layout) -> String {
+    // `layout.viewer`, `layout.flashes`, `layout.nonce`, and the request's `path` and
+    // `url_with(..)` through the `Deref`s.
+    let _fragment = layout.bare();
+    format!("{} {}", layout.path, layout.theme)
+}
+```
+
 ### Text in pages
 
 `owt_web::text` holds the small renderings pages repeat. A moment is a `SystemTime`
