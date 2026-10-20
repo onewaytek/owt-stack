@@ -20,7 +20,7 @@
 //! | [`htmx`] | `axum-htmx`'s extractors and responders, re-exported |
 //! | [`fragment`] | htmx fragments at their own URLs: `HX-Push-Url` or `HX-Replace-Url`, `HX-Reselect`, no `Vary` |
 //! | [`sse`] | event framing and the stream response |
-//! | [`pager`], [`text`] | page arithmetic; slugs, word truncation, paragraphs |
+//! | [`pager`], [`text`] | page arithmetic; slugs, word truncation, paragraphs, UTC dates, relative times, plurals, `LIKE` escaping |
 
 pub mod assets;
 pub mod cache;
