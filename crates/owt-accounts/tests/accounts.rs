@@ -951,6 +951,101 @@ async fn the_password_gate_refuses_a_deactivated_account_and_an_unusable_hash() 
     db.drop().await;
 }
 
+async fn page_handler(page: owt_accounts::PageCtx) -> String {
+    let viewer = page
+        .viewer
+        .as_ref()
+        .map_or("anonymous", |a| a.username.as_str());
+    let shown: Vec<_> = page.flashes.iter().map(|f| f.text().to_owned()).collect();
+    let bare = page.bare();
+    format!(
+        "{viewer}|{}|{}|{}|{}|{}",
+        page.path,
+        shown.join(","),
+        page.nonce,
+        bare.flashes.len(),
+        page.clone().at("/elsewhere?x=1").full_path,
+    )
+}
+
+async fn flash_handler(session: Session<Data>) -> &'static str {
+    session.flash(owt_web::flash::Level::Info, "Saved.");
+    session.flash(owt_web::flash::Level::Error, "Oops.");
+    "flashed"
+}
+
+#[tokio::test]
+async fn the_page_context_takes_the_flashes_once_and_leaves_them_for_a_full_page() {
+    let db = db!();
+    let sessions = sessions();
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let extra = Router::new()
+        .route("/page", get(page_handler))
+        .route("/flash", post(flash_handler));
+    let router = app(&db, &sessions, extra).layer(from_fn_with_state(
+        owt_web::headers::Csp::new(),
+        owt_web::headers::Csp::layer,
+    ));
+    let client = owt_test::Client::new(router);
+    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    client.post_form("/flash", &[]).await;
+
+    // A fragment takes none: they wait for the page.
+    let fragment = client.get_htmx("/page").await.text();
+    assert_eq!(fragment.split('|').nth(2), Some(""), "{fragment}");
+
+    // The page shows both, once. The viewer, the path, `at` and `bare` read as set.
+    let response = client.get("/page").await;
+    let page = response.text();
+    let parts: Vec<_> = page.split('|').collect();
+    assert_eq!(&parts[..3], ["ada", "/page", "Saved.,Oops."], "{page}");
+    // The nonce is the one the CSP layer put in the policy, not a fresh one.
+    let policy = response.header("content-security-policy").unwrap();
+    assert!(
+        policy.contains(&format!("'nonce-{}'", parts[3])),
+        "{policy}"
+    );
+    assert_eq!(&parts[4..], ["0", "/elsewhere?x=1"]);
+    let again = client.get("/page").await.text();
+    assert_eq!(again.split('|').nth(2), Some(""), "{again}");
+
+    // A boosted navigation is a full page.
+    client.post_form("/flash", &[]).await;
+    let boosted = client
+        .send(
+            axum::http::Request::get("/page")
+                .header("hx-request", "true")
+                .header("hx-boosted", "true")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .text();
+    assert_eq!(boosted.split('|').nth(2), Some("Saved.,Oops."), "{boosted}");
+
+    // A history restore after a cache miss wants a whole page.
+    client.post_form("/flash", &[]).await;
+    let restore = client
+        .send(
+            axum::http::Request::get("/page")
+                .header("hx-request", "true")
+                .header("hx-history-restore-request", "true")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .text();
+    assert_eq!(restore.split('|').nth(2), Some("Saved.,Oops."), "{restore}");
+
+    // Anonymous, with a nonce of its own per request.
+    client.clear_cookies();
+    let a = client.get("/page").await.text();
+    let b = client.get("/page").await.text();
+    assert!(a.starts_with("anonymous|/page|"), "{a}");
+    assert_ne!(a.split('|').nth(3), b.split('|').nth(3));
+    db.drop().await;
+}
+
 fn identity(uid: &str, email: Option<&str>, verified: bool) -> oauth::Identity {
     oauth::Identity {
         uid: uid.into(),

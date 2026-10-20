@@ -12,6 +12,8 @@
 //! - [`session`]: what the cookie carries, signing in and out, the validator.
 //! - [`layer`]: the middleware that loads the signed-in account once per request,
 //!   and the extractors ([`Signed`], [`Staff`], [`Maybe`]) a handler names.
+//! - [`page`]: the context a full page is drawn with ([`PageCtx`]): viewer, request,
+//!   messages shown once, nonce.
 //! - [`identities`]: provider identities (OAuth) linked to accounts, and the app's
 //!   own local ones.
 //! - [`links`]: one-time sign-in links.
@@ -35,6 +37,7 @@ pub mod identities;
 pub mod layer;
 pub mod links;
 pub mod migrations;
+pub mod page;
 pub mod password;
 pub mod policies;
 pub mod roles;
@@ -43,6 +46,7 @@ pub mod social;
 pub mod store;
 
 pub use layer::{Accounts, Maybe, MaybeWith, Signed, SignedWith, Staff};
+pub use page::PageCtx;
 pub use store::{Account, New, normalize};
 
 /// Why an account operation did not happen. Each message is written for the person
