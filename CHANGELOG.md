@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.9.0](https://github.com/onewaytek/owt-stack/compare/v0.8.1...v0.9.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** owt-accounts migrates its own tables; migrations::assert_installed is gone. An app awaits owt_accounts::migrations::run(&pool) at start, before its own migrator, then deletes its copies of the library's files from migrations/ (and the assert_installed test) and sets set_ignore_missing(true) on its migrator, since the copies' rows stay in _sqlx_migrations; the first run adopts them by checksum without re-running anything. Its binary takes a migrate subcommand running that sequence, which the justfile's migrate_command and rust-ci.yml's migrate-command run, and its tests use #[sqlx::test(migrations = false)] and await the same sequence. An app whose own migrations must precede the library's runs them first with
+
+### Features
+
+* **accounts:** PageCtx, the context a full page is drawn with ([#211](https://github.com/onewaytek/owt-stack/issues/211)) ([1567b63](https://github.com/onewaytek/owt-stack/commit/1567b6348df5b1858bf8b9651b53c57cde72ca1c))
+* **accounts:** password_gate signs in a fixed account against a deployment-wide hash ([#207](https://github.com/onewaytek/owt-stack/issues/207)) ([b5abfe4](https://github.com/onewaytek/owt-stack/commit/b5abfe433a3e04f2ccd3f61bb5b61eb6875c8658))
+* **accounts:** the account commands as a clap subcommand behind a cli feature ([#218](https://github.com/onewaytek/owt-stack/issues/218)) ([01cdb03](https://github.com/onewaytek/owt-stack/commit/01cdb03411b08cc3480814f9e768492cbf331a45))
+* **accounts:** the library migrates its own tables, in a ledger of its own ([#197](https://github.com/onewaytek/owt-stack/issues/197)) ([67c0095](https://github.com/onewaytek/owt-stack/commit/67c00950b1b3122af2c2a5613746a10613480e8d))
+* **auth:** a bot guard for anonymous forms: honeypot, Turnstile and a budget ([#221](https://github.com/onewaytek/owt-stack/issues/221)) ([c1ada63](https://github.com/onewaytek/owt-stack/commit/c1ada63060548c6cebdc5ab8240f4184d9f47288)), closes [#154](https://github.com/onewaytek/owt-stack/issues/154)
+* **ci:** conventional-commits.yml takes a title input to skip the title check ([#203](https://github.com/onewaytek/owt-stack/issues/203)) ([97697a7](https://github.com/onewaytek/owt-stack/commit/97697a7ff2bddab47f908a482166710d1f927367))
+* **ci:** image-check.yml builds and verifies the image on a pull request without pushing ([#217](https://github.com/onewaytek/owt-stack/issues/217)) ([87ed7d6](https://github.com/onewaytek/owt-stack/commit/87ed7d654d1f5d32b6155c07c1dac7e351d950bd))
+* **runtime:** start-up sequence and metrics listener helpers ([#219](https://github.com/onewaytek/owt-stack/issues/219)) ([55d5fe0](https://github.com/onewaytek/owt-stack/commit/55d5fe09d03712f5a5c8db29f01416d2ca35db7e)), closes [#149](https://github.com/onewaytek/owt-stack/issues/149)
+* **templates:** apply.sh runs an optional pre-render hook ([#209](https://github.com/onewaytek/owt-stack/issues/209)) ([5a3a72c](https://github.com/onewaytek/owt-stack/commit/5a3a72c972fd4d55cb0980349258addc8dc111cb))
+* **templates:** cronjob.yaml reads a Secret of the task's own ([#205](https://github.com/onewaytek/owt-stack/issues/205)) ([d26c1be](https://github.com/onewaytek/owt-stack/commit/d26c1be55f2143f578c81f1dd04ad8f5cee65911))
+* **templates:** env.sh makes the app's environment Secret ([#212](https://github.com/onewaytek/owt-stack/issues/212)) ([ed2f8b8](https://github.com/onewaytek/owt-stack/commit/ed2f8b89c7023e5f667747891ca01ed5016a539a))
+* **test:** account fixtures and a client signed in without Argon2 ([#220](https://github.com/onewaytek/owt-stack/issues/220)) ([fd0f0eb](https://github.com/onewaytek/owt-stack/commit/fd0f0ebd3b14a0ce90c5c17dac4a4b336ab7a17a)), closes [#151](https://github.com/onewaytek/owt-stack/issues/151)
+* **web:** a preference cookie read from an allowed set and always Secure ([#215](https://github.com/onewaytek/owt-stack/issues/215)) ([5a38e2e](https://github.com/onewaytek/owt-stack/commit/5a38e2e809485295b4ed4796b3531ae7c07769c7)), closes [#153](https://github.com/onewaytek/owt-stack/issues/153)
+* **web:** apply the standard layer stack in the one correct order with Stack ([#214](https://github.com/onewaytek/owt-stack/issues/214)) ([734641a](https://github.com/onewaytek/owt-stack/commit/734641a4b3b70131944e9a2538345d7d824a10b3))
+* **web:** serve static files from Assets with the cache policy, and define url() by macro ([#208](https://github.com/onewaytek/owt-stack/issues/208)) ([64ac2ac](https://github.com/onewaytek/owt-stack/commit/64ac2acb5c3c4018f240e93d13470bf86a43145c))
+* **web:** text helpers for UTC dates, relative times, plurals and LIKE escaping ([#206](https://github.com/onewaytek/owt-stack/issues/206)) ([a52130f](https://github.com/onewaytek/owt-stack/commit/a52130f4b32c69538a10a2a6f37b73f784a417d2)), closes [#152](https://github.com/onewaytek/owt-stack/issues/152)
+
+
+### Bug Fixes
+
+* **ci:** requeue-rc re-runs a person's lost promotion before a bot's ([#210](https://github.com/onewaytek/owt-stack/issues/210)) ([69c54dd](https://github.com/onewaytek/owt-stack/commit/69c54dd33240919c8bac3ea99ec31a6353bb0ff7))
+* **ci:** sync-rc releases rc when main brought code rc lacked ([#213](https://github.com/onewaytek/owt-stack/issues/213)) ([8c8d4af](https://github.com/onewaytek/owt-stack/commit/8c8d4af4a99615370083b08d21fa878c252500c6))
+* **deps:** bump actions/download-artifact from 8.0.1 to 8.0.2 ([#193](https://github.com/onewaytek/owt-stack/issues/193)) ([4213c58](https://github.com/onewaytek/owt-stack/commit/4213c586eda45b09de27d4a8e219a6383a3fd11a))
+* **deps:** bump actions/upload-artifact from 7.0.1 to 7.0.2 ([#194](https://github.com/onewaytek/owt-stack/issues/194)) ([671c227](https://github.com/onewaytek/owt-stack/commit/671c2271ba92c5aec6e4ad0d8be7797b82f8bd4e))
+* **deps:** bump html-escape from 0.2.15 to 0.3.0 ([#196](https://github.com/onewaytek/owt-stack/issues/196)) ([0160897](https://github.com/onewaytek/owt-stack/commit/0160897d093948cc1c7ee486727b8f89e887bb03))
+* **deps:** bump taiki-e/install-action from 2.87.27 to 2.87.29 ([#192](https://github.com/onewaytek/owt-stack/issues/192)) ([4ed1ee5](https://github.com/onewaytek/owt-stack/commit/4ed1ee5a45b70637ab0777982b3e1c840fd00661))
+* **deps:** bump the patch-and-minor group with 4 updates ([#195](https://github.com/onewaytek/owt-stack/issues/195)) ([39f6b29](https://github.com/onewaytek/owt-stack/commit/39f6b29e2d872b258b0e345c294c7594597a4c52))
+* **deps:** rustls-webpki and the webpki root bundles refuse the distrusted intermediates ([#223](https://github.com/onewaytek/owt-stack/issues/223)) ([67174d5](https://github.com/onewaytek/owt-stack/commit/67174d5c326c4d7dc9d37999cd7b0680d19e5ed3))
+* **templates:** apply.sh passes parameters in a --param-file ([#204](https://github.com/onewaytek/owt-stack/issues/204)) ([c8cdad9](https://github.com/onewaytek/owt-stack/commit/c8cdad9a0e224a6b9473250ba30e9a95ec96d0ad))
+
 ## [0.8.1](https://github.com/onewaytek/owt-stack/compare/v0.8.0...v0.8.1) (2026-10-19)
 
 
