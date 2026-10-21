@@ -12,9 +12,9 @@ jobs:
   ci:
     uses: ./.github/workflows/rust-ci.yml
     with:
-      # The same gate a developer runs (justfile). The crates hold no migrations;
-      # owt-runtime's job tests take advisory locks on a Postgres, and owt-bus's
-      # and the leases' tests use Redis.
+      # The same gate a developer runs (justfile). There is no root migrations/:
+      # owt-accounts' tests apply the crate's own, owt-runtime's job tests take
+      # advisory locks on a Postgres, and owt-bus's and the leases' tests use Redis.
       check-command: just check
       database: owt
       redis: true

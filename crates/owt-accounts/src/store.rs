@@ -23,8 +23,8 @@ pub struct Account {
     pub session_epoch: i32,
     /// The names of the app's roles it holds (see [`crate::roles`]), sorted; read on
     /// every request with the rest, so a revoked role is gone at the next one.
-    /// A query of the app's own that does not select it (one written before roles,
-    /// say) reads none: it fails closed. Select [`COLUMNS`] to read them.
+    /// A query of the app's own that does not select it reads none: it fails closed.
+    /// Select [`COLUMNS`] to read them.
     #[sqlx(default)]
     pub roles: Vec<String>,
 }
@@ -291,9 +291,9 @@ pub async fn create_in(conn: &mut sqlx::PgConnection, new: New<'_>) -> Result<Ac
 /// An account [`set_password_sign_in`] turned off is never found, by either name.
 ///
 /// A login that matches no account, or an account with no password, still costs a
-/// full Argon2 check, so the time taken does not say which accounts exist. A hash in
-/// an older format is replaced once the password has proved itself, and the account's
-/// `last_sign_in` is stamped.
+/// full Argon2 check, so the time taken does not say which accounts exist. A hash with
+/// outdated Argon2 parameters is replaced once the password has proved itself, and the
+/// account's `last_sign_in` is stamped.
 ///
 /// Charge [`owt_auth::throttle::Throttle::sign_in`] first and do not call this when
 /// it refuses: that is what bounds guessing.
@@ -516,7 +516,7 @@ pub async fn list(db: impl PgExecutor<'_>) -> sqlx::Result<Vec<Account>> {
 }
 
 /// Whether the account has a password that can open it (else only an identity or
-/// a link does): an Argon2 hash, not an empty or legacy one.
+/// a link does): an Argon2 hash, not an empty one.
 pub async fn has_password(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<bool> {
     sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
         "SELECT {USABLE_PASSWORD} FROM accounts WHERE id = $1"

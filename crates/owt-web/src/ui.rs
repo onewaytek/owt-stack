@@ -528,7 +528,7 @@ mod tests {
     }
 
     fn links(html: &str) -> Vec<(String, String)> {
-        // (href, text) of each anchor, text with the sr-only span stripped.
+        // (href, text) of each anchor, text with the `owt-sr` span stripped.
         html.split("<a href=\"")
             .skip(1)
             .map(|rest| {

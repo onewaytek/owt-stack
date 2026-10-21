@@ -16,8 +16,6 @@
 //! holder's run goes on until its next renewal fails: up to a third of the TTL of
 //! two owners. Work whose exclusivity matters wants a Redis with `noeviction`, or
 //! one of its own, and a run that checks [`Held`] before each owner-only step.
-//!
-//! Lifted from an app's per-session clock and loop leases.
 
 use std::sync::Arc;
 use std::time::Duration;

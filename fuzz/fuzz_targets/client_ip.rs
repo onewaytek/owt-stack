@@ -31,10 +31,14 @@ fuzz_target!(|input: Input| {
         l.extend_from_slice(&input.proxy_entry);
         l
     };
-    let Ok(first) = HeaderValue::from_bytes(&appended) else { return };
+    let Ok(first) = HeaderValue::from_bytes(&appended) else {
+        return;
+    };
     headers.append("x-forwarded-for", first);
     if input.second_header {
-        let Ok(second) = HeaderValue::from_bytes(&input.proxy_entry) else { return };
+        let Ok(second) = HeaderValue::from_bytes(&input.proxy_entry) else {
+            return;
+        };
         headers.append("x-forwarded-for", second);
     }
     let one = Source::ForwardedFor { proxies: 1 };
@@ -47,7 +51,9 @@ fuzz_target!(|input: Input| {
         assert_eq!(got, expected, "{input:?}");
     }
     // More proxies than entries: the peer.
-    let many = Source::ForwardedFor { proxies: usize::from(input.proxies).max(1) + 64 };
+    let many = Source::ForwardedFor {
+        proxies: usize::from(input.proxies).max(1) + 64,
+    };
     assert_eq!(many.client_ip(&headers, peer), peer);
     let _ = Source::Peer.client_ip(&headers, peer);
     let _ = Source::Header("cf-connecting-ip".into()).client_ip(&headers, peer);

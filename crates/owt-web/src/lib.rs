@@ -1,4 +1,4 @@
-//! The HTTP layer the onewaytek apps share.
+//! The HTTP layer apps on owt-stack share.
 //!
 //! Server-rendered Axum: handlers return Askama pages, htmx requests get fragments,
 //! and nothing here assumes a particular domain. Each module is independent; an app

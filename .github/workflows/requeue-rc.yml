@@ -37,7 +37,7 @@ name: Requeue rc promotions
 #     needs: promote
 #     if: always() && github.event.pull_request.head.repo.full_name == github.repository
 #     permissions: {actions: write, contents: read, pull-requests: read}
-#     uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@vX.Y.Z  # the release the app uses
+#     uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # vX.Y.Z, the release the app uses
 #     with: {workflow: pr.yml}
 #
 #   # requeue-rc.yml
@@ -47,7 +47,7 @@ name: Requeue rc promotions
 #   jobs:
 #     requeue:
 #       permissions: {actions: write, contents: read, pull-requests: read}
-#       uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@vX.Y.Z
+#       uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # vX.Y.Z
 #       with: {workflow: pr.yml}
 #
 # Runs on the arc-openshift-k8s ARC scale set, as rust-ci.yml does (override with the

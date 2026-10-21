@@ -1,6 +1,6 @@
 [package]
 name = "owt-runtime"
-description = "Process plumbing the onewaytek apps share: configuration from the environment, logging and tracing, Prometheus metrics, the Postgres pool and locked migrations, background jobs across replicas, serving with graceful shutdown."
+description = "Process plumbing apps on owt-stack share: configuration from the environment, logging and tracing, Prometheus metrics, the Postgres pool and locked migrations, background jobs across replicas, serving with graceful shutdown."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ default = ["metrics"]
 metrics = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:metrics-process"]
 # Leases in Redis, and jobs that run on whichever replica holds one.
 redis = ["dep:redis"]
-# Trace export over OTLP gRPC when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+# Trace export over OTLP gRPC when `logging::Options::otel_endpoint` is set.
 otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
 
 [dependencies]

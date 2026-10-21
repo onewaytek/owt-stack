@@ -8,12 +8,12 @@
 //! never touches the library's tables.
 //!
 //! An app that holds copies of the files in its `migrations/` has them in
-//! `_sqlx_migrations` under versions of its own. [`run`]
-//! recognises each copy by its checksum (sqlx's SHA-384 of the file, the same bytes
-//! as [`ALL`]'s) and records it in [`LEDGER`] as applied, without running it again;
-//! a copy whose checksum differs, or that failed, is refused by name. The app then
-//! deletes its copies, and its migrator ignores the versions it no longer has (see
-//! the README's upgrade notes, and [`forget_copies`]).
+//! `_sqlx_migrations` under versions of its own. [`run`] recognises each copy by its
+//! checksum (sqlx's SHA-384 of the file, the same bytes as [`ALL`]'s) and records it in
+//! [`LEDGER`] as applied, without running it again; a copy whose checksum differs, or
+//! that failed, is refused by name. The app then deletes its copies, and its migrator
+//! ignores the versions it no longer has (see the README's upgrade notes, and
+//! [`forget_copies`]).
 //!
 //! **A shipped migration is frozen.** sqlx records each applied migration's checksum,
 //! here and in an app that adopted copies, and refuses a migration whose text
@@ -466,11 +466,11 @@ const DEFERRED: &[(&str, &str)] = &[
 ///   account whose name is a lookalike of an earlier one keeps it, under a key that
 ///   carries its id, so only new names are held to the rule.
 ///
-/// Then identities with no subject are deleted, sign-in links are cut to 30 days,
-/// and the constraints `0003` and `0005` added are validated (which locks no writer
-/// out). Call it at every start: once done it reads one index and the catalog. An
-/// account it cannot complete is logged and left for the next call; it never fails
-/// the start over one row.
+/// Then identities with no provider or subject are deleted, sign-in links are cut to 30
+/// days (one whose token is not a SHA-256 digest is deleted), and the constraints
+/// `0003` and `0005` added are validated (which locks no writer out). Call it at every
+/// start: once done it reads one index and the catalog. An account it cannot complete
+/// is logged and left for the next call; it never fails the start over one row.
 ///
 /// # Errors
 ///
@@ -877,13 +877,13 @@ async fn applied_checksums(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Vec<u8>>> {
 ///
 /// A migration [`LEDGER`] records as applied, or the app's `_sqlx_migrations` records
 /// as a copy (by its checksum; both found on the `search_path` as sqlx finds them), is
-/// installed, and what it created is the library's own; the names of every other migration are checked against the
-/// tables, indexes, sequences, views, types and functions there, and the columns and
-/// constraints it adds to an existing table (an `accounts.password_sign_in` of the
-/// app's own) against that table's. A held table, index, column or constraint name
-/// fails that migration; a held name Postgres would have
-/// picked itself (a key's index, an identity's sequence) is taken silently with a
-/// suffix instead, so the library no longer recognizes the key. Call it when the
+/// installed, and what it created is the library's own; the names of every other
+/// migration are checked against the tables, indexes, sequences, views, types and
+/// functions there, and the columns and constraints it adds to an existing table (an
+/// `accounts.password_sign_in` of the app's own) against that table's. A held table,
+/// index, column or constraint name fails that migration; a held name Postgres would
+/// have picked itself (a key's index, an identity's sequence) is taken silently with a
+/// suffix instead, so the library does not recognize the key. Call it when the
 /// migrations fail, to say why, or from a test against a copy of the app's schema
 /// before adopting the crate.
 ///

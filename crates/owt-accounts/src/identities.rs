@@ -582,7 +582,7 @@ fn username_base(identity: &Identity) -> String {
 
 /// Create an account named `base`, or `base2`, `base3`… if taken, then `base` with
 /// a fresh random suffix for as long as those are taken too (each has one chance in
-/// 36⁸ of colliding, so in practice the first one lands; there is no candidate after
+/// 10⁸ of colliding, so in practice the first one lands; there is no candidate after
 /// which this gives up or panics). The email is dropped if another account takes it
 /// first: [`arrive`] checked it was free, but two first sign-ins with one address
 /// can race, and the loser still gets an account (without the email, as an

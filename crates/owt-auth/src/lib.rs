@@ -1,4 +1,4 @@
-//! Authentication the onewaytek apps share.
+//! Authentication apps on owt-stack share.
 //!
 //! * [`password`]: Argon2id hashing off the async runtime, a bounded number at once.
 //! * [`throttle`]: budgets for sign-in attempts, by address and by account.

@@ -7,12 +7,12 @@ name: App release (reusable)
 #     release:
 #       needs: ci
 #       permissions: {contents: write, issues: write, pull-requests: write}
-#       uses: onewaytek/owt-stack/.github/workflows/release.yml@vX.Y.Z  # the release the app uses
+#       uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # vX.Y.Z, the release the app uses
 #     image:
 #       needs: release
 #       if: needs.release.outputs.version != ''
 #       permissions: {contents: read, packages: write}
-#       uses: onewaytek/owt-stack/.github/workflows/image.yml@vX.Y.Z  # the release the app uses
+#       uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # vX.Y.Z, the release the app uses
 #       with: {version: "${{ needs.release.outputs.version }}"}
 #
 # rc carries code no one has reviewed yet (promote-rc merges open pull requests

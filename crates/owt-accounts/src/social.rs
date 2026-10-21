@@ -60,10 +60,10 @@ pub const START: &str = "/auth/{provider}/start";
 /// The path that removes a connection; `{id}` is the identity's row id.
 pub const REMOVE: &str = "/auth/connections/{id}/remove";
 
-/// The presets [`Providers::from_env`] reads, by the variable prefix each uses.
 /// A preset's constructor.
 type Preset = fn() -> oauth::Provider;
 
+/// The presets [`Providers::from_env`] reads, by the variable prefix each uses.
 const PRESETS: [(&str, Preset); 3] = [
     ("GOOGLE", oauth::google),
     ("DISCORD", oauth::discord),

@@ -24,7 +24,7 @@
 //! `rediss://` URL (TLS, verified against the system's roots) wherever the path to
 //! it leaves the node.
 //!
-//! **Failure handling**, each learnt from a fault-injection run:
+//! **Failure handling:**
 //! * A publish Redis refuses is delivered locally: a Redis blip degrades to
 //!   single-replica behaviour instead of silence.
 //! * Each replica publishes a heartbeat to itself every 2 s and treats 6 s of silence

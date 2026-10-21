@@ -9,7 +9,11 @@ fuzz_target!(|input: (&str, &str, Option<&str>)| {
     let (uri, key, value) = input;
     let info = RequestInfo::at(uri);
     assert!(!info.path.starts_with("//"), "{uri:?} -> {:?}", info.path);
-    assert!(!info.full_path.starts_with("//"), "{uri:?} -> {:?}", info.full_path);
+    assert!(
+        !info.full_path.starts_with("//"),
+        "{uri:?} -> {:?}",
+        info.full_path
+    );
     let _ = info.query_value(key);
     let with = info.query_with(key, value);
     assert!(with.starts_with('?'), "{uri:?} -> {with:?}");

@@ -149,8 +149,8 @@ serve::serve_with("0.0.0.0:8000", app, serve::shutdown_signal(), options).await
 ```
 
 The server speaks HTTP/1.1 only (the router in front speaks HTTP/2 to browsers);
-`axum::serve` also answered HTTP/2 without TLS (h2c) when axum's `http2` feature was
-on.
+a bare `axum::serve` also answers HTTP/2 without TLS (h2c) when axum's `http2`
+feature is on.
 
 **Bounds.** What each bound counts:
 
@@ -1061,7 +1061,8 @@ test awaits that sequence on its pool before anything else.
 Each table is also a type of its name, and its triggers and constraints are its own.
 An app that already has any of these names (a table, view, index, sequence, type or
 function, or a column or constraint of that name on the table named) renames its own
-first, in a migration of its own placed before owt-accounts' files. A taken table or index name fails the migration at `CREATE`; a
+first, in a migration of its own that runs before the library's (the paragraph on
+`migrate_locked_to`, above). A taken table or index name fails the migration at `CREATE`; a
 taken key index or sequence name is worse: Postgres gives the library's a suffix
 silently, and the library no longer recognizes a taken username. Renaming a table
 keeps the names of its indexes and sequences, so rename those
@@ -1103,7 +1104,9 @@ An OIDC issuer is operator configuration, never a tenant's or a visitor's input:
 is the namespace its subjects are trusted in, so two configurations naming one issuer
 share people. `identities::list` returns `Linked::provider` as stored, the issuer's
 URL for an OIDC provider and the id (`google`) for a preset; match it against
-`Provider::key()`, not `Provider::id`.
+`Provider::key()`, not `Provider::id`. An issuer is written in canonical form (a
+lower-case host, no default port, no trailing `/`); `oidc` refuses another spelling,
+since it would match no token's `iss`.
 
 **Local and system accounts have no provider and no password.** An app that vouches
 for someone itself (its own check: a kiosk's code, a device it enrolled) or keeps an
@@ -1146,36 +1149,6 @@ store::set_password_sign_in(&pool, id, false).await?;
 let _retired: Option<i64> = identities::forget_as(&pool, "kiosk", device).await?;
 # let _ = jobs; Ok(()) }
 ```
-
-**Upgrading from 0.4 (roles and admin):** install `ALL[1]` (roles) as the app's next
-migration (above). `Account` gains `roles`, read by `store::COLUMNS`, now public; a
-query of the app's own that decodes an `Account` without it reads no roles. The
-admin's `Admin::routes` nests itself at its base: merge it, don't nest it.
-
-**Upgrading from 0.4 (identities):** identities are stored under `Provider::key()`: the issuer for
-an OIDC provider (it used to be the id, `sso`), and `google`, `discord` or `twitch`
-for the presets (unchanged, if the app passed exactly those names). An identity
-under any other key is a stranger at its next sign-in (a second, empty account with
-self-signup on; refused without). At start, before serving, move the old rows and
-refuse to serve while any remain:
-
-```rust,no_run
-# async fn start(pool: sqlx::PgPool, sso: owt_auth::oauth::Provider) -> anyhow::Result<()> {
-use owt_accounts::identities;
-let configured = [&sso, &owt_auth::oauth::google()];
-// Refused when "sso" is still a configured provider's key, or is the issuer's.
-let moved = identities::rekey(&pool, "sso", &sso, &configured).await?;
-// A subject the new key has already: that person signed in between the deploy
-// and the rekey, and has two accounts. Which to keep is a person's decision.
-anyhow::ensure!(moved.conflicts.is_empty(), "identities to reconcile: {:?}", moved.conflicts);
-let stray = identities::unconfigured(&pool, &configured).await?;
-anyhow::ensure!(stray.is_empty(), "identities under keys no provider gives: {stray:?}");
-# Ok(()) }
-```
-
-An issuer is written in canonical form (a lower-case host, no default port, no
-trailing `/`); `oidc` refuses another spelling, since it would match no token's
-`iss`.
 
 **Logins:** a username is one token without `@`; an email always has one. So a login
 is never both, and nobody can register a username equal to someone else's email to
@@ -1419,7 +1392,7 @@ async fn main_with(cli: Cli, pool: sqlx::PgPool) -> anyhow::Result<()> {
 a `LEFT JOIN LATERAL` in the one query that loads the account and checks the session's
 epoch, so it costs no second round trip and a revoked session reads nothing. A
 handler names `SignedWith<Viewer>` (walled as `Signed`) or `MaybeWith<Viewer>`;
-`Maybe`, `Signed`, `Staff` and `roles::Holds` work as before. `QUERY` is SQL pasted
+`Maybe`, `Signed`, `Staff` and `roles::Holds` work unchanged beside them. `QUERY` is SQL pasted
 as it is, so it is a constant in the app's code, never built from a request; it binds
 no parameters. Its columns are named apart from the account's (`id`, `username`,
 `email`, `is_staff`, `is_active`, `session_epoch`, `roles`): a row with a name twice
@@ -1741,7 +1714,7 @@ assert!(account.to_string().contains("correct-horse-battery-staple")); // the se
 `owt_accounts::policies` tracks which version of each of the app's policies (its
 terms, its privacy notice) each account has agreed to. It asks again when one
 changes. The app declares the documents and writes their text, and supplies its
-layout as for the admin. The tables come from `0004_owt_accounts_policies.sql`
+layout as for the admin. The tables come from the `owt_accounts_policies` migration
 (above), and they start empty.
 
 - **Versions:** staff write a draft, preview it and publish it. Publishing numbers
@@ -2733,8 +2706,7 @@ an app's first weekly pull request shows it). The template ignores one npm packa
 stylesheet's `github:onewaytek/owt-stack#vX.Y.Z`: Dependabot does not order a git
 dependency's tags as versions and proposes moving it to an older tag, so the app moves
 it with `npm install -D` when it adopts a release (**Tailwind:** below).
-An app that copied the template earlier adds the same `ignore` entry to its npm
-ecosystem before it resumes Dependabot. Every app then answers to the same commands:
+Every app then answers to the same commands:
 
 ```sh
 just setup        # npm ci, sqlx-cli and cargo-audit at CI's versions
@@ -2753,8 +2725,7 @@ committed query metadata with it. So point `DATABASE_URL` at a database of the a
 own (`just db`'s, or a scratch one on a shared server, `createdb myapp_check`), never
 at one another app migrates: outside CI, the recipe refuses a server's shared
 `postgres` or `template1` database, and a URL that names none (the user's name is
-then the database). An app that copied the template earlier takes the new `migrate`
-recipe and `check`'s order, or its `doc` step fails on an unmigrated database.
+then the database).
 App-specific recipes go below the template's `---- app recipes ----` line. The
 compose ports and database name come from the app's `.env` (`POSTGRES_PORT`,
 `POSTGRES_DB`, ...), so two apps' stacks can run side by side.
@@ -2818,7 +2789,7 @@ and `rustc-wrapper = "sccache"` under `[build]` in `~/.cargo/config.toml`.
 ```yaml
 jobs:
   checks:
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.8.1
     with:
       check-command: just check
       database: myapp        # empty for no Postgres
@@ -2901,12 +2872,12 @@ jobs:
   release:
     needs: ci
     permissions: {contents: write, issues: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/release.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # v0.8.1
   image:
     needs: release
     if: needs.release.outputs.version != ''
     permissions: {contents: read, packages: write}
-    uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.8.1
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
@@ -2946,7 +2917,7 @@ jobs:
   jobs:
     image:
       permissions: {contents: read, packages: write}
-      uses: onewaytek/owt-stack/.github/workflows/image.yml@v0.8.1
+      uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.8.1
       with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   ```
@@ -3043,31 +3014,31 @@ jobs:
     secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
     permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
-    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@v0.8.1  # and "commits / commits"
+    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.8.1, and "commits / commits"
     # with: {title: false}   # an app that checks titles another way: only "commits / commits" runs (the skipped
     # "commits / title" counts as passing for a required check)
   candidate:
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.8.1
     with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}", candidate: true}
   check-rc:
     needs: candidate
     if: needs.candidate.outputs.changed == 'true'
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.8.1
     with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   promote:
     needs: [candidate, check-rc]
     permissions: {contents: write, actions: write}
-    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.8.1
     with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
   requeue:
     needs: promote
     if: always() && github.event.pull_request.head.repo.full_name == github.repository
     permissions: {actions: write, contents: read, pull-requests: read}
-    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # v0.8.1
     with: {workflow: pr.yml}  # this file
 # in requeue-rc.yml, on {schedule: [{cron: "*/30 * * * *"}], workflow_dispatch: {}}:
 # the requeue job above, without its needs and if
@@ -3076,7 +3047,7 @@ jobs:
     needs: release
     if: github.ref_name == 'main'
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.8.1
     with: {source: main}
 ```
 <!-- x-release-please-end -->
@@ -3195,9 +3166,7 @@ secret is mounted. Every stage starts from a Red Hat Hummingbird image on
 `registry.access.redhat.com` (`hi/nodejs:22`, `hi/rust:1`, `hi/core-runtime:2`),
 which needs no login. The runtime runs as uid 65532 and keeps `sh` and coreutils for
 `oc exec`; the build fails if `sh`, `timeout` or `env` stop running. The names are
-fully qualified, so a local `podman build` works without a registry prompt. An app
-on the earlier distroless template moves by copying the template again; one with its
-own runtime stage changes `FROM` and `USER nonroot` (to `USER 65532`).
+fully qualified, so a local `podman build` works without a registry prompt.
 `core-runtime` runs non-root from its first step: its default user is 65532 from the
 first instruction, not root until a `USER` line, so a `RUN` in the runtime stage that
 needs root (a package install, a write outside `/app`) fails there. Do that work in an earlier
@@ -3243,7 +3212,7 @@ jobs:
     # A fork's pull request is not built here (image-check.yml refuses it too).
     if: github.event.pull_request.head.repo.full_name == github.repository
     permissions: {contents: read}
-    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@v0.8.1
+    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.8.1
     with: {bin: myapp}   # as the release's image job
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
@@ -3508,11 +3477,8 @@ than that. An app with a slow export or upload sets a longer one in `params.env`
 (`ROUTE_TIMEOUT=2m`, always with a unit, `us`, `ms`, `s`, `m`, `h` or `d`: the router
 reads a bare number as milliseconds and ignores, without a word, a value it cannot
 parse, so `apply.sh` refuses one without a unit) rather than annotating the Route by
-hand, outside the template. The first apply after copying the template sets the
-annotation: an app that annotated its Route by hand puts that value in `params.env`
-first, or the diff shows it reset to `30s`; and on a cluster whose IngressController
-sets `tuningOptions.serverTimeout`, `30s` replaces that default for this Route, so
-pass the cluster's value ("Upgrading from 0.8"). (An upgraded WebSocket answers to
+hand, outside the template; an existing Route's value goes in `params.env` before
+the first apply, or the apply resets it ("Upgrading from 0.8"). (An upgraded WebSocket answers to
 the router's `timeout tunnel` instead, an hour by default.)
 
 **Backups come with it.** The database takes a volume snapshot nightly
@@ -3814,12 +3780,13 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `migrations::assert_installed` is gone. An app that copied `ALL` into its
   `migrations/` moves over in one release, without re-running anything:
 
-  1. At start, before its own migrator, the app awaits
-     `owt_accounts::migrations::run(&pool)`. On the first start it finds the copies
-     in `_sqlx_migrations` by checksum (whatever versions and names the app gave
-     them), records them in `_owt_accounts_migrations` as applied without running
-     them, and runs any entry the app had not copied yet. Replicas starting together
-     take its advisory lock in turn; the second finds nothing to do.
+  1. At start the app awaits `owt_accounts::migrations::start(&pool, || its migrator)`
+     in place of its migrator and `complete`: `migrations::run(&pool)`, then the app's
+     migrator, then `migrations::complete`. On the first start `run` finds the copies in
+     `_sqlx_migrations` by checksum (whatever versions and names the app gave them),
+     records them in `_owt_accounts_migrations` as applied without running them, and
+     runs any entry the app had not copied yet. Replicas starting together take its
+     advisory lock in turn; the second finds nothing to do.
   2. The app deletes its copies from `migrations/`: every file whose text is one of
      `ALL` (`0001_owt_accounts.sql`, `0006_owt_accounts_roles.sql`, and so on), and
      the test that called `assert_installed`.
@@ -3830,13 +3797,14 @@ The router example under "Wiring an app" composes the layers; beyond it:
      during the rollout, and a rollback works. Once no running binary carries the
      copies, `owt_accounts::migrations::forget_copies(&pool)` may delete them and the
      app may drop `set_ignore_missing`; leaving them is harmless.
-  4. An app whose own migrations must partly run before the library's (one that
-     renamed an `accounts` of its own out of the way) runs its migrator to that
-     version first with `owt_runtime::db::migrate_locked_to`, then `migrations::run`,
-     then `migrate_locked`. A database built from nothing then runs the app's
-     migrations after all of the library's (or after the split), not interleaved with
-     them as the copies were: run CI, or `just migrate` on an empty database, before
-     deploying, since that order is new for every app.
+  4. An app whose own migrations must partly run before the library's (one that renamed
+     an `accounts` of its own out of the way) runs its migrator to that version first
+     with `owt_runtime::db::migrate_locked_to`, then `migrations::run`, then
+     `migrate_locked`, then `migrations::complete`, in place of `start`. A database
+     built from nothing then runs the app's migrations after all of the library's (or
+     after the split), not interleaved with them as the copies were: run CI, or `just
+     migrate` on an empty database, before deploying, since that order is new for every
+     app.
   5. The app's binary takes a `migrate` subcommand that runs the start's sequence and
      exits; the justfile's `migrate_command` and `rust-ci.yml`'s `migrate-command`
      run it (`SQLX_OFFLINE=true cargo run --locked -- migrate`), because a database
@@ -3845,8 +3813,7 @@ The router example under "Wiring an app" composes the layers; beyond it:
      makes the library's tables: `#[sqlx::test(migrations = false)]` (in place of
      `#[sqlx::test]` or `#[sqlx::test(migrator = "myapp::MIGRATOR")]`), and the test
      first awaits the app's start-up sequence on the pool it is given (its `migrate`
-     function: `migrations::run`, then the app's migrator), so every test runs the
-     order production runs.
+     function: `migrations::start`), so every test runs the order production runs.
   7. `run` stops the start, naming the row, when a copy differs from its entry
      (`EditedCopy`: the app edited a copy, so its table is not the library's), is
      recorded as failed (`FailedCopy`), or skips an earlier entry (`Gap`). Nothing is
@@ -3855,6 +3822,27 @@ The router example under "Wiring an app" composes the layers; beyond it:
      its text nor its name: `run` then applies that entry anew and fails at the first
      name it already holds, and `migrations::conflicts(&pool)` names them.
 
+- Copy the templates again (`templates/openshift/`, `templates/justfile`,
+  `templates/dependabot.yml`) and keep `params.env`:
+  - `justfile`: the `migrate` recipe runs `migrate_command` and refuses a shared
+    `postgres` or `template1` database outside CI, and `check` starts with `migrate`;
+    without them its `doc` step fails on an unmigrated database.
+  - `dependabot.yml`: its npm ecosystem ignores the stylesheet's
+    `@onewaytek/owt-stack` git dependency, which Dependabot would move to an older
+    tag. An app that copied the template earlier adds the `ignore` entry before it
+    resumes Dependabot.
+  - `apply.sh` passes the parameters in a `--param-file`, so a comma in a value
+    (`RUST_LOG=info,myapp=debug`) is one value. `env.sh` and the `pre-render` hook
+    are new and optional ("The app's environment"); `cronjob.yaml` reads an optional
+    `myapp-<JOB>-env` Secret after `myapp-env`.
+- An app that passed `dispatch-release: false` to the `sync-rc` call of
+  `promote-rc.yml` drops it: the sync then releases `rc` only when the merge changed
+  `rc`'s tree.
+- `owt_test::Client` sends every request from the peer `owt_test::PEER`, so a handler
+  taking `ConnectInfo<SocketAddr>` or `ClientIp` answers under it; a test that
+  asserted the 500 from a missing peer uses `Client::with_peer(None)`.
+- `PoolConfig::connect` waits up to a minute for an unreachable database;
+  `connect_within(url, Duration::ZERO)` tries once.
 - `app.yaml` sets the Route's `haproxy.router.openshift.io/timeout` from
   `ROUTE_TIMEOUT` (default `30s`). Before the first apply with the new template, copy
   any timeout the live Route carries into `params.env`, or the apply resets it:
@@ -3947,230 +3935,18 @@ The router example under "Wiring an app" composes the layers; beyond it:
   still constructed and matched by name, and `Refused`'s `Display` is still the
   sentence to show for any of them.
 
-## Upgrading from 0.5
-
-- `Cache::connect` and `Leases::new` refuse a prefix with characters other than ASCII
-  letters, digits, `_`, `.` and `-`, as `Bus::redis` already did, and `Leases::new`
-  returns a `Result`: add `?`. An app whose prefix has a `:` or a space renames it:
-  its cache starts cold, and while old and new replicas overlap in the rollout each
-  side holds its own leases, so a leased job may run twice until the rollout ends.
-- Install `owt_accounts::migrations::ALL[3]` (`owt_accounts_policies`) as the app's
-  next unused migration version (see "Tables" under "Accounts"), whether or not the
-  app uses site policies: `assert_installed` expects every entry. Its tables stay
-  empty until the app wires `policies::Policies` ("Site policies"). It takes the
-  `policy_*` names listed under "Names the migrations take": an app with a table,
-  index or function of one of them renames its own first.
-- Install `owt_accounts::migrations::ALL[4]` (`owt_accounts_local`) as the app's next
-  unused migration version after that, whether or not the app uses local accounts,
-  and keep awaiting `migrations::complete` before serving (it validates the
-  constraint this one adds). It takes the table `account_local_identities` (with its
-  `_pkey` and `_account` indexes), the column `accounts.password_sign_in` (every
-  existing account keeps password sign-in) and the constraint
-  `accounts_password_sign_in_hash`: an app with one of those names renames its own
-  first (`migrations::conflicts` names it).
-- `owt_accounts::Refused` has a new variant, `NoPasswordSignIn` (`store::set_password`
-  on an account whose password sign-in is off). `Refused` is not `#[non_exhaustive]`:
-  an exhaustive `match` on it adds an arm.
-- `owt_accounts::social::Connections` has a lifetime, `Connections<'a>`, for the words
-  it draws with: a field or return type naming it becomes `Connections<'static>`.
-- Move the npm stylesheet package with
-  `npm install -D @onewaytek/owt-stack@github:onewaytek/owt-stack#v0.6.0`, not by
-  editing the tag in `package.json`, and check the lock's `resolved` commit (see
-  **Tailwind:**): a plain `npm install` keeps the old commit in `package-lock.json`.
-- **Re-applying the OpenShift template:** pass `-p POSTGRES_MAJOR=<the major the
-  cluster runs>`, and keep compose and CI's `postgres-major` on it. The default, 18,
-  upgrades an older cluster in place (or is refused before CNPG 1.26). Moving to a
-  new major is its own step: "Upgrading Postgres" under "Commands, CI, releases and
-  deployment". The new `DB_SUFFIX` parameter leaves the default render as it was.
-- **An app moving from a template that took no backups** (a hand-written one, or
-  none) applies this one, at its current major, and confirms the first backup
-  completed (`oc get backups.postgresql.cnpg.io` shows the immediate one `completed`)
-  before deploying a migration it can't undo. That apply's backup pauses a single
-  instance for a few seconds during its rollout, and its prune needs the internal
-  image registry ("Backups come with it", under "Commands, CI, releases and
-  deployment").
-- The OpenShift template's Deployment reads `myapp-env` whole and `REDIS_URL` from
-  `myapp-redis`'s `url`, each only if it exists, so the next apply rolls the pods once
-  and changes nothing else. An app whose environment was patched onto the Deployment
-  (`oc set env`) moves it into `myapp-env` in the order "Moving from `oc set env` to
-  `myapp-env`" gives (the Secret, then the apply, then the entries off: an entry left
-  behind silently wins over the Secret), and its hand-made Redis and CronJobs onto
-  `redis.yaml` and `cronjob.yaml` ("Commands, CI, releases and deployment"). Check
-  first that no Secret of either name already holds something else.
-
-### Authentication
-
-- `oauth::Provider`'s `scope` is a `Cow<'static, str>`: a literal becomes
-  `scope: "openid email".into()`, and a scope from configuration is a `String`
-  (`scope: configured.into()`), no longer leaked to get a `&'static str`.
-- `oauth::Error` is `#[non_exhaustive]`: a `match` on it adds a `_` arm.
-
-## Upgrading from 0.4
-
-- **The cache starts cold once:** its keys move from `<prefix>:` to `<prefix>:c:`, so
-  no cache key can name a lease. Old keys expire or are evicted on their own.
-- `Bus::redis` refuses a prefix with characters other than ASCII letters, digits,
-  `_`, `.` and `-`, and a zero `beat_every`.
-- `CHANGE_REQUESTS_URL` must be `https` unless it names `localhost` or a cluster
-  service by its absolute name (`….svc.cluster.local.`, with the final dot), and may
-  not carry credentials, a query or a fragment.
-- `serve::serve` closes a connection whose request head (or the next one on a
-  kept-alive connection) takes over 30 seconds, holds 4096 connections at most, and
-  stops draining after 20 seconds, which also ends an SSE stream still
-  open then; the new `serve_with` sets other bounds (build its `ServeOptions` from
-  `default()`). It serves HTTP/1.1 only: no h2c. A WebSocket leaves the
-  server at its upgrade and is bounded by none of these: its handler limits how many
-  it holds and for how long. Behind the OpenShift router, and with SSE, see
-  "Serving" below.
-- `jobs::singleton` aborts a run whose lock is no longer seen held. Behind a
-  transaction-mode pooler (PgBouncer) the check lands on another server connection,
-  so every run longer than `jobs::LOCK_CHECK` is aborted: give singletons a direct
-  connection.
-- `CrossOrigin::trust` panics on an entry that is not an `http(s)` origin; blank
-  entries are still ignored.
-- A 5xx response no longer seals session changes, except a sign-out, which then
-  seals an empty session.
-- `session::key_for` is new and recommended: `key_from_base64` makes a secret
-  copied between environments one key. Moving to it signs everyone out, unless the
-  old key opens sessions for a while (`also_open_with`, above).
-- `key_from_base64` and `key_for` refuse a secret that is a pattern rather than
-  random bytes (fewer than 8 distinct byte values); a test fixture of `[7u8; 64]`
-  needs real bytes.
-- `RequestInfo::at` always yields a path starting with `/`.
-
-### Authentication
-
-- `oauth::oidc` takes the issuer as its third argument (as the issuer writes its
-  `iss`: a lower-case host, no default port; a trailing `/` is dropped) and returns
-  `Result<Provider, oauth::Error>`: it refuses an issuer or endpoint that is not
-  `https` (`http` only on the loopback host). `Provider` has an `issuer` field: a
-  struct literal adds `issuer: None`, or starts from a preset with `..`.
-- `Client::complete` needs an ID token from an OIDC provider, held to its `iss`, its
-  `aud` (and `azp`) naming this client, its `exp`, and its `sub` being the
-  user-info response's; ask for the `openid` scope. A redirect from the token or
-  user-info endpoint is refused.
-- `complete` holds a hand-built `Provider` whose `issuer` is `Some` to the form
-  `oidc` gives (no trailing `/` on the issuer; issuer, token and user-info URLs
-  `https`, or `http` on the loopback host, with no credentials), or fails with
-  `Error::Config`.
-- The `google`, `discord` and `twitch` presets (and `oidc`'s) return no identity for
-  an empty `sub` or `id`, so `complete` fails with `Error::NoIdentity`.
-- `oauth::Error` has new variants, `IdToken`, `Config` and `Redirected`; a `match`
-  on it needs arms.
-- An app with its own code exchange (to keep the person's tokens) makes none of
-  these checks. The next release brings `Client::complete_with_tokens`, `refresh`
-  and `client_credentials`, which make them; move to those then.
-- `password::verify_or_decoy` runs the decoy check for any stored hash it cannot
-  verify, not only a missing one; `password::usable(hash)` says which those are.
-- `password::needs_rehash` is true for a hash of an older Argon2 version (`v=16`)
-  too, even at today's costs.
-- `jwt::Verifier` refetches keys older than `jwt::KEYS_MAX_AGE` (an hour), refuses
-  encryption keys, and refuses every token once its keys could not be refetched for
-  `jwt::KEYS_STALE_LIMIT` (a day).
-
-### Accounts
-
-Install `ALL[1]` (`owt_accounts_roles`) and `ALL[2]` (`owt_accounts_constraints`)
-as the app's next unused migration versions (an app's own migrations hold the low
-numbers; see "Tables"), and **await `owt_accounts::migrations::complete(&pool)`
-after the migrations run and before serving**, at every start. An app with an OIDC
-provider moves its identities to the issuer's key first (see "Upgrading from 0.4 (identities)" under
-"Accounts"); `Welcome::match_verified_email` and `Arrival::Matched` are gone.
-
-`0003` changes only the schema, under a 5-second lock timeout (a deploy that cannot
-have its locks fails and is run again): the `username_skeleton` column, and
-constraints added `NOT VALID`, which bind every write from then on, a 0.4 replica's
-still running included (it gets an error for a row it would write in the old form).
-`complete` then moves each account made before it, in Rust, as sign-in normalizes
-what is typed, and validates the constraints once every row holds them:
-
-- **Usernames are NFKC-normalized** (a fullwidth `ａｄｍｉｎ` becomes `admin`, `´bob`
-  a name without the leading space NFKC gives it), and `@` becomes `-`. One that
-  would become another account's name takes its id as a suffix (`admin-42`), or the
-  first free name after that. Its owner signs in with the new name, or by email or
-  a provider; typing the old one now reaches the account it became like (`admin`),
-  so tell them: `Completed::renamed` lists every rename, and it is logged.
-- **Emails are NFKC-normalized and lower-cased.** One that would become another
-  account's address, or has nothing before its `@`, is cleared
-  (`Completed::emails_cleared`).
-- **A password hash the library cannot verify is cleared** (a legacy format, a
-  damaged value; `Completed::passwords_cleared`). It never opened the account. An
-  Argon2 hash without its version field is kept: it verifies.
-- **A negative session epoch becomes 0.**
-- **Each account gets its lookalike key.** An old account whose name is a lookalike
-  of an earlier one keeps it, under a key carrying its id; new names are held to the
-  rule. A row an older replica writes during the rollout has no key until the next
-  `complete`; `store::create` compares a new name against such rows too.
-- **Identities with an empty provider or subject are deleted** (they matched no
-  one), **sign-in links are cut to 30 days**, and links whose digest is not a
-  SHA-256 (no token could match one) are deleted.
-
-`complete` never fails a start over one account: one it cannot move is logged and
-listed in `Completed::failed`, and tried again next time; `Completed::validated` is
-`true` once every constraint holds for every row.
-
-Also:
-
-- `store::create` takes a pool; `store::create_in` takes a connection (inside a
-  transaction, say).
-- `links::MAX_TTL` is 30 days (it was a century); longer `ttl`s are capped.
-- `store::authenticate` fails a sign-in whose password changed while it was checked;
-  `store::change_password` is new.
-- `Refused` has `CurrentPassword` and `UsernameLookalike` variants.
-- `Linked::label` shows an email only when the provider verified it.
-- The social routes refuse cross-origin `POST`s themselves.
-
-### Serving
-
-`serve::serve`'s bounds (above, and "Bounds" under "Wiring an app") are new in 0.5,
-and two of them reach further than their names:
-
-- **An app behind the OpenShift router serves with a longer
-  `header_read_timeout`.** It is also how long an idle kept-alive connection stays
-  open (30 s), and the router reuses idle connections to the pod for longer (its
-  `timeout http-keep-alive` is 300 s), so a request it sends on a connection the app
-  has just closed fails with a 502, now and then. Move `main` to `serve_with` with
-  the timeout above the router's, as "Wiring an app" shows.
-- **SSE streams count.** A Server-Sent Events stream is an ordinary HTTP/1.1
-  response, so each open one holds one of the 4096 connections (`max_connections`)
-  for as long as it lasts, and a stop cuts every stream still open at the 20-second
-  drain. A WebSocket leaves the count at its upgrade and is not drained. An app with
-  many SSE clients raises `max_connections` with `serve_with`, and its pages
-  reconnect after a rollout and fetch what they missed.
-
-## Upgrading from 0.1
-
-- **Everyone signs in once more:** the sealed session gains its start time (`i`), and
-  cookies sealed before it no longer open. Session data may not use the field names
-  `k`, `x` or `i`.
-- `Sessions::validate_with`'s closure answers a `Verdict` (a `bool` still converts).
-- `oauth::Client::complete` takes the callback's `state`; drop the app's own
-  `Pending::matches` check. `Pending` gains `provider`, so a sign-in in flight across
-  the deploy fails once with `Error::Provider`.
-- `jwt::Error` and `oauth::Error` have new variants; a `match` on them needs arms.
-- `jwt::Verifier::discover` refuses a discovery document whose `issuer` is not
-  exactly the configured one (trailing slash included) or whose `jwks_uri` is not
-  https.
-- `CrossOrigin::layer` refuses cross-origin WebSocket upgrades. A bypass prefix
-  matches whole path segments: `/mcp` no longer covers `/mcp-admin`.
-- The workspace's `tower-http` names only `timeout`; an app names its own features
-  (`fs` for `ServeDir`; see "Adding it to an app").
-- `sqlx` is built with `tls-rustls-aws-lc-rs` (above).
-- The OpenShift template adds NetworkPolicies, Postgres over verified TLS, a
-  read-only root filesystem and a `CNPG_NAMESPACE` parameter: process it into a
-  staging namespace first.
-
 ## Working on owt-stack
 
 `just check` is the gate (fmt, clippy over every crate and feature and over
 `owt-change` and `owt-auth` without their defaults, `dev-only`, the tests with the README
-doctests, `cargo audit`), and CI runs the same command. The Redis tests run when
+doctests, `cargo audit`, the template tests, the commitlint configuration and `image-check`), and CI
+runs the same command. The Redis tests run when
 `REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
 `DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL
 whose certificate the system trusts (`SSL_CERT_FILE=ca.crt` for a test CA; the test's
 header says how to run such a Redis). Each is skipped otherwise; CI sets the first two.
 
-**Tests come in four kinds**, and a change to anything that reads what a client sent
+**Tests come in five kinds**, and a change to anything that reads what a client sent
 adds to the first:
 
 - *Properties* (`crates/*/tests/properties.rs`, `owt-bus/tests/model.rs`): what must

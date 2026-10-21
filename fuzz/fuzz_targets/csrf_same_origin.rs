@@ -48,18 +48,26 @@ fuzz_target!(|input: Input| {
             })
         });
     if headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("cross-site") {
-        assert!(result.is_err() || origin_trusted, "cross-site passed: {input:?}");
+        assert!(
+            result.is_err() || origin_trusted,
+            "cross-site passed: {input:?}"
+        );
     }
     // A readable Origin with no Host to compare against passes only when trusted.
     if headers.get("sec-fetch-site").is_none()
         && headers.get("origin").is_some_and(|v| v.to_str().is_ok())
         && headers.get("host").is_none()
     {
-        assert!(result.is_err() || origin_trusted, "origin without host passed: {input:?}");
+        assert!(
+            result.is_err() || origin_trusted,
+            "origin without host passed: {input:?}"
+        );
     }
     // An unreadable Origin or Sec-Fetch-Site never passes (it is not an absent one).
     if headers.get("origin").is_some_and(|v| v.to_str().is_err())
-        || headers.get("sec-fetch-site").is_some_and(|v| v.to_str().is_err())
+        || headers
+            .get("sec-fetch-site")
+            .is_some_and(|v| v.to_str().is_err())
     {
         assert!(result.is_err(), "unreadable header passed: {input:?}");
     }

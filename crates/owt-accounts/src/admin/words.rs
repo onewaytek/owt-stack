@@ -18,8 +18,7 @@
 /// [`Views`](super::Views) draws its own markup with the same words. What an app's
 /// people chose (usernames, emails, a role's label) is never in here, and neither
 /// are the account rules' refusals ([`Refused`](crate::Refused)), which an app
-/// words by matching on them. Build a `Words` with `..Words::ENGLISH`: a new field
-/// then takes its English, where a literal naming every field stops compiling.
+/// words by matching on them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Words {
     /// The list's title and the link back to it: `Accounts`.

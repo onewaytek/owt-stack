@@ -604,11 +604,10 @@ jobs:
             echo "TAGS=${tags[*]}"
           } >> "$GITHUB_ENV"
           for t in "${tags[@]}"; do echo "tag ${REPO}:${t}"; done
-      # A stable image (X.Y, latest) is what production follows: its tag must be on
-      # main, which only reviewed changes reach. Asked of the API, so this job needs no
-      # checkout.
       # The tag still names the commit the build job checked out (it could have moved
-      # since), and a stable one is on main.
+      # since). A stable image (X.Y, latest) is what production follows, so its tag is
+      # also on main, which only reviewed changes reach. Asked of the API, so this job
+      # needs no checkout.
       - name: The tag names the built commit
         env:
           TOKEN: ${{ github.token }}

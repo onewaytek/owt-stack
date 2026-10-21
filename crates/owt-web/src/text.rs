@@ -205,8 +205,7 @@ fn relative(from: SystemTime, to: SystemTime, pattern: &str, w: &Words<'_>) -> S
 }
 
 /// How long before `now` the moment `t` was (`5 minutes ago`). Months are 30 days
-/// and years 365. A moment in the
-/// future, or under a minute back, is `words.now`.
+/// and years 365. A moment in the future, or under a minute back, is `words.now`.
 #[must_use]
 pub fn ago_at(
     t: impl Borrow<SystemTime>,

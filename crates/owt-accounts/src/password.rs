@@ -74,14 +74,13 @@ pub fn check(password: &str, like: &[&str]) -> Vec<Problem> {
 
 /// Twenty letters and digits that pass every rule here, given what the password must
 /// not resemble (`like`, as in [`check`]): drawn again if it happens to contain the
-/// username. About 116 bits, uniform over its alphabet.
+/// username. About 116 bits (20 × log2 56), uniform over its alphabet.
 #[must_use]
 pub fn generate(like: &[&str]) -> String {
     use rand::RngExt;
     const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rng = rand::rng();
     loop {
-        // Uniform over the alphabet (no modulo bias): 20 × log2(56) ≈ 116 bits.
         let password: String = (0..20)
             .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
             .collect();
