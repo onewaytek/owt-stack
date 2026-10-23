@@ -1271,7 +1271,7 @@ mod tests {
             .unwrap();
         assert_eq!(who.uid, "42");
         assert_eq!(tokens.access, "at");
-        assert_eq!(tokens.expires_in, Some(std::time::Duration::from_secs(900)));
+        assert_eq!(tokens.expires_in, Some(std::time::Duration::from_mins(15)));
         assert_eq!(tokens.refresh.as_deref(), Some("rt"));
         assert_eq!(tokens.refresh_expires_in, None);
         assert_eq!(tokens.scope.as_deref(), Some("openid api"));
@@ -1286,9 +1286,9 @@ mod tests {
         use std::time::Duration;
         let read = |v: Value| Tokens::read(&v);
         let t = read(serde_json::json!({"access_token": "a", "expires_in": 900})).unwrap();
-        assert_eq!(t.access_lifetime(), Duration::from_secs(900));
+        assert_eq!(t.access_lifetime(), Duration::from_mins(15));
         let t = read(serde_json::json!({"access_token": "a", "expires_in": "900"})).unwrap();
-        assert_eq!(t.expires_in, Some(Duration::from_secs(900)));
+        assert_eq!(t.expires_in, Some(Duration::from_mins(15)));
         let t = read(serde_json::json!({"access_token": "a", "expires_in": -5})).unwrap();
         assert_eq!(t.expires_in, Some(Duration::ZERO));
         let t = read(serde_json::json!({"access_token": "a"})).unwrap();
@@ -1301,7 +1301,7 @@ mod tests {
             "access_token": "a", "refresh_token": "r", "refresh_expires_in": 1800,
         }))
         .unwrap();
-        assert_eq!(t.refresh_expires_in, Some(Duration::from_secs(1800)));
+        assert_eq!(t.refresh_expires_in, Some(Duration::from_mins(30)));
         let t = read(serde_json::json!({"access_token": "a", "refresh_expires_in": 0})).unwrap();
         assert_eq!(t.refresh_expires_in, None);
         for bad in [

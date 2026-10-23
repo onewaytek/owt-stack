@@ -1992,7 +1992,7 @@ let social = SocialSignIn::new(pool.clone(), oauth::http_client()?, providers, W
     .sign_in_page("/login")                  // failures land here with ?social=
     .connections_page("/account/connections") // connects and removals land here
     .after_sign_in("/")                      // when the form gave no `next` on this site
-    .connect_within(Duration::from_secs(15 * 60)); // how recent a sign-in a connect needs
+    .connect_within(Duration::from_mins(15)); // how recent a sign-in a connect needs
 
 // The start form's redirect goes to the provider: allow its origin in form-action.
 let mut form_action = vec!["'self'".to_owned()];
@@ -2426,8 +2426,8 @@ use std::time::{Duration, SystemTime};
 use owt_runtime::jobs::{CancellationToken, Every, Jobs};
 
 # async fn demo(pool: sqlx::PgPool) {
-const HOUR: Duration = Duration::from_secs(3600);
-const DAY: Duration = Duration::from_secs(24 * 3600);
+const HOUR: Duration = Duration::from_hours(1);
+const DAY: Duration = Duration::from_hours(24);
 let jobs = Jobs::new(CancellationToken::new());
 
 // Each Monday at 03:00 UTC, once, whichever replica gets there first.
@@ -2677,7 +2677,7 @@ use owt_test::{Client, accounts};
 use owt_web::session::Sessions;
 
 # async fn run(app: impl FnOnce(&Sessions<Data>) -> Router, pool: sqlx::PgPool) {
-let sessions = Sessions::<Data>::new(accounts::test_key(), "s", Duration::from_secs(3600), false);
+let sessions = Sessions::<Data>::new(accounts::test_key(), "s", Duration::from_hours(1), false);
 let client = Client::new(app(&sessions));
 let ada = client.sign_in_new(&pool, &sessions, "ada").await; // signed in, policies agreed
 assert_eq!(client.get_page("/me").await.status, 200);

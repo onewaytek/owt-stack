@@ -1850,16 +1850,16 @@ mod tests {
     #[test]
     fn lifetimes_read_as_words() {
         let words = Words::ENGLISH;
-        assert_eq!(words.duration(Duration::from_secs(900)), "15 minutes");
+        assert_eq!(words.duration(Duration::from_mins(15)), "15 minutes");
         assert_eq!(words.duration(Duration::from_secs(3_600)), "1 hour");
-        assert_eq!(words.duration(Duration::from_secs(86_400 * 7)), "7 days");
-        assert_eq!(words.duration(Duration::from_secs(5_400)), "90 minutes");
+        assert_eq!(words.duration(Duration::from_hours(7 * 24)), "7 days");
+        assert_eq!(words.duration(Duration::from_mins(90)), "90 minutes");
         let french = Words {
             day: "{n} jour",
             days: "{n} jours",
             ..Words::ENGLISH
         };
-        assert_eq!(french.duration(Duration::from_secs(86_400 * 7)), "7 jours");
+        assert_eq!(french.duration(Duration::from_hours(7 * 24)), "7 jours");
     }
 
     /// Every word on the pages comes from `Words`: another set leaves no English behind.

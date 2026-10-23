@@ -1672,7 +1672,7 @@ async fn a_local_identity_reaches_an_account_no_password_opens() {
         );
     }
     // A link handed out while passwords opened it (a lost-password one, say).
-    let old_link = links::mint(&db.pool, desk.id, Duration::from_secs(900), "lost")
+    let old_link = links::mint(&db.pool, desk.id, Duration::from_mins(15), "lost")
         .await
         .unwrap();
     let before = store::by_id(&db.pool, desk.id).await.unwrap().unwrap();
@@ -1687,7 +1687,7 @@ async fn a_local_identity_reaches_an_account_no_password_opens() {
     assert_eq!(err.refused(), Some(&Refused::Link));
     // One an operator mints after still opens it, and turning it off again voids
     // nothing and moves nothing.
-    let new_link = links::mint(&db.pool, desk.id, Duration::from_secs(900), "kiosk")
+    let new_link = links::mint(&db.pool, desk.id, Duration::from_mins(15), "kiosk")
         .await
         .unwrap();
     assert!(!store::has_password(&db.pool, desk.id).await.unwrap());
@@ -1778,7 +1778,7 @@ async fn a_local_identity_is_a_way_in_until_it_is_forgotten() {
             .unwrap()
     );
 
-    let link = links::mint(&db.pool, desk.id, Duration::from_secs(900), "setup")
+    let link = links::mint(&db.pool, desk.id, Duration::from_mins(15), "setup")
         .await
         .unwrap();
     assert_eq!(
@@ -2603,7 +2603,7 @@ fn admin(db: &Db) -> owt_accounts::admin::Admin {
 /// The test app with the whole admin.
 fn admin_app(db: &Db, sessions: &Sessions<Data>) -> Router {
     let admin = admin(db)
-        .sign_in_links(Duration::from_secs(86_400), |token| {
+        .sign_in_links(Duration::from_hours(24), |token| {
             format!("https://app.example/login/link/{token}")
         })
         .more("Profile", |a| format!("/staff/profiles/{}", a.id));
@@ -5485,7 +5485,7 @@ async fn every_way_in_stamps_the_last_sign_in() {
 
     // A sign-in link.
     let bob = store::create(&db.pool, new("bob", "", None)).await.unwrap();
-    let link = links::mint(&db.pool, bob.id, Duration::from_secs(900), "test")
+    let link = links::mint(&db.pool, bob.id, Duration::from_mins(15), "test")
         .await
         .unwrap();
     assert_eq!(last_sign_in(&db, bob.id).await, None);

@@ -222,7 +222,7 @@ fn oversized(encoded_len: usize) -> bool {
 
 /// The longest a session lasts, however often it is re-sealed, unless
 /// [`Sessions::absolute_lifetime`] says otherwise (or `max_age` is longer).
-pub const ABSOLUTE_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
+pub const ABSOLUTE_LIFETIME: Duration = Duration::from_hours(30 * 24);
 
 /// What the cookie holds, before sealing. Field names are short: they ride on every
 /// request.
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn the_absolute_lifetime_ends_on_the_second() {
-        assert_eq!(ABSOLUTE_LIFETIME, Duration::from_secs(2_592_000), "30 days");
+        assert_eq!(ABSOLUTE_LIFETIME, Duration::from_hours(720), "30 days");
         let s = sessions().absolute_lifetime(Duration::from_secs(7200));
         let lenient = s.clone().absolute_lifetime(ABSOLUTE_LIFETIME);
         let data = Data::default();
@@ -1363,7 +1363,7 @@ mod tests {
         let a_minute_left = lenient.seal_begun("abc", now() - 7140, &data);
         assert!(s.unseal(&a_minute_left).is_some());
         // The default never undercuts a longer max_age.
-        let year = Duration::from_secs(365 * 86_400);
+        let year = Duration::from_hours(365 * 24);
         let long = Sessions::<Data>::new(Key::generate(), "sid", year, true);
         assert!(
             long.unseal(&long.seal_begun("abc", now() - 200 * 86_400, &data))
