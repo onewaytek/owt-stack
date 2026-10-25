@@ -883,8 +883,9 @@ axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).a
 ```
 
 **`jwt` is a feature** of `owt-auth`, on by default. It brings `jsonwebtoken` and,
-through its RustCrypto backend, `rsa`, which carries RUSTSEC-2023-0071 (Marvin) with
-no fixed release, so the app's `cargo audit` fails until it ignores that advisory.
+through its RustCrypto backend, `rsa` and `crypto-bigint` 0.5, which carry
+RUSTSEC-2023-0071 (Marvin) and RUSTSEC-2026-0387 (timing variability) with no fixed
+release on their line, so the app's `cargo audit` fails until it ignores both.
 `oauth` needs neither: it reads the ID token the token endpoint answered over TLS and
 checks its claims (OIDC Core 3.1.3.7), not its signature. An app that names `owt-auth`
 only for passwords, throttles or `oauth` turns the feature off:
@@ -895,7 +896,7 @@ owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.9.0", def
 ```
 <!-- x-release-please-end -->
 
-An app that verifies bearer tokens keeps it, and says why the advisory does not apply
+An app that verifies bearer tokens keeps it, and says why the advisories do not apply
 in its `.cargo/audit.toml`:
 
 ```toml
@@ -905,6 +906,10 @@ ignore = [
     # signing); no fixed release. It arrives through owt-auth's `jwt` feature, which
     # only verifies signatures, a public-key operation.
     "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5: secret-dependent branches in constant-time arithmetic. It
+    # arrives the same way (p256/p384), and verifying a signature computes on public
+    # values only.
+    "RUSTSEC-2026-0387",
 ]
 ```
 
