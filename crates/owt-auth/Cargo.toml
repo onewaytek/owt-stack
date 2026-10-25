@@ -10,7 +10,8 @@ publish.workspace = true
 [features]
 default = ["jwt"]
 # `jwt`: bearer-token verification against a JWKS. It brings jsonwebtoken and, through
-# its rust_crypto backend, `rsa` (RUSTSEC-2023-0071, see .cargo/audit.toml); the rest
+# its rust_crypto backend, `rsa` (RUSTSEC-2023-0071) and crypto-bigint 0.5
+# (RUSTSEC-2026-0387), both ignored in .cargo/audit.toml with why; the rest
 # of the crate (oauth's ID-token checks included) needs neither.
 jwt = ["dep:jsonwebtoken"]
 

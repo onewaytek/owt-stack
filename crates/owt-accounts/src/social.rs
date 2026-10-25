@@ -308,7 +308,7 @@ pub const MAX_NEXT: usize = 1024;
 /// How long a sign-in begun at a provider may take to come back: the callback after
 /// that is `expired`. A copy of the session cookie made while one was pending opens
 /// nothing once it has passed.
-pub const PENDING_FOR: Duration = Duration::from_secs(10 * 60);
+pub const PENDING_FOR: Duration = Duration::from_mins(10);
 
 /// A sign-in on its way to a provider and back, kept in the session between the two.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -581,7 +581,7 @@ impl SocialSignIn {
             sign_in_page: "/login".into(),
             connections_page: "/account/connections".into(),
             after_sign_in: "/".into(),
-            connect_within: Duration::from_secs(15 * 60),
+            connect_within: Duration::from_mins(15),
             on_arrival: None,
             on_connect: None,
             views: Drawn(Arc::new(Tailwind)),

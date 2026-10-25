@@ -38,7 +38,7 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use cookie::{Cookie, SameSite};
 
 /// The longest a browser keeps a cookie: 400 days.
-pub const MAX_AGE: Duration = Duration::from_secs(400 * 86_400);
+pub const MAX_AGE: Duration = Duration::from_hours(400 * 24);
 
 /// A name [`Preference::new`] refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -172,7 +172,7 @@ mod tests {
         Preference::new(
             "__Host-theme",
             &["light", "dark"],
-            Duration::from_secs(86_400),
+            Duration::from_hours(24),
             "__Host-session",
         )
         .unwrap()

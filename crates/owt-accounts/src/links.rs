@@ -36,7 +36,7 @@ fn digest(token: &str) -> Vec<u8> {
 /// The longest a link lives: 30 days. A link is a bearer credential that may sit in
 /// a mailbox, a chat log or a proxy's access log (it travels in the URL), so a
 /// longer `ttl` is capped here.
-pub const MAX_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const MAX_TTL: Duration = Duration::from_hours(30 * 24);
 
 /// Mint a link for `account_id`, good for `ttl` (at most [`MAX_TTL`]), with `reason`
 /// for the audit trail.

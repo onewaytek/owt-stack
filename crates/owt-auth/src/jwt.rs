@@ -56,7 +56,7 @@ pub const KEYS_MAX_AGE: Duration = Duration::from_secs(3600);
 /// How long keys held through failed refetches keep verifying: past this, a provider
 /// (or a network path) that keeps the refetch failing does not keep a withdrawn key
 /// alive, and tokens are refused until a fetch succeeds.
-pub const KEYS_STALE_LIMIT: Duration = Duration::from_secs(24 * 3600);
+pub const KEYS_STALE_LIMIT: Duration = Duration::from_hours(24);
 
 /// How long a fetch of the provider's keys (or its discovery document) may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);

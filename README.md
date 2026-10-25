@@ -883,8 +883,9 @@ axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).a
 ```
 
 **`jwt` is a feature** of `owt-auth`, on by default. It brings `jsonwebtoken` and,
-through its RustCrypto backend, `rsa`, which carries RUSTSEC-2023-0071 (Marvin) with
-no fixed release, so the app's `cargo audit` fails until it ignores that advisory.
+through its RustCrypto backend, `rsa` and `crypto-bigint` 0.5, which carry
+RUSTSEC-2023-0071 (Marvin) and RUSTSEC-2026-0387 (timing variability) with no fixed
+release on their line, so the app's `cargo audit` fails until it ignores both.
 `oauth` needs neither: it reads the ID token the token endpoint answered over TLS and
 checks its claims (OIDC Core 3.1.3.7), not its signature. An app that names `owt-auth`
 only for passwords, throttles or `oauth` turns the feature off:
@@ -895,7 +896,7 @@ owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.9.0", def
 ```
 <!-- x-release-please-end -->
 
-An app that verifies bearer tokens keeps it, and says why the advisory does not apply
+An app that verifies bearer tokens keeps it, and says why the advisories do not apply
 in its `.cargo/audit.toml`:
 
 ```toml
@@ -905,6 +906,10 @@ ignore = [
     # signing); no fixed release. It arrives through owt-auth's `jwt` feature, which
     # only verifies signatures, a public-key operation.
     "RUSTSEC-2023-0071",
+    # crypto-bigint 0.5: secret-dependent branches in constant-time arithmetic. It
+    # arrives the same way (p256/p384), and verifying a signature computes on public
+    # values only.
+    "RUSTSEC-2026-0387",
 ]
 ```
 
@@ -1992,7 +1997,7 @@ let social = SocialSignIn::new(pool.clone(), oauth::http_client()?, providers, W
     .sign_in_page("/login")                  // failures land here with ?social=
     .connections_page("/account/connections") // connects and removals land here
     .after_sign_in("/")                      // when the form gave no `next` on this site
-    .connect_within(Duration::from_secs(15 * 60)); // how recent a sign-in a connect needs
+    .connect_within(Duration::from_mins(15)); // how recent a sign-in a connect needs
 
 // The start form's redirect goes to the provider: allow its origin in form-action.
 let mut form_action = vec!["'self'".to_owned()];
@@ -2426,8 +2431,8 @@ use std::time::{Duration, SystemTime};
 use owt_runtime::jobs::{CancellationToken, Every, Jobs};
 
 # async fn demo(pool: sqlx::PgPool) {
-const HOUR: Duration = Duration::from_secs(3600);
-const DAY: Duration = Duration::from_secs(24 * 3600);
+const HOUR: Duration = Duration::from_hours(1);
+const DAY: Duration = Duration::from_hours(24);
 let jobs = Jobs::new(CancellationToken::new());
 
 // Each Monday at 03:00 UTC, once, whichever replica gets there first.
@@ -2677,7 +2682,7 @@ use owt_test::{Client, accounts};
 use owt_web::session::Sessions;
 
 # async fn run(app: impl FnOnce(&Sessions<Data>) -> Router, pool: sqlx::PgPool) {
-let sessions = Sessions::<Data>::new(accounts::test_key(), "s", Duration::from_secs(3600), false);
+let sessions = Sessions::<Data>::new(accounts::test_key(), "s", Duration::from_hours(1), false);
 let client = Client::new(app(&sessions));
 let ada = client.sign_in_new(&pool, &sessions, "ada").await; // signed in, policies agreed
 assert_eq!(client.get_page("/me").await.status, 200);

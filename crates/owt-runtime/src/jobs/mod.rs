@@ -552,7 +552,7 @@ mod tests {
     use super::*;
 
     const HOUR: Duration = Duration::from_secs(3600);
-    const DAY: Duration = Duration::from_secs(86_400);
+    const DAY: Duration = Duration::from_hours(24);
 
     thread_local! {
         /// The wall clock a test set: this time at this paused-clock instant.
@@ -624,8 +624,8 @@ mod tests {
 
     #[test]
     fn an_offset_of_a_period_or_more_is_reduced() {
-        let a = Every::aligned(HOUR, Duration::from_secs(90 * 60));
-        assert_eq!(a.offset(), Some(Duration::from_secs(30 * 60)));
+        let a = Every::aligned(HOUR, Duration::from_mins(90));
+        assert_eq!(a.offset(), Some(Duration::from_mins(30)));
         assert_eq!(a.next_boundary(at(ELEVEN)), Some(at(ELEVEN + 1800)));
         assert_eq!(Every::aligned(HOUR, HOUR).offset(), Some(Duration::ZERO));
         assert_eq!(Every::new(HOUR).offset(), None);
@@ -755,7 +755,7 @@ mod tests {
                 async move {
                     if first {
                         // Past 12:00 and 13:00, to 13:30.
-                        tokio::time::sleep(Duration::from_secs(150 * 60)).await;
+                        tokio::time::sleep(Duration::from_mins(150)).await;
                     }
                     Ok(())
                 }

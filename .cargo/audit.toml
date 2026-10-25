@@ -9,6 +9,14 @@ ignore = [
     # (The test suite signs with a throwaway key.)
     "RUSTSEC-2023-0071",
 
+    # crypto-bigint 0.5: secret-dependent branches in arithmetic meant to be
+    # constant-time; fixed only in 0.7.6. It arrives the same way, through
+    # jsonwebtoken's rust_crypto backend (p256/p384 -> elliptic-curve 0.13), and
+    # ES256/ES384 verification computes on public values only: the signature, the
+    # key and the message. Lifts when a jsonwebtoken release moves to
+    # elliptic-curve 0.14.
+    "RUSTSEC-2026-0387",
+
     # basic-toml: unmaintained. It arrives through askama_derive, a proc-macro that
     # reads the crate's own askama.toml at compile time; nothing links it into a
     # built artifact and it never sees runtime or untrusted input. Lifts when an
