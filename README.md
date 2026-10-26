@@ -3464,8 +3464,11 @@ TUNNEL_ID=<id>                    # cloudflared tunnel list; not a secret
 # CREDENTIALS_SECRET=myapp-tunnel # the default, <NAME>-tunnel
 ```
 
-`TUNNEL_HOST` without `TUNNEL_ID`, or the reverse, is refused, as is a `TUNNEL_ID`
-that is no UUID, or a `TUNNEL_HOST` with no `tunnel.yaml` beside the script.
+`TUNNEL_HOST` without `TUNNEL_ID`, or the reverse, is refused, as is a `TUNNEL_HOST`
+that is not a bare host name (a wildcard, `*.example.com`, is one), a `TUNNEL_ID` that
+is no UUID, or a `TUNNEL_HOST` with no `tunnel.yaml` beside the script. The objects'
+names are fixed (`cloudflared`, `cloudflared-config`), whatever `NAME` is: one tunnel
+per namespace, as one app per namespace.
 `cloudflared` reads its config once, at start, so `apply.sh` puts a checksum of the
 rendered config in the connectors' pod template (`TUNNEL_CONFIG_CHECKSUM`): a new host
 or tunnel rolls them, one at a time, each new connector registered with the edge
@@ -3475,13 +3478,18 @@ digest (`CLOUDFLARED_IMAGE`), with no self-update, so the connectors restart onl
 an upgrade of owt-stack or the app changes it; each one requests 10m CPU and 48Mi
 (about what one uses idle), with a `TUNNEL_MEMORY_LIMIT` of 256Mi for the streams it
 carries. There is no PodDisruptionBudget: on a single node a drain takes both pods
-whatever it says.
+whatever it says; on several, the two spread across nodes when they can. Liveness
+reads `/ready` but waits five minutes of failures, so an edge or network outage that
+`cloudflared` rides out by reconnecting does not restart it into CrashLoopBackOff.
 
 The NetworkPolicies come with it: `myapp-from-tunnel` admits the connectors to the
 app's HTTP port, beside `app.yaml`'s policy, which admits the router alone, and
 `cloudflared` admits nothing to the connectors and lets them open only the cluster's
 DNS (`DNS_NAMESPACE`, `DNS_PORT`, as `egress.yaml`'s), Cloudflare's edge on 7844 (QUIC
-over UDP, HTTP/2 over TCP), HTTPS, and the app's HTTP port.
+over UDP, HTTP/2 over TCP), HTTPS (IPv4 and IPv6 alike), and the app's HTTP port.
+Removing the tunnel is by hand, since `apply.sh` renders and never deletes: drop the
+two keys, then `oc delete deployment,configmap,networkpolicy -l app=cloudflared` and
+`oc delete networkpolicy myapp-from-tunnel`.
 
 Every request through the tunnel carries the client's address in `CF-Connecting-IP`,
 which Cloudflare sets, so the app's environment (`env.env`, below) has

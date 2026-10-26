@@ -285,7 +285,7 @@ tunnel_run "TUNNEL_HOST=www.example.com" "TUNNEL_ID=$id"
 tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id" "CREDENTIALS_SECRET=other-creds"
 logged "CREDENTIALS_SECRET=other-creds" || fail "params.env names the credentials Secret"
 tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id" "TUNNEL_CONFIG_CHECKSUM=stale"
-grep -q "TUNNEL_CONFIG_CHECKSUM=stale" "$log" && fail "a checksum in params.env wins over the computed one"
+grep -q "TUNNEL_CONFIG_CHECKSUM=stale" "$log" && fail "the computed checksum wins over one in params.env"
 [ "$(checksum)" = "$first" ] || fail "a checksum in params.env changes the computed one"
 for half in "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id" "TUNNEL_HOST=myapp.example.com TUNNEL_ID="; do
   # shellcheck disable=SC2086 # each word is a line
@@ -297,6 +297,14 @@ done
 tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=myapp"
 [ "$rc" -eq 2 ] || fail "a TUNNEL_ID that is no UUID exits 2 (got $rc)"
 grep -q "TUNNEL_ID=myapp is not a tunnel's UUID" "$work/err" || fail "names the bad TUNNEL_ID"
+for bad in https://myapp.example.com myapp.example.com/x myapp.example.com:443 '"myapp.example.com"x' localhost; do
+  tunnel_run "TUNNEL_HOST=$bad" "TUNNEL_ID=$id"
+  [ "$rc" -eq 2 ] || fail "TUNNEL_HOST=$bad exits 2 (got $rc)"
+  grep -qF "is not a host name" "$work/err" || fail "names the bad TUNNEL_HOST $bad"
+  grep -q "^oc process" "$log" && fail "TUNNEL_HOST=$bad rendered something"
+done
+tunnel_run "TUNNEL_HOST=*.example.com" "TUNNEL_ID=$id"
+[ "$rc" -eq 0 ] || fail "a wildcard TUNNEL_HOST is taken (got $rc)"
 rm "$work/deploy/tunnel.yaml"
 tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id"
 [ "$rc" -eq 2 ] || fail "a tunnel without tunnel.yaml exits 2 (got $rc)"

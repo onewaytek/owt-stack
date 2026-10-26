@@ -27,8 +27,13 @@
 # config rolls the connectors; a hand render that omits it leaves them on the old
 # config until `oc rollout restart deployment/cloudflared`.
 #
-# Every object is labelled app=cloudflared, and the Deployment and ConfigMap are
-# named cloudflared and cloudflared-config, one tunnel per namespace.
+# The Deployment, ConfigMap and the connectors' policy are named cloudflared and
+# cloudflared-config, whatever NAME is: one tunnel per namespace, as one app per
+# namespace. The tunnel's objects are labelled app=cloudflared, but for the policy
+# admitting the connectors to the app, which is the app's (app=NAME).
+# Removing the tunnel is by hand: apply.sh renders, and never deletes.
+#   oc delete deployment,configmap,networkpolicy -l app=cloudflared
+#   oc delete networkpolicy myapp-from-tunnel
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
@@ -93,7 +98,7 @@ objects:
           # streams SSE, and does not time out a response in flight. No
           # originRequest.httpHostHeader: the browser's Host passes through, so the
           # app sees TUNNEL_HOST, which its origin checks compare against.
-          - hostname: ${TUNNEL_HOST}
+          - hostname: "${TUNNEL_HOST}"
             service: http://${NAME}:80
           # Required: cloudflared refuses to start without a catch-all last rule.
           - service: http_status:404
@@ -123,6 +128,13 @@ objects:
             checksum/config: "${TUNNEL_CONFIG_CHECKSUM}"
         spec:
           automountServiceAccountToken: false
+          # On a cluster of several nodes, the two connectors on two of them when it can.
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: ScheduleAnyway
+              labelSelector:
+                matchLabels: {app: cloudflared}
           # cloudflared stops taking new requests on SIGTERM and gives those in
           # flight its 30-second grace period; this outlasts it.
           terminationGracePeriodSeconds: 40
@@ -145,11 +157,14 @@ objects:
                 periodSeconds: 10
               livenessProbe:
                 # /ready, not TCP: a connector that has lost every edge connection
-                # still holds its metrics port open, and a restart is what fixes it.
+                # still holds its metrics port open, and a restart is what fixes one
+                # that stays that way. Five minutes of failures, not one: cloudflared
+                # reconnects by itself through a short edge or network outage, and
+                # restarts during one would only back off into CrashLoopBackOff.
                 httpGet: {path: /ready, port: metrics}
                 initialDelaySeconds: 20
-                periodSeconds: 20
-                failureThreshold: 3
+                periodSeconds: 30
+                failureThreshold: 10
               resources:
                 # Sized from live connectors (about 5m CPU and 35Mi each). No CPU
                 # limit: throttling the proxy would delay every request.
@@ -177,7 +192,7 @@ objects:
     metadata:
       name: ${NAME}-from-tunnel
       namespace: ${NAMESPACE}
-      labels: {app: cloudflared}
+      labels: {app: "${NAME}"}
     spec:
       podSelector:
         matchLabels: {app: "${NAME}"}
@@ -212,6 +227,7 @@ objects:
             - {protocol: TCP, port: "${{DNS_PORT}}"}
         - to:
             - ipBlock: {cidr: 0.0.0.0/0}
+            - ipBlock: {cidr: "::/0"}
           ports:
             - {protocol: UDP, port: 7844}
             - {protocol: TCP, port: 7844}

@@ -187,6 +187,9 @@ if [ -n "${given[TUNNEL_HOST]:-}" ] || [ -n "${given[TUNNEL_ID]:-}" ]; then
   fi
   [[ ${given[TUNNEL_ID]} =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] ||
     { echo "$params: TUNNEL_ID=${given[TUNNEL_ID]} is not a tunnel's UUID (cloudflared tunnel list)" >&2; exit 2; }
+  # A host name, or a wildcard one (*.example.com): no scheme, path, port or quote.
+  [[ ${given[TUNNEL_HOST]} =~ ^(\*\.)?([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]] ||
+    { echo "$params: TUNNEL_HOST=${given[TUNNEL_HOST]} is not a host name (myapp.example.com: no scheme, path or port)" >&2; exit 2; }
   [ -f "$here/tunnel.yaml" ] || { echo "$params sets TUNNEL_HOST, and tunnel.yaml is not here" >&2; exit 2; }
   command -v sha256sum >/dev/null || command -v shasum >/dev/null ||
     { echo "the tunnel's config checksum needs sha256sum or shasum" >&2; exit 2; }
