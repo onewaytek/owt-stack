@@ -1,0 +1,222 @@
+# The public way in for an app deployed from app.yaml on a private cluster: a
+# Cloudflare named tunnel. Two cloudflared connectors in the app's namespace dial out
+# to Cloudflare's edge, and requests for TUNNEL_HOST come back down those
+# connections to the app's Service, so nothing has to be reachable from the internet.
+# The tunnel is locally managed: its ingress rules live here, in git, and the
+# Cloudflare account holds only the tunnel and its DNS record.
+#
+# One tunnel per app, in the app's own namespace, never shared: a connector restart
+# drops every WebSocket and SSE stream it carries, so connectors shared between apps
+# would let one app's rollout or crash cut another's live connections.
+#
+# Made once, where cloudflared is logged in to the Cloudflare account:
+#
+#   cloudflared tunnel create myapp                 # writes ~/.cloudflared/<id>.json
+#   oc create secret generic myapp-tunnel -n myapp \
+#     --from-file=credentials.json=$HOME/.cloudflared/<id>.json
+#   cloudflared tunnel route dns myapp myapp.example.com
+#
+# then rendered by apply.sh when params.env sets TUNNEL_HOST and TUNNEL_ID, or by hand:
+#
+#   oc process -f tunnel.yaml -p NAME=myapp -p NAMESPACE=myapp \
+#     -p TUNNEL_HOST=myapp.example.com -p TUNNEL_ID=<id> \
+#     -p CREDENTIALS_SECRET=myapp-tunnel | oc apply -f -
+#
+# cloudflared reads its config once, at start. apply.sh puts a checksum of the
+# rendered config in the pod template (TUNNEL_CONFIG_CHECKSUM), so a change to the
+# config rolls the connectors; a hand render that omits it leaves them on the old
+# config until `oc rollout restart deployment/cloudflared`.
+#
+# Every object is labelled app=cloudflared, and the Deployment and ConfigMap are
+# named cloudflared and cloudflared-config, one tunnel per namespace.
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: owt-app-tunnel
+  annotations:
+    description: A Cloudflare named tunnel forwarding a public host to an owt-stack app.
+parameters:
+  - name: NAME
+    description: The app's name, as given to app.yaml (its Service and pod label).
+    required: true
+  - name: NAMESPACE
+    required: true
+  - name: TUNNEL_HOST
+    description: The public host the tunnel answers for (myapp.example.com).
+    required: true
+  - name: TUNNEL_ID
+    description: The tunnel's UUID, from `cloudflared tunnel create` (or `cloudflared tunnel list`).
+    required: true
+  - name: CREDENTIALS_SECRET
+    description: >-
+      The Secret holding the tunnel's credentials.json; apply.sh passes <NAME>-tunnel
+      unless params.env names another.
+    required: true
+  - name: CLOUDFLARED_IMAGE
+    description: >-
+      cloudflared, by tag and digest: the tag names the release, the digest is what
+      runs. The component carrying all public traffic restarts only when this changes.
+    value: docker.io/cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4
+  - name: TUNNEL_MEMORY_LIMIT
+    description: >-
+      Each connector's memory limit. A connector idles near 35Mi; each stream it
+      carries (a WebSocket, an SSE response) adds to that.
+    value: 256Mi
+  - name: TUNNEL_CONFIG_CHECKSUM
+    description: >-
+      A checksum of the rendered config, set by apply.sh; a change rolls the connectors.
+    value: ""
+  - name: DNS_NAMESPACE
+    description: The namespace the cluster's DNS pods run in.
+    value: openshift-dns
+  - name: DNS_PORT
+    description: The port those pods answer on (OpenShift's CoreDNS listens on 5353).
+    value: "5353"
+objects:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: cloudflared-config
+      namespace: ${NAMESPACE}
+      labels: {app: cloudflared}
+    data:
+      config.yaml: |
+        tunnel: ${TUNNEL_ID}
+        credentials-file: /etc/cloudflared/creds/credentials.json
+        # The image is pinned, and a self-update would drop every connection.
+        no-autoupdate: true
+        # Serves /ready, which the probes read: 200 only once this connector has
+        # registered with the edge.
+        metrics: 0.0.0.0:2000
+        ingress:
+          # app.yaml's Service, on its port 80. cloudflared upgrades WebSockets and
+          # streams SSE, and does not time out a response in flight. No
+          # originRequest.httpHostHeader: the browser's Host passes through, so the
+          # app sees TUNNEL_HOST, which its origin checks compare against.
+          - hostname: ${TUNNEL_HOST}
+            service: http://${NAME}:80
+          # Required: cloudflared refuses to start without a catch-all last rule.
+          - service: http_status:404
+
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: cloudflared
+      namespace: ${NAMESPACE}
+      labels: {app: cloudflared}
+    spec:
+      # Two: a WebSocket is pinned to the connector that accepted it and dies with
+      # it, so with one replica every restart would take the site off the edge.
+      # No PodDisruptionBudget: on a single-node cluster a drain takes both pods
+      # whatever it says, and a budget would only hold the drain up.
+      replicas: 2
+      strategy:
+        type: RollingUpdate
+        # The new connector registers (/ready) before an old one stops.
+        rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+      selector:
+        matchLabels: {app: cloudflared}
+      template:
+        metadata:
+          labels: {app: cloudflared}
+          annotations:
+            checksum/config: "${TUNNEL_CONFIG_CHECKSUM}"
+        spec:
+          automountServiceAccountToken: false
+          # cloudflared stops taking new requests on SIGTERM and gives those in
+          # flight its 30-second grace period; this outlasts it.
+          terminationGracePeriodSeconds: 40
+          containers:
+            - name: cloudflared
+              image: ${CLOUDFLARED_IMAGE}
+              args: [tunnel, --config, /etc/cloudflared/config.yaml, run]
+              env:
+                # restricted-v2 runs this under an arbitrary UID with no home.
+                - {name: HOME, value: /tmp}
+              ports:
+                - {name: metrics, containerPort: 2000}
+              volumeMounts:
+                - {name: config, mountPath: /etc/cloudflared/config.yaml, subPath: config.yaml, readOnly: true}
+                - {name: creds, mountPath: /etc/cloudflared/creds, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+              readinessProbe:
+                httpGet: {path: /ready, port: metrics}
+                initialDelaySeconds: 5
+                periodSeconds: 10
+              livenessProbe:
+                # /ready, not TCP: a connector that has lost every edge connection
+                # still holds its metrics port open, and a restart is what fixes it.
+                httpGet: {path: /ready, port: metrics}
+                initialDelaySeconds: 20
+                periodSeconds: 20
+                failureThreshold: 3
+              resources:
+                # Sized from live connectors (about 5m CPU and 35Mi each). No CPU
+                # limit: throttling the proxy would delay every request.
+                requests: {cpu: 10m, memory: 48Mi}
+                limits: {memory: "${TUNNEL_MEMORY_LIMIT}"}
+              # restricted-v2 compatible; the SCC assigns the UID.
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+                seccompProfile: {type: RuntimeDefault}
+          volumes:
+            - name: config
+              configMap: {name: cloudflared-config}
+            - name: creds
+              secret: {secretName: "${CREDENTIALS_SECRET}"}
+            - name: tmp
+              emptyDir: {medium: Memory, sizeLimit: 16Mi}
+
+  # app.yaml's policy admits the router alone; policies add up, so this one lets the
+  # connectors reach the app's HTTP port too.
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: ${NAME}-from-tunnel
+      namespace: ${NAMESPACE}
+      labels: {app: cloudflared}
+    spec:
+      podSelector:
+        matchLabels: {app: "${NAME}"}
+      policyTypes: [Ingress]
+      ingress:
+        - from:
+            - podSelector:
+                matchLabels: {app: cloudflared}
+          ports: [{port: http}]
+
+  # The connectors take no connections (their probes come from the kubelet, which
+  # policies do not filter), and open only these: the cluster's DNS, Cloudflare's
+  # edge on 7844 (QUIC over UDP, HTTP/2 over TCP when UDP is blocked), HTTPS (the
+  # Cloudflare API), and the app's HTTP port. The edge's addresses are Cloudflare's
+  # to change, so the edge rules name no range.
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: cloudflared
+      namespace: ${NAMESPACE}
+      labels: {app: cloudflared}
+    spec:
+      podSelector:
+        matchLabels: {app: cloudflared}
+      policyTypes: [Ingress, Egress]
+      egress:
+        - to:
+            - namespaceSelector:
+                matchLabels: {kubernetes.io/metadata.name: "${DNS_NAMESPACE}"}
+          ports:
+            - {protocol: UDP, port: "${{DNS_PORT}}"}
+            - {protocol: TCP, port: "${{DNS_PORT}}"}
+        - to:
+            - ipBlock: {cidr: 0.0.0.0/0}
+          ports:
+            - {protocol: UDP, port: 7844}
+            - {protocol: TCP, port: 7844}
+            - {protocol: TCP, port: 443}
+        - to:
+            - podSelector:
+                matchLabels: {app: "${NAME}"}
+          ports: [{port: http}]

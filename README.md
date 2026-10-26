@@ -33,6 +33,7 @@ Outside the crates:
 | `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger and the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone, connecting to nothing |
 | `templates/openshift/egress.yaml` | where the app's pods (or a task's) may connect: its database, its Redis, the cluster's DNS and port 443 of the internet, and nothing else |
+| `templates/openshift/tunnel.yaml` | the public address on a private cluster: a locally managed Cloudflare named tunnel of the app's own, two `cloudflared` connectors forwarding its host to the app's Service, and their NetworkPolicies |
 | `templates/openshift/apply.sh` | renders every template present from the app's `params.env` (and `jobs/*.env`), plus an optional `pre-render` hook, `oc diff` by default, `--apply` to apply; `apply-test.sh` proves it against a stand-in `oc` |
 | `templates/openshift/cronjob.yaml` | a scheduled task in the app's image, with the app's database, TLS, environment and NetworkPolicies |
 | `templates/openshift/env.sh` | creates and patches the app's `myapp-env` Secret from an `env.env` of its settings: literals, keys generated once, keys taken from the caller's environment; `env-test.sh` proves it |
@@ -3246,7 +3247,8 @@ deploy/openshift/apply.sh --apply
 ```
 
 `app.yaml` is always rendered; `redis.yaml` and `egress.yaml` (for the app's pods,
-then each task's) when present; `cronjob.yaml` once per
+then each task's) when present; `tunnel.yaml` when `params.env` sets `TUNNEL_HOST`
+and `TUNNEL_ID` (below); `cronjob.yaml` once per
 `deploy/openshift/jobs/<JOB>.env`, whose lines (`JOB`, `SCHEDULE`, `ARGS`, and any
 override such as `INTERNET_CIDR` or the task's `MEMORY_LIMIT`) are read over
 `params.env`; `monitoring.yaml` with `--monitoring`, since it needs monitoring-edit
@@ -3432,6 +3434,69 @@ looks like a DNS failure, and deleting the policy (`oc delete networkpolicy
 myapp-egress`) restores the open egress. The database's instances get no egress
 policy: the CloudNativePG instance manager talks to the cluster API. `redis.yaml`'s
 Redis gets one of its own there, admitting no egress at all.
+
+**The public address, through a Cloudflare tunnel.** On a cluster the internet
+cannot reach, `tunnel.yaml` gives the app a Cloudflare named tunnel of its own: two
+`cloudflared` connectors in its namespace dial out to Cloudflare's edge, and requests
+for `TUNNEL_HOST` come back down those connections to the app's Service (port 80),
+the browser's `Host` passed through. The tunnel is locally managed: its ingress rules
+are the template's, in git, and the Cloudflare account holds only the tunnel and its
+DNS record. Each app has its own tunnel and connectors, never another app's: a
+connector restart drops every WebSocket and SSE stream it carries ("Decisions").
+
+Made once, where `cloudflared` is logged in to the account (`cloudflared tunnel
+login`): the tunnel, whose credentials file goes into a Secret and nowhere else, and
+the DNS record, a proxied CNAME to `<id>.cfargotunnel.com`:
+
+```sh
+cloudflared tunnel create myapp                       # prints the id, writes ~/.cloudflared/<id>.json
+oc create secret generic myapp-tunnel -n myapp \
+  --from-file=credentials.json=$HOME/.cloudflared/<id>.json
+cloudflared tunnel route dns myapp myapp.example.com  # --overwrite-dns replaces a record
+```
+
+Then `params.env` names the host and the tunnel, and `apply.sh` renders `tunnel.yaml`
+beside `app.yaml`:
+
+```sh
+TUNNEL_HOST=myapp.example.com
+TUNNEL_ID=<id>                    # cloudflared tunnel list; not a secret
+# CREDENTIALS_SECRET=myapp-tunnel # the default, <NAME>-tunnel
+```
+
+`TUNNEL_HOST` without `TUNNEL_ID`, or the reverse, is refused, as is a `TUNNEL_ID`
+that is no UUID, or a `TUNNEL_HOST` with no `tunnel.yaml` beside the script.
+`cloudflared` reads its config once, at start, so `apply.sh` puts a checksum of the
+rendered config in the connectors' pod template (`TUNNEL_CONFIG_CHECKSUM`): a new host
+or tunnel rolls them, one at a time, each new connector registered with the edge
+before an old one stops. A rotated credentials Secret is not in the checksum: `oc
+rollout restart deployment/cloudflared` after it. The image is pinned by tag and
+digest (`CLOUDFLARED_IMAGE`), with no self-update, so the connectors restart only when
+an upgrade of owt-stack or the app changes it; each one requests 10m CPU and 48Mi
+(about what one uses idle), with a `TUNNEL_MEMORY_LIMIT` of 256Mi for the streams it
+carries. There is no PodDisruptionBudget: on a single node a drain takes both pods
+whatever it says.
+
+The NetworkPolicies come with it: `myapp-from-tunnel` admits the connectors to the
+app's HTTP port, beside `app.yaml`'s policy, which admits the router alone, and
+`cloudflared` admits nothing to the connectors and lets them open only the cluster's
+DNS (`DNS_NAMESPACE`, `DNS_PORT`, as `egress.yaml`'s), Cloudflare's edge on 7844 (QUIC
+over UDP, HTTP/2 over TCP), HTTPS, and the app's HTTP port.
+
+Every request through the tunnel carries the client's address in `CF-Connecting-IP`,
+which Cloudflare sets, so the app's environment (`env.env`, below) has
+`CLIENT_IP=header:CF-Connecting-IP` ("The client's address"). That header is believed
+from anyone who can reach the app: the app's Route still answers on the cluster's own
+network, and a client there could write the header itself, so this setting is for an
+app whose Route only trusted machines reach. The Route stays for them; the tunnel is
+the public way in. By hand, without `apply.sh`, the render names the Secret, and a
+config change needs the restart:
+
+```sh
+oc process -f templates/openshift/tunnel.yaml -p NAME=myapp -p NAMESPACE=myapp \
+  -p TUNNEL_HOST=myapp.example.com -p TUNNEL_ID=<id> \
+  -p CREDENTIALS_SECRET=myapp-tunnel | oc apply -f -
+```
 
 **An app whose database already exists passes the major it runs**, on every apply:
 `-p POSTGRES_MAJOR=16` if
@@ -3730,6 +3795,12 @@ this command, run when the app adopts a release, is the only thing that moves it
 - **OpenShift Template, not Kustomize**, for the deployment: the app's name must reach
   the image trigger annotation and the CNPG Secret's name, which Kustomize's name
   transformers do not rewrite.
+- **One Cloudflare tunnel per app**, with its connectors in the app's namespace. A
+  WebSocket or SSE stream is pinned to the connector that accepted it and ends when
+  that connector restarts, so connectors shared between apps would let one app's
+  rollout, crash or config change cut another's live connections. The tunnel is
+  locally managed (credentials in a Secret, ingress rules in git), not configured in
+  the Cloudflare dashboard, so a deploy's configuration stays reviewable in one place.
 
 ## Security an app wires
 
@@ -3777,6 +3848,35 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+
+## Upgrading from 0.9
+
+- **The Cloudflare tunnel is a template** (`templates/openshift/tunnel.yaml`, "The
+  public address, through a Cloudflare tunnel"). An app that keeps its own copy of
+  the `cloudflared` ConfigMap and Deployment (in its `app.yaml`, or a `tunnel.yaml` and
+  script of its own) moves over in place, without a second tunnel: the template's
+  objects are the copies' names (`cloudflared-config`, `cloudflared`), with the same
+  `app: cloudflared` selector, so the apply updates them.
+
+  1. Copy `tunnel.yaml` and `apply.sh` into `deploy/openshift/`, and delete the app's
+     own tunnel objects from its templates, and any script of its own that rendered
+     them.
+  2. In `params.env`: `TUNNEL_HOST` (the host the copy served), `TUNNEL_ID` (from
+     `cloudflared tunnel list`, or the `TunnelID` in the credentials Secret:
+     `oc get secret myapp-tunnel -o jsonpath='{.data.credentials\.json}' | base64 -d`),
+     and `CREDENTIALS_SECRET` when the Secret is not `myapp-tunnel`. The Secret, the
+     tunnel and its DNS record stay as they are.
+  3. `deploy/openshift/apply.sh`, and read the diff: the ConfigMap's comments, the
+     image (now with its digest), resources, probes' port name and the pod template's
+     annotations change, so the connectors roll once, one at a time. Then `--apply`.
+  4. A policy of the copy's that admitted the connectors to the app under another name
+     (`myapp-from-cloudflared`) is now `myapp-from-tunnel`'s job: `oc delete
+     networkpolicy myapp-from-cloudflared`. A rule for the connectors written into the
+     app's own policy goes when that policy is `app.yaml`'s again.
+
+  The connectors gain an egress policy they did not have: DNS, 7844 and 443 to the
+  internet, and the app's HTTP port. A connector that cannot register shows as not
+  ready, and the rollout stops with the old one still serving.
 
 ## Upgrading from 0.8
 
