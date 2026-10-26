@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # apply.sh against a stand-in `oc` that records what it is asked: which templates
 # are rendered with which parameters, diff against apply, the jobs' files, the
-# egress policies per set of pods, and the refusals. It proves the script's own
+# egress policies per set of pods, the tunnel and its config checksum, and the
+# refusals. It proves the script's own
 # logic; the templates' output is `oc process`'s to render, on a real run.
 #
 #   templates/openshift/apply-test.sh       (`just templates` runs it)
@@ -20,13 +21,18 @@ cat >"$work/bin/oc" <<'FAKE'
 # It encodes three things about the real client: `--parameters` prints a header line
 # and then one parameter a line, name first; `--param-file` holds one KEY=VALUE a
 # line, a comma in a value is no list, and `-p` is refused (it would split one);
-# `diff` exits 1 on a difference.
+# `diff` exits 1 on a difference. A jsonpath render (the tunnel's config, for its
+# checksum) prints the parameters it was given, so it changes when they do.
 set -euo pipefail
 printf 'oc %s\n' "$*" >>"$FAKE_LOG"
 case "$*" in
   "process --local -f "*" --parameters")
     echo "NAME DESCRIPTION GENERATOR VALUE"
     sed -nE 's/^  - name: ([A-Z_]+).*/\1/p' "$4"
+    ;;
+  "process --local -f "*" -o jsonpath="*)
+    printf 'config of %s:' "$(basename "$4")"
+    cat "${5#--param-file=}"
     ;;
   "process --local -f "*)
     [ "$(basename "$4")" != "${FAKE_PROCESS_FAIL:-}" ] || { echo "fake: render refused" >&2; exit 1; }
@@ -245,5 +251,67 @@ ln -s "$work/deploy/missing" "$work/deploy/pre-render"
 rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "a dangling pre-render exits 2 (got $rc)"
 grep -q "not an executable file" "$work/err" || fail "names the dangling hook"
 rm "$work/deploy/pre-render"
+
+# 11. The tunnel: rendered when params.env sets TUNNEL_HOST and TUNNEL_ID, after the
+#     app's egress, with CREDENTIALS_SECRET defaulting to <NAME>-tunnel and a checksum
+#     of its config that changes with the config and with nothing else; skipped when
+#     neither is set; refused when one is set without the other, when TUNNEL_ID is no
+#     UUID, or when tunnel.yaml is not here.
+cp "$here/egress.yaml" "$work/deploy/"
+cp "$work/good.env" "$work/deploy/params.env"
+rc=0; run || rc=$?
+[ "$rc" -eq 1 ] || fail "diff without a tunnel (got $rc)"
+grep -q "rendered tunnel.yaml" "$log" && fail "a tunnel rendered without TUNNEL_HOST"
+grep -q "tunnel.yaml is here but .* sets no TUNNEL_HOST" "$work/err" || fail "the no-tunnel note"
+id=0f6a3c1e-8b2d-4c5e-9a7f-1d2e3f4a5b6c
+tunnel_run() {
+  { cat "$work/good.env"; printf '%s\n' "$@"; } >"$work/deploy/params.env"
+  rc=0; run --apply || rc=$?
+}
+checksum() { sed -n 's/^rendered tunnel.yaml .*TUNNEL_CONFIG_CHECKSUM=\([0-9a-f]*\).*/\1/p' "$log"; }
+tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id"
+[ "$rc" -eq 0 ] || fail "apply with a tunnel (got $rc)"
+logged "rendered tunnel.yaml NAME=myapp NAMESPACE=myapp-staging TUNNEL_HOST=myapp.example.com TUNNEL_ID=$id CREDENTIALS_SECRET=myapp-tunnel TUNNEL_CONFIG_CHECKSUM=" || fail "tunnel.yaml's parameters"
+grep -q "tunnel.yaml is here but" "$work/err" && fail "the no-tunnel note with a tunnel"
+grep -c "^oc apply -f " "$log" | grep -qx 3 || fail "three applies with the tunnel"
+awk '/^oc process --local -f .*-o yaml$/ { print $5 }' "$log" | tr '\n' ' ' | grep -q "app.yaml .*egress.yaml .*tunnel.yaml" || fail "the tunnel after the app's egress"
+grep -q "^config of tunnel.yaml:.*TUNNEL_CONFIG_CHECKSUM" "$log" && fail "the checksum fed its own render"
+first=$(checksum)
+[[ $first =~ ^[0-9a-f]{16}$ ]] || fail "a 16-digit checksum (got '$first')"
+tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id"
+[ "$(checksum)" = "$first" ] || fail "the same config, the same checksum"
+tunnel_run "TUNNEL_HOST=www.example.com" "TUNNEL_ID=$id"
+[ "$(checksum)" != "$first" ] || fail "a new host, a new checksum"
+tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id" "CREDENTIALS_SECRET=other-creds"
+logged "CREDENTIALS_SECRET=other-creds" || fail "params.env names the credentials Secret"
+tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id" "TUNNEL_CONFIG_CHECKSUM=stale"
+grep -q "TUNNEL_CONFIG_CHECKSUM=stale" "$log" && fail "the computed checksum wins over one in params.env"
+[ "$(checksum)" = "$first" ] || fail "a checksum in params.env changes the computed one"
+for half in "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id" "TUNNEL_HOST=myapp.example.com TUNNEL_ID="; do
+  # shellcheck disable=SC2086 # each word is a line
+  tunnel_run $half
+  [ "$rc" -eq 2 ] || fail "'$half' exits 2 (got $rc)"
+  grep -q "TUNNEL_HOST and TUNNEL_ID go together" "$work/err" || fail "names the half-set tunnel '$half'"
+  grep -q "^oc process" "$log" && fail "'$half' rendered something"
+done
+tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=myapp"
+[ "$rc" -eq 2 ] || fail "a TUNNEL_ID that is no UUID exits 2 (got $rc)"
+grep -q "TUNNEL_ID=myapp is not a tunnel's UUID" "$work/err" || fail "names the bad TUNNEL_ID"
+for bad in https://myapp.example.com myapp.example.com/x myapp.example.com:443 '"myapp.example.com"x' localhost; do
+  tunnel_run "TUNNEL_HOST=$bad" "TUNNEL_ID=$id"
+  [ "$rc" -eq 2 ] || fail "TUNNEL_HOST=$bad exits 2 (got $rc)"
+  grep -qF "is not a host name" "$work/err" || fail "names the bad TUNNEL_HOST $bad"
+  grep -q "^oc process" "$log" && fail "TUNNEL_HOST=$bad rendered something"
+done
+tunnel_run "TUNNEL_HOST=*.example.com" "TUNNEL_ID=$id"
+[ "$rc" -eq 0 ] || fail "a wildcard TUNNEL_HOST is taken (got $rc)"
+rm "$work/deploy/tunnel.yaml"
+tunnel_run "TUNNEL_HOST=myapp.example.com" "TUNNEL_ID=$id"
+[ "$rc" -eq 2 ] || fail "a tunnel without tunnel.yaml exits 2 (got $rc)"
+grep -q "sets TUNNEL_HOST, and tunnel.yaml is not here" "$work/err" || fail "names the missing tunnel.yaml"
+grep -q "^oc process" "$log" && fail "rendered without tunnel.yaml"
+cp "$work/good.env" "$work/deploy/params.env"
+rc=0; run || rc=$?
+grep -q "tunnel.yaml" "$work/err" && fail "a note about a tunnel.yaml that is not here"
 
 echo "apply.sh: ok"

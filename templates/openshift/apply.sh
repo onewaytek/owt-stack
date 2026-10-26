@@ -30,6 +30,10 @@
 #   app.yaml         always
 #   redis.yaml       when present
 #   egress.yaml      when present: for the app's pods (POD=NAME), and each task's
+#   tunnel.yaml      when params.env sets TUNNEL_HOST and TUNNEL_ID (one without the
+#                    other is refused); CREDENTIALS_SECRET defaults to <NAME>-tunnel,
+#                    and a checksum of the connectors' config goes in their pod
+#                    template, so a change to it rolls them
 #   cronjob.yaml     when present: once per jobs/<JOB>.env, whose lines (JOB,
 #                    SCHEDULE, ARGS, and any override) are read over params.env;
 #                    a key the job's file leaves out keeps the app's value
@@ -173,6 +177,45 @@ if [ "${given[ROUTE_TIMEOUT]+set}" ] && ! [[ ${given[ROUTE_TIMEOUT]} =~ ^[1-9][0
   echo "$params: ROUTE_TIMEOUT=${given[ROUTE_TIMEOUT]} is not a number with a unit (us, ms, s, m, h or d: 30s, 2m)" >&2
   exit 2
 fi
+# The tunnel needs both its public host and the UUID of the tunnel serving it; with
+# neither, it is not rendered.
+tunnel=no
+if [ -n "${given[TUNNEL_HOST]:-}" ] || [ -n "${given[TUNNEL_ID]:-}" ]; then
+  if [ -z "${given[TUNNEL_HOST]:-}" ] || [ -z "${given[TUNNEL_ID]:-}" ]; then
+    echo "$params: TUNNEL_HOST and TUNNEL_ID go together (the public host, and the UUID of the tunnel that serves it)" >&2
+    exit 2
+  fi
+  [[ ${given[TUNNEL_ID]} =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] ||
+    { echo "$params: TUNNEL_ID=${given[TUNNEL_ID]} is not a tunnel's UUID (cloudflared tunnel list)" >&2; exit 2; }
+  # A host name, or a wildcard one (*.example.com): no scheme, path, port or quote.
+  [[ ${given[TUNNEL_HOST]} =~ ^(\*\.)?([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]] ||
+    { echo "$params: TUNNEL_HOST=${given[TUNNEL_HOST]} is not a host name (myapp.example.com: no scheme, path or port)" >&2; exit 2; }
+  [ -f "$here/tunnel.yaml" ] || { echo "$params sets TUNNEL_HOST, and tunnel.yaml is not here" >&2; exit 2; }
+  command -v sha256sum >/dev/null || command -v shasum >/dev/null ||
+    { echo "the tunnel's config checksum needs sha256sum or shasum" >&2; exit 2; }
+  [ -n "${given[CREDENTIALS_SECRET]:-}" ] || given[CREDENTIALS_SECRET]=${given[NAME]}-tunnel
+  tunnel=yes
+elif [ -f "$here/tunnel.yaml" ]; then
+  echo "tunnel.yaml is here but $params sets no TUNNEL_HOST: no tunnel rendered" >&2
+fi
+
+# cloudflared reads its config once, at start. A checksum of the config as rendered
+# goes in the connectors' pod template (TUNNEL_CONFIG_CHECKSUM), so a change to the
+# config changes the pods, and the Deployment rolls them.
+tunnel_checksum() {
+  local template=$1 config
+  unset 'given[TUNNEL_CONFIG_CHECKSUM]'
+  args_for "$template"
+  config=$(oc process --local -f "$template" "${args[@]}" \
+    -o 'jsonpath={.items[?(@.kind=="ConfigMap")].data.config\.yaml}') ||
+    { echo "oc process failed on tunnel.yaml" >&2; exit 2; }
+  [ -n "$config" ] || { echo "tunnel.yaml rendered no ConfigMap config.yaml" >&2; exit 2; }
+  if command -v sha256sum >/dev/null; then
+    given[TUNNEL_CONFIG_CHECKSUM]=$(printf '%s' "$config" | sha256sum | cut -c1-16)
+  else
+    given[TUNNEL_CONFIG_CHECKSUM]=$(printf '%s' "$config" | shasum -a 256 | cut -c1-16)
+  fi
+}
 
 run "$here/app.yaml" "app.yaml"
 [ -f "$here/redis.yaml" ] && run "$here/redis.yaml" "redis.yaml"
@@ -180,6 +223,10 @@ if [ -f "$here/egress.yaml" ]; then
   given[POD]=${given[NAME]}
   run "$here/egress.yaml" "egress.yaml for ${given[POD]}"
   unset 'given[POD]'
+fi
+if [ "$tunnel" = yes ]; then
+  tunnel_checksum "$here/tunnel.yaml"
+  run "$here/tunnel.yaml" "tunnel.yaml for ${given[TUNNEL_HOST]}"
 fi
 if [ -f "$here/cronjob.yaml" ]; then
   shopt -s nullglob
