@@ -526,12 +526,13 @@ async fn save(session: Session<SessionData>) -> axum::response::Redirect {
 
 With `owt-accounts`, `owt_accounts::PageCtx` is that context, extracted: the viewer
 (`viewer`, `None` when anonymous; the app's `load_with` read as `extra`), the
-`request`, the `flashes`, the CSP `nonce`. The flashes are taken from the session
-once, as the context is extracted, so a handler that draws the page shows each exactly
-once; a request htmx sent for a fragment takes none (they wait for the next full
-page; a boosted navigation and a history restore are full pages). Extract it once per
-request: a second `PageCtx` finds the session empty, and an extractor after it that
-rejects (a `Form`, say) loses the messages already taken.
+`request`, the CSP `nonce`, and `flashes()`. The flashes are taken from the session
+once, by the first call to `flashes()` (when the page is drawn), so a handler that
+draws the page shows each exactly once and one whose later extractor rejects (a
+`Form`, say) leaves them for the next page; a request htmx sent for a fragment takes
+none (they wait for the next full page; a boosted navigation and a history restore are
+full pages). Extract it once per request: a second `PageCtx` finds the session empty
+once the first has taken the messages; clones share them.
 `PageCtx<T>` names the app's session data when it is not `session::Data`; it must be
 `HasFlashes` and the type the session layer holds (another type, or no layer, reads an
 empty session and logs at `debug`). Install the session layer outside `Accounts::load`;
@@ -565,7 +566,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Layout {
 }
 
 async fn games(layout: Layout) -> String {
-    // `layout.viewer`, `layout.flashes`, `layout.nonce`, and the request's `path` and
+    // `layout.viewer`, `layout.flashes()`, `layout.nonce`, and the request's `path` and
     // `url_with(..)` through the `Deref`s.
     let _fragment = layout.bare();
     format!("{} {}", layout.path, layout.theme)
