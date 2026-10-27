@@ -449,6 +449,17 @@ the handler and write `<script nonce="{{ nonce }}">`.
   `assets()` (the `Assets`, rehashing on every call in a debug build) and
   `url(path)`.
 
+  A `.css` file is served with the relative URLs inside it versioned too: each
+  `url(...)` and `@import` that names a file in the directory (`url(../fonts/a.woff2)`,
+  `url('b.woff2#id')`) gains `?v=<hash>` of that file, so fonts and images a
+  stylesheet loads are `immutable` like the stylesheet. Absolute and root-relative
+  URLs, `data:` URLs, fragments, URLs that already have a query, percent-encoded
+  paths and files that are not there are left as written. The stylesheet's own hash
+  folds in the hashes of the files it names, so changing a font changes the
+  stylesheet's URL, and it is served with an `ETag` (its hash) and a `Content-Length`
+  of the rewritten bytes. Nothing changes in the file on disk; the vendored font
+  files need no hash in their names.
+
   ```rust,no_run
   mod assets {
       owt_web::static_assets!("static", "/static");
