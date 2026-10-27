@@ -9,7 +9,9 @@
 //!   told it failed tries again, differently; one told it succeeded moves on.
 //! * [`Verdict::Failed`] when Turnstile is on and the token is missing, refused, or
 //!   could not be checked: show the form again with a message. It is a person's
-//!   expired token as often as a bot, so it is not pretended away.
+//!   expired token as often as a bot, so it is not pretended away. The guard logs
+//!   why: a refusal that means a wrong secret (see [`Outcome::is_misconfigured`]) at
+//!   `error`, since it refuses every post, and the rest at `debug`.
 //! * [`Verdict::Accept`] otherwise.
 //!
 //! The budget is checked first, so a flood costs a map lookup, not a Turnstile
@@ -129,6 +131,52 @@ pub enum VerifyError {
     Http(#[from] reqwest::Error),
 }
 
+/// siteverify's `error-codes` that mean the deployment is wrong, not the visitor: no
+/// secret sent, or one Cloudflare does not know (mistyped, revoked, or a test key in
+/// production). Every token is refused until it is fixed.
+const MISCONFIGURED_CODES: [&str; 2] = ["missing-input-secret", "invalid-input-secret"];
+
+/// What Turnstile made of a token it could be asked about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Outcome {
+    /// The token is good (and, if one is expected, for the right hostname).
+    Passed,
+    /// The token was refused.
+    Refused {
+        /// siteverify's `error-codes`, such as `timeout-or-duplicate`; empty for a
+        /// blank or oversized token, which is refused without a request.
+        codes: Vec<String>,
+    },
+    /// The token is good but was issued for another site than
+    /// [`Turnstile::expect_hostname`] names.
+    WrongHostname {
+        /// The hostname Cloudflare reported, if it reported one.
+        got: Option<String>,
+    },
+}
+
+impl Outcome {
+    /// Whether the token passed.
+    #[must_use]
+    pub const fn is_passed(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+
+    /// Whether the refusal says the deployment is wrong rather than the visitor: the
+    /// secret is missing or invalid, so every post will be refused. Log those at
+    /// `warn` or `error`, and the rest at `debug`.
+    #[must_use]
+    pub fn is_misconfigured(&self) -> bool {
+        match self {
+            Self::Refused { codes } => codes
+                .iter()
+                .any(|c| MISCONFIGURED_CODES.contains(&c.as_str())),
+            Self::Passed | Self::WrongHostname { .. } => false,
+        }
+    }
+}
+
 /// Cloudflare Turnstile: the site key a page embeds and the secret a server checks
 /// tokens with.
 #[derive(Clone)]
@@ -152,6 +200,8 @@ impl std::fmt::Debug for Turnstile {
 struct SiteVerify {
     success: bool,
     hostname: Option<String>,
+    #[serde(default, rename = "error-codes")]
+    error_codes: Vec<String>,
 }
 
 impl Turnstile {
@@ -208,12 +258,12 @@ impl Turnstile {
         &self.site_key
     }
 
-    /// Whether Turnstile accepts `token` (the form's `cf-turnstile-response`) for a
-    /// post from `ip`. A missing, blank or oversized token is refused without a request.
-    pub async fn verify(&self, token: &str, ip: IpAddr) -> Result<bool, VerifyError> {
+    /// What Turnstile makes of `token` (the form's `cf-turnstile-response`) for a post
+    /// from `ip`. A missing, blank or oversized token is refused without a request.
+    pub async fn verify(&self, token: &str, ip: IpAddr) -> Result<Outcome, VerifyError> {
         let token = token.trim();
         if token.is_empty() || token.len() > MAX_TOKEN_BYTES {
-            return Ok(false);
+            return Ok(Outcome::Refused { codes: Vec::new() });
         }
         let ip = ip.to_string();
         let answer: SiteVerify = self
@@ -229,13 +279,24 @@ impl Turnstile {
             .error_for_status()?
             .json()
             .await?;
-        Ok(answer.success
-            && self.hostname.as_deref().is_none_or(|want| {
-                answer
-                    .hostname
-                    .as_deref()
-                    .is_some_and(|got| got.eq_ignore_ascii_case(want))
-            }))
+        if !answer.success {
+            return Ok(Outcome::Refused {
+                codes: answer.error_codes,
+            });
+        }
+        let right_site = self.hostname.as_deref().is_none_or(|want| {
+            answer
+                .hostname
+                .as_deref()
+                .is_some_and(|got| got.eq_ignore_ascii_case(want))
+        });
+        Ok(if right_site {
+            Outcome::Passed
+        } else {
+            Outcome::WrongHostname {
+                got: answer.hostname,
+            }
+        })
     }
 }
 
@@ -298,8 +359,20 @@ impl Guard {
             return Verdict::Accept;
         };
         match turnstile.verify(token, ip).await {
-            Ok(true) => Verdict::Accept,
-            Ok(false) => Verdict::Failed,
+            Ok(Outcome::Passed) => Verdict::Accept,
+            Ok(outcome) => {
+                if outcome.is_misconfigured() {
+                    tracing::error!(
+                        ?outcome,
+                        "turnstile rejected the secret key; refusing every post"
+                    );
+                } else if matches!(outcome, Outcome::WrongHostname { .. }) {
+                    tracing::warn!(?outcome, "turnstile token was issued for another hostname");
+                } else {
+                    tracing::debug!(?outcome, "turnstile refused the token");
+                }
+                Verdict::Failed
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "turnstile could not be reached; refusing the post");
                 Verdict::Failed
@@ -338,10 +411,20 @@ mod tests {
             post(move |body: String| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async move {
-                    let ok = body.contains("secret=sekrit")
+                    let known = body.contains("secret=sekrit");
+                    let ok = known
                         && body.contains("response=good")
                         && body.contains("remoteip=10.0.0.1");
-                    axum::Json(serde_json::json!({ "success": ok, "hostname": "app.example" }))
+                    let code = if known {
+                        "timeout-or-duplicate"
+                    } else {
+                        "invalid-input-secret"
+                    };
+                    axum::Json(serde_json::json!({
+                        "success": ok,
+                        "hostname": "app.example",
+                        "error-codes": if ok { vec![] } else { vec![code] },
+                    }))
                 }
             }),
         );
@@ -428,16 +511,72 @@ mod tests {
                 .expect_hostname("APP.example")
                 .verify("good", ip1)
                 .await
-                .ok(),
-            Some(true)
+                .unwrap(),
+            Outcome::Passed
         );
+        let wrong = t
+            .expect_hostname("other.example")
+            .verify("good", ip1)
+            .await
+            .unwrap();
         assert_eq!(
-            t.expect_hostname("other.example")
-                .verify("good", ip1)
-                .await
-                .ok(),
-            Some(false)
+            wrong,
+            Outcome::WrongHostname {
+                got: Some("app.example".into())
+            }
         );
+        assert!(!wrong.is_passed() && !wrong.is_misconfigured());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_carries_siteverifys_error_codes() {
+        let t = stand_in(Arc::new(AtomicUsize::new(0))).await;
+        let refused = t.verify("stale", ip(1)).await.unwrap();
+        assert_eq!(
+            refused,
+            Outcome::Refused {
+                codes: vec!["timeout-or-duplicate".into()]
+            }
+        );
+        assert!(!refused.is_passed() && !refused.is_misconfigured());
+        // A blank token is refused without a request, so there are no codes.
+        assert_eq!(
+            t.verify(" ", ip(1)).await.unwrap(),
+            Outcome::Refused { codes: vec![] }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_secret_is_a_misconfiguration() {
+        let t = stand_in(Arc::new(AtomicUsize::new(0))).await;
+        let wrong = Turnstile::from_values(Some("site".into()), Some("nope".into()))
+            .unwrap()
+            .unwrap()
+            .with_endpoint(t.endpoint.clone());
+        let outcome = wrong.verify("good", ip(1)).await.unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Refused {
+                codes: vec!["invalid-input-secret".into()]
+            }
+        );
+        assert!(outcome.is_misconfigured());
+        for code in ["missing-input-secret", "invalid-input-secret"] {
+            let o = Outcome::Refused {
+                codes: vec!["other".into(), code.into()],
+            };
+            assert!(o.is_misconfigured(), "{code}");
+        }
+        assert!(!Outcome::Passed.is_misconfigured());
+        assert!(
+            !Outcome::Refused {
+                codes: vec!["invalid-input-response".into()]
+            }
+            .is_misconfigured()
+        );
+        // The guard still just fails the post.
+        let g = Guard::new(HP, Some(wrong), throttle(10));
+        assert_eq!(g.check(ip(1), "", "good").await, Verdict::Failed);
     }
 
     #[tokio::test]
