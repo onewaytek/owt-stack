@@ -2,6 +2,13 @@
 //! recovered from a shell. Nest [`AccountCommand`] under the app's own `Cli` and call
 //! [`run`] with the pool.
 //!
+//! An app that wants its own command names or flags (a `create-user --host`, a
+//! `login-link` with a shorter default lifetime) keeps its own clap enum instead:
+//! `#[command(flatten)]` [`CreateArgs`] or [`LinkArgs`] into a variant beside the
+//! app's flags and call [`create`] or [`link`] from its handler. [`create`] returns
+//! the new [`Account`], so what the app adds (a flag's effect, a welcome) runs after
+//! it exists.
+//!
 //! No secret rides in argv, where `ps` and shell history keep it. A password is
 //! read from stdin when something is piped to it (one line, its newline dropped) and
 //! generated otherwise (or when `--generate` says so); a generated password and a
@@ -16,7 +23,7 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use sqlx::PgPool;
 
 use crate::store::{self, Account, New};
@@ -25,27 +32,76 @@ use crate::{links, password};
 /// The longest a link lives, in minutes: [`links::MAX_TTL`].
 const MAX_MINUTES: i64 = (links::MAX_TTL.as_secs() / 60).cast_signed();
 
+/// The lifetime of a link, in minutes, when `--minutes` is not given: what [`run`]
+/// uses, and what [`link`] takes as its `default_minutes` to do the same.
+pub const DEFAULT_MINUTES: u32 = 60;
+
+/// The longest a link's `--reason`, in characters.
+const MAX_REASON: usize = 200;
+
+/// Parse `--next`: a local path ([`links::valid_next`]).
+fn parse_next(text: &str) -> Result<String, String> {
+    if links::valid_next(text) {
+        Ok(text.to_owned())
+    } else {
+        Err("a path on this site, starting with a single `/` (no host, scheme, backslash or whitespace)".into())
+    }
+}
+
+/// Parse `--reason`: a short line for the audit trail.
+fn parse_reason(text: &str) -> Result<String, String> {
+    if text.trim().is_empty()
+        || text.chars().count() > MAX_REASON
+        || text.chars().any(char::is_control)
+    {
+        Err(format!("one line of at most {MAX_REASON} characters"))
+    } else {
+        Ok(text.to_owned())
+    }
+}
+
+/// The arguments of `create`, for an app to flatten into a command of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Args)]
+pub struct CreateArgs {
+    /// The new account's username.
+    pub username: String,
+    /// Its email.
+    #[arg(long)]
+    pub email: Option<String>,
+    /// Make it staff.
+    #[arg(long)]
+    pub staff: bool,
+    /// Generate the password even when stdin is piped.
+    #[arg(long, conflicts_with = "no_password")]
+    pub generate: bool,
+    /// Give it no password: it is reached by a sign-in link (`link`) or a provider.
+    #[arg(long)]
+    pub no_password: bool,
+}
+
+/// The arguments of `link`, for an app to flatten into a command of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Args)]
+pub struct LinkArgs {
+    /// The account's username or email.
+    pub login: String,
+    /// How long it lives, in minutes (at most 30 days; 60 unless the app says
+    /// otherwise).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=MAX_MINUTES))]
+    pub minutes: Option<u32>,
+    /// Why it was minted, kept with the link for the audit trail.
+    #[arg(long, default_value = "cli", value_parser = parse_reason)]
+    pub reason: String,
+    /// A path on this site to land on after signing in, such as `/admin/`.
+    #[arg(long, value_parser = parse_next)]
+    pub next: Option<String>,
+}
+
 /// An account command. `login` is a username or an email.
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
 pub enum AccountCommand {
     /// Create an account. Its password is read from stdin when piped, else
     /// generated and printed once.
-    Create {
-        /// The new account's username.
-        username: String,
-        /// Its email.
-        #[arg(long)]
-        email: Option<String>,
-        /// Make it staff.
-        #[arg(long)]
-        staff: bool,
-        /// Generate the password even when stdin is piped.
-        #[arg(long, conflicts_with = "no_password")]
-        generate: bool,
-        /// Give it no password: it is reached by a sign-in link (`link`) or a provider.
-        #[arg(long)]
-        no_password: bool,
-    },
+    Create(CreateArgs),
     /// Set an account's password, signing it out everywhere. Read from stdin when
     /// piped, else generated and printed once.
     SetPassword {
@@ -56,13 +112,7 @@ pub enum AccountCommand {
         generate: bool,
     },
     /// Mint a one-time sign-in link, printed once.
-    Link {
-        /// The account's username or email.
-        login: String,
-        /// How long it lives, in minutes (at most 30 days).
-        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=MAX_MINUTES))]
-        minutes: u32,
-    },
+    Link(LinkArgs),
     /// Make an account staff.
     Staff {
         /// The account's username or email.
@@ -123,42 +173,8 @@ pub async fn run_with(
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     match command {
-        AccountCommand::Create {
-            username,
-            email,
-            staff,
-            generate,
-            no_password,
-        } => {
-            let email = email.unwrap_or_default();
-            let (given, generated) = if no_password {
-                (None, false)
-            } else {
-                let like = [username.as_str(), email.as_str()];
-                let (secret, generated) = password_from(stdin, generate, &like)?;
-                (Some(secret), generated)
-            };
-            let account = store::create(
-                pool,
-                New {
-                    username: &username,
-                    email: &email,
-                    password: given.as_deref(),
-                    is_staff: staff,
-                },
-            )
-            .await?;
-            let shown =
-                writeln!(out, "created {} (id {})", account.username, account.id).and_then(|()| {
-                    match (generated, &given) {
-                        (true, Some(secret)) => show_once(out, "password", secret),
-                        _ => Ok(()),
-                    }
-                });
-            shown.context(
-                "the account was created, but its generated password was not shown; \
-                 set another with set-password --generate",
-            )?;
+        AccountCommand::Create(args) => {
+            create(pool, stdin, out, &args).await?;
         }
         AccountCommand::SetPassword { login, generate } => {
             let account = find(pool, &login).await?;
@@ -179,23 +195,7 @@ pub async fn run_with(
                  set another with set-password --generate",
             )?;
         }
-        AccountCommand::Link { login, minutes } => {
-            let account = find(pool, &login).await?;
-            if !account.is_active {
-                bail!("{} is deactivated", account.username);
-            }
-            let ttl = Duration::from_secs(u64::from(minutes) * 60);
-            let minted = links::mint(pool, account.id, ttl, "cli")
-                .await
-                .context("minting the link")?;
-            writeln!(
-                out,
-                "sign-in link for {}, once, {minutes} minutes:",
-                account.username
-            )
-            .and_then(|()| writeln!(out, "{}", link_url(&minted.token)))
-            .context("the link was minted but not shown; it expires unused")?;
-        }
+        AccountCommand::Link(args) => link(pool, out, &args, DEFAULT_MINUTES, link_url).await?,
         AccountCommand::Staff { login } => set_staff(pool, out, &login, true).await?,
         AccountCommand::Unstaff { login } => set_staff(pool, out, &login, false).await?,
         AccountCommand::Hash { generate } => {
@@ -207,6 +207,93 @@ pub async fn run_with(
             writeln!(out, "{hash}")?;
         }
     }
+    Ok(())
+}
+
+/// The `create` command: make the account `args` names, reading its password from
+/// `stdin` or generating one, and write the result to `out`. Returns the account, for
+/// an app that does more once it exists.
+///
+/// # Errors
+///
+/// As [`run`]; a refusal ([`crate::Refused`]) is the sentence to show.
+pub async fn create(
+    pool: &PgPool,
+    stdin: Option<&mut (dyn BufRead + Send)>,
+    out: &mut (dyn Write + Send),
+    args: &CreateArgs,
+) -> anyhow::Result<Account> {
+    let CreateArgs {
+        username,
+        email,
+        staff,
+        generate,
+        no_password,
+    } = args;
+    let email = email.as_deref().unwrap_or_default();
+    let (given, generated) = if *no_password {
+        (None, false)
+    } else {
+        let like = [username.as_str(), email];
+        let (secret, generated) = password_from(stdin, *generate, &like)?;
+        (Some(secret), generated)
+    };
+    let account = store::create(
+        pool,
+        New {
+            username,
+            email,
+            password: given.as_deref(),
+            is_staff: *staff,
+        },
+    )
+    .await?;
+    let shown = writeln!(out, "created {} (id {})", account.username, account.id).and_then(|()| {
+        match (generated, &given) {
+            (true, Some(secret)) => show_once(out, "password", secret),
+            _ => Ok(()),
+        }
+    });
+    shown.context(
+        "the account was created, but its generated password was not shown; \
+         set another with set-password --generate",
+    )?;
+    Ok(account)
+}
+
+/// The `link` command: mint a one-time sign-in link for the account `args` names and
+/// write its URL (`link_url` of the token) to `out`. The link lives `args.minutes`, or
+/// `default_minutes` when none was given (at most 30 days).
+///
+/// # Errors
+///
+/// As [`run`].
+pub async fn link(
+    pool: &PgPool,
+    out: &mut (dyn Write + Send),
+    args: &LinkArgs,
+    default_minutes: u32,
+    link_url: impl Fn(&str) -> String + Sync,
+) -> anyhow::Result<()> {
+    let account = find(pool, &args.login).await?;
+    if !account.is_active {
+        bail!("{} is deactivated", account.username);
+    }
+    let minutes = args
+        .minutes
+        .unwrap_or(default_minutes)
+        .clamp(1, u32::try_from(MAX_MINUTES)?);
+    let ttl = Duration::from_secs(u64::from(minutes) * 60);
+    let minted = links::mint_with(pool, account.id, ttl, &args.reason, args.next.as_deref())
+        .await
+        .context("minting the link")?;
+    writeln!(
+        out,
+        "sign-in link for {}, once, {minutes} minutes:",
+        account.username
+    )
+    .and_then(|()| writeln!(out, "{}", link_url(&minted.token)))
+    .context("the link was minted but not shown; it expires unused")?;
     Ok(())
 }
 

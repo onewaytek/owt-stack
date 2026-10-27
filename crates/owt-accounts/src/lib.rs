@@ -103,6 +103,10 @@ pub enum Refused {
     /// A sign-in link that is unknown, used or expired.
     #[error("That sign-in link is not valid any more.")]
     Link,
+    /// A sign-in link's landing page that is not a path on the site (see
+    /// [`links::valid_next`]).
+    #[error("Enter a page on this site, starting with a single “/”.")]
+    Next,
 }
 
 /// What an account operation returns when it fails: a refusal the person can act
