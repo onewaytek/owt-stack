@@ -259,7 +259,7 @@ jobs:
           fi
       - name: Install sccache
         if: ${{ steps.sccache.outputs.enabled == 'true' }}
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: sccache@0.18.0
           fallback: none
@@ -317,7 +317,7 @@ jobs:
         run: cargo fetch --locked
       - name: Install the gate's tools
         if: ${{ inputs.check-command != '' }}
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         # Pinned, so the gate doesn't change under an app between its own commits.
         # Prebuilt and checksummed by the action's manifests; `fallback: none`, so a
         # tool without one fails here instead of being compiled from the shared index.
@@ -412,7 +412,7 @@ jobs:
       # whatever the shared index says, which any job on the scale set can write.
       - name: Install cargo-audit
         if: ${{ inputs.check-command == '' && inputs.audit }}
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-audit@0.22.2
           fallback: none
