@@ -958,14 +958,14 @@ async fn page_handler(page: owt_accounts::PageCtx) -> String {
         .viewer
         .as_ref()
         .map_or("anonymous", |a| a.username.as_str());
-    let shown: Vec<_> = page.flashes.iter().map(|f| f.text().to_owned()).collect();
+    let shown: Vec<_> = page.flashes().iter().map(|f| f.text().to_owned()).collect();
     let bare = page.bare();
     format!(
         "{viewer}|{}|{}|{}|{}|{}",
         page.path,
         shown.join(","),
         page.nonce,
-        bare.flashes.len(),
+        bare.flashes().len(),
         page.clone().at("/elsewhere?x=1").full_path,
     )
 }
@@ -1045,6 +1045,41 @@ async fn the_page_context_takes_the_flashes_once_and_leaves_them_for_a_full_page
     let b = client.get("/page").await.text();
     assert!(a.starts_with("anonymous|/page|"), "{a}");
     assert_ne!(a.split('|').nth(3), b.split('|').nth(3));
+    db.drop().await;
+}
+
+async fn form_handler(
+    page: owt_accounts::PageCtx,
+    axum::Form(form): axum::Form<std::collections::HashMap<String, u32>>,
+) -> String {
+    format!("{} {}", page.flashes().len(), form.len())
+}
+
+#[tokio::test]
+async fn a_later_extractor_that_rejects_leaves_the_flashes_for_the_next_page() {
+    let db = db!();
+    let sessions = sessions();
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let extra = Router::new()
+        .route("/page", get(page_handler))
+        .route("/form", post(form_handler))
+        .route("/flash", post(flash_handler));
+    let router = app(&db, &sessions, extra).layer(from_fn_with_state(
+        owt_web::headers::Csp::new(),
+        owt_web::headers::Csp::layer,
+    ));
+    let client = owt_test::Client::new(router);
+    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    client.post_form("/flash", &[]).await;
+
+    // The form's values must be numbers, so this body is rejected after `PageCtx`.
+    let rejected = client.post_form("/form", &[("n", "not a number")]).await;
+    assert!(rejected.status.is_client_error());
+
+    let page = client.get("/page").await.text();
+    assert_eq!(page.split('|').nth(2), Some("Saved.,Oops."), "{page}");
+    let again = client.get("/page").await.text();
+    assert_eq!(again.split('|').nth(2), Some(""), "{again}");
     db.drop().await;
 }
 
