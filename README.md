@@ -2638,8 +2638,10 @@ fragment::assert_same_element(&page.text(), "<main id=\"m\"> <p>Hi</p></main>", 
 
 // Golden pages: compared modulo layout, with what changes per run masked.
 // `UPDATE_GOLDEN=1 cargo test` rewrites the snapshots; review the diff.
-// `asset_versions` drops a URL's leading `?v=…` (the fingerprint on static URLs), so
-// a snapshot recorded with the stylesheet built matches a test job that builds no CSS.
+// `asset_versions` drops the `?v=…` fingerprint from URLs under `/static/` (and only
+// those: a page link like `/watch?v=abc` keeps it), so a snapshot recorded with the
+// stylesheet built matches a test job that builds no CSS. Assets under another prefix:
+// `asset_versions_under("/assets")`.
 let normalize = Normalizer::new().uuids("<uuid>").asset_versions();
 # if false { // no snapshots beside the README
 let mut golden = Golden::new("tests/golden/pages");
