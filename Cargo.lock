@@ -2264,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "owt-accounts"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "askama",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "owt-auth"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2317,7 +2317,7 @@ dependencies = [
 
 [[package]]
 name = "owt-bus"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "owt-change"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "askama",
  "axum",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "owt-runtime"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "owt-test"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2401,7 +2401,7 @@ dependencies = [
 
 [[package]]
 name = "owt-web"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "askama",
@@ -3027,7 +3027,7 @@ dependencies = [
 
 [[package]]
 name = "readme"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "askama",

@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.10.0](https://github.com/onewaytek/owt-stack/compare/v0.9.0...v0.10.0) (2026-10-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** `AccountCommand::Create` and `AccountCommand::Link` are tuple variants holding `cli::CreateArgs` and `cli::LinkArgs`; an app that builds or matches them (a test, say) writes `Create(CreateArgs { .. })` and `Link(LinkArgs { .. })`, and `LinkArgs::minutes` is an `Option<u32>`. The command line is unchanged apart from the new flags. The app runs `migrations::run` (or `start`) to apply migration 0006; an app that keeps copies of the library's migration files may copy `0006_link_next.sql` as its next version, unaltered.
+* **accounts:** `PageCtx::flashes` is a method returning `&[Flash]`, no longer a public `Vec<Flash>` field. An app reads `page.flashes()` where it read `page.flashes` (`Alerts { flashes: page.flashes() }`, `{% for f in page.flashes() %}`), and cannot construct the field or move the `Vec` out; clone the slice (`.to_vec()`) where it needs ownership.
+* **auth:** `Budgets` has a new field `attempt_window: Duration`. An app that builds `Budgets` with a struct literal without `..Budgets::default()` adds the field or the `..Budgets::default()` rest.
+* **auth:** `Turnstile::verify` returns `Result<Outcome, VerifyError>` instead of `Result<bool, VerifyError>`. An app calling it directly replaces `verify(..).await? ` used as a bool with `.is_passed()`, and may log `Outcome::Refused { codes }` (at warn or error when `is_misconfigured()`). Apps that only use `Guard` change nothing.
+* **deps:** owt-stack's crates declare rust-version 1.99. An app that builds with an older toolchain (a pinned rust-toolchain.toml or an older image) moves to Rust 1.99 or later; one on rust:1 or stable changes nothing.
+
+### Features
+
+* **accounts:** link --reason and --next, and CreateArgs and LinkArgs for an app's own commands ([#247](https://github.com/onewaytek/owt-stack/issues/247)) ([f5e9082](https://github.com/onewaytek/owt-stack/commit/f5e90821ef1ea279b3a50d8ca7c590bc206a841c)), closes [#226](https://github.com/onewaytek/owt-stack/issues/226)
+* **accounts:** PageCtx takes its flash messages when the page is drawn ([#244](https://github.com/onewaytek/owt-stack/issues/244)) ([60e0a67](https://github.com/onewaytek/owt-stack/commit/60e0a67e88756ea4e5702326c7d6348e72e1b357)), closes [#225](https://github.com/onewaytek/owt-stack/issues/225)
+* **auth:** guard budget window, signed-in posters and sign-in-required mode ([#245](https://github.com/onewaytek/owt-stack/issues/245)) ([4e02e16](https://github.com/onewaytek/owt-stack/commit/4e02e16c32882b2003a1ad3ce1206df4dead8cd8)), closes [#227](https://github.com/onewaytek/owt-stack/issues/227)
+* **auth:** Turnstile::verify reports siteverify's error-codes ([#243](https://github.com/onewaytek/owt-stack/issues/243)) ([0ee8f58](https://github.com/onewaytek/owt-stack/commit/0ee8f5878c12f043a73fcc4274ac2e833d667939)), closes [#229](https://github.com/onewaytek/owt-stack/issues/229)
+* **ci:** cargo-profile input for image-check.yml and image.yml ([#242](https://github.com/onewaytek/owt-stack/issues/242)) ([fe63952](https://github.com/onewaytek/owt-stack/commit/fe63952fcc0f59cef20def0919813fda6a7e88c5))
+* **templates:** tunnel.yaml, a Cloudflare named tunnel per app ([#235](https://github.com/onewaytek/owt-stack/issues/235)) ([b9d865d](https://github.com/onewaytek/owt-stack/commit/b9d865db4f555d25d17a7bef9c4cc92708a55d22))
+* **web:** Assets::warm hashes every file at startup, lazy reads leave the executor ([#246](https://github.com/onewaytek/owt-stack/issues/246)) ([7dd463b](https://github.com/onewaytek/owt-stack/commit/7dd463b1d28f8452d2ca8263791faf375e5b47d9)), closes [#232](https://github.com/onewaytek/owt-stack/issues/232)
+* **web:** version the URLs inside served stylesheets ([#248](https://github.com/onewaytek/owt-stack/issues/248)) ([31adfff](https://github.com/onewaytek/owt-stack/commit/31adfff31a524b7d4aa5550b2a60df45878f2f19)), closes [#231](https://github.com/onewaytek/owt-stack/issues/231)
+
+
+### Bug Fixes
+
+* **deps:** bump astral-sh/setup-uv from 10.3.0 to 10.3.2 ([#237](https://github.com/onewaytek/owt-stack/issues/237)) ([f4f8770](https://github.com/onewaytek/owt-stack/commit/f4f87708d53131dc505a9f6aa08a34e0d11e6ccd))
+* **deps:** bump docker/login-action from 4.6.0 to 4.7.0 ([#238](https://github.com/onewaytek/owt-stack/issues/238)) ([e87b38b](https://github.com/onewaytek/owt-stack/commit/e87b38bfb8d72602dbb6bfd655fb582ac3f0534d))
+* **deps:** bump Swatinem/rust-cache from 2.9.2 to 2.9.3 ([#240](https://github.com/onewaytek/owt-stack/issues/240)) ([d2002f8](https://github.com/onewaytek/owt-stack/commit/d2002f8e9244d39918721ab6f37ffe214e6b06bf))
+* **deps:** bump taiki-e/install-action from 2.87.29 to 2.87.31 ([#239](https://github.com/onewaytek/owt-stack/issues/239)) ([58c7b8e](https://github.com/onewaytek/owt-stack/commit/58c7b8e9bcfad263bebea71a1ad3661931141346))
+* **test:** asset_versions masks only asset URLs, not every ?v= link ([#241](https://github.com/onewaytek/owt-stack/issues/241)) ([2fc2ae4](https://github.com/onewaytek/owt-stack/commit/2fc2ae46f62e43b4e3ea30ead3c5405eb1db4893))
+
+
+### Build System
+
+* **deps:** dependencies to their latest, and Rust 1.99 ([#233](https://github.com/onewaytek/owt-stack/issues/233)) ([cd4b27f](https://github.com/onewaytek/owt-stack/commit/cd4b27f5662d1f50436b24456e753d22183fec24))
+
 ## [0.9.0](https://github.com/onewaytek/owt-stack/compare/v0.8.1...v0.9.0) (2026-10-21)
 
 
