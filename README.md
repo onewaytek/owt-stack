@@ -937,6 +937,15 @@ other fails at start, as does an HTTP client that cannot be built. Verification 
 templates' images have them). `Turnstile::expect_hostname("app.example")` also refuses
 a token Cloudflare issued for another site.
 
+`Turnstile::verify` (which `Guard` calls) answers `Result<Outcome, VerifyError>`:
+`Outcome::Passed`, `Outcome::Refused { codes }` with siteverify's `error-codes` (empty
+for a blank or oversized token), or `Outcome::WrongHostname { got }`.
+`Outcome::is_misconfigured()` is true for `missing-input-secret` and
+`invalid-input-secret`: the deployment's secret is wrong and every post is refused, so
+log those at `warn` or `error` and the rest at `debug`. `Guard` does exactly that
+(`error` for a wrong secret, `warn` for a wrong hostname, `debug` for the rest) and
+still answers `Verdict::Failed`.
+
 Pick the honeypot's field name so browsers will not autofill it: not `website`,
 `email`, `phone` or `name`, which password managers fill for people, and a person
 who trips the honeypot is silently dropped. `Honeypot::new("company_url")`, say.
