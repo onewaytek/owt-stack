@@ -1086,7 +1086,21 @@ async fn a_later_extractor_that_rejects_leaves_the_flashes_for_the_next_page() {
 #[cfg(feature = "cli")]
 mod cli {
     use super::*;
-    use owt_accounts::cli::{AccountCommand, run_with};
+    use owt_accounts::cli::{AccountCommand, CreateArgs, LinkArgs, run_with};
+
+    fn link_args(
+        login: &str,
+        minutes: Option<u32>,
+        reason: &str,
+        next: Option<&str>,
+    ) -> AccountCommand {
+        AccountCommand::Link(LinkArgs {
+            login: login.into(),
+            minutes,
+            reason: reason.into(),
+            next: next.map(Into::into),
+        })
+    }
 
     /// Run `command` with `stdin` piped (or not), returning what it printed.
     async fn exec(db: &Db, command: AccountCommand, stdin: Option<&str>) -> anyhow::Result<String> {
@@ -1117,13 +1131,13 @@ mod cli {
     }
 
     fn create(username: &str) -> AccountCommand {
-        AccountCommand::Create {
+        AccountCommand::Create(CreateArgs {
             username: username.to_owned(),
             email: Some(format!("{username}@example.com")),
             staff: false,
             generate: false,
             no_password: false,
-        }
+        })
     }
 
     /// The value after `: ` on the line that starts with `what`.
@@ -1221,20 +1235,171 @@ mod cli {
     }
 
     #[tokio::test]
-    async fn a_link_opens_once_and_staff_come_and_go() {
+    async fn a_link_keeps_its_reason_and_where_to_land() {
+        use owt_accounts::links;
         let db = db!();
         let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
-        // A link redeems once; the token is in the URL printed.
+        let token_of = |out: &str| {
+            out.lines()
+                .last()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+
+        // The defaults: reason `cli`, nowhere in particular.
+        let out = exec(&db, link_args("ada", None, "cli", None), None)
+            .await
+            .unwrap();
+        assert!(out.contains("60 minutes"), "{out}");
+        let reason: String =
+            sqlx::query_scalar("SELECT reason FROM sign_in_links WHERE account_id = $1")
+                .bind(ada.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(reason, "cli");
+        let opened = links::redeem_with(&db.pool, &token_of(&out), "cli-test")
+            .await
+            .unwrap();
+        assert_eq!((opened.account.id, opened.next), (ada.id, None));
+
+        // A reason and a landing page ride with the link; `redeem` still signs in.
         let out = exec(
             &db,
-            AccountCommand::Link {
-                login: "ada".into(),
-                minutes: 5,
-            },
+            link_args("ada", Some(15), "idp outage", Some("/admin/?tab=1")),
             None,
         )
         .await
         .unwrap();
+        assert!(out.contains("15 minutes"), "{out}");
+        let reason: String = sqlx::query_scalar(
+            "SELECT reason FROM sign_in_links WHERE account_id = $1 AND next IS NOT NULL",
+        )
+        .bind(ada.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(reason, "idp outage");
+        let opened = links::redeem_with(&db.pool, &token_of(&out), "cli-test")
+            .await
+            .unwrap();
+        assert_eq!(opened.next.as_deref(), Some("/admin/?tab=1"));
+        let out = exec(&db, link_args("ada", None, "x", Some("/in")), None)
+            .await
+            .unwrap();
+        assert!(
+            links::redeem(&db.pool, &token_of(&out), "cli-test")
+                .await
+                .is_ok()
+        );
+
+        // The handler refuses a landing page that is not local, and stores nothing.
+        let count = || sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sign_in_links");
+        let before = count().fetch_one(&db.pool).await.unwrap();
+        let err = exec(
+            &db,
+            link_args("ada", None, "x", Some("//evil.example")),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("minting"), "{err}");
+        assert_eq!(before, count().fetch_one(&db.pool).await.unwrap());
+
+        // The app's default lifetime applies when `--minutes` is absent.
+        let mut out = Vec::new();
+        owt_accounts::cli::link(
+            &db.pool,
+            &mut out,
+            &LinkArgs {
+                login: "ada".into(),
+                minutes: None,
+                reason: "cli".into(),
+                next: None,
+            },
+            15,
+            |t| format!("https://example.test/in/{t}"),
+        )
+        .await
+        .unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("15 minutes"));
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn create_returns_the_account_for_the_app_to_extend() {
+        let db = db!();
+        let mut out = Vec::new();
+        let args = CreateArgs {
+            username: "ada".into(),
+            email: None,
+            staff: false,
+            generate: true,
+            no_password: false,
+        };
+        let account = owt_accounts::cli::create(&db.pool, None, &mut out, &args)
+            .await
+            .unwrap();
+        assert_eq!(account.username, "ada");
+        assert!(String::from_utf8(out).unwrap().contains("created ada"));
+        db.drop().await;
+    }
+
+    #[test]
+    fn the_flags_parse_and_next_must_be_local() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct App {
+            #[command(subcommand)]
+            command: AccountCommand,
+        }
+        let parse = |args: &[&str]| {
+            App::try_parse_from(
+                ["app", "link", "ada"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+        };
+        let AccountCommand::Link(ok) = parse(&["--next", "/admin/", "--reason", "outage"])
+            .unwrap()
+            .command
+        else {
+            panic!("not a link");
+        };
+        assert_eq!(
+            (ok.next.as_deref(), ok.reason.as_str(), ok.minutes),
+            (Some("/admin/"), "outage", None)
+        );
+        for bad in [
+            "//evil.example",
+            "https://evil.example/",
+            "admin",
+            "/\\evil.example",
+            "/ok\\x",
+            "/a b",
+            "/a\tb",
+            "/\n/evil.example",
+            "javascript:alert(1)",
+            "",
+        ] {
+            assert!(parse(&["--next", bad]).is_err(), "{bad:?} must be refused");
+        }
+        assert!(parse(&["--reason", ""]).is_err());
+        assert!(parse(&["--reason", "two\nlines"]).is_err());
+        assert!(parse(&["--minutes", "0"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_link_opens_once_and_staff_come_and_go() {
+        let db = db!();
+        let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+        // A link redeems once; the token is in the URL printed.
+        let out = exec(&db, link_args("ada", Some(5), "cli", None), None)
+            .await
+            .unwrap();
         let url = out.lines().last().unwrap();
         let token = url.strip_prefix("https://example.test/in/").unwrap();
         assert!(
@@ -1283,13 +1448,13 @@ mod cli {
         );
 
         // No password: the account is reached by a link or a provider.
-        let none = AccountCommand::Create {
+        let none = AccountCommand::Create(CreateArgs {
             username: "kiosk".into(),
             email: None,
             staff: true,
             generate: false,
             no_password: true,
-        };
+        });
         let out = exec(&db, none, None).await.unwrap();
         assert!(!out.contains("password"), "{out}");
         assert!(
@@ -1300,16 +1465,9 @@ mod cli {
                 .is_staff
         );
         store::set_active(&db.pool, ada.id, false).await.unwrap();
-        let err = exec(
-            &db,
-            AccountCommand::Link {
-                login: "ada".into(),
-                minutes: 5,
-            },
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = exec(&db, link_args("ada", Some(5), "cli", None), None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("deactivated"), "{err}");
 
         db.drop().await;

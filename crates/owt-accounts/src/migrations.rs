@@ -69,6 +69,10 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_local",
         sql: include_str!("../migrations/0005_local_identities.sql"),
     },
+    Migration {
+        name: "owt_accounts_link_next",
+        sql: include_str!("../migrations/0006_link_next.sql"),
+    },
 ];
 
 /// The table [`run`] records the library's migrations in, in the schema they run in
@@ -725,6 +729,7 @@ const SHIPPED_SHA256: &[&str] = &[
     "4e910454cfdd01ef4559772fd8b4140f39d887383ebb2de06c920924161152e0",
     "629cca392e80505f93a71a9eb9d13683ef82f31790d682363d346ebfb2f32f52",
     "2952542fa9af6f8c1c7ee21987676fd1ed42cb0d18c752b485d4f315f4eccb18",
+    "78ba0baf7def1dd8206f5479f79c88549ecc809c82f7c7ed6421aaa8b7f47a33",
 ];
 
 /// The names each of [`ALL`] gives a relation (table, index, sequence) in the schema
@@ -795,6 +800,7 @@ const FUNCTIONS: &[(&str, &[&str])] = &[(
 const COLUMNS: &[(&str, &[&str])] = &[
     ("owt_accounts_constraints", &["accounts.username_skeleton"]),
     ("owt_accounts_local", &["accounts.password_sign_in"]),
+    ("owt_accounts_link_next", &["sign_in_links.next"]),
 ];
 
 /// The constraints each of [`ALL`] adds to a table an earlier one created, as

@@ -1084,6 +1084,7 @@ test awaits that sequence on its pool before anything else.
 | `owt_accounts_constraints` | | `accounts_username_skeleton_key` | | `accounts.username_skeleton`; constraints `accounts_username_skeleton_form`, `accounts_password_hash_form`, `accounts_username_nfkc`, `accounts_email_form`, `accounts_session_epoch_check` on `accounts`, `account_identities_named` on `account_identities`, `sign_in_links_lifetime` and `sign_in_links_digest` on `sign_in_links` |
 | `owt_accounts_policies` | `policy_versions`, `policy_acceptances`, `policy_acceptance_events` | `policy_versions_pkey`, `policy_versions_id_seq`, `policy_versions_kind_version_key`, `policy_acceptances_pkey`, `policy_acceptances_version`, `policy_acceptance_events_pkey`, `policy_acceptance_events_id_seq`, `policy_acceptance_events_account` | `policy_versions_immutable()`, `policy_versions_keep_current()` | |
 | `owt_accounts_local` | `account_local_identities` | `account_local_identities_pkey`, `account_local_identities_account` | | `accounts.password_sign_in`; constraint `accounts_password_sign_in_hash` on `accounts` |
+| `owt_accounts_link_next` | | | | `sign_in_links.next` |
 
 Each table is also a type of its name, and its triggers and constraints are its own.
 An app that already has any of these names (a table, view, index, sequence, type or
@@ -1355,6 +1356,12 @@ identities::link(&pool, ada.id, &owt_auth::oauth::discord(), &discord_who).await
 let minted = links::mint(&pool, ada.id, std::time::Duration::from_secs(900), "new account").await?;
 let _url = format!("https://app.example/login/link/{}", minted.token);
 let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Refused::Link when spent
+// A link can name where to land: `mint_with` takes a local path (`links::valid_next`:
+// one `/`, no `//host`, backslash, whitespace or scheme; else `Refused::Next`), and
+// `redeem_with` returns it for the handler to redirect to after `session::sign_in`.
+let minted = links::mint_with(&pool, ada.id, std::time::Duration::from_secs(900), "outage", Some("/admin/")).await?;
+let opened = links::redeem_with(&pool, &minted.token, &ip.to_string()).await?;
+let _land_on = opened.next.as_deref().unwrap_or("/"); // opened.account signs in
 # let _ = app; Ok(()) }
 ```
 
@@ -1370,14 +1377,60 @@ with no staff or a lost password. No password rides in argv: `create` and
 password otherwise (`--generate` forces it); `hash` reads one and prints its Argon2
 hash, for a deployment-wide password (`session::password_gate`). A generated password
 and a sign-in link are printed once, to stdout, and logged nowhere; `link` takes
-`--minutes` (60, at most 30 days) and needs the URL of the app's `links::redeem`
-route. `login` is a username or an email; `create --no-password` makes an account
+`--minutes` (60, at most 30 days), `--reason` (kept with the link for the audit trail,
+`cli` unless given) and `--next` (a path on the site to land on after signing in,
+`/admin/` say; a host, scheme or backslash is refused), and needs the URL of the app's
+`links::redeem_with` route, which returns the `--next` to redirect to. `login` is a username or an email; `create --no-password` makes an account
 that a link or a provider opens. The hash begins `$argon2id$…`: quote it with single
 quotes in a shell or env file, and double each `$` in a compose file, or it is expanded
 and opens nothing. A generated password is shown after the account is made; if the
 output fails, the error says the account exists and to set another. The futures are
 `Send` and hold no lock on stdin or stdout across an await. `run_with` takes the input
 and output explicitly, for a test.
+
+An app with command names or flags of its own (`create-user --host`, a `login-link` that
+lives 15 minutes by default) keeps its own clap enum and reuses the handlers:
+`#[command(flatten)]` `cli::CreateArgs` or `cli::LinkArgs` into a variant beside its
+flags, then call `cli::create(pool, stdin, out, &args)`, which returns the new
+`Account` for the app to go on with, or `cli::link(pool, out, &args, default_minutes,
+link_url)`. `AccountCommand::Create` and `Link` hold the same two structs.
+
+```rust
+use std::io::{self, BufRead, BufReader, IsTerminal};
+use clap::Subcommand;
+use owt_accounts::cli::{self, CreateArgs, LinkArgs};
+
+#[derive(Subcommand)]
+enum Command {
+    CreateUser {
+        #[command(flatten)]
+        account: CreateArgs,
+        /// The app's own flag.
+        #[arg(long)]
+        host: bool,
+    },
+    LoginLink(LinkArgs),
+}
+
+async fn run(command: Command, pool: sqlx::PgPool) -> anyhow::Result<()> {
+    let mut piped = (!io::stdin().is_terminal()).then(|| BufReader::new(io::stdin()));
+    let piped = piped.as_mut().map(|input| input as &mut (dyn BufRead + Send));
+    let mut out = io::stdout();
+    match command {
+        Command::CreateUser { account, host } => {
+            let made = cli::create(&pool, piped, &mut out, &account).await?;
+            if host {
+                // The app's own step, now that `made.id` exists.
+            }
+        }
+        // A quarter of an hour unless `--minutes` says otherwise.
+        Command::LoginLink(args) => {
+            cli::link(&pool, &mut out, &args, 15, |t| format!("https://myapp.example/login/link/{t}")).await?;
+        }
+    }
+    Ok(())
+}
+```
 
 ```toml
 owt-accounts = { git = "…", tag = "…", features = ["cli"] }
