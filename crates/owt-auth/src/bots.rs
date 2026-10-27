@@ -3,6 +3,9 @@
 //! An anonymous form with no budget is a free write into the app's database or an
 //! operator's inbox. [`Guard::check`] answers what to do with a post:
 //!
+//! * [`Verdict::SignInRequired`] when the guard was built with
+//!   [`Guard::require_sign_in_without_turnstile`], Turnstile is off and the poster is
+//!   anonymous: send them to sign in.
 //! * [`Verdict::TooMany`] when the address is over its budget: answer 429.
 //! * [`Verdict::Pretend`] when the honeypot was filled: answer exactly as for a
 //!   person (the same redirect, the same thanks) and store or send nothing. A bot
@@ -20,9 +23,14 @@
 //! minute), so forms do not spend the sign-in budget and the reverse. The address is
 //! the client's: see `owt_web::client_ip`.
 //!
+//! A signed-in poster goes through [`Guard::check_signed_in`]: charged and checked for
+//! the honeypot like anyone, but Turnstile is skipped. The budget's window is the
+//! [`Throttle`]'s ([`Budgets::attempt_window`](crate::throttle::Budgets)), so "5 an
+//! hour" is a throttle of its own.
+//!
 //! Turnstile is configured by `TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY`
 //! ([`Turnstile::from_env`]); with neither set it is off and the guard is a honeypot
-//! and a budget.
+//! and a budget, unless it requires sign-in then.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -306,6 +314,9 @@ impl Turnstile {
 pub enum Verdict {
     /// Handle it.
     Accept,
+    /// Turnstile is off and the guard requires sign-in without it, and the poster is
+    /// anonymous: send them to sign in. Nothing was charged.
+    SignInRequired,
     /// A bot: answer as for a person, store and send nothing.
     Pretend,
     /// The address is over its budget: answer 429.
@@ -321,6 +332,7 @@ pub struct Guard {
     honeypot: Honeypot,
     turnstile: Option<Turnstile>,
     throttle: Arc<Throttle>,
+    sign_in_without_turnstile: bool,
 }
 
 impl Guard {
@@ -331,7 +343,18 @@ impl Guard {
             honeypot,
             turnstile,
             throttle,
+            sign_in_without_turnstile: false,
         }
+    }
+
+    /// With no Turnstile, answer an anonymous post [`Verdict::SignInRequired`] instead
+    /// of accepting it on a honeypot and a budget alone. Signed-in posters
+    /// ([`check_signed_in`](Self::check_signed_in)) are unaffected. Without this, a
+    /// guard with Turnstile off is open to anyone.
+    #[must_use]
+    pub const fn require_sign_in_without_turnstile(mut self) -> Self {
+        self.sign_in_without_turnstile = true;
+        self
     }
 
     /// The honeypot, for the form's markup and field name.
@@ -349,11 +372,11 @@ impl Guard {
     /// Decide a post from `ip`, with the honeypot field's posted `honeypot` value
     /// and the form's `cf-turnstile-response` as `token`.
     pub async fn check(&self, ip: IpAddr, honeypot: &str, token: &str) -> Verdict {
-        if !self.throttle.attempt(ip) {
-            return Verdict::TooMany;
+        if self.turnstile.is_none() && self.sign_in_without_turnstile {
+            return Verdict::SignInRequired;
         }
-        if self.honeypot.tripped(honeypot) {
-            return Verdict::Pretend;
+        if let Some(refused) = self.screen(ip, honeypot) {
+            return refused;
         }
         let Some(turnstile) = &self.turnstile else {
             return Verdict::Accept;
@@ -377,6 +400,25 @@ impl Guard {
                 tracing::warn!(error = %e, "turnstile could not be reached; refusing the post");
                 Verdict::Failed
             }
+        }
+    }
+
+    /// Decide a post from a signed-in person at `ip`: charged to the budget and
+    /// checked for the honeypot as for anyone, but with no Turnstile. Never
+    /// [`Verdict::Failed`] or [`Verdict::SignInRequired`].
+    #[must_use]
+    pub fn check_signed_in(&self, ip: IpAddr, honeypot: &str) -> Verdict {
+        self.screen(ip, honeypot).unwrap_or(Verdict::Accept)
+    }
+
+    /// The budget, then the honeypot: what every post answers to.
+    fn screen(&self, ip: IpAddr, honeypot: &str) -> Option<Verdict> {
+        if !self.throttle.attempt(ip) {
+            Some(Verdict::TooMany)
+        } else if self.honeypot.tripped(honeypot) {
+            Some(Verdict::Pretend)
+        } else {
+            None
         }
     }
 }
@@ -586,6 +628,56 @@ mod tests {
         assert_eq!(g.check(ip(1), "", "good").await, Verdict::Accept);
         assert_eq!(g.check(ip(1), "", "good").await, Verdict::TooMany);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_signed_in_poster_skips_turnstile_but_not_the_rest() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let g = Guard::new(HP, Some(stand_in(calls.clone()).await), throttle(3));
+        // No token and no request to Cloudflare.
+        assert_eq!(g.check_signed_in(ip(1), ""), Verdict::Accept);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The honeypot still counts, and still costs budget.
+        assert_eq!(g.check_signed_in(ip(1), "spam"), Verdict::Pretend);
+        assert_eq!(g.check_signed_in(ip(1), ""), Verdict::Accept);
+        assert_eq!(g.check_signed_in(ip(1), ""), Verdict::TooMany);
+        // The same budget as anonymous posts from the address.
+        assert_eq!(g.check(ip(1), "", "good").await, Verdict::TooMany);
+        assert_eq!(g.check_signed_in(ip(2), ""), Verdict::Accept);
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_post_without_turnstile_can_require_sign_in() {
+        // Off by default: open, as before.
+        let open = Guard::new(HP, None, throttle(10));
+        assert_eq!(open.check(ip(1), "", "").await, Verdict::Accept);
+
+        let g = Guard::new(HP, None, throttle(1)).require_sign_in_without_turnstile();
+        assert_eq!(g.check(ip(1), "", "").await, Verdict::SignInRequired);
+        assert_eq!(g.check(ip(1), "spam", "").await, Verdict::SignInRequired);
+        // It spent no budget: the signed-in post still has its one.
+        assert_eq!(g.check_signed_in(ip(1), ""), Verdict::Accept);
+        assert_eq!(g.check_signed_in(ip(1), ""), Verdict::TooMany);
+
+        // With Turnstile on the setting changes nothing.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let g = Guard::new(HP, Some(stand_in(calls).await), throttle(10))
+            .require_sign_in_without_turnstile();
+        assert_eq!(g.check(ip(1), "", "good").await, Verdict::Accept);
+        assert_eq!(g.check(ip(1), "", "bad").await, Verdict::Failed);
+    }
+
+    #[tokio::test]
+    async fn a_guard_counts_over_the_throttles_window() {
+        let t = Arc::new(Throttle::new(Budgets {
+            attempts_per_address: 2,
+            attempt_window: Duration::from_secs(3600),
+            ..Budgets::default()
+        }));
+        let g = Guard::new(HP, None, t);
+        assert_eq!(g.check(ip(1), "", "").await, Verdict::Accept);
+        assert_eq!(g.check(ip(1), "", "").await, Verdict::Accept);
+        assert_eq!(g.check(ip(1), "", "").await, Verdict::TooMany);
     }
 
     #[tokio::test]

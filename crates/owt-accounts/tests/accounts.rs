@@ -771,6 +771,7 @@ async fn the_password_gate_opens_a_fixed_account_with_the_deployments_hash() {
         attempts_per_address: 100,
         sign_ins_per_address: 100,
         sign_ins_per_account: 3,
+        ..owt_auth::throttle::Budgets::default()
     };
     let throttle = Arc::new(owt_auth::throttle::Throttle::new(budgets));
     let state = (db.pool.clone(), throttle, hash.clone(), desk.id);
@@ -851,6 +852,7 @@ async fn a_login_cannot_spend_the_gates_budget() {
         attempts_per_address: 100,
         sign_ins_per_address: 100,
         sign_ins_per_account: 1,
+        ..owt_auth::throttle::Budgets::default()
     };
     let throttle = Arc::new(owt_auth::throttle::Throttle::new(budgets));
     let state = (db.pool.clone(), throttle, hash, desk.id);

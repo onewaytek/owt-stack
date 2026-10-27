@@ -2,7 +2,8 @@
 //!
 //! Three budgets, each per minute: every attempt from one address (a flood), sign-ins
 //! from one address (guessing across accounts), and sign-ins to one account (guessing
-//! one password from many addresses).
+//! one password from many addresses). A form that wants "5 an hour" sets the window of
+//! the first with [`Budgets::attempt_window`].
 //!
 //! A sign-in is charged *before* its password is checked, and one over budget is not
 //! checked at all. Charging only failures would not stop a guess: the right password,
@@ -31,14 +32,21 @@
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 
-/// The budgets, each per minute.
+/// The budgets, each per minute except where `attempt_window` says otherwise.
 #[derive(Clone, Copy, Debug)]
 pub struct Budgets {
-    /// Attempts of any kind (sign-in, sign-up, reset) from one address.
+    /// Attempts of any kind (sign-in, sign-up, reset) from one address, per
+    /// [`attempt_window`](Self::attempt_window).
     pub attempts_per_address: u32,
+    /// The window `attempts_per_address` is counted over: a minute by default, an hour
+    /// for a form that allows 5 an hour. The budget refills evenly across it (one
+    /// attempt every 12 minutes at 5 an hour), so a spent budget does not come back
+    /// all at once. A zero window is a minute.
+    pub attempt_window: Duration,
     /// Sign-ins from one address.
     pub sign_ins_per_address: u32,
     /// Sign-ins to one account.
@@ -49,6 +57,7 @@ impl Default for Budgets {
     fn default() -> Self {
         Self {
             attempts_per_address: 200,
+            attempt_window: Duration::from_secs(60),
             sign_ins_per_address: 20,
             sign_ins_per_account: 5,
         }
@@ -77,6 +86,19 @@ impl std::fmt::Debug for Throttle {
 
 fn per_minute(n: u32) -> Quota {
     Quota::per_minute(NonZeroU32::new(n).unwrap_or(NonZeroU32::MIN))
+}
+
+/// `n` over `window`: a burst of `n`, refilled one at a time every `window / n`.
+fn per_window(n: u32, window: Duration) -> Quota {
+    let n = NonZeroU32::new(n).unwrap_or(NonZeroU32::MIN);
+    if window.is_zero() {
+        return Quota::per_minute(n);
+    }
+    Quota::with_period(window / n.get()).map_or_else(
+        // `window / n` rounded down to nothing: as fast as a clock can count.
+        || Quota::per_minute(n),
+        |q| q.allow_burst(n),
+    )
 }
 
 /// The key `address` is counted under: an IPv4 address as itself (also when written
@@ -119,7 +141,10 @@ impl Throttle {
     #[must_use]
     pub fn new(budgets: Budgets) -> Self {
         Self {
-            attempts: RateLimiter::keyed(per_minute(budgets.attempts_per_address)),
+            attempts: RateLimiter::keyed(per_window(
+                budgets.attempts_per_address,
+                budgets.attempt_window,
+            )),
             sign_ins_by_address: RateLimiter::keyed(per_minute(budgets.sign_ins_per_address)),
             sign_ins_by_account: RateLimiter::keyed(per_minute(budgets.sign_ins_per_account)),
             calls: AtomicU32::new(0),
@@ -171,6 +196,7 @@ mod tests {
     fn budgets(n: u32) -> Budgets {
         Budgets {
             attempts_per_address: n,
+            attempt_window: Duration::from_secs(60),
             sign_ins_per_address: n,
             sign_ins_per_account: n,
         }
@@ -182,6 +208,7 @@ mod tests {
             attempts_per_address: 3,
             sign_ins_per_address: 100,
             sign_ins_per_account: 100,
+            ..Budgets::default()
         });
         assert!((0..3).all(|_| t.attempt(ip(1))));
         assert!(!t.attempt(ip(1)));
@@ -192,6 +219,7 @@ mod tests {
             attempts_per_address: 100,
             sign_ins_per_address: 2,
             sign_ins_per_account: 2,
+            ..Budgets::default()
         });
         // One account guessed from many addresses.
         assert!(t.sign_in(ip(3), "ann"));
@@ -201,6 +229,41 @@ mod tests {
         assert!(t.sign_in(ip(6), "bob"));
         assert!(t.sign_in(ip(6), "cy"));
         assert!(!t.sign_in(ip(6), "di"));
+    }
+
+    #[test]
+    fn the_attempt_window_sets_how_a_budget_refills() {
+        // 3 an hour: three at once, and a spent budget does not come back in a moment.
+        let hourly = Throttle::new(Budgets {
+            attempts_per_address: 3,
+            attempt_window: Duration::from_secs(3600),
+            ..Budgets::default()
+        });
+        assert!((0..3).all(|_| hourly.attempt(ip(1))));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!hourly.attempt(ip(1)));
+        assert!(hourly.attempt(ip(2)), "another address has its own");
+
+        // 2 per 2s refills one every second (wide enough that a loaded machine
+        // doesn't refill one between the attempts).
+        let quick = Throttle::new(Budgets {
+            attempts_per_address: 2,
+            attempt_window: Duration::from_secs(2),
+            ..Budgets::default()
+        });
+        assert!(quick.attempt(ip(1)) && quick.attempt(ip(1)));
+        assert!(!quick.attempt(ip(1)));
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(quick.attempt(ip(1)), "one attempt came back");
+
+        // A zero window is a minute, not a panic or an unlimited budget.
+        let zero = Throttle::new(Budgets {
+            attempts_per_address: 1,
+            attempt_window: Duration::ZERO,
+            ..Budgets::default()
+        });
+        assert!(zero.attempt(ip(1)) && !zero.attempt(ip(1)));
+        assert_eq!(Budgets::default().attempt_window, Duration::from_secs(60));
     }
 
     #[test]
@@ -262,6 +325,7 @@ mod tests {
             attempts_per_address: 100_000,
             sign_ins_per_address: 2,
             sign_ins_per_account: 2,
+            ..Budgets::default()
         });
         // One address walks a list of names, far past its own budget.
         for i in 0..500 {

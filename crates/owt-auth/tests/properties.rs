@@ -87,6 +87,7 @@ proptest! {
             attempts_per_address: attempts,
             sign_ins_per_address: per_address,
             sign_ins_per_account: per_account,
+            ..Budgets::default()
         });
         let (mut a, mut s, mut n) = (HashMap::new(), HashMap::new(), HashMap::new());
         let spend = |map: &mut HashMap<u8, u32>, key: u8, budget: u32| {
@@ -114,7 +115,7 @@ proptest! {
     /// An account name of any length and content is counted, and never unbounded.
     #[test]
     fn any_account_name_can_be_throttled(name in prop_oneof![any::<String>(), "[\u{130}ßA-Z]{0,400}"]) {
-        let throttle = Throttle::new(Budgets { attempts_per_address: 100, sign_ins_per_address: 100, sign_ins_per_account: 1 });
+        let throttle = Throttle::new(Budgets { attempts_per_address: 100, sign_ins_per_address: 100, sign_ins_per_account: 1, ..Budgets::default() });
         prop_assert!(throttle.sign_in(address(1), &name));
         prop_assert!(!throttle.sign_in(address(2), &name));
     }
