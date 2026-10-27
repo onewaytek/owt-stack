@@ -7,11 +7,14 @@
 //! can never be pinned in a browser or at the edge under a URL that claims to be
 //! current.
 //!
-//! The hash is of the bytes on disk, computed on first use and memoized per existing
-//! file (misses are not stored, so request paths cannot grow the map): the files are
-//! fixed once the app is built, and a file replaced under a running process keeps its
-//! first hash. With `watch(true)`, typically in debug builds, it is recomputed on
-//! every call, so a Tailwind `--watch` rebuild is never served under a stale
+//! The hash is of the bytes on disk, memoized per existing file (misses are not
+//! stored, so request paths cannot grow the map): the files are fixed once the app is
+//! built, and a file replaced under a running process keeps its first hash. Call
+//! [`Assets::warm`] before binding the listener to hash every file up front; a file
+//! first hashed later is read on the first request that needs it (off the async
+//! executor when that is the static service, on the caller's thread for
+//! [`Assets::url`]). With `watch(true)`, typically in debug builds, it is recomputed
+//! on every call, so a Tailwind `--watch` rebuild is never served under a stale
 //! fingerprint.
 //!
 //! The directory is served as it is: symlinks in it are followed, so it must hold
@@ -101,6 +104,68 @@ impl Assets {
         Some(format!("{:016x}", h.finish()))
     }
 
+    /// Hash every file in the directory now, so no request reads one for its hash.
+    /// Call it before binding the listener, in the blocking context of startup (it
+    /// reads every file). Returns the number of files hashed. Dotfiles and
+    /// dot-directories, which are never served, are skipped, as are symlinked
+    /// directories; a file that cannot be read is left to the lazy path. A no-op with
+    /// `watch(true)`, which hashes on every call.
+    pub fn warm(&self) -> usize {
+        if self.0.watch {
+            return 0;
+        }
+        let mut count = 0;
+        let mut pending = vec![String::new()];
+        while let Some(rel) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(self.0.dir.join(&rel)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                let path = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if (kind.is_file() || entry.path().is_file()) && self.hash(&path).is_some() {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// The memoized hash of `path`, if there is one; never touches the disk.
+    fn memoized(&self, path: &str) -> Option<String> {
+        if self.0.watch {
+            return None;
+        }
+        self.0.hashes.read().ok()?.get(path).cloned()
+    }
+
+    /// [`hash`](Self::hash) for async code: a memoized hash is returned as is, and a
+    /// miss reads the file on the blocking pool, not on a runtime worker.
+    async fn hash_blocking(&self, path: String) -> Option<String> {
+        if let Some(h) = self.memoized(&path) {
+            return Some(h);
+        }
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.hash(&path))
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// The content hash of `path` (relative to the directory), or `None` if there is
     /// no such file. Paths that leave the directory (`..`, or an absolute path, which
     /// would replace it) have none.
@@ -167,11 +232,15 @@ impl Assets {
     /// the `2xx` it revalidates.
     pub async fn cache_policy(State(this): State<Self>, req: Request, next: Next) -> Response {
         let path = req.uri().path().trim_start_matches('/').to_owned();
-        let pinned = req
+        let version = req
             .uri()
             .query()
             .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("v=")))
-            .is_some_and(|v| this.hash(&path).is_some_and(|h| h == v));
+            .map(str::to_owned);
+        let pinned = match version {
+            Some(v) => this.hash_blocking(path).await.is_some_and(|h| h == v),
+            None => false,
+        };
         let mut res = next.run(req).await;
         let policy =
             if pinned && (res.status().is_success() || res.status() == StatusCode::NOT_MODIFIED) {
@@ -368,6 +437,50 @@ mod tests {
         assert_eq!(a.hash("css/../../etc/passwd"), None);
         assert_eq!(a.hash("/etc/passwd"), None);
         assert_eq!(a.hash(""), None);
+    }
+
+    #[test]
+    fn warming_hashes_every_served_file_up_front() {
+        let d = dir().join("warm");
+        std::fs::create_dir_all(d.join("sub/deep")).unwrap();
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::write(d.join("a.js"), "1").unwrap();
+        std::fs::write(d.join("sub/b.js"), "2").unwrap();
+        std::fs::write(d.join("sub/deep/c.js"), "3").unwrap();
+        std::fs::write(d.join(".env"), "SECRET").unwrap();
+        std::fs::write(d.join(".git/config"), "x").unwrap();
+        let a = Assets::new(&d, "/s");
+        assert_eq!(a.warm(), 3);
+        // Replaced after warming, a file keeps the hash it had at startup, and the
+        // memo holds exactly the served files.
+        let before = a.hash("sub/b.js");
+        std::fs::write(d.join("sub/b.js"), "changed").unwrap();
+        assert_eq!(a.hash("sub/b.js"), before);
+        assert_eq!(a.0.hashes.read().unwrap().len(), 3);
+        // Watching hashes on every call, so there is nothing to warm.
+        assert_eq!(Assets::new(&d, "/s").watch(true).warm(), 0);
+        assert_eq!(Assets::new(d.join("missing"), "/s").warm(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cold_pinned_request_is_hashed_and_served_immutable() {
+        // Hashed on the blocking pool the first time, and from the memo after.
+        let d = dir().join("cold");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("app.js"), "1").unwrap();
+        let url = Assets::new(&d, "/static").url("app.js");
+        let cold = Assets::new(&d, "/static");
+        let app = cold.mount(Router::new());
+        assert!(cold.memoized("app.js").is_none());
+        assert_eq!(
+            cache_control(app.clone(), &url).await,
+            (200, Some(IMMUTABLE.into()))
+        );
+        assert!(cold.memoized("app.js").is_some());
+        assert_eq!(
+            cache_control(app, &url).await,
+            (200, Some(IMMUTABLE.into()))
+        );
     }
 
     #[test]
