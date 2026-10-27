@@ -3086,6 +3086,7 @@ the template's:
 | `bin` | (required) | `ARG BIN` |
 | `bin-links` | none | names linked to `server` in `/usr/local/bin` |
 | `cargo-args` | none | extra `cargo build` arguments |
+| `cargo-profile` | `release` | the profile `cargo build` uses (`--release`, else `--profile <name>`; `dev` installs from `target/debug`); meant for `image-check.yml`, see below |
 | `assets-script` | `css:build` (empty: no npm) | `ARG CSS_SCRIPT` |
 | `node-version` / `node-version-file` | `22` / none | the assets stage's `hi/nodejs` |
 | `files` | `static` | `COPY` into the work directory |
@@ -3188,8 +3189,12 @@ commit the way a release does and verifies all but the push: with `builder: cran
 glibc, by the same `build` and `verify` jobs as `image.yml`'s (`just image-check`
 keeps them identical); with `builder: docker` the Dockerfile is built with BuildKit
 and pushed nowhere. It takes `image.yml`'s inputs that shape the build (`bin`,
-`cargo-args`, `files`, `base-image`, ...) and none that shape the push. It is a
-workflow of its own because no job in it writes: the caller grants `contents: read`
+`cargo-args`, `files`, `base-image`, ...) and none that shape the push.
+`cargo-profile` makes the check cheaper: a pull request can build with `dev`, or with a
+profile of the app's own that turns off fat LTO and sets many codegen units
+(`[profile.ci] inherits = "release"`), instead of the release link. The check then does
+not prove that the release profile's link succeeds, so a release still builds with
+`release`. It is a workflow of its own because no job in it writes: the caller grants `contents: read`
 only, which a Dependabot pull request's token can. (A called workflow that asks for
 `packages: write`, as `image.yml`'s `push` does, fails to start for a caller that
 grants less, skipped job or not.) Call it from a workflow of its own with a `paths:`

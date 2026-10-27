@@ -77,9 +77,17 @@ on:
         type: string
         default: ""
       cargo-args:
-        description: Extra arguments for `cargo build --release --locked --bin <bin>` (features, say).
+        description: Extra arguments for `cargo build --locked --bin <bin>` (features, say).
         type: string
         default: ""
+      cargo-profile:
+        description: >-
+          The Cargo profile to build with: `--release` for `release`, else `--profile <name>`
+          (`dev` builds into target/debug, any other into target/<name>). Meant for
+          image-check.yml, to skip the release profile's link on a pull request; a
+          release leaves it at `release`.
+        type: string
+        default: release
       container:
         description: >-
           The Rust job container. It needs bash, git, curl and tar; the verify job checks
@@ -311,6 +319,7 @@ jobs:
         env:
           BIN: ${{ inputs.bin }}
           CARGO_ARGS: ${{ inputs.cargo-args }}
+          PROFILE: ${{ inputs.cargo-profile }}
         shell: bash
         run: |
           set -euo pipefail
@@ -318,8 +327,17 @@ jobs:
             echo "::error::the crane builder needs \`bin\`, the Cargo binary to build"
             exit 1
           fi
+          if ! [[ "$PROFILE" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::cargo-profile is a profile name ('$PROFILE')"
+            exit 1
+          fi
+          if [ "$PROFILE" = release ]; then
+            profile=(--release)
+          else
+            profile=(--profile "$PROFILE")
+          fi
           # Unquoted on purpose: several arguments.
-          cargo build --release --locked --bin "$BIN" $CARGO_ARGS
+          cargo build "${profile[@]}" --locked --bin "$BIN" $CARGO_ARGS
       - name: sccache statistics
         if: ${{ always() && env.RUSTC_WRAPPER == 'sccache' }}
         continue-on-error: true
@@ -338,6 +356,7 @@ jobs:
         working-directory: ${{ inputs.workdir }}
         env:
           BIN: ${{ inputs.bin }}
+          PROFILE: ${{ inputs.cargo-profile }}
           LINKS: ${{ inputs.bin-links }}
           FILES: ${{ inputs.files }}
           OWNER: ${{ inputs.files-owner }}
@@ -358,7 +377,9 @@ jobs:
           out="$RUNNER_TEMP/image-layer"
           rm -rf "$stage" "$out"
           mkdir -p "$stage/usr/local/bin" "$stage/$wd" "$out"
-          install -m 0755 "target/release/$BIN" "$stage/usr/local/bin/server"
+          # The profile's directory: `dev` builds into debug, the others into their name.
+          case "$PROFILE" in dev) dir=debug ;; *) dir="$PROFILE" ;; esac
+          install -m 0755 "target/$dir/$BIN" "$stage/usr/local/bin/server"
           links=()
           for l in $LINKS; do
             if ! [[ "$l" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$l" = server ] || [ "$l" = . ] || [ "$l" = .. ]; then
