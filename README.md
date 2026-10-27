@@ -441,7 +441,10 @@ the handler and write `<script nonce="{{ nonce }}">`.
   served by `assets.mount(router)` (or `assets.service()`, nested where the app
   likes): a request whose `?v=` is the file's current hash is `immutable`, any other
   is `no-cache`, a missing file included. Templates call a function that returns
-  `assets.url("css/app.css")`, which carries the content hash. The macro
+  `assets.url("css/app.css")`, which carries the content hash. Call `assets.warm()`
+  at startup, before binding the listener: it hashes every file up front, so no
+  request reads a file for its hash (a miss in the static service is read off the
+  async executor, but `url` in a handler's template blocks on one). The macro
   `owt_web::static_assets!("static", "/static")` defines both in one module:
   `assets()` (the `Assets`, rehashing on every call in a debug build) and
   `url(path)`.
@@ -451,6 +454,7 @@ the handler and write `<script nonce="{{ nonce }}">`.
       owt_web::static_assets!("static", "/static");
   }
   # fn main() {
+  assets::assets().warm(); // before binding the listener
   let app = assets::assets().mount(axum::Router::new());
   # let _: axum::Router = app;
   let stylesheet = assets::url("css/app.css"); // /static/css/app.css?v=<hash>
