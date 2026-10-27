@@ -919,6 +919,8 @@ ignore = [
 A form anyone can post (a contact form, a public intake) is a free write into the
 app's database or an operator's inbox. `owt_auth::bots::Guard` decides each post:
 
+- no Turnstile, `Guard::require_sign_in_without_turnstile()` set and the poster
+  anonymous: `Verdict::SignInRequired`, redirect to sign in (nothing is charged);
 - over its address's budget: `Verdict::TooMany`, answer 429;
 - the honeypot filled: `Verdict::Pretend`, answer **exactly as for a person** (same
   redirect, same thanks) and store or send nothing, so a bot learns nothing to adapt to;
@@ -945,6 +947,14 @@ for a blank or oversized token), or `Outcome::WrongHostname { got }`.
 log those at `warn` or `error` and the rest at `debug`. `Guard` does exactly that
 (`error` for a wrong secret, `warn` for a wrong hostname, `debug` for the rest) and
 still answers `Verdict::Failed`.
+
+A form that allows "5 an hour" sets `Budgets { attempts_per_address: 5, attempt_window:
+Duration::from_secs(3600), .. }` (the window defaults to a minute; the budget refills
+evenly across it). A signed-in poster goes through `guard.check_signed_in(ip, honeypot)`:
+the budget and the honeypot apply, Turnstile does not, and the answer is `Accept`,
+`Pretend` or `TooMany`. With Turnstile off, a guard is open to anyone unless it is built
+with `.require_sign_in_without_turnstile()`, so the form can say "only signed-in people
+can send" when the keys are missing.
 
 Pick the honeypot's field name so browsers will not autofill it: not `website`,
 `email`, `phone` or `name`, which password managers fill for people, and a person
@@ -981,6 +991,7 @@ match guard.check(ip, &form.company_url, &form.token).await {
     Verdict::Accept => { /* store or send `form.message`, then redirect */ }
     Verdict::Pretend => { /* the same redirect, nothing stored or sent */ }
     Verdict::TooMany => { /* 429 */ }
+    Verdict::SignInRequired => { /* redirect to sign in */ }
     _ => { /* render the form again: "please try the check again" */ }
 }
 # let _ = form.message;
