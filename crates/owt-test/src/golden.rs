@@ -75,12 +75,21 @@ impl Normalizer {
     /// Drop the `?v=<hash>` an `owt_web::assets::Assets` URL carries, so a page
     /// recorded with the stylesheet built compares equal to one rendered where it is
     /// not (a test job that builds no CSS gets the bare URL): the link reads
-    /// `/static/css/app.css` either way. The mask is `?v=` at the start of any query,
-    /// so a page link whose first parameter is `v` loses it too (the comparison is
-    /// unaffected: both sides lose it alike); one with `v` later in the query keeps it.
+    /// `/static/css/app.css` either way. Only URLs under `/static/` are touched; for
+    /// assets served under another prefix, use [`asset_versions_under`](Self::asset_versions_under).
     #[must_use]
     pub fn asset_versions(self) -> Self {
-        self.mask(r#"\?v=[^"'&<>\s]*"#, "")
+        self.asset_versions_under("/static")
+    }
+
+    /// [`asset_versions`](Self::asset_versions) for assets served under `prefix` (as
+    /// given to `Assets::new`, with or without its slashes). A `?v=` anywhere else,
+    /// such as `https://example.com/watch?v=abc`, is kept: the snapshot still notices
+    /// that link changing.
+    #[must_use]
+    pub fn asset_versions_under(self, prefix: &str) -> Self {
+        let prefix = regex::escape(prefix.trim_matches('/'));
+        self.mask(&format!(r#"(/{prefix}/[^"'?<>\s]*)\?v=[^"'&<>\s]*"#), "$1")
     }
 
     /// `html` with its references canonical, collapsed, masked, one tag per line,
@@ -257,6 +266,26 @@ mod tests {
             n.normalize(built).contains("page=2&amp;v=1"),
             "a query's own v= is kept"
         );
+    }
+
+    /// Only asset URLs lose their version; the rest of the URL survives (`$1`).
+    #[test]
+    fn asset_versions_leave_page_links_alone() {
+        let n = Normalizer::new().asset_versions();
+        let out = n.normalize(
+            r#"<a href="https://example.com/watch?v=abc">w</a><a href="/watch?v=abc">w</a><link href="/static/css/app.css?v=1f">"#,
+        );
+        assert!(out.contains(r#"href="https://example.com/watch?v=abc""#));
+        assert!(out.contains(r#"href="/watch?v=abc""#));
+        assert!(out.contains(r#"href="/static/css/app.css""#));
+    }
+
+    #[test]
+    fn asset_versions_under_takes_the_prefix() {
+        let n = Normalizer::new().asset_versions_under("assets/");
+        let out = n.normalize(r#"<link href="/assets/a.css?v=1"><link href="/static/a.css?v=1">"#);
+        assert!(out.contains(r#"href="/assets/a.css""#));
+        assert!(out.contains(r#"href="/static/a.css?v=1""#));
     }
 
     #[test]
