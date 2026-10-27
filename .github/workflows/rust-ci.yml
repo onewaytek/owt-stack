@@ -220,7 +220,7 @@ jobs:
       # directory (a shared target dir cannot be checked; an sccache entry is keyed by
       # the compiler, its flags and the exact inputs, and a miss costs one compile).
       # The job needs no volume.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-targets: "false"
       # sccache, with one Redis shared by every job on the scale set. A Rust entry's key
