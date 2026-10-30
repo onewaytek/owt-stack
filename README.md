@@ -290,7 +290,10 @@ A session past the timeout is no session: its cookies are removed, and
 can redirect to `/login?reason=idle` (the next request carries no cookie to tell).
 A request with `owt-passive: 1` (`session::PASSIVE_HEADER`), or whose handler calls
 `Session::passive()`, is not activity, so a poll cannot keep an unattended screen
-signed in. Every response to a request whose session stands carries
+signed in. An app marks its server-sent-event and long-poll routes the same way
+(`Session::passive()` in the handler, or `owt-passive: 1` on the request): an
+`EventSource` reconnects on its own and a long poll returns and is reissued, so left
+unmarked each reconnect counts as activity and the idle timeout never fires. Every response to a request whose session stands carries
 `owt-idle-remaining: <seconds>` (`session::IDLE_REMAINING_HEADER`), with
 `Cache-Control: no-store` and `Vary: cookie`, since the value is one person's.
 
@@ -4280,10 +4283,16 @@ the template's:
 
   ```sh
   cosign verify ghcr.io/<owner>/<app>@<digest> \
-    --certificate-identity-regexp '^https://github.com/onewaytek/owt-stack/\.github/workflows/image\.yml@' \
+    --certificate-identity-regexp '^https://github.com/onewaytek/owt-stack/\.github/workflows/image\.yml@refs/tags/v' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     --certificate-github-workflow-repository <owner>/<app>
   ```
+
+  The identity ends in the workflow's ref, so pin it: `@refs/tags/v` accepts any
+  release tag, and `--certificate-identity
+  https://github.com/onewaytek/owt-stack/.github/workflows/image.yml@refs/tags/vX.Y.Z`
+  (the release the app calls) accepts one. A pattern that ends at `@` would also
+  verify an image signed by a workflow run from an unreviewed branch.
 - **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
   digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact and attaches
   it to the image as a signed attestation (`cosign verify-attestation --type
