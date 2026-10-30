@@ -10,7 +10,7 @@ use owt_web::session::Session;
 use sqlx::PgPool;
 
 use super::state::{self, Kind, MfaSession, State};
-use super::{Event, EventKind, Factor, Limiter, Mfa, MfaError, Next};
+use super::{Event, EventKind, Factor, Key, LOCK_AFTER, Limiter, Mfa, MfaError, Next};
 use crate::session::{self, Signed};
 use crate::store::{self, Account};
 
@@ -52,21 +52,6 @@ impl Entry {
             })
             .map(|_| Self::Enroll)
     }
-
-    /// The enrollment is done: sign the pending session in, or record the factor.
-    pub(super) fn finish<T: MfaSession>(
-        self,
-        session: &Session<T>,
-        account: &Account,
-        now: SystemTime,
-        mfa: bool,
-    ) -> Next {
-        if matches!(self, Self::Enroll) {
-            session::sign_in(session, account);
-        }
-        state::record(session, account, mfa, now);
-        Next::Done
-    }
 }
 
 impl Mfa {
@@ -101,9 +86,8 @@ impl Mfa {
             .filter(|p| matches!(p.kind, Kind::Challenge | Kind::Reauth))
             .filter(|p| state::within(p.at, self.pending_ttl, state::unix(now)))
             .ok_or(MfaError::NoChallenge)?;
-        // A key no login can spell (`password_sign_in` refuses control characters).
         limiter
-            .charge(ip, &format!("\0mfa\0{}", pending.account))
+            .charge(ip, Key::SecondFactor(pending.account))
             .await?;
         let account = store::by_id_in_epoch(pool, pending.account, pending.epoch)
             .await?
@@ -126,28 +110,31 @@ impl Mfa {
             }
             Answer::Recovery(code) => {
                 let remaining = Self::use_recovery_code(pool, &account, code).await?;
-                events.push(Event {
-                    account: account.id,
-                    kind: EventKind::RecoveryCodeUsed { remaining },
-                });
+                if Self::unlock_by_recovery(pool, account.id).await? {
+                    events.push(Event::new(account.id, EventKind::Unlocked(Factor::Totp)));
+                }
+                events.push(Event::new(
+                    account.id,
+                    EventKind::RecoveryCodeUsed { remaining },
+                ));
                 Factor::RecoveryCode
             }
         };
-        events.push(Event {
-            account: account.id,
-            kind: EventKind::ChallengePassed(factor),
-        });
+        events.push(Event::new(account.id, EventKind::ChallengePassed(factor)));
 
         if pending.kind == Kind::Reauth {
             session.update(|d| d.mfa_mut().pending = None);
         } else {
             session::sign_in(session, &account);
+            // The sign-in is complete only now, so this is the time it shows.
+            store::signed_in(pool, account.id).await?;
         }
         state::record(session, &account, true, now);
         Ok((account, events))
     }
 
-    /// A TOTP code against the account's confirmed authenticator, once.
+    /// A TOTP code against the account's confirmed authenticator, once. A wrong code is
+    /// counted; [`LOCK_AFTER`] in a row lock the authenticator.
     async fn check_totp(
         &self,
         pool: &PgPool,
@@ -155,35 +142,79 @@ impl Mfa {
         code: &str,
         now: SystemTime,
     ) -> Result<(), MfaError> {
-        let row: Option<(Vec<u8>, Option<i64>)> = sqlx::query_as(
-            "SELECT secret, last_step FROM account_totp
+        let row: Option<(Vec<u8>, Option<i64>, bool)> = sqlx::query_as(
+            "SELECT secret, last_step, locked_at IS NOT NULL FROM account_totp
              WHERE account_id = $1 AND confirmed_at IS NOT NULL",
         )
         .bind(account.id)
         .fetch_optional(pool)
         .await?;
-        let Some((sealed, last)) = row else {
+        let Some((stored, last, locked)) = row else {
             return Err(MfaError::Invalid);
         };
-        let secret = self.open(&sealed, account.id)?;
+        if locked {
+            return Err(MfaError::Locked);
+        }
+        let (secret, reseal) = self.open(&stored, account.id)?;
         let last = last.and_then(|s| u64::try_from(s).ok());
-        let step = totp::verify(&secret, code, now, last).ok_or(MfaError::Invalid)?;
+        let Some(step) = totp::verify(&secret, code, now, last) else {
+            return Err(Self::count_failure(pool, account.id).await?);
+        };
         let step = i64::try_from(step).map_err(|e| MfaError::fault(e.into()))?;
         // The check and the write are one statement: two requests with one code both
         // read the old step, and only one of them moves it forward.
         let moved = sqlx::query(
-            "UPDATE account_totp SET last_step = $2
-             WHERE account_id = $1 AND (last_step IS NULL OR last_step < $2)",
+            "UPDATE account_totp SET last_step = $2, failed_attempts = 0
+             WHERE account_id = $1 AND locked_at IS NULL
+               AND (last_step IS NULL OR last_step < $2)",
         )
         .bind(account.id)
         .bind(step)
         .execute(pool)
         .await?;
-        if moved.rows_affected() == 1 {
-            Ok(())
-        } else {
-            Err(MfaError::Invalid)
+        if moved.rows_affected() != 1 {
+            return Err(Self::count_failure(pool, account.id).await?);
         }
+        if reseal {
+            self.reseal(pool, account.id, &stored, &secret).await;
+        }
+        Ok(())
+    }
+
+    /// Count a wrong code; the error to answer with ([`MfaError::Locked`] when this one
+    /// locked the factor).
+    async fn count_failure(pool: &PgPool, account: i64) -> Result<MfaError, MfaError> {
+        let (locked,): (bool,) = sqlx::query_as(
+            "UPDATE account_totp SET failed_attempts = failed_attempts + 1,
+                    locked_at = CASE WHEN failed_attempts + 1 >= $2 AND locked_at IS NULL
+                                     THEN now() ELSE locked_at END
+             WHERE account_id = $1 RETURNING locked_at IS NOT NULL",
+        )
+        .bind(account)
+        .bind(LOCK_AFTER)
+        .fetch_one(pool)
+        .await?;
+        Ok(if locked {
+            MfaError::Locked
+        } else {
+            MfaError::Invalid
+        })
+    }
+
+    /// A recovery code was used: the authenticator's count of wrong codes starts again,
+    /// and it is unlocked. Whether it was locked.
+    async fn unlock_by_recovery(pool: &PgPool, account: i64) -> Result<bool, MfaError> {
+        let was: Option<(bool,)> = sqlx::query_as(
+            "WITH old AS (SELECT locked_at IS NOT NULL AS locked FROM account_totp
+                          WHERE account_id = $1 FOR UPDATE),
+                  done AS (UPDATE account_totp SET failed_attempts = 0, locked_at = NULL
+                           WHERE account_id = $1 RETURNING 1)
+             SELECT locked FROM old",
+        )
+        .bind(account)
+        .fetch_optional(pool)
+        .await?;
+        Ok(was.is_some_and(|(locked,)| locked))
     }
 
     /// Use up the recovery code `typed` matches among the account's unused ones; the
@@ -234,7 +265,7 @@ impl Mfa {
     /// sign-in's.
     ///
     /// # Errors
-    /// [`MfaError::Invalid`] for a wrong password, [`MfaError::NoChallenge`] if the
+    /// [`MfaError::BadPassword`] for a wrong password, [`MfaError::NoChallenge`] if the
     /// session is not signed in as `account`, [`MfaError::NothingToProve`] for an account
     /// with neither password nor factor, or a throttle or fault.
     pub async fn begin_reauth<T: MfaSession, L: Limiter>(
@@ -253,16 +284,14 @@ impl Mfa {
         if !signed {
             return Err(MfaError::NoChallenge);
         }
-        limiter
-            .charge(ip, &format!("\0reauth\0{}", account.id))
-            .await?;
+        limiter.charge(ip, Key::Reauth(account.id)).await?;
         let has_password = store::has_password(pool, account.id).await?;
         let has_factor = self.factors(pool, account.id).await?.any();
         if has_password {
-            let given = password.ok_or(MfaError::Invalid)?;
-            let opened = store::authenticate(pool, &account.username, given).await?;
+            let given = password.ok_or(MfaError::BadPassword)?;
+            let opened = store::check_password(pool, &account.username, given).await?;
             if opened.is_none_or(|a| a.id != account.id) {
-                return Err(MfaError::Invalid);
+                return Err(MfaError::BadPassword);
             }
         } else if !has_factor {
             return Err(MfaError::NothingToProve);

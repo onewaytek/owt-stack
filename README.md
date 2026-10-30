@@ -1685,10 +1685,19 @@ six digits cannot be guessed. A code works once: a TOTP step at or before the la
 accepted is refused (replay), and a recovery code is marked used by the same statement
 that checks it is unused.
 
-Session data needs the state: `session::Data` has it. An app with its own session type
-implements `mfa::MfaSession` beside `session::Signed` (and clears the state in
-`Signed::on_sign_in`). Any other way in (a sign-in link, a provider) calls
-`Mfa::first_factor_passed` in place of `session::sign_in`, or it skips the second factor.
+**Every door is closed where the session is read.** Install `Accounts::load_mfa::<T>` (or
+`load_with_mfa`) in place of `Accounts::load`, on an `Accounts` built `.require_mfa(mfa)`. A
+signature for an account that has a confirmed factor, or that the policy requires to have
+one, then counts as signed in only when the session shows a second factor passed for that
+account and epoch; until then the request is anonymous and the session becomes the pending
+sign-in above, so a challenge or enrollment page can continue it
+(`Mfa::pending_account`). A provider sign-in (`social`), a sign-in link, `password_gate` and
+an old `/login` route left in place are all held; none can skip the second factor. Without
+that layer only the doors that call `Mfa::first_factor_passed` enforce it. Session data
+needs the state: `session::Data` and `social::Data` have it; an app with its own session type
+implements `mfa::MfaSession` beside `session::Signed` and clears the state in
+`Signed::on_sign_in`. `Mfa::password_sign_in` does not stamp `last_sign_in` until the second
+factor passes.
 
 ```rust,no_run
 use axum::extract::{Form, State};
@@ -1747,12 +1756,20 @@ Enrolling an authenticator is `begin_totp` (a fresh secret, stored unconfirmed, 
 `confirm_totp` with the first code, which turns it on and returns ten recovery codes
 **once** (only their hashes are stored). `Mfa::factors` lists what an account holds,
 `remove_totp` removes the authenticator and its codes (refused with `MfaError::LastFactor`
-when the policy requires one), and `regenerate_recovery_codes` replaces the codes. Each
-returns `Event`s with stable names (`mfa.totp.enrolled`, `mfa.totp.removed`,
-`mfa.recovery_codes.issued`, `mfa.recovery_code.used`, `mfa.challenge.passed`) for the
-app's audit log; none of them touches a session epoch. Put enrollment, removal and
-regeneration behind step-up (below): a session someone merely left open must not be
-able to enroll its own authenticator.
+when the policy requires one), and `regenerate_recovery_codes` replaces the codes.
+**Each takes a `ChangeProof`**, which only `Mfa::authorize_change` makes: for an account
+that has a factor it requires a second factor used lately (a recovery code counts), for the
+first enrollment a recent sign-in, and for a pending enrollment under `Required` it allows
+it. A handler that forgets the step-up does not compile. Each change moves the account's
+session epoch on, so its *other* sessions end at their next request, and reseals the
+current one. Each returns `Event`s with stable names (`mfa.totp.enrolled`, `mfa.totp.removed`,
+`mfa.recovery_codes.issued`, `mfa.recovery_code.used`, `mfa.factor.unlocked`,
+`mfa.challenge.passed`) for the app's audit log. **Email the account's owner** on a removal,
+on a used recovery code, and on any event with `while_pending` set (a factor enrolled from a
+pending sign-in, on a password alone). Ten wrong authenticator codes in a row lock it
+(`MfaError::Locked`, counted in the database); a recovery code or `Mfa::unlock_totp` (for
+staff) unlocks it. A `SharedThrottle`'s `on_lockout` hook gets the throttle key of a
+second-factor lockout; `mfa::lockout_account(&lockout.account)` is the account id to email.
 
 **The policy and the secret.** `MfaPolicy::Optional` challenges only accounts that
 enrolled; `Required` is every account; `MfaPolicy::when(|a| a.is_staff)` is the accounts
@@ -1763,29 +1780,48 @@ have a factor from a stolen password, not a never-enrolled account from one: giv
 accounts a one-time sign-in link, or have staff enroll them. The TOTP secret in
 `account_totp.secret` lets whoever reads it make that account's codes for ever:
 supply a `SecretSealer` that encrypts it with a key the database does not hold
-(`owt-crypt`'s, say). The default, `Unsealed`, stores it in the clear and logs a warning;
-it is for development.
+(`owt-crypt`'s, say). The stored value carries a format byte and the sealer's key id, so
+keys rotate (a secret sealed under an older id is opened with it and resealed at its next
+use). The default, `Unsealed`, stores it in the clear, marked plain, and logs a warning; it is
+for development, and a plain row is accepted and sealed at its next use once a real sealer is
+set, so adopting one later locks nobody out.
 
 ```rust,no_run
 use owt_accounts::mfa::{Mfa, MfaPolicy, SecretSealer};
 
 struct Sealer; // wraps the app's `owt-crypt` key
 impl SecretSealer for Sealer {
+    // The id of the key `seal` uses now; stored with the ciphertext.
+    fn key_id(&self) -> &str { "2026-10" }
     // `context` binds the ciphertext to the account's row: pass it as the associated data.
     fn seal(&self, plaintext: &[u8], context: &[u8]) -> anyhow::Result<Vec<u8>> {
         # let _ = context;
         Ok(plaintext.to_vec()) // encrypt here
     }
-    fn open(&self, sealed: &[u8], context: &[u8]) -> anyhow::Result<Vec<u8>> {
-        # let _ = context;
+    // `key_id` names the key it was sealed under, which may be an older one.
+    fn open(&self, key_id: &str, sealed: &[u8], context: &[u8]) -> anyhow::Result<Vec<u8>> {
+        # let _ = (key_id, context);
         Ok(sealed.to_vec()) // and decrypt here
     }
 }
 
+# fn demo(pool: sqlx::PgPool) {
+use axum::{Router, middleware::from_fn_with_state};
+use owt_accounts::{Accounts, session::Data};
+
 // Staff must use a second factor; everyone else may.
-let _mfa = Mfa::new("Acme Health")
+let mfa = Mfa::new("Acme Health")
     .sealer(Sealer)
     .policy(MfaPolicy::when(|account| account.is_staff));
+
+// The layer that reads sessions holds every signature to it, wherever it came from.
+let accounts = Accounts::new(pool, "/login")
+    .reauth_at("/reauth")
+    .enroll_at("/mfa/enroll")
+    .require_mfa(mfa);
+let _app: Router = Router::new()
+    .layer(from_fn_with_state(accounts, Accounts::load_mfa::<Data>));
+# }
 ```
 
 **Step-up.** The session records when the account last proved who it is, and when it last
@@ -1795,9 +1831,13 @@ otherwise the visitor is sent to `Accounts::reauth_at(path)` (`/reauth` by defau
 `?next=` set. `RecentMfa<SECS>` asks for a second factor in that time, for what must not
 be done on a password alone. `require_recent` and `require_recent_mfa` are the same
 check as a function returning a typed `StepUp` (never recorded, stale, no second factor)
-for an app that answers in its own way. A session signed in by a way that records
-nothing (`session::sign_in`, a link, a provider) counts as *unrecorded* until
-`mfa::mark_authenticated` stamps it, so step-up fails closed. The re-authentication page
+for an app that answers in its own way. An account with no second factor gets
+`StepUp::NoSecondFactor` from `RecentMfa` (under `require_mfa`) and is sent to
+`Accounts::enroll_at(path)` (`/mfa/enroll`), not to a re-authentication that cannot help. A
+session signed in by a way that records nothing (`session::sign_in`, a link, a provider)
+counts as *unrecorded* until `mfa::mark_authenticated` stamps it (for the account the
+session is signed in as, and only that), so step-up fails closed; it records no second
+factor, which the layer still demands of an account that has one. The re-authentication page
 calls `Mfa::begin_reauth` (the password, for an account that has one), then
 `Mfa::challenge` if the account has a factor; both renew the times. Use it before
 exporting records, changing or removing a factor or regenerating recovery codes,
@@ -4206,11 +4246,17 @@ this command, run when the app adopts a release, is the only thing that moves it
 - **Recovery codes are Argon2id hashes**, not a peppered HMAC: 50 bits is too little for
   a fast hash, and a pepper is a secret to keep and rotate; the table alone then
   protects them.
-- **A second factor is TOTP and recovery codes, with step-up.** Pending sign-ins carry no
-  signature, so no extractor can mistake one for a session. A session records when the
-  account last proved who it is, bound to its account and epoch, and sensitive actions
-  ask for a recent proof (`Recent`, `RecentMfa`); a sign-in that records nothing counts
-  as stale. The TOTP secret is sealed by an app-supplied `SecretSealer`.
+- **A second factor is TOTP and recovery codes, with step-up, enforced at the layer.**
+  Pending sign-ins carry no signature, so no extractor can mistake one for a session, and
+  `Accounts::load_mfa` holds every signature (provider, link, gate, old route) to the
+  second factor. A session records when the account last proved who it is, bound to its
+  account and epoch, and sensitive actions ask for a recent proof (`Recent`, `RecentMfa`);
+  a sign-in that records nothing counts as stale. Factor changes need a `ChangeProof` from
+  `Mfa::authorize_change`, move the account's session epoch on and reseal the current
+  session. Ten wrong codes lock the authenticator (persisted). The TOTP secret is stored
+  with a format and key id by an app-supplied `SecretSealer`. Enrolling from a pending
+  sign-in is allowed under `Required` and flagged (`while_pending`) so the owner is told;
+  the library does not require an emailed link.
 - **The shared throttle fails closed.** If Redis is unreachable, sign-in is refused
   (`Refusal::Unavailable`) rather than allowed unthrottled: the throttle is the only
   bound on online guessing. `FailMode::Open` is the app's choice to make.

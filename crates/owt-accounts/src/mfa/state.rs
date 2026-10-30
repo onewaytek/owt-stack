@@ -151,3 +151,38 @@ pub(crate) fn record<T: MfaSession>(
         });
     });
 }
+
+/// The session's account changed its factors and its epoch moved on from `old_epoch`: sign
+/// the session in under the new one, keeping when it last proved itself (and, if `mfa_now`,
+/// recording a second factor now), so changing a factor neither signs this session out nor
+/// freshens its proof.
+pub(crate) fn reseal<T: MfaSession>(
+    session: &Session<T>,
+    account: &Account,
+    old_epoch: i32,
+    mfa_now: bool,
+    now: SystemTime,
+) {
+    let now = unix(now);
+    session.update(|d| {
+        let old = d
+            .mfa()
+            .auth
+            .filter(|a| a.account == account.id && a.epoch == old_epoch);
+        let auth = Auth {
+            account: account.id,
+            epoch: account.session_epoch,
+            at: old.map_or(now, |a| a.at),
+            mfa_at: if mfa_now {
+                Some(now)
+            } else {
+                old.and_then(|a| a.mfa_at)
+            },
+        };
+        d.set_signature(Some(Signature {
+            account: account.id,
+            epoch: account.session_epoch,
+        }));
+        d.mfa_mut().auth = Some(auth);
+    });
+}

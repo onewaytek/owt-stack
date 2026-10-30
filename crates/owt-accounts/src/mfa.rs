@@ -22,16 +22,29 @@
 //! * [`Next::Enroll`]: the policy requires a factor and it has none. The pending sign-in
 //!   opens nothing except enrollment: [`Mfa::pending_account`], [`Mfa::begin_totp`] and
 //!   [`Mfa::confirm_totp`], which signs the session in once the first code is proved.
-//!   (Whoever has the password can enroll their own authenticator at this point.
-//!   Requiring enrollment only protects accounts that have a factor from a password
-//!   alone; to protect a new account, create it with a one-time sign-in link or have
-//!   staff enroll it.)
+//!   Whoever has the password can enroll their own authenticator at this point, so the
+//!   events of such an enrollment have `while_pending` set: **email the account's owner
+//!   whenever one does** (and when turning on [`MfaPolicy::Required`], roll it out by
+//!   groups). The policy protects accounts that have a factor from a password alone, not
+//!   a never-enrolled account from one.
 //!
 //! A pending sign-in expires ([`Mfa::pending_ttl`], ten minutes). Every wrong answer is
-//! charged to the throttle under a key of the account's, so six digits cannot be
-//! guessed. Any other first factor (a sign-in link, a provider) goes through
-//! [`Mfa::first_factor_passed`] in place of [`session::sign_in`](crate::session::sign_in),
-//! or it skips the second factor.
+//! charged to the throttle under a key of the account's ([`Key`]), so six digits cannot be
+//! guessed; and [`LOCK_AFTER`] wrong authenticator codes in a row (counted in the
+//! database, so across replicas and over days) lock it, until a recovery code or staff
+//! ([`Mfa::unlock_totp`]) unlock it ([`MfaError::Locked`]: tell the owner).
+//!
+//! # Every door
+//!
+//! The second factor is enforced where the session is *read*, not where it is made:
+//! install [`Accounts::load_mfa`](crate::Accounts::load_mfa) with
+//! [`Accounts::require_mfa`](crate::Accounts::require_mfa) in place of `Accounts::load`.
+//! A signature for an account that has a factor, or that the policy requires to have
+//! one, then counts as signed in only when the session shows the second factor passed for
+//! that account and epoch; otherwise the request is anonymous and the session becomes the
+//! pending sign-in above. So a provider sign-in, a link, a password gate and an old
+//! `/login` route left in place cannot skip it. Without the layer, only the doors that
+//! call [`Mfa::first_factor_passed`] enforce it.
 //!
 //! # Step-up
 //!
@@ -40,15 +53,21 @@
 //! proof is older than a limit with a [`StepUp`], which the app answers with its
 //! re-authentication page; [`Mfa::begin_reauth`] and [`Mfa::challenge`] renew it.
 //! Put it in front of what must not be done from a session someone merely left open:
-//! exporting records, changing or removing a factor, regenerating recovery codes,
-//! break-glass access, changing the password or email.
+//! exporting records, break-glass access, changing the password or email. Changing a
+//! factor needs it, and the compiler sees to that: [`Mfa::authorize_change`] makes the
+//! [`ChangeProof`] that [`Mfa::begin_totp`], [`Mfa::confirm_totp`], [`Mfa::remove_totp`]
+//! and [`Mfa::regenerate_recovery_codes`] take, and it asks for a second factor used
+//! within the limit (a recovery code counts: it proves the person holds one of the
+//! account's factors). Each of those moves the account's session epoch on, so every other
+//! session of it ends, and reseals the current one.
 //!
 //! # Secrets
 //!
 //! The TOTP secret is stored where the database could be read: have a
 //! [`SecretSealer`] encrypt it with a key the database does not hold (`owt-crypt`'s,
-//! say). The development default [`Unsealed`] stores it in the clear and says so in the
-//! log.
+//! say). What is stored carries a format byte and the key id, so keys rotate; the
+//! development default [`Unsealed`] stores it in the clear, marked plain, and says so in
+//! the log. A plain row is accepted and sealed at its next use once a real sealer is set.
 //!
 //! # Audit
 //!
@@ -70,7 +89,7 @@ use owt_web::session::Session;
 use sqlx::PgPool;
 use zeroize::Zeroizing;
 
-use crate::session::{self, SignInRefused};
+use crate::session::{self, SignInRefused, Signed};
 use crate::store::{self, Account};
 
 mod challenge;
@@ -81,14 +100,24 @@ pub use challenge::Answer;
 pub use state::{Auth, Kind, MfaSession, Pending, State};
 pub use step_up::{
     Recent, RecentMfa, StepUp, require_recent, require_recent_at, require_recent_mfa,
+    require_recent_mfa_for,
 };
 
 /// Stamp the session as authenticated now, for a sign-in that did not go through this
-/// module ([`session::sign_in`](crate::session::sign_in) clears the record): call it
-/// right after, only when the person really just proved who they are (a password, a
-/// one-time link, a provider's sign-in). It records no second factor.
-pub fn mark_authenticated<T: MfaSession>(session: &Session<T>, account: &Account) {
-    state::record(session, account, false, SystemTime::now());
+/// module ([`session::sign_in`](crate::session::sign_in) clears the record): call it right
+/// after the credential was checked (a one-time link, a provider's sign-in). It stamps
+/// only the account the session is signed in as, and records no second factor: an account
+/// that has one, or that the policy requires to, is held at the layer
+/// ([`Accounts::require_mfa`](crate::Accounts::require_mfa)) until it passes, whatever
+/// this records. Returns whether it stamped.
+pub fn mark_authenticated<T: MfaSession>(session: &Session<T>, account: &Account) -> bool {
+    let signed = session
+        .read(Signed::signature)
+        .is_some_and(|s| s.account == account.id && s.epoch == account.session_epoch);
+    if signed {
+        state::record(session, account, false, SystemTime::now());
+    }
+    signed
 }
 
 /// A second factor an account can hold.
@@ -121,6 +150,20 @@ pub struct Event {
     pub account: i64,
     /// What happened.
     pub kind: EventKind,
+    /// A factor was enrolled from a *pending* sign-in, on a password alone (the policy
+    /// required a factor and the account had none). Whoever holds the password can do
+    /// this, so tell the account's owner by email whenever it is true.
+    pub while_pending: bool,
+}
+
+impl Event {
+    pub(crate) fn new(account: i64, kind: EventKind) -> Self {
+        Self {
+            account,
+            kind,
+            while_pending: false,
+        }
+    }
 }
 
 /// What an [`Event`] records.
@@ -139,6 +182,8 @@ pub enum EventKind {
         /// The unused codes left.
         remaining: i64,
     },
+    /// A locked factor was unlocked (by a recovery code or by staff).
+    Unlocked(Factor),
     /// A second-factor challenge was passed: a sign-in completed, or a session was
     /// re-authenticated.
     ChallengePassed(Factor),
@@ -157,6 +202,7 @@ impl Event {
             EventKind::Removed(_) => "mfa.factor.removed",
             EventKind::RecoveryCodesIssued => "mfa.recovery_codes.issued",
             EventKind::RecoveryCodeUsed { .. } => "mfa.recovery_code.used",
+            EventKind::Unlocked(_) => "mfa.factor.unlocked",
             EventKind::ChallengePassed(_) => "mfa.challenge.passed",
         }
     }
@@ -208,32 +254,56 @@ impl MfaPolicy {
 /// XChaCha20-Poly1305) under a key the database does not hold, and binds the
 /// ciphertext to the row with `context` as the associated data, so one account's
 /// sealed secret pasted into another's row does not open.
+///
+/// What is stored carries a format byte and the [`key_id`](Self::key_id) of the key that
+/// sealed it, so keys can be rotated: a secret sealed under an older key id is opened
+/// with it (the sealer is told which) and resealed under the current one at its next
+/// use. A secret stored by [`Unsealed`] is marked as plain and is likewise accepted and
+/// resealed once a real sealer is set, so adopting one later locks nobody out.
 pub trait SecretSealer: Send + Sync {
-    /// The bytes to store for `plaintext`.
+    /// The id of the key [`seal`](Self::seal) uses now (at most 255 bytes).
+    fn key_id(&self) -> &str;
+
+    /// Whether this stores the secret in the clear ([`Unsealed`] only).
+    fn is_plaintext(&self) -> bool {
+        false
+    }
+
+    /// The bytes to store for `plaintext`, under the current key.
     ///
     /// # Errors
     /// The sealing failed; nothing is stored.
     fn seal(&self, plaintext: &[u8], context: &[u8]) -> anyhow::Result<Vec<u8>>;
 
-    /// The secret `sealed` holds.
+    /// The secret `sealed` holds, sealed under the key `key_id` names.
     ///
     /// # Errors
-    /// It does not open (a wrong key, damage, another row's `context`).
-    fn open(&self, sealed: &[u8], context: &[u8]) -> anyhow::Result<Vec<u8>>;
+    /// It does not open (a wrong or unknown key, damage, another row's `context`).
+    fn open(&self, key_id: &str, sealed: &[u8], context: &[u8]) -> anyhow::Result<Vec<u8>>;
 }
 
-/// The development sealer: stores the secret **in the clear**. Not for production: a
-/// read of the database (a backup, a SQL injection, a replica) would then hand over every
-/// account's second factor. [`Mfa::new`] logs a warning when it is in use.
+/// The development sealer: stores the secret **in the clear**, marked as plain. Not for
+/// production: a read of the database (a backup, a SQL injection, a replica) would then
+/// hand over every account's second factor. [`Mfa::new`] logs a warning when it is in
+/// use.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Unsealed;
 
 impl SecretSealer for Unsealed {
+    #[allow(clippy::unnecessary_literal_bound)] // the trait's signature
+    fn key_id(&self) -> &str {
+        ""
+    }
+
+    fn is_plaintext(&self) -> bool {
+        true
+    }
+
     fn seal(&self, plaintext: &[u8], _: &[u8]) -> anyhow::Result<Vec<u8>> {
         Ok(plaintext.to_vec())
     }
 
-    fn open(&self, sealed: &[u8], _: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn open(&self, _: &str, sealed: &[u8], _: &[u8]) -> anyhow::Result<Vec<u8>> {
         Ok(sealed.to_vec())
     }
 }
@@ -247,17 +317,62 @@ pub enum Throttled {
     Unavailable,
 }
 
+/// What an attempt is charged to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key<'a> {
+    /// A password sign-in to this login (a username or an email).
+    Login(&'a str),
+    /// Second-factor answers for this account.
+    SecondFactor(i64),
+    /// Re-authentication of this account.
+    Reauth(i64),
+}
+
+impl Key<'_> {
+    /// The string a [`Throttle`] counts it under. A login cannot spell the other two
+    /// ([`Mfa::password_sign_in`] refuses control characters).
+    #[must_use]
+    pub fn as_throttle_key(&self) -> String {
+        match self {
+            Self::Login(login) => (*login).to_owned(),
+            Self::SecondFactor(id) => format!("\0mfa\0{id}"),
+            Self::Reauth(id) => format!("\0reauth\0{id}"),
+        }
+    }
+}
+
+/// The account a throttle key names, if it is one of the second-factor kinds: for the
+/// `Lockout::account` that
+/// [`SharedThrottle::on_lockout`](owt_auth::throttle::shared::SharedThrottle::on_lockout)
+/// passes its hook, so the app can email the owner "someone is guessing your second
+/// factor".
+#[must_use]
+pub fn lockout_account(throttle_key: &str) -> Option<i64> {
+    throttle_key
+        .strip_prefix("\0mfa\0")
+        .or_else(|| throttle_key.strip_prefix("\0reauth\0"))
+        .and_then(|id| id.parse().ok())
+}
+
 /// What charges sign-in attempts: the in-process [`Throttle`], or with the `redis`
 /// feature the [`SharedThrottle`](owt_auth::throttle::shared::SharedThrottle), whose
 /// budgets hold across replicas (use it when there are several).
 pub trait Limiter: Send + Sync {
-    /// Charge a sign-in attempt under `key` from `ip`.
-    fn charge(&self, ip: IpAddr, key: &str) -> impl Future<Output = Result<(), Throttled>> + Send;
+    /// Charge an attempt under `key` from `ip`.
+    fn charge(
+        &self,
+        ip: IpAddr,
+        key: Key<'_>,
+    ) -> impl Future<Output = Result<(), Throttled>> + Send;
 }
 
 impl Limiter for Throttle {
-    fn charge(&self, ip: IpAddr, key: &str) -> impl Future<Output = Result<(), Throttled>> + Send {
-        let allowed = self.sign_in(ip, key);
+    fn charge(
+        &self,
+        ip: IpAddr,
+        key: Key<'_>,
+    ) -> impl Future<Output = Result<(), Throttled>> + Send {
+        let allowed = self.sign_in(ip, &key.as_throttle_key());
         std::future::ready(if allowed {
             Ok(())
         } else {
@@ -268,12 +383,14 @@ impl Limiter for Throttle {
 
 #[cfg(feature = "redis")]
 impl Limiter for owt_auth::throttle::shared::SharedThrottle {
-    async fn charge(&self, ip: IpAddr, key: &str) -> Result<(), Throttled> {
+    async fn charge(&self, ip: IpAddr, key: Key<'_>) -> Result<(), Throttled> {
         use owt_auth::throttle::shared::Refusal;
-        self.sign_in(ip, key).await.map_err(|r| match r {
-            Refusal::Unavailable => Throttled::Unavailable,
-            _ => Throttled::Spent,
-        })
+        self.sign_in(ip, &key.as_throttle_key())
+            .await
+            .map_err(|r| match r {
+                Refusal::Unavailable => Throttled::Unavailable,
+                _ => Throttled::Spent,
+            })
     }
 }
 
@@ -301,6 +418,18 @@ pub enum MfaError {
     /// The shared throttle could not be reached and fails closed. Answer 503.
     #[error("Signing in is unavailable for a moment. Please try again shortly.")]
     Unavailable,
+    /// The authenticator is locked after too many wrong codes in a row. A recovery code
+    /// unlocks it, or staff do ([`Mfa::unlock_totp`]). The app should tell the owner.
+    #[error(
+        "Too many wrong codes. Use a recovery code to unlock the authenticator, or ask for help."
+    )]
+    Locked,
+    /// A password was asked for and is not the account's.
+    #[error("That is not your password.")]
+    BadPassword,
+    /// The change needs the person to have proved who they are lately.
+    #[error(transparent)]
+    StepUp(#[from] StepUp),
     /// The code is wrong, expired, or already used. It does not say which.
     #[error("That code is not right, or it has been used already.")]
     Invalid,
@@ -374,15 +503,14 @@ impl From<MfaError> for owt_web::Error {
 /// An authenticator being set up: show it once.
 ///
 /// It holds the secret in three forms. Send the page `Cache-Control: no-store`, do not
-/// log it, and let it go out of scope (its text is zeroed when dropped, the SVG is not:
-/// an SVG is markup the browser needs).
+/// log it, and let it go out of scope (its text is zeroed when dropped, the SVG's too).
 pub struct TotpEnrollment {
     /// The secret as base32, to type into an authenticator that cannot scan.
     pub secret: Zeroizing<String>,
     /// The `otpauth://` URI the QR code encodes.
     pub uri: Zeroizing<String>,
     /// The QR code as an SVG document (safe to embed unescaped: the library made it).
-    pub qr_svg: String,
+    pub qr_svg: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for TotpEnrollment {
@@ -410,6 +538,8 @@ pub struct Factors {
     pub totp_confirmed_at: Option<i64>,
     /// Recovery codes not yet used.
     pub recovery_codes_left: i64,
+    /// The authenticator is locked after too many wrong codes ([`MfaError::Locked`]).
+    pub totp_locked: bool,
 }
 
 impl Factors {
@@ -425,6 +555,20 @@ impl Factors {
     pub fn any(&self) -> bool {
         self.count() > 0
     }
+}
+
+/// Wrong authenticator codes in a row after which the factor is locked.
+pub const LOCK_AFTER: i32 = 10;
+
+/// Proof that the person may change their factors now: made by [`Mfa::authorize_change`]
+/// and nothing else, and asked for by every function that changes them
+/// ([`Mfa::begin_totp`], [`Mfa::confirm_totp`], [`Mfa::remove_totp`],
+/// [`Mfa::regenerate_recovery_codes`]), so a handler that forgets the step-up does not
+/// compile.
+#[derive(Debug)]
+pub struct ChangeProof {
+    account: i64,
+    pending: bool,
 }
 
 /// The configuration the second-factor functions share. Build one at start, keep it
@@ -467,7 +611,8 @@ impl Mfa {
         }
     }
 
-    /// Seal the secrets with `sealer`.
+    /// Seal the secrets with `sealer`. Secrets already stored in the clear (by
+    /// [`Unsealed`]) keep working and are sealed at their next use.
     #[must_use]
     pub fn sealer(mut self, sealer: impl SecretSealer + 'static) -> Self {
         self.sealer = Arc::new(sealer);
@@ -505,6 +650,78 @@ impl Mfa {
         format!("owt-accounts/totp/{account}").into_bytes()
     }
 
+    /// The bytes to store for `secret`: `0` and the secret itself for [`Unsealed`], else
+    /// `1`, the key id's length, the key id, and what the sealer returned.
+    fn pack(&self, secret: &Secret, account: i64) -> Result<Vec<u8>, MfaError> {
+        if self.sealer.is_plaintext() {
+            let mut out = vec![0u8];
+            out.extend_from_slice(secret.as_bytes());
+            return Ok(out);
+        }
+        let id = self.sealer.key_id().as_bytes();
+        let len = u8::try_from(id.len())
+            .map_err(|_| MfaError::fault(anyhow::anyhow!("a sealer key id over 255 bytes")))?;
+        let sealed = self
+            .sealer
+            .seal(secret.as_bytes(), &Self::context(account))
+            .map_err(MfaError::fault)?;
+        let mut out = vec![1u8, len];
+        out.extend_from_slice(id);
+        out.extend_from_slice(&sealed);
+        Ok(out)
+    }
+
+    /// The secret `stored` holds, and whether it should be stored again (it is plain and
+    /// there is a real sealer now, or it was sealed under an older key).
+    fn unpack(&self, stored: &[u8], account: i64) -> Result<(Secret, bool), MfaError> {
+        let bad = || MfaError::fault(anyhow::anyhow!("a stored TOTP secret in an unknown format"));
+        let (plain, reseal) = match stored.first().copied() {
+            Some(0) => (
+                Zeroizing::new(stored[1..].to_vec()),
+                !self.sealer.is_plaintext(),
+            ),
+            Some(1) if !self.sealer.is_plaintext() => {
+                let len = usize::from(*stored.get(1).ok_or_else(bad)?);
+                let id = stored.get(2..2 + len).ok_or_else(bad)?;
+                let id = std::str::from_utf8(id).map_err(|_| bad())?;
+                let sealed = stored.get(2 + len..).ok_or_else(bad)?;
+                let plain = self
+                    .sealer
+                    .open(id, sealed, &Self::context(account))
+                    .map_err(MfaError::fault)?;
+                (Zeroizing::new(plain), id != self.sealer.key_id())
+            }
+            _ => return Err(bad()),
+        };
+        let secret = Secret::from_bytes(&plain).ok_or_else(|| {
+            MfaError::fault(anyhow::anyhow!("a stored TOTP secret of a bad length"))
+        })?;
+        Ok((secret, reseal))
+    }
+
+    /// Store `secret` again under the current sealer, if `stored` is still what the row
+    /// holds. Best effort: the next use tries again.
+    pub(crate) async fn reseal(&self, pool: &PgPool, account: i64, stored: &[u8], secret: &Secret) {
+        let Ok(packed) = self.pack(secret, account) else {
+            return;
+        };
+        let done = sqlx::query(
+            "UPDATE account_totp SET secret = $3 WHERE account_id = $1 AND secret = $2",
+        )
+        .bind(account)
+        .bind(stored)
+        .bind(&packed)
+        .execute(pool)
+        .await;
+        if let Err(e) = done {
+            tracing::warn!(error = %e, "a TOTP secret could not be resealed");
+        }
+    }
+
+    pub(crate) fn open(&self, stored: &[u8], account: i64) -> Result<(Secret, bool), MfaError> {
+        self.unpack(stored, account)
+    }
+
     /// The account whose pending sign-in is waiting for [`Kind::Enroll`] (it must enroll a
     /// factor) or [`Kind::Challenge`], if the session holds one that has not expired and
     /// whose epoch still stands.
@@ -531,10 +748,12 @@ impl Mfa {
     /// # Errors
     /// The database.
     pub async fn factors(&self, pool: &PgPool, account: i64) -> sqlx::Result<Factors> {
-        let (confirmed_at, left): (Option<i64>, i64) = sqlx::query_as(
+        let (confirmed_at, locked, left): (Option<i64>, bool, i64) = sqlx::query_as(
             "SELECT
                (SELECT EXTRACT(EPOCH FROM confirmed_at)::bigint FROM account_totp
                  WHERE account_id = $1 AND confirmed_at IS NOT NULL),
+               COALESCE((SELECT locked_at IS NOT NULL FROM account_totp
+                 WHERE account_id = $1 AND confirmed_at IS NOT NULL), false),
                (SELECT count(*) FROM account_recovery_codes
                  WHERE account_id = $1 AND used_at IS NULL)",
         )
@@ -544,16 +763,60 @@ impl Mfa {
         Ok(Factors {
             totp_confirmed_at: confirmed_at,
             recovery_codes_left: left,
+            totp_locked: locked,
         })
+    }
+
+    /// Whether the session may change `account`'s factors now, as a [`ChangeProof`] every
+    /// change asks for:
+    ///
+    /// * the session is signed in as `account`, which has a factor: a second factor must
+    ///   have been used within `max_age` ([`require_recent_mfa`]; a recovery code counts);
+    /// * signed in, no factor yet (the first enrollment): a recent sign-in
+    ///   ([`require_recent`]);
+    /// * holding the pending [`Kind::Enroll`] of `account`: allowed. The proof is then
+    ///   marked pending and the events of the enrollment carry `while_pending`.
+    ///
+    /// # Errors
+    /// [`MfaError::StepUp`] (send the person to re-authenticate), [`MfaError::NoChallenge`]
+    /// if the session is neither, or the database.
+    pub async fn authorize_change<T: MfaSession>(
+        &self,
+        pool: &PgPool,
+        session: &Session<T>,
+        account: &Account,
+        max_age: Duration,
+    ) -> Result<ChangeProof, MfaError> {
+        let entry = challenge::Entry::of(session, account, self.pending_ttl, SystemTime::now())
+            .ok_or(MfaError::NoChallenge)?;
+        let pending = match entry {
+            challenge::Entry::Enroll => true,
+            challenge::Entry::Signed => {
+                if self.factors(pool, account.id).await?.any() {
+                    require_recent_mfa(session, max_age)?;
+                } else {
+                    require_recent(session, max_age)?;
+                }
+                false
+            }
+        };
+        Ok(ChangeProof {
+            account: account.id,
+            pending,
+        })
+    }
+
+    fn proof_for(proof: &ChangeProof, account: &Account) -> Result<(), MfaError> {
+        if proof.account == account.id {
+            Ok(())
+        } else {
+            Err(MfaError::NoChallenge)
+        }
     }
 
     /// Begin setting up an authenticator for `account`: a fresh secret, stored
     /// unconfirmed (it signs nobody in), and the forms to show it in. Calling again
     /// before a code is confirmed replaces the secret.
-    ///
-    /// For a signed-in account, put this behind [`require_recent_mfa`] or
-    /// [`require_recent`]: whoever holds a session can otherwise enroll their own
-    /// authenticator on the account.
     ///
     /// # Errors
     /// [`MfaError::AlreadyEnrolled`] (remove the old one first), or a fault.
@@ -561,12 +824,10 @@ impl Mfa {
         &self,
         pool: &PgPool,
         account: &Account,
+        proof: &ChangeProof,
     ) -> Result<TotpEnrollment, MfaError> {
+        Self::proof_for(proof, account)?;
         let secret = Secret::generate().map_err(MfaError::fault)?;
-        let sealed = self
-            .sealer
-            .seal(secret.as_bytes(), &Self::context(account.id))
-            .map_err(MfaError::fault)?;
         let stored = sqlx::query(
             "INSERT INTO account_totp (account_id, secret) VALUES ($1, $2)
              ON CONFLICT (account_id) DO UPDATE
@@ -574,7 +835,7 @@ impl Mfa {
                WHERE account_totp.confirmed_at IS NULL",
         )
         .bind(account.id)
-        .bind(&sealed)
+        .bind(self.pack(&secret, account.id)?)
         .execute(pool)
         .await?;
         if stored.rows_affected() == 0 {
@@ -596,18 +857,20 @@ impl Mfa {
         Ok(TotpEnrollment {
             secret: secret.to_base32(),
             uri,
-            qr_svg,
+            qr_svg: Zeroizing::new(qr_svg),
         })
     }
 
     /// Confirm the authenticator `begin_totp` started with the first `code` it shows.
-    /// The authenticator then challenges every sign-in, and ten recovery codes are
-    /// made (replacing any earlier set) and returned **once**.
+    /// The authenticator then challenges every sign-in, and the recovery codes are made
+    /// (replacing any earlier set) and returned **once**.
     ///
-    /// `session` is either signed in as `account` (the settings page: the time of a
-    /// second factor is recorded) or holds its pending [`Kind::Enroll`] (the
-    /// policy's first sign-in: it is signed in now, [`Confirmed::next`] is
-    /// [`Next::Done`]); anything else is [`MfaError::NoChallenge`].
+    /// The account's session epoch moves on: every *other* session of it ends at its next
+    /// request (one an attacker held does not outlive the owner's enrollment), and this
+    /// session is resealed under the new epoch with the factor recorded. A pending
+    /// enrollment ([`Kind::Enroll`]) is signed in now ([`Confirmed::next`] is
+    /// [`Next::Done`]); its events have `while_pending` set, and the owner should be
+    /// emailed.
     ///
     /// # Errors
     /// [`MfaError::Invalid`] for a wrong code, [`MfaError::NotEnrolling`] if none was
@@ -617,19 +880,19 @@ impl Mfa {
         pool: &PgPool,
         session: &Session<T>,
         account: &Account,
+        proof: &ChangeProof,
         code: &str,
     ) -> Result<Confirmed, MfaError> {
+        Self::proof_for(proof, account)?;
         let now = SystemTime::now();
-        let entry = challenge::Entry::of(session, account, self.pending_ttl, now)
-            .ok_or(MfaError::NoChallenge)?;
         let row: Option<(Vec<u8>,)> = sqlx::query_as(
             "SELECT secret FROM account_totp WHERE account_id = $1 AND confirmed_at IS NULL",
         )
         .bind(account.id)
         .fetch_optional(pool)
         .await?;
-        let (sealed,) = row.ok_or(MfaError::NotEnrolling)?;
-        let secret = self.open(&sealed, account.id)?;
+        let (stored,) = row.ok_or(MfaError::NotEnrolling)?;
+        let (secret, _) = self.open(&stored, account.id)?;
         let step = totp::verify(&secret, code, now, None).ok_or(MfaError::Invalid)?;
         let codes = recovery::generate(self.recovery_codes)
             .await
@@ -639,49 +902,64 @@ impl Mfa {
         // Confirm only the secret that was checked: a begin between the read and here
         // replaced it.
         let confirmed = sqlx::query(
-            "UPDATE account_totp SET confirmed_at = now(), last_step = $2
+            "UPDATE account_totp SET confirmed_at = now(), last_step = $2,
+                    failed_attempts = 0, locked_at = NULL
              WHERE account_id = $1 AND confirmed_at IS NULL AND secret = $3",
         )
         .bind(account.id)
         .bind(i64::try_from(step).map_err(|e| MfaError::fault(e.into()))?)
-        .bind(&sealed)
+        .bind(&stored)
         .execute(&mut *tx)
         .await?;
         if confirmed.rows_affected() == 0 {
             return Err(MfaError::NotEnrolling);
         }
         replace_codes(&mut tx, account.id, &codes).await?;
+        let epoch = bump_epoch(&mut tx, account.id).await?;
         tx.commit().await?;
 
-        let next = entry.finish(session, account, now, true);
+        let account_now = Account {
+            session_epoch: epoch,
+            ..account.clone()
+        };
+        let next = if proof.pending {
+            session::sign_in(session, &account_now);
+            state::record(session, &account_now, true, now);
+            store::signed_in(pool, account.id).await?;
+            Next::Done
+        } else {
+            state::reseal(session, &account_now, account.session_epoch, true, now);
+            Next::Done
+        };
+        let event = |kind| Event {
+            while_pending: proof.pending,
+            ..Event::new(account.id, kind)
+        };
         Ok(Confirmed {
             recovery_codes: codes,
             next,
             events: vec![
-                Event {
-                    account: account.id,
-                    kind: EventKind::Enrolled(Factor::Totp),
-                },
-                Event {
-                    account: account.id,
-                    kind: EventKind::RecoveryCodesIssued,
-                },
+                event(EventKind::Enrolled(Factor::Totp)),
+                event(EventKind::RecoveryCodesIssued),
             ],
         })
     }
 
-    /// Replace the account's recovery codes with new ones, returned **once**.
-    /// Needs an authenticator (the codes are its backup). Put it behind
-    /// [`require_recent_mfa`].
+    /// Replace the account's recovery codes with new ones, returned **once**. Needs an
+    /// authenticator (the codes are its backup). Moves the session epoch on and reseals
+    /// this session, as [`confirm_totp`](Self::confirm_totp) does.
     ///
     /// # Errors
     /// [`MfaError::NotEnrolled`], or a fault.
-    pub async fn regenerate_recovery_codes(
+    pub async fn regenerate_recovery_codes<T: MfaSession>(
         &self,
         pool: &PgPool,
+        session: &Session<T>,
         account: &Account,
+        proof: &ChangeProof,
     ) -> Result<(Vec<Recovery>, Event), MfaError> {
-        if !self.factors(pool, account.id).await?.any() {
+        Self::proof_for(proof, account)?;
+        if proof.pending || !self.factors(pool, account.id).await?.any() {
             return Err(MfaError::NotEnrolled);
         }
         let codes = recovery::generate(self.recovery_codes)
@@ -700,22 +978,43 @@ impl Mfa {
             return Err(MfaError::NotEnrolled);
         }
         replace_codes(&mut tx, account.id, &codes).await?;
+        let epoch = bump_epoch(&mut tx, account.id).await?;
         tx.commit().await?;
-        let event = Event {
-            account: account.id,
-            kind: EventKind::RecoveryCodesIssued,
+        let account_now = Account {
+            session_epoch: epoch,
+            ..account.clone()
         };
-        Ok((codes, event))
+        state::reseal(
+            session,
+            &account_now,
+            account.session_epoch,
+            false,
+            SystemTime::now(),
+        );
+        Ok((
+            codes,
+            Event::new(account.id, EventKind::RecoveryCodesIssued),
+        ))
     }
 
     /// Remove the authenticator and the recovery codes behind it. Refused with
     /// [`MfaError::LastFactor`] when the policy requires `account` to have a factor and
-    /// this is its last. Changes no session epoch: other sessions stay signed in. Put it
-    /// behind [`require_recent_mfa`], and tell the owner.
+    /// this is its last. Moves the session epoch on (other sessions end) and reseals
+    /// this one. Tell the owner.
     ///
     /// # Errors
     /// [`MfaError::NotEnrolled`], [`MfaError::LastFactor`], or a fault.
-    pub async fn remove_totp(&self, pool: &PgPool, account: &Account) -> Result<Event, MfaError> {
+    pub async fn remove_totp<T: MfaSession>(
+        &self,
+        pool: &PgPool,
+        session: &Session<T>,
+        account: &Account,
+        proof: &ChangeProof,
+    ) -> Result<Event, MfaError> {
+        Self::proof_for(proof, account)?;
+        if proof.pending {
+            return Err(MfaError::NotEnrolled);
+        }
         let mut tx = pool.begin().await?;
         let held: Option<(Option<i64>,)> = sqlx::query_as(
             "SELECT EXTRACT(EPOCH FROM confirmed_at)::bigint FROM account_totp
@@ -726,8 +1025,7 @@ impl Mfa {
         .await?;
         match held {
             Some((Some(_),)) => {}
-            // An enrollment never confirmed is not a factor: clearing it is harmless,
-            // but there is nothing to remove.
+            // An enrollment never confirmed is not a factor: there is nothing to remove.
             _ => return Err(MfaError::NotEnrolled),
         }
         // Other factors would be counted here; there are none yet.
@@ -742,28 +1040,46 @@ impl Mfa {
             .bind(account.id)
             .execute(&mut *tx)
             .await?;
+        let epoch = bump_epoch(&mut tx, account.id).await?;
         tx.commit().await?;
-        Ok(Event {
-            account: account.id,
-            kind: EventKind::Removed(Factor::Totp),
-        })
+        let account_now = Account {
+            session_epoch: epoch,
+            ..account.clone()
+        };
+        state::reseal(
+            session,
+            &account_now,
+            account.session_epoch,
+            false,
+            SystemTime::now(),
+        );
+        Ok(Event::new(account.id, EventKind::Removed(Factor::Totp)))
     }
 
-    fn open(&self, sealed: &[u8], account: i64) -> Result<Secret, MfaError> {
-        let plain = Zeroizing::new(
-            self.sealer
-                .open(sealed, &Self::context(account))
-                .map_err(MfaError::fault)?,
-        );
-        Secret::from_bytes(&plain)
-            .ok_or_else(|| MfaError::fault(anyhow::anyhow!("a stored TOTP secret of a bad length")))
+    /// Unlock the authenticator after too many wrong codes ([`LOCK_AFTER`]): for staff
+    /// answering the owner. (A recovery code unlocks it by itself.)
+    ///
+    /// # Errors
+    /// [`MfaError::NotEnrolled`] if there is no authenticator, or a fault.
+    pub async fn unlock_totp(&self, pool: &PgPool, account: i64) -> Result<Event, MfaError> {
+        let done = sqlx::query(
+            "UPDATE account_totp SET failed_attempts = 0, locked_at = NULL
+             WHERE account_id = $1 AND confirmed_at IS NOT NULL",
+        )
+        .bind(account)
+        .execute(pool)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(MfaError::NotEnrolled);
+        }
+        Ok(Event::new(account, EventKind::Unlocked(Factor::Totp)))
     }
 
     /// What follows a checked first factor (a password, a sign-in link, a provider's
     /// sign-in) for `account`: it is signed in, or its sign-in is made pending on a
-    /// second factor, or on enrollment. Use it in place of
-    /// [`session::sign_in`](crate::session::sign_in) on every way in that should
-    /// honour the policy.
+    /// second factor, or on enrollment. The password sign-in below does this; the layer
+    /// ([`Accounts::require_mfa`](crate::Accounts::require_mfa)) does it for a session
+    /// signed in any other way.
     ///
     /// # Errors
     /// The database.
@@ -774,26 +1090,44 @@ impl Mfa {
         account: &Account,
     ) -> Result<Next, MfaError> {
         let now = SystemTime::now();
-        let kind = if self.factors(pool, account.id).await?.any() {
+        let has = self.factors(pool, account.id).await?.any();
+        let Some(kind) = self.pending_kind(account, has) else {
+            session::sign_in(session, account);
+            state::record(session, account, false, now);
+            store::signed_in(pool, account.id).await?;
+            return Ok(Next::Done);
+        };
+        Self::make_pending(session, account, kind, now);
+        Ok(match kind {
+            Kind::Enroll => Next::Enroll,
+            _ => Next::Challenge,
+        })
+    }
+
+    /// What `account` must pass before it is signed in, given whether it `has` a factor.
+    fn pending_kind(&self, account: &Account, has: bool) -> Option<Kind> {
+        if has {
             Some(Kind::Challenge)
         } else if self.requires(account) {
             Some(Kind::Enroll)
         } else {
             None
-        };
-        let Some(kind) = kind else {
-            session::sign_in(session, account);
-            state::record(session, account, false, now);
-            return Ok(Next::Done);
-        };
+        }
+    }
+
+    /// Make the session a pending sign-in: a new id, no signature.
+    fn make_pending<T: MfaSession>(
+        session: &Session<T>,
+        account: &Account,
+        kind: Kind,
+        now: SystemTime,
+    ) {
         let pending = Pending {
             account: account.id,
             epoch: account.session_epoch,
             at: state::unix(now),
             kind,
         };
-        // A new id, and no signature: whoever was signed in on this browser is not, and
-        // the pending sign-in grants nothing.
         session.cycle_id();
         session.update(|d| {
             d.set_signature(None);
@@ -802,14 +1136,41 @@ impl Mfa {
                 auth: None,
             };
         });
-        Ok(match kind {
-            Kind::Enroll => Next::Enroll,
-            _ => Next::Challenge,
-        })
+    }
+
+    /// The layer's question about a request that carries a signature for `account`:
+    /// whether it may stand as signed in. It may if the session shows a second factor
+    /// passed for this account and epoch, or if the account has none and the policy does
+    /// not require one. Otherwise the session becomes the pending sign-in it should have
+    /// been (so a challenge or enrollment form can follow), and the request is
+    /// anonymous. `Ok(Some(has_factor))` when it stands.
+    pub(crate) async fn gate<T: MfaSession>(
+        &self,
+        pool: &PgPool,
+        session: &Session<T>,
+        account: &Account,
+    ) -> sqlx::Result<Option<bool>> {
+        let passed = session.read(|d| {
+            d.signature()
+                .and_then(|s| state::auth_for(d.mfa(), s))
+                .is_some_and(|a| a.mfa_at.is_some())
+        });
+        if passed {
+            return Ok(Some(true));
+        }
+        let has = self.factors(pool, account.id).await?.any();
+        match self.pending_kind(account, has) {
+            None => Ok(Some(false)),
+            Some(kind) => {
+                Self::make_pending(session, account, kind, SystemTime::now());
+                Ok(None)
+            }
+        }
     }
 
     /// The password sign-in with a second factor: charge `limiter` for `login` from
-    /// `ip`, check the password only if it allows ([`store::authenticate`]), then
+    /// `ip`, check the password only if it allows ([`store::check_password`], which does
+    /// not stamp `last_sign_in`: that waits for the second factor), then
     /// [`first_factor_passed`](Self::first_factor_passed).
     ///
     /// # Errors
@@ -827,11 +1188,14 @@ impl Mfa {
         if login.trim().chars().any(char::is_control) {
             return Err(SignInRefused::Mismatch);
         }
-        limiter.charge(ip, login).await.map_err(|t| match t {
-            Throttled::Spent => SignInRefused::Throttled,
-            Throttled::Unavailable => SignInRefused::Unavailable,
-        })?;
-        let account = store::authenticate(pool, login, password)
+        limiter
+            .charge(ip, Key::Login(login))
+            .await
+            .map_err(|t| match t {
+                Throttled::Spent => SignInRefused::Throttled,
+                Throttled::Unavailable => SignInRefused::Unavailable,
+            })?;
+        let account = store::check_password(pool, login, password)
             .await?
             .ok_or(SignInRefused::Mismatch)?;
         self.first_factor_passed(pool, session, &account)
@@ -841,6 +1205,17 @@ impl Mfa {
                 other => SignInRefused::Fault(crate::Error::Hash(anyhow::anyhow!(other))),
             })
     }
+}
+
+/// Move the account's session epoch on, in `tx`; the new one.
+async fn bump_epoch(tx: &mut sqlx::PgConnection, account: i64) -> sqlx::Result<i32> {
+    sqlx::query_scalar(
+        "UPDATE accounts SET session_epoch = session_epoch + 1 WHERE id = $1
+         RETURNING session_epoch",
+    )
+    .bind(account)
+    .fetch_one(tx)
+    .await
 }
 
 /// Replace the account's recovery codes, in `tx`.

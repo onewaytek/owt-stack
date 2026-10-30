@@ -9,16 +9,21 @@ SET LOCAL lock_timeout = '5s';
 -- One authenticator per account. A row with confirmed_at NULL is an enrollment begun
 -- and not yet proved with a first code: it signs nobody in, and a new begin replaces it.
 --
--- `secret` HOLDS A SECRET. It is whatever owt_accounts::mfa::SecretSealer returned for
--- the 20 random bytes: ciphertext when the app supplies a sealer (encrypt it at rest
--- with a key the database does not hold, such as owt-crypt's), the bytes themselves
--- with the development default. Anyone who reads a plain one can make that account's
--- codes for ever.
+-- `secret` HOLDS A SECRET. Its first byte is a format: 0, then the 20 random bytes
+-- themselves (the development default, owt_accounts::mfa::Unsealed); or 1, a key-id
+-- length, the key id, then what the app's owt_accounts::mfa::SecretSealer returned
+-- (ciphertext, under a key the database does not hold, such as owt-crypt's). A plain
+-- row is accepted and resealed on its next use once the app supplies a sealer. Anyone
+-- who reads a plain one can make that account's codes for ever.
 CREATE TABLE account_totp (
     account_id bigint PRIMARY KEY REFERENCES accounts ON DELETE CASCADE,
     secret bytea NOT NULL CHECK (octet_length(secret) > 0),
     -- The last time step accepted: a step at or before it is a replay.
     last_step bigint CHECK (last_step >= 0),
+    -- Wrong codes in a row. At 10 the factor is locked (locked_at): a recovery code, or
+    -- staff (owt_accounts::mfa::Mfa::unlock_totp), unlocks it.
+    failed_attempts integer NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
+    locked_at timestamptz,
     confirmed_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -32,4 +37,6 @@ CREATE TABLE account_recovery_codes (
     created_at timestamptz NOT NULL DEFAULT now(),
     used_at timestamptz
 );
-CREATE INDEX account_recovery_codes_account ON account_recovery_codes (account_id);
+-- Only the unused ones are looked up.
+CREATE INDEX account_recovery_codes_account ON account_recovery_codes (account_id)
+    WHERE used_at IS NULL;
