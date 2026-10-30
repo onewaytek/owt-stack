@@ -10,6 +10,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-crypt` | envelope field encryption: AES-256-GCM data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
+| `owt-storage` | objects in an S3-compatible bucket (B2, R2, MinIO): client-side encryption through `owt-crypt` in bounded memory, streaming multipart uploads, presigned URLs, verified deletion |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar, signed in as an account without Argon2; account fixtures; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -58,6 +59,7 @@ owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
+owt-storage = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
@@ -2430,6 +2432,64 @@ from the node, holding the same wrap key under the same object id (so the KEK id
 To recover, move the backup HSM to the replacement node, start its connector, and
 start the app; nothing in the database changes.
 
+### Object storage
+
+`owt-storage` keeps files (recordings, documents, images) in an S3-compatible bucket:
+Backblaze B2, Cloudflare R2, or MinIO in development. Objects that hold health data
+are **encrypted in the app** before they leave it, under a fresh content key per
+object that `owt-crypt` seals for the tenant and the object's key. The bucket, its
+replicas and anyone holding its credentials see only ciphertext.
+
+```rust,no_run
+use std::time::Duration;
+use owt_storage::{S3Config, Storage};
+
+# async fn demo<R: tokio::io::AsyncRead + Unpin + Send>(crypt: owt_crypt::Crypt, upload: R) -> anyhow::Result<()> {
+let storage = Storage::s3(&S3Config {
+    endpoint: owt_runtime::env::required("MYAPP_S3_ENDPOINT")?, // https://s3.us-west-004.backblazeb2.com
+    bucket: owt_runtime::env::required("MYAPP_S3_BUCKET")?,
+    region: owt_runtime::env::required("MYAPP_S3_REGION")?,
+    access_key_id: owt_runtime::env::required("MYAPP_S3_KEY_ID")?,
+    secret_access_key: owt_runtime::env::required("MYAPP_S3_SECRET")?,
+})?
+.encrypted(crypt);
+
+// A recording of any length: encrypted 1 MiB at a time into a multipart upload.
+let bytes = storage.upload_sealed("practice-3", "recordings/7f3a.webm", upload).await?;
+
+// Read it back (it refuses an object altered, truncated, or copied to another key).
+let audio = storage.get_sealed("practice-3", "recordings/7f3a.webm").await?;
+
+// Gone, and checked gone.
+storage.delete_verified("recordings/7f3a.webm").await?;
+
+// Non-sensitive files: a short-lived URL the browser reads directly.
+let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?;
+# let _ = (bytes, audio, url); Ok(()) }
+```
+
+- **Encrypted format.** A header (magic, format, chunk size, the sealed content key,
+  a nonce prefix), then 1 MiB chunks, each AES-256-GCM sealed with the header as
+  associated data and a nonce of the prefix, the chunk's index and a last-chunk flag
+  (the STREAM construction). Any edited byte, a chunk dropped from the end, swapped
+  chunks, or the object copied under another key or tenant fails to open.
+  `download_sealed` streams into a writer and writes each chunk only once it
+  authenticates; on an error, discard what it wrote.
+- **Presigned URLs** live at most `MAX_PRESIGN` (an hour) and move bytes between the
+  browser and the bucket without passing through the app, so the app cannot encrypt
+  them. For health data, either stream uploads through the app (`upload_sealed`
+  from the request body), or let the browser `PUT` to a presigned URL under an
+  `incoming/` prefix and then `seal_uploaded(scope, "incoming/…", "recordings/…")`,
+  which encrypts it into its final key and deletes the plaintext, verified. Give
+  `incoming/` a lifecycle rule that expires objects after a day, so an upload never
+  sealed does not linger. A presigned URL limits neither size nor content type.
+- **Verified deletion** deletes, then requires the store to answer that the object is
+  gone. In a bucket with versioning or Object Lock, earlier versions stay until the
+  bucket's lifecycle rules remove them; set those rules to match the retention the
+  app promises.
+- `Storage::from_store` takes any `object_store` store: `InMemory` in tests, a
+  directory in development (neither presigns).
+
 ### Change requests
 
 `owt-change` lets a site's signed-in admins ask for a change from the page itself. A
@@ -4322,7 +4382,7 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `fix(web): Drop the cache` does not; an app without a commitlint configuration of
 its own is checked by the same rules (`commitlint.config.mjs`). Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
-`accounts`, `change`, `crypt`, `tailwind`, `deps`, `release` (release-please and its configuration).
+`accounts`, `change`, `crypt`, `storage`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it
