@@ -17,6 +17,8 @@
 //! - [`identities`]: provider identities (OAuth) linked to accounts, and the app's
 //!   own local ones.
 //! - [`links`]: one-time sign-in links.
+//! - [`mfa`]: a second factor (an authenticator app, recovery codes), the challenge
+//!   after the password, a policy that requires it, and step-up re-authentication.
 //! - [`roles`]: user, staff, and the roles an app declares; the [`roles::Holds`]
 //!   extractor.
 //! - [`admin`]: the staff pages that find and change accounts.
@@ -39,6 +41,7 @@ pub mod cli;
 pub mod identities;
 pub mod layer;
 pub mod links;
+pub mod mfa;
 pub mod migrations;
 pub mod page;
 pub mod password;

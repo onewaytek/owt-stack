@@ -43,6 +43,7 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 regex = "1"
 proptest = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.10"
 redis = { version = "1.7", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "aio", "connection-manager"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }

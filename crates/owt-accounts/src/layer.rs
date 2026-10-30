@@ -38,6 +38,7 @@ use crate::store::{self, Account, Extra};
 pub struct Accounts {
     pool: PgPool,
     sign_in: String,
+    reauth: String,
 }
 
 impl Accounts {
@@ -47,7 +48,16 @@ impl Accounts {
         Self {
             pool,
             sign_in: sign_in.into(),
+            reauth: "/reauth".to_owned(),
         }
+    }
+
+    /// Where [`Recent`](crate::mfa::Recent) sends a visitor whose last sign-in is too
+    /// old for the page (a path, `/reauth` by default), with `?next=` set.
+    #[must_use]
+    pub fn reauth_at(mut self, path: impl Into<String>) -> Self {
+        self.reauth = path.into();
+        self
     }
 
     /// The middleware. Install it with
@@ -115,6 +125,7 @@ impl Accounts {
         };
         req.extensions_mut().insert(loaded);
         req.extensions_mut().insert(SignInAt(self.sign_in.clone()));
+        req.extensions_mut().insert(ReauthAt(self.reauth.clone()));
         let htmx = HtmxWall::of(&req, &self.sign_in);
         let mut response = next.run(req).await;
         if let Some(htmx) = htmx {
@@ -181,7 +192,7 @@ impl HtmxWall {
 /// The path and query the client sent (`OriginalUri`): under `Router::nest`, the
 /// request's own URI has had the prefix removed. Only its path and query, so an
 /// absolute-form request target cannot put a host into `next`.
-fn asked_for<'a>(extensions: &'a Extensions, uri: &'a Uri) -> &'a str {
+pub(crate) fn asked_for<'a>(extensions: &'a Extensions, uri: &'a Uri) -> &'a str {
     let uri = extensions.get::<OriginalUri>().map_or(uri, |u| &u.0);
     uri.path_and_query().map_or("/", |p| p.as_str())
 }
@@ -205,6 +216,10 @@ struct LoadedExtra<X>(X);
 /// Where the sign-in page is, for the extractors' redirect.
 #[derive(Clone, Debug)]
 struct SignInAt(String);
+
+/// Where the re-authentication page is, for [`Recent`](crate::mfa::Recent)'s redirect.
+#[derive(Clone, Debug)]
+pub(crate) struct ReauthAt(pub(crate) String);
 
 /// The signed-in account, if any. Available to anything with the request's
 /// extensions (a page-context extractor, say), not only as a handler argument.
@@ -271,7 +286,7 @@ const UNAVAILABLE: &str = "Signing in is unavailable for a moment. Please try ag
 /// `?next=` is the URI the client sent ([`asked_for`]): a visitor sent back to
 /// `/profile` instead of `/es/profile` lands on a 404 or another page. On an htmx
 /// request [`Accounts::load`] turns the redirect into [`HtmxWall`]'s.
-fn wall(parts: &Parts) -> Error {
+pub(crate) fn wall(parts: &Parts) -> Error {
     if matches!(parts.extensions.get::<Loaded>(), Some(Loaded::Unknown)) {
         return Error::unavailable(UNAVAILABLE);
     }

@@ -73,6 +73,10 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_link_next",
         sql: include_str!("../migrations/0006_link_next.sql"),
     },
+    Migration {
+        name: "owt_accounts_mfa",
+        sql: include_str!("../migrations/0007_mfa.sql"),
+    },
 ];
 
 /// The table [`run`] records the library's migrations in, in the schema they run in
@@ -730,6 +734,7 @@ const SHIPPED_SHA256: &[&str] = &[
     "629cca392e80505f93a71a9eb9d13683ef82f31790d682363d346ebfb2f32f52",
     "2952542fa9af6f8c1c7ee21987676fd1ed42cb0d18c752b485d4f315f4eccb18",
     "78ba0baf7def1dd8206f5479f79c88549ecc809c82f7c7ed6421aaa8b7f47a33",
+    "6144909be228ce5054b935ada5004403d9ed2769d8b622a0c18e49f23de50f0e",
 ];
 
 /// The names each of [`ALL`] gives a relation (table, index, sequence) in the schema
@@ -785,6 +790,17 @@ const RELATIONS: &[(&str, &[&str])] = &[
             "account_local_identities",
             "account_local_identities_pkey",
             "account_local_identities_account",
+        ],
+    ),
+    (
+        "owt_accounts_mfa",
+        &[
+            "account_totp",
+            "account_totp_pkey",
+            "account_recovery_codes",
+            "account_recovery_codes_pkey",
+            "account_recovery_codes_id_seq",
+            "account_recovery_codes_account",
         ],
     ),
 ];
