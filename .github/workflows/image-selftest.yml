@@ -1,0 +1,81 @@
+name: Image selftest
+
+# A manual exercise of image-check.yml and image.yml against tests/image-sample, a
+# standalone crate (and a busybox Dockerfile) that is never shipped. Run it by hand
+# after changing either workflow; nothing triggers it.
+#
+# Dispatch runs both check jobs (the crane and the docker builder), which build and
+# verify the image and push nothing. With `image` set it then runs image.yml for both
+# builders, which signs and attests as a real release does and pushes the test tags
+# `selftest` and `selftest-docker` to ghcr.io/onewaytek/owt-stack. image.yml builds a
+# release tag, so:
+#
+#   1. Create a prerelease tag on the commit to test (`v0.0.0-rc.N`, N unused) and
+#      push it: git tag v0.0.0-rc.N <sha> && git push origin v0.0.0-rc.N
+#   2. Dispatch this workflow on that commit's branch with `image` checked and
+#      `version` set to the tag.
+#
+# Clean up afterwards:
+#
+#   - delete the tag: git push origin :refs/tags/v0.0.0-rc.N
+#   - delete the package versions tagged `selftest` and `selftest-docker`, and the
+#     `sha256-<digest>.sig` and `.att` tags cosign left beside them, from the
+#     owt-stack package (Packages, then Package settings, or
+#     `gh api -X DELETE /orgs/onewaytek/packages/container/owt-stack/versions/<id>`,
+#     ids from `gh api /orgs/onewaytek/packages/container/owt-stack/versions`).
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Also run image.yml, which pushes the selftest tags to ghcr.
+        type: boolean
+        default: false
+      version:
+        description: With image, a prerelease tag that exists on the commit (v0.0.0-rc.N).
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  check-crane:
+    permissions: {contents: read}
+    uses: ./.github/workflows/image-check.yml
+    with:
+      bin: image-sample
+      cargo-args: --manifest-path tests/image-sample/Cargo.toml --target-dir target
+      assets-script: ""
+      sccache-redis: ""
+      files: tests/image-sample/files
+  check-docker:
+    permissions: {contents: read}
+    uses: ./.github/workflows/image-check.yml
+    with:
+      builder: docker
+      context: tests/image-sample
+      dockerfile: tests/image-sample/Dockerfile
+  image-crane:
+    if: inputs.image
+    needs: [check-crane, check-docker]
+    permissions: {contents: read, packages: write, id-token: write}
+    uses: ./.github/workflows/image.yml
+    with:
+      version: ${{ inputs.version }}
+      tag: selftest
+      bin: image-sample
+      cargo-args: --manifest-path tests/image-sample/Cargo.toml --target-dir target
+      assets-script: ""
+      sccache-redis: ""
+      files: tests/image-sample/files
+  image-docker:
+    if: inputs.image
+    needs: [check-crane, check-docker]
+    permissions: {contents: read, packages: write, id-token: write}
+    uses: ./.github/workflows/image.yml
+    with:
+      builder: docker
+      version: ${{ inputs.version }}
+      tag: selftest-docker
+      context: tests/image-sample
+      dockerfile: tests/image-sample/Dockerfile
