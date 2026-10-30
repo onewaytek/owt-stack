@@ -2549,6 +2549,99 @@ jobs.singleton("close_week", weekly, pool.clone(), 7_210_002, move || {
 # }
 ```
 
+### Durable job queue
+
+`jobs` runs periodic work; `owt_runtime::queue` runs work items that must each
+happen once even across crashes and deploys (a message to send, a file to process).
+Each job is a row of `owt_jobs`, a table the library migrates into its own ledger
+(`_owt_runtime_migrations`): await `queue::migrate(&pool)` at start, before the first
+enqueue.
+
+- **Enqueue** with `Queue::enqueue`, or `enqueue_in(&mut tx, ..)` inside the app's
+  own transaction, so the job exists exactly when the change that wants it commits.
+  `Job::key` is an idempotency key: enqueueing the same key again returns the first
+  job (`Enqueued { fresh: false, .. }`) for as long as its row lasts. `Job::delay`
+  and `Job::run_at` schedule it.
+- **Claims** take due jobs oldest first with `FOR UPDATE SKIP LOCKED`, so replicas
+  never take the same job or wait on each other. Each claim counts an attempt, and
+  that attempt number fences it: a claim that went stale and was given to another
+  worker can no longer complete or fail the job.
+- **Retries** back off exponentially with jitter (`Retry`, default 5 attempts from
+  about 10 s, capped at an hour). After the last attempt, or when the handler returns
+  `JobError::permanent(..)`, the job is **dead**: kept with its payload and last error
+  for `Queue::dead`, `Queue::redrive` (queued again with fresh attempts) or
+  `Queue::discard_dead`.
+- **The worker** claims while it has free slots (`concurrency`), runs each job in its
+  own task (a panic is a failed attempt), renews running jobs' heartbeats every third
+  of `stale_after`, and puts back jobs whose heartbeat went stale on any replica (a
+  replica that died). Done jobs are purged after `retain_done` (7 days), which frees
+  their keys. On shutdown it claims nothing more, gives running jobs
+  `shutdown_grace` to finish, then aborts the rest and queues them again without
+  counting the attempt.
+
+```rust,no_run
+use std::time::Duration;
+use owt_runtime::jobs::{CancellationToken, Jobs};
+use owt_runtime::queue::{self, Claimed, Job, JobError, Queue, QueueMetrics, Retry};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SendReminder { appointment: i64 }
+
+async fn send_reminder(job: Claimed) -> Result<(), JobError> {
+    // A payload that never parses will not parse next time either.
+    let r: SendReminder = job.json().map_err(JobError::permanent)?;
+    let _ = r.appointment; // look the appointment up, send, ... (`?` retries)
+    Ok(())
+}
+
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+queue::migrate(&pool).await?;
+let reminders = Queue::new(pool.clone(), "reminders")?.retry(Retry {
+    max_attempts: 8,
+    base: Duration::from_secs(30),
+    cap: Duration::from_hours(2),
+});
+
+// In the transaction that books the appointment: once per appointment.
+let mut tx = pool.begin().await?;
+let job = Job::json(&SendReminder { appointment: 42 })?
+    .key("reminder:42")
+    .delay(Duration::from_hours(23));
+reminders.enqueue_in(&mut tx, job).await?;
+tx.commit().await?;
+
+let shutdown = CancellationToken::new();
+let jobs = Jobs::new(shutdown.clone());
+reminders
+    .worker(send_reminder)
+    .concurrency(8)
+    .metrics(QueueMetrics::prefixed("myapp"))
+    .spawn(&jobs);
+
+owt_runtime::serve::shutdown_signal().await;
+shutdown.cancel();
+jobs.stopped().await; // running jobs finish, or go back to the queue
+# Ok(()) }
+```
+
+**Payloads are not encrypted.** The table, its backups and its replicas hold them as
+they are. A payload carries references (an id the handler looks up), not personal or
+health data; one that must carry such data is encrypted by the app before it is
+enqueued. A done job's payload is emptied at once; a dead job's is kept for
+redriving, so discard dead jobs the app will not redrive. The last error is stored
+(cut to `queue::MAX_ERROR_CHARS`) and logged, so a handler keeps personal data out of
+its error messages too.
+
+`QueueMetrics::prefixed("myapp")` records `<prefix>_queue_jobs_total{queue,outcome}`
+(`done`, `retried`, `dead`, `lost`, `released`, `recovered`),
+`<prefix>_queue_job_seconds{queue}`, and, at each housekeeping pass,
+`<prefix>_queue_depth{queue,state}` and `<prefix>_queue_lag_seconds{queue}` (how long
+the oldest due job has waited); call its `describe()` inside the closure passed to
+`owt_runtime::metrics::install`. Alert on lag and on dead jobs.
+
+A worker without `Jobs` is `worker.run(shutdown).await`; `Queue::claim`,
+`complete`, `fail` and `heartbeat` are there for an app that drives jobs itself.
+
 ### Front-end assets
 
 The browser fetches nothing from another origin: whatever another origin serves runs
