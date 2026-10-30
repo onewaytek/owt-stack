@@ -9,6 +9,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
+| `owt-crypt` | envelope field encryption: AES-256-GCM data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar, signed in as an account without Argon2; account fixtures; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -56,6 +57,7 @@ owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
+owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
@@ -67,6 +69,7 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 
 `owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export,
 `redis` for leases and leased jobs.
+`owt-crypt`'s: `yubihsm` for `YubiHsmKek` (it builds libusb from source when the system has none, so it needs a C compiler).
 `owt-change`'s: `accounts` (default) for `owt_accounts::Staff` as its admin.
 `owt-accounts`' `test-util` (off by default, for `[dev-dependencies]`) gives the admin's
 view models an `example()` each, for an app's tests of its own templates, and
@@ -2298,6 +2301,135 @@ let social = social.on_arrival(move |arrived| {
 | Connect always lands on `?social=sign-in-again` | The session began longer ago than `connect_within`; the person signs in again first. If it repeats right after signing in, the sign-in page is not signing a signed-in person in again (it redirects them away instead). |
 | Start-up fails naming a variable | A pair half-set, `PUBLIC_BASE_URL` missing or not an `https` origin, a callback path without `{provider}` (or with another capture), or an OIDC issuer or endpoint that is not `https`. |
 
+### Field encryption
+
+`owt-crypt` encrypts the columns that hold health or other sensitive data, so the
+database, its backups and its replicas hold only ciphertext. Each tenant (a
+*scope*) has its own AES-256 data keys, stored only wrapped by a key-encryption key
+(KEK). A value is sealed with AES-256-GCM, and its associated data binds it to its
+`Field`: scope, table, column and row. A ciphertext copied into another row, column
+or tenant does not decrypt there.
+
+```rust,no_run
+use std::sync::Arc;
+use owt_crypt::kek::{KekProvider, LocalKek};
+use owt_crypt::{Crypt, Field};
+
+# async fn demo(pool: sqlx::PgPool, note_id: &str) -> anyhow::Result<()> {
+owt_crypt::migrate(&pool).await?;
+
+// Production: the YubiHSM (below). Everywhere else: a software keyring.
+let kek: Arc<dyn KekProvider> = Arc::new(LocalKek::from_env("MYAPP_KEK")?);
+let crypt = Crypt::new(pool.clone(), kek)
+    .require_hardware_kek(owt_runtime::env::flag("MYAPP_REQUIRE_HARDWARE_KEK", false)?)?;
+
+// The row id is the app's, made before the insert (a UUID), and never changes.
+let field = Field::new("practice-3", "notes", "body", note_id);
+let sealed: Vec<u8> = crypt.encrypt_str(&field, "Reports sleeping better.").await?;
+sqlx::query("INSERT INTO notes (id, tenant, body) VALUES ($1, $2, $3)")
+    .bind(note_id).bind("practice-3").bind(&sealed)
+    .execute(&pool).await?;
+
+// Decrypted values are zeroized when dropped.
+let body = crypt.decrypt_string(&field, &sealed).await?;
+# let _ = body; Ok(()) }
+```
+
+Store ciphertexts as `bytea`. A value's row reference must be known before the
+insert and never change: an id the app makes (a UUID as text), not a sequence the
+database assigns on insert.
+
+**Equality search.** A blind index is HMAC-SHA256 of the value under the tenant's
+index key (not its data key), stored beside the ciphertext and searched instead of
+it. It shows which rows hold equal values, so index only what must be found by
+exact match (an email, a record number), never free text, and normalize first:
+
+```rust,no_run
+# async fn demo(pool: sqlx::PgPool, crypt: owt_crypt::Crypt) -> anyhow::Result<()> {
+let email = "Ann@Example.com".trim().to_lowercase();
+let idx = crypt.blind_index("practice-3", "patients", "email", email.as_bytes()).await?;
+let found: Option<String> = sqlx::query_scalar("SELECT id FROM patients WHERE tenant = $1 AND email_idx = $2")
+    .bind("practice-3").bind(&idx[..])
+    .fetch_optional(&pool).await?;
+# let _ = found; Ok(()) }
+```
+
+**Rotation.** `crypt.rotate(scope, Purpose::Data)` adds a data key version: new
+values use it, old ones still decrypt, and `reencrypt_column` moves a column onto it
+in batches, beside live writes (each row is updated only if it still holds the value
+read). Rotating the index key changes every index: search with
+`blind_index_candidates` (`= ANY($1)`) until the column's indexes are recomputed. A
+KEK rotation touches no data: put the new KEK first (a keyring entry, or a
+`KekChain` of the new provider and the old) and run `rewrap`, which wraps every data
+key under the new KEK; then retire the old one.
+
+```rust,no_run
+use owt_crypt::{Column, Purpose, Scope};
+# async fn demo(crypt: owt_crypt::Crypt) -> anyhow::Result<()> {
+crypt.rotate("practice-3", Purpose::Data).await?;
+let column = Column { table: "notes", id: "id", column: "body", scope: Scope::Column("tenant") };
+let moved = crypt.reencrypt_column(&column, 500).await?;
+let rewrapped = crypt.rewrap().await?; // after a KEK change
+# let _ = (moved, rewrapped); Ok(()) }
+```
+
+`crypt.shred(scope)` deletes a tenant's keys, so everything encrypted for it is
+unreadable for good (backups taken before still hold the wrapped keys until they
+expire).
+
+**The software KEK** (`LocalKek`) is for development, CI and staging: a keyring of
+`name:base64key` entries, the current first, from an environment variable
+(`LocalKek::from_env`) or a mounted file (`from_file`). Make an entry with
+`LocalKek::generate_entry("2026-10")`; to rotate, put a new entry first, deploy, run
+`rewrap`, then drop the old entry. Anyone who can read the variable can read every
+key it wraps, so production sets `require_hardware_kek(true)` and starts only with a
+hardware KEK.
+
+**The YubiHSM KEK** (feature `yubihsm`). The KEK is an AES-256-CCM wrap key inside
+a YubiHSM 2 (FIPS) on the node; it never leaves the device. Data keys are sent to it
+to be wrapped and unwrapped, and unwrapped keys are cached in memory (zeroized when
+dropped), so the HSM is asked once per key per process. The app reaches it through
+`yubihsm-connector` on the node (HTTP, `127.0.0.1:12345` by default) or USB, with an
+authentication key that has only the `wrap-data` and `unwrap-data` capabilities over
+the wrap key's domain, never the factory default key:
+
+```rust,no_run
+use std::sync::Arc;
+use owt_crypt::kek::KekProvider;
+use owt_crypt::yubihsm::YubiHsmKek;
+
+# fn demo() -> anyhow::Result<()> {
+let password = owt_runtime::env::required("MYAPP_HSM_PASSWORD")?;
+// Authentication key 0x0002, wrap key 0x0064; checks the wrap key at startup.
+let kek: Arc<dyn KekProvider> = Arc::new(YubiHsmKek::http("127.0.0.1", 12345, 0x0002, password.as_bytes(), 0x0064)?);
+# let _ = kek; Ok(()) }
+```
+
+Provision once, with Yubico's `yubihsm-shell`, on an offline machine: an AES-256-CCM
+wrap key (`aes256-ccm-wrap`) with the capabilities `wrap-data`, `unwrap-data` and
+`exportable-under-wrap` (for the backup, below), and an authentication key for the
+app with `wrap-data` and `unwrap-data` only. Change or delete the factory
+authentication key.
+
+**Backup and disaster recovery.** The wrap key exists only inside HSMs, so losing the
+HSM without a second copy loses every key it wraps, and so all encrypted data.
+Before production holds any, keep a second YubiHSM 2, offline and in a safe away
+from the node, holding the same wrap key under the same object id (so the KEK id,
+`yubihsm:0x0064`, matches):
+
+1. Put the same *transport* wrap key on both devices: key material generated on the
+   offline machine, imported into each HSM as a wrap key with `export-wrapped` and
+   `import-wrapped` (delegating the KEK's capabilities), then destroyed, or kept
+   only as shares split between officers (Yubico's `yubihsm-setup ksp` does this).
+2. Export the KEK from the primary under the transport key (`get wrapped`) and
+   import it on the backup (`put wrapped`). The KEK leaves an HSM only encrypted.
+3. Test the backup: plug it into a staging node, point a staging app at a copy of
+   production's `owt_crypt_keys`, and decrypt a known value. Repeat after every KEK
+   rotation, which needs the same export to the backup.
+
+To recover, move the backup HSM to the replacement node, start its connector, and
+start the app; nothing in the database changes.
+
 ### Change requests
 
 `owt-change` lets a site's signed-in admins ask for a change from the page itself. A
@@ -4190,7 +4322,7 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `fix(web): Drop the cache` does not; an app without a commitlint configuration of
 its own is checked by the same rules (`commitlint.config.mjs`). Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
-`accounts`, `change`, `tailwind`, `deps`, `release` (release-please and its configuration).
+`accounts`, `change`, `crypt`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it

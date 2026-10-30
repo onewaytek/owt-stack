@@ -17,6 +17,7 @@ owt-accounts = { workspace = true, features = ["test-util", "cli"] }
 owt-auth = { workspace = true, features = ["jwt"] }
 owt-bus.workspace = true
 owt-change.workspace = true
+owt-crypt = { workspace = true, features = ["yubihsm"] }
 owt-runtime = { workspace = true, features = ["redis"] }
 owt-test.workspace = true
 owt-web.workspace = true
