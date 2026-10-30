@@ -9,6 +9,9 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
+| `owt-crypt` | envelope field encryption: AES-256-GCM data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
+| `owt-storage` | objects in an S3-compatible bucket (B2, R2, MinIO): client-side encryption through `owt-crypt` in bounded memory, streaming multipart uploads, presigned URLs, verified deletion |
+| `owt-audit` | an append-only, hash-chained audit log: one chain per tenant, SHA-256 over a canonical encoding, triggers that refuse changes, a verifier (and its clap subcommand, feature `cli`), and anchoring of the chain heads to external write-once storage |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar, signed in as an account without Argon2; account fixtures; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -56,6 +59,9 @@ owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
+owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
+owt-storage = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
+owt-audit = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
@@ -67,6 +73,7 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 
 `owt-runtime`'s features: `metrics` (default) for Prometheus, `otel` for trace export,
 `redis` for leases and leased jobs.
+`owt-crypt`'s: `yubihsm` for `YubiHsmKek` (it builds libusb from source when the system has none, so it needs a C compiler).
 `owt-change`'s: `accounts` (default) for `owt_accounts::Staff` as its admin.
 `owt-accounts`' `test-util` (off by default, for `[dev-dependencies]`) gives the admin's
 view models an `example()` each, for an app's tests of its own templates, and
@@ -119,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         default_filter: "myapp=info,tower_http=info".into(),
         json: !env::flag("DEBUG", false)?,
         otel_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        ..logging::Options::default()
     });
     let pool = PoolConfig { max: env::parse_or("DB_POOL_MAX", 10)?, ..PoolConfig::default() }
         .connect(&env::required("DATABASE_URL")?)
@@ -254,6 +262,80 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
         .layer(from_fn(headers::private_by_default))
         .layer(from_fn(headers::security))
 }
+```
+
+**Idle timeout and lifetimes.** Three limits end a session, and an app handling
+health data sets all three: `max_age` (how long a cookie lives without being
+resealed), `absolute_lifetime` (from sign-in, however active: 30 days unless set),
+and `idle_timeout` (since the person's last activity). Revocation is the epoch above:
+`sign_out_everywhere`, a password change or a deactivation moves the account's
+`session_epoch`, and the validator refuses every session sealed under the old one on
+its next request, on every replica.
+
+With `idle_timeout`, the cookie also carries the last-active time. Activity (a
+request that carries the session, is not passive and does not fail) refreshes it at
+most once per `idle_refresh` (a tenth of the timeout, at least 15 s, by default;
+never more than half the timeout), so a busy page does not rewrite a cookie on every
+request, and a session ends between the timeout less one refresh and the timeout
+after the last activity, give or take the replicas' clock skew. An activity-only
+refresh sets a second cookie (`<name>-seen`), sealed and bound to the session's id,
+and leaves the session cookie alone: a slow request in one tab cannot put back a
+session another tab has since signed out of. Activity alone does not extend `max_age`: the
+session cookie's own expiry moves only when a handler changes the session, so set
+`max_age` to the longest working day the app allows, and let the idle timeout end
+sessions sooner.
+
+A session past the timeout is no session: its cookies are removed, and
+`Session::idle_expired()` is true for that request, so a guard on the app's pages
+can redirect to `/login?reason=idle` (the next request carries no cookie to tell).
+A request with `owt-passive: 1` (`session::PASSIVE_HEADER`), or whose handler calls
+`Session::passive()`, is not activity, so a poll cannot keep an unattended screen
+signed in. Every response to a request whose session stands carries
+`owt-idle-remaining: <seconds>` (`session::IDLE_REMAINING_HEADER`), with
+`Cache-Control: no-store` and `Vary: cookie`, since the value is one person's.
+
+Turning the timeout on ends every session older than it (a cookie sealed without the
+last-active time counts from its sign-in), and replicas without it drop the time
+when they reseal: enable it once every replica runs a build that knows it.
+
+```rust,no_run
+use std::time::Duration;
+use axum::{Router, routing::get};
+use owt_web::session::{Session, Sessions};
+
+# #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+# struct SessionData {}
+# fn demo(key: cookie::Key) -> (Sessions<SessionData>, Router) {
+let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_hours(12), true)
+    .absolute_lifetime(Duration::from_hours(12))
+    .idle_timeout(Duration::from_mins(15));
+
+// The page polls this (passively) and shows a warning in the last two minutes.
+let routes = Router::new().route("/session/idle", get(|session: Session<SessionData>| async move {
+    session.passive();
+    match session.idle_remaining() {
+        Some(left) if left <= Duration::from_mins(2) => format!(
+            r#"<div role="alert">Signing you out in {} s for inactivity.
+               <button hx-post="/session/stay" hx-swap="none">Stay signed in</button></div>"#,
+            left.as_secs()
+        ),
+        _ => String::new(),
+    }
+}))
+// Any request that is not passive extends the session; this one does nothing else.
+.route("/session/stay", axum::routing::post(|| async { "" }));
+# (sessions, routes) }
+```
+
+The poller is a sibling of the warning it fills, so the "Stay signed in" button
+does not inherit its passive header (htmx inherits `hx-headers` from ancestors), and
+its click counts as activity. Cross-origin protection needs no token here (see
+"Decisions").
+
+```html
+<span hx-get="/session/idle" hx-trigger="every 30s" hx-target="#idle-warning"
+      hx-headers='{"owt-passive": "1"}'></span>
+<div id="idle-warning" aria-live="polite"></div>
 ```
 
 **The same stack as a builder.** `owt_web::stack::Stack` applies these layers, and the
@@ -484,6 +566,88 @@ the handler and write `<script nonce="{{ nonce }}">`.
   `127.0.0.1:9464` on a workstation, and in a pod, where the scraper reaches the pod's
   address, `metrics::spawn_listener_on_all_interfaces(9464, sample)`, which says what it
   does. `metrics::serve` stays for an app that owns its listener.
+
+### Keeping sensitive values out of logs
+
+`logging::init` redacts by field name: a `tracing` event or span field whose name
+matches the denylist is logged as `[redacted]`, in the JSON and the text output and, with
+feature `otel`, in the span, event and link attributes exported over OTLP. The value is
+replaced before it is formatted, so the original never reaches the writer or the
+exporter. This includes fields added later with `span.record(..)`.
+
+A name is normalized before it is compared, so `passwordHash`, `Set-Cookie` and
+`access.token` are judged as `password_hash`, `set_cookie` and `access_token`, and each
+segment of a dotted name is judged on its own (`password.value`). Redacted by default:
+
+* the names `password`, `passwd`, `pwd`, `secret`, `token`, `access_token`,
+  `refresh_token`, `id_token`, `authorization`, `cookie`, `set_cookie`, `api_key`,
+  `apikey`, `private_key`, `ssn`, `dob`, `date_of_birth`, `email`, `phone`, `address`,
+  `name`, `first_name`, `last_name`, `diagnosis`, `note`, `notes`, `content`,
+  `transcript`, `mrn` and `patient_name`;
+* a name ending `_secret`, `_token` or `_password`, and one that is or ends in `_` and
+  `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key` or
+  `encryption_key` (`cache_key` and `idempotency_key` are not);
+* a name starting `ssn` or `authorization`, and a name with a `_`-separated word
+  (trailing digits ignored) `password`, `passwd`, `pwd`, `secret`, `token`,
+  `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`, `phone`, `address`,
+  `name`, `diagnosis`, `note`, `notes`, `transcript` or `mrn`, so `user_email`,
+  `phone_number` and `password1` are caught.
+
+The word rule catches operational names too (`bind_address`, `file_name`), so a name can be
+allowed. The defaults never redact the attributes the tracing layers write, by exact
+name (`code.filepath`, `code.lineno`, `code.module.name`, `otel.name`, `otel.kind`,
+`otel.status_code`, `thread.id`, `thread.name`, ...), nor `target`, `level`, `message`,
+`server.address`, `host.name`, `db.name`, `service.name`, `token_count` and
+`max_tokens`; any other name under `code.` or `otel.` is judged like the rest, so
+`otel.secret` is redacted. `Options::redact_allow` lists names that are never
+redacted and wins over every other rule; a dotted name is judged segment by segment,
+skipping allowed segments. `Options::redact_fields` adds names to redact,
+and wins over the defaults' allowlist. `redact_defaults: false` drops the defaults (and
+every rule above) so that exactly `redact_fields` applies.
+
+`logging::Sensitive<T>` wraps a value whose `Debug` and `Display` print `[redacted]`,
+also inside a derived `Debug`. It has no `Deref`: `expose()` and `into_inner()` are the
+only reads, so each is visible in review. `Deserialize` is transparent, so a form or
+configuration struct can hold one. There is no `Serialize`: storing `"[redacted]"` in a
+cache or a queue would corrupt the value silently, so persisting one is a compile
+error and the code that stores it calls `expose()`.
+
+```rust,no_run
+use owt_runtime::logging::{self, Sensitive};
+
+# #[derive(serde::Deserialize)]
+struct Login {
+    email: String,
+    password: Sensitive<String>,
+}
+
+# fn run(login: Login) {
+let _logging = logging::init(&logging::Options {
+    service: "myapp",
+    // Redacted in addition to the defaults.
+    redact_fields: vec!["nickname".into()],
+    ..logging::Options::default()
+});
+// `email` is denied by name; `credential` is not, so `Sensitive` keeps the password out.
+tracing::info!(email = %login.email, credential = ?login.password, "login attempt");
+let password: &str = login.password.expose();
+# let _ = password;
+# }
+```
+
+Redaction is a safety net, not a policy. An app must still not log PHI or credentials
+on purpose, and the list is a floor: a field named for something it does not know is
+logged. Only names are judged:
+
+* A value inside a message, as in `info!("saw {}", name)`, is not a field and is
+  logged as it is. A bridged `log` record is only a message, so it is logged as it is
+  too.
+* With feature `otel`, span names, event names (a tracing event's message) and status
+  descriptions are exported as written, like a message, so they must never carry data.
+* A `Debug` or `Display` value is not inspected. `info!(req = ?login)` prints every
+  member of `login`, because the field is named `req`; wrap the members in `Sensitive`.
+  An error's message prints whatever it contains (a unique violation names the
+  duplicate value), so log an error's code or kind where data may appear.
 
 ### Handlers, errors and pages
 
@@ -2650,6 +2814,443 @@ let social = social.on_arrival(move |arrived| {
 | Connect always lands on `?social=sign-in-again` | The session began longer ago than `connect_within`; the person signs in again first. If it repeats right after signing in, the sign-in page is not signing a signed-in person in again (it redirects them away instead). |
 | Start-up fails naming a variable | A pair half-set, `PUBLIC_BASE_URL` missing or not an `https` origin, a callback path without `{provider}` (or with another capture), or an OIDC issuer or endpoint that is not `https`. |
 
+### Field encryption
+
+`owt-crypt` encrypts the columns that hold health or other sensitive data, so the
+database, its backups and its replicas hold only ciphertext. Each tenant (a
+*scope*) has its own AES-256 data keys, stored only wrapped by a key-encryption key
+(KEK). A value is sealed with AES-256-GCM, and its associated data binds it to its
+`Field`: scope, table, column and row. A ciphertext copied into another row, column
+or tenant does not decrypt there.
+
+```rust,no_run
+use std::sync::Arc;
+use owt_crypt::kek::{KekProvider, LocalKek};
+use owt_crypt::{Crypt, Field};
+
+# async fn demo(pool: sqlx::PgPool, note_id: &str) -> anyhow::Result<()> {
+owt_crypt::migrate(&pool).await?;
+
+// Production: the YubiHSM (below). Everywhere else: a software keyring.
+let kek: Arc<dyn KekProvider> = Arc::new(LocalKek::from_env("MYAPP_KEK")?);
+let hardware = owt_runtime::env::flag("MYAPP_REQUIRE_HARDWARE_KEK", false)?;
+let crypt = Crypt::new(pool.clone(), kek).require_hardware_kek(hardware)?;
+if hardware {
+    // No key may still be wrapped by a software KEK (a chain's old provider, say).
+    crypt.check_keys_hardware().await?;
+}
+
+// The row id is the app's, made before the insert (a UUID), and never changes.
+let field = Field::new("practice-3", "notes", "body", note_id);
+let sealed: Vec<u8> = crypt.encrypt_str(&field, "Reports sleeping better.").await?;
+sqlx::query("INSERT INTO notes (id, tenant, body) VALUES ($1, $2, $3)")
+    .bind(note_id).bind("practice-3").bind(&sealed)
+    .execute(&pool).await?;
+
+// Decrypted values are zeroized when dropped.
+let body = crypt.decrypt_string(&field, &sealed).await?;
+# let _ = body; Ok(()) }
+```
+
+Store ciphertexts as `bytea`. A value's row reference must be known before the
+insert and never change: an id the app makes (a UUID as text), not a sequence the
+database assigns on insert.
+
+**Equality search.** A blind index is HMAC-SHA256 of the value under the tenant's
+index key (not its data key), stored beside the ciphertext and searched instead of
+it. It shows which rows hold equal values, so index only what must be found by
+exact match (an email, a record number), never free text, and normalize first:
+
+```rust,no_run
+# async fn demo(pool: sqlx::PgPool, crypt: owt_crypt::Crypt) -> anyhow::Result<()> {
+let email = "Ann@Example.com".trim().to_lowercase();
+let idx = crypt.blind_index("practice-3", "patients", "email", email.as_bytes()).await?;
+let found: Option<String> = sqlx::query_scalar("SELECT id FROM patients WHERE tenant = $1 AND email_idx = $2")
+    .bind("practice-3").bind(&idx[..])
+    .fetch_optional(&pool).await?;
+# let _ = found; Ok(()) }
+```
+
+**Rotation.** `crypt.rotate(scope, Purpose::Data)` adds a data key version: new
+values use it, old ones still decrypt, and `reencrypt_column` moves a column onto it
+in batches, beside live writes (each row is updated only if it still holds the value
+read). Rotating the index key changes every index: search with
+`blind_index_candidates` (`= ANY($1)`) until the column's indexes are recomputed. A
+KEK rotation touches no data: put the new KEK first (a keyring entry, or a
+`KekChain` of the new provider and the old) and run `rewrap`, which wraps every data
+key under the new KEK, checking that each rewrapped key unwraps to the same bytes
+before replacing the old; then retire the old one. Rotating to a new HSM wrap key is
+a new object id, so a new KEK id: chain the two providers and rewrap.
+
+```rust,no_run
+use owt_crypt::{Column, Purpose, Scope};
+# async fn demo(crypt: owt_crypt::Crypt) -> anyhow::Result<()> {
+crypt.rotate("practice-3", Purpose::Data).await?;
+let column = Column { table: "notes", id: "id", column: "body", scope: Scope::Column("tenant") };
+let moved = crypt.reencrypt_column(&column, 500).await?;
+let rewrapped = crypt.rewrap().await?; // after a KEK change
+# let _ = (moved, rewrapped); Ok(()) }
+```
+
+```rust,no_run
+use std::sync::Arc;
+use owt_crypt::Crypt;
+use owt_crypt::kek::{KekChain, KekProvider};
+use owt_crypt::yubihsm::YubiHsmKek;
+
+# async fn demo(pool: sqlx::PgPool, password: &str) -> anyhow::Result<()> {
+// Rotating from wrap key 0x0064 to 0x0065: the new one wraps, the old one still unwraps.
+let old: Arc<dyn KekProvider> = Arc::new(YubiHsmKek::http("127.0.0.1", 12345, 0x0002, password.as_bytes(), 0x0064)?);
+let new: Arc<dyn KekProvider> = Arc::new(YubiHsmKek::http("127.0.0.1", 12345, 0x0002, password.as_bytes(), 0x0065)?);
+let crypt = Crypt::new(pool, Arc::new(KekChain::new(new, vec![old])));
+crypt.rewrap().await?;
+// Nothing may stay under a software KEK in production: alarm on a non-empty list.
+assert!(crypt.software_wrapped_keys().await?.is_empty());
+# Ok(()) }
+```
+
+`reencrypt_column` returns `Reencrypted { moved, failed, complete }`. A row that does
+not decrypt (malformed, an older key version shredded, refused) is listed in `failed`
+by id and skipped, and the job stops after 10,000 failures or a pass that moves
+nothing (a trigger or policy swallowing the update, or live writers winning every
+race), so a bad row cannot wedge it. Those two stops return `complete: false`:
+retire an old key version only after a run that is `complete` with nothing in
+`failed`, never on `moved: 0` alone. A KEK id no provider knows aborts the job with an
+error. A data key seals with random 96-bit nonces, which is safe for
+about 2^32 messages per key (NIST SP 800-38D): rotate data keys well before that,
+yearly or every N writes. Two concurrent `rotate` calls may each add a version; that
+is harmless.
+
+**Shredding.** `crypt.shred(scope)` deletes a tenant's keys and records a tombstone
+in `owt_crypt_shredded`, in one transaction, so everything encrypted for the tenant is
+unreadable and the scope can never get keys again (the tombstone is permanent, so a
+shredded scope id is never reusable: do not shred ids the app recycles) (`encrypt` and `rotate` fail with
+`CryptError::Shredded`). Each `Crypt` caches unwrapped keys for `cache_ttl` (default
+five minutes, `Crypt::new(..).cache_ttl(Duration::from_secs(60))`), so another
+replica can still decrypt for up to that long after a shred, or notice a `rewrap`:
+the TTL is the shred latency, and a shorter one asks the HSM more often. Shredding
+does not reach WAL archives, replicas, logical-decoding slots or backups; they hold
+the wrapped keys until they expire, so set their retention with that in mind.
+
+**The software KEK** (`LocalKek`) is for development, CI and staging: a keyring of
+`name:base64key` entries, the current first, from an environment variable
+(`LocalKek::from_env`) or a mounted file (`from_file`). Make an entry with
+`LocalKek::generate_entry("2026-10")`; to rotate, put a new entry first, deploy, run
+`rewrap`, then drop the old entry. Anyone who can read the variable can read every
+key it wraps, so production sets `require_hardware_kek(true)` and starts only with a
+hardware KEK. `require_hardware_kek` checks the current KEK only: a `KekChain` from a
+software KEK to an HSM passes it while rows are still software-wrapped. So production
+runs `require_hardware_kek(true)` and then `crypt.check_keys_hardware().await?` at
+start-up, which fails while any stored key is wrapped by a KEK that is not hardware
+(`software_wrapped_keys()` lists those ids). Treat a non-empty list after `rewrap` as
+an alarm.
+
+**The YubiHSM KEK** (feature `yubihsm`). The KEK is an AES-256-CCM wrap key inside
+a YubiHSM 2 on the node (the YubiHSM 2 FIPS model where FIPS 140-2 validation is required, which adds restrictions on algorithms and authentication keys); it never leaves the device. Data keys are sent to it
+to be wrapped and unwrapped, and unwrapped keys are cached in memory (zeroized when
+dropped) for `cache_ttl`, so the HSM is asked once per key per interval. The app reaches it through
+`yubihsm-connector` on the node (HTTP, `127.0.0.1:12345` by default) or USB, with an
+authentication key that has only the `wrap-data` and `unwrap-data` capabilities over
+the wrap key's domain, never the factory default key. `YubiHsmKek` refuses, at start,
+a wrap key that is not AES-256-CCM, lacks `wrap-data` or `unwrap-data`, or has
+`export-wrapped` or `import-wrapped`, and wraps and unwraps 32 random bytes as a
+self-test, so a wrongly provisioned authentication key fails at startup. It also
+refuses an authentication key that holds `export-wrapped`, `import-wrapped`,
+`put-wrap-key`, `generate-wrap-key` or `delete-wrap-key`. An unwrap is `Refused` only
+when the device reports the message as invalid or unauthentic; connection, session
+and every other device error are `Unavailable`. These checks are unit-tested against
+`MockHsm` and a fake device; `tests/yubihsm.rs` runs them against real hardware when
+`OWT_YUBIHSM_CONNECTOR` is set:
+
+```rust,no_run
+use std::sync::Arc;
+use owt_crypt::kek::KekProvider;
+use owt_crypt::yubihsm::YubiHsmKek;
+
+# fn demo() -> anyhow::Result<()> {
+let password = owt_runtime::env::required("MYAPP_HSM_PASSWORD")?;
+// Authentication key 0x0002, wrap key 0x0064; checks the wrap key at startup.
+let kek: Arc<dyn KekProvider> = Arc::new(YubiHsmKek::http("127.0.0.1", 12345, 0x0002, password.as_bytes(), 0x0064)?);
+# let _ = kek; Ok(()) }
+```
+
+Provision once, with Yubico's `yubihsm-shell`, on an offline machine: an AES-256-CCM
+wrap key (`aes256-ccm-wrap`) with the capabilities `wrap-data`, `unwrap-data` and
+`exportable-under-wrap` (for the backup, below), and an authentication key for the
+app with `wrap-data` and `unwrap-data` only, and without `export-wrapped`. Change or
+delete the factory authentication key. `exportable-under-wrap` stays on the KEK only
+while a backup copy is being made.
+
+**Backup and disaster recovery.** The wrap key exists only inside HSMs, so losing the
+HSM without a second copy loses every key it wraps, and so all encrypted data.
+Before production holds any, keep a second YubiHSM 2, offline and in a safe away
+from the node, holding the same wrap key under the same object id (so the KEK id,
+`yubihsm:0x0064`, matches):
+
+0. Create the app's authentication key on the backup HSM as well, with the same id
+   and password (and capabilities and domains): authentication keys are not exported,
+   and without it the backup cannot be used.
+1. Put the same *transport* wrap key on both devices (`yubihsm-shell`, `put wrapkey`):
+   key material generated on the offline machine, imported into each HSM as a wrap key
+   with `export-wrapped` and `import-wrapped`, and with *delegated* capabilities that
+   include `exportable-under-wrap`, `wrap-data` and `unwrap-data` (the ceiling on what
+   it may carry; without `exportable-under-wrap` the KEK cannot be exported again on
+   the next rotation). The transport key itself needs no `wrap-data` or `unwrap-data`.
+   Then destroy the material, or keep it as split custody: key shares held by
+   different officers.
+2. Export the KEK from the primary under the transport key (`get wrapped`) and
+   import it on the backup (`put wrapped`). The KEK leaves an HSM only encrypted.
+3. Test the backup: plug it into a staging node, point a staging app at a copy of
+   production's `owt_crypt_keys`, and decrypt a known value. Repeat after every KEK
+   rotation, which needs the same export to the backup.
+
+To recover, move the backup HSM to the replacement node, start its connector, and
+start the app; nothing in the database changes.
+
+### Object storage
+
+`owt-storage` keeps files (recordings, documents, images) in an S3-compatible bucket:
+one inside the cluster (MinIO, or OpenShift Data Foundation's object gateway, through
+`Storage::s3_in_cluster`), Cloudflare R2, Backblaze B2, or MinIO in development. Objects that hold health data
+are **encrypted in the app** before they leave it, under a fresh content key per
+object that `owt-crypt` seals for the tenant and the object's key. The bucket, its
+replicas and anyone holding its credentials see only ciphertext.
+
+```rust,no_run
+use std::time::Duration;
+use owt_storage::{S3Config, Storage};
+
+# async fn demo<R: tokio::io::AsyncRead + Unpin + Send>(crypt: owt_crypt::Crypt, upload: R) -> anyhow::Result<()> {
+let storage = Storage::s3(&S3Config {
+    endpoint: owt_runtime::env::required("MYAPP_S3_ENDPOINT")?, // https://s3.us-west-004.backblazeb2.com
+    bucket: owt_runtime::env::required("MYAPP_S3_BUCKET")?,
+    region: owt_runtime::env::required("MYAPP_S3_REGION")?,
+    access_key_id: owt_runtime::env::required("MYAPP_S3_KEY_ID")?,
+    secret_access_key: owt_runtime::env::required("MYAPP_S3_SECRET")?,
+})?
+.encrypted(crypt);
+
+// A recording of any length, from the request body: encrypted 1 MiB at a time into
+// a multipart upload before anything reaches the bucket.
+let bytes = storage.upload_sealed("practice-3", "recordings/7f3a.webm", upload).await?;
+
+// Read it back (it refuses an object altered, truncated, or copied to another key).
+let audio = storage.get_sealed("practice-3", "recordings/7f3a.webm").await?;
+
+// Gone, and checked gone.
+storage.delete_verified("recordings/7f3a.webm").await?;
+
+// Non-sensitive files: a short-lived URL the browser reads directly.
+let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?;
+# let _ = (bytes, audio, url); Ok(()) }
+```
+
+- **Encrypted format.** A header (magic, format, chunk size, the sealed content key,
+  a nonce prefix), then 1 MiB chunks, each AES-256-GCM sealed with the header as
+  associated data and a nonce of the prefix, the chunk's index and a last-chunk flag
+  (the STREAM construction). Any edited byte, a chunk dropped from the end, swapped
+  chunks, or the object copied under another key or tenant fails to open.
+  `download_sealed` streams into a writer and writes each chunk only once it
+  authenticates; on an error, discard what it wrote. A reader rejects any chunk size
+  but the writer's.
+- **Rotating data keys.** The sealed content key is in the header, and the header is
+  every chunk's associated data, so an object cannot move to a newer `owt-crypt`
+  data-key version without being rewritten. `storage.reencrypt(scope, key)` does that:
+  it streams the object through `download_sealed` into `upload_sealed` at the same key
+  (the object's key is part of what the content key is bound to, so a copy from a
+  temporary key would not open), replacing it only after the last chunk verified. Run
+  it per object after `rotate` and `reencrypt_column`, before retiring an old version.
+  Readers see the old version until the replacement lands. Hold an app-level lock on
+  the key (no concurrent writer) while it runs: it checks the object's size and etag
+  before and just before completing and fails with `StorageError::Conflict` on a
+  change, but a store's multipart completion has no `If-Match`, so only the lock closes
+  the race. The plaintext passes through a 1 MiB in-process pipe that is not zeroized
+  when freed.
+- **Size limit.** Uploads use 5 MiB parts and a multipart upload has at most 10,000, so
+  an object is limited to about 48 GiB; a larger limit needs a larger part size.
+- **Health data streams through the app.** Upload it with `upload_sealed` straight
+  from the request body, so it is encrypted before it touches storage, and serve it
+  with `download_sealed` into the response. Presigned URLs are for data that may sit
+  in the bucket as it is.
+- **Presigned URLs** live at most `MAX_PRESIGN` (an hour) and move bytes between the
+  browser and the bucket without passing through the app, so the app cannot encrypt
+  them. **Not for health data:** the pattern below leaves plaintext in the bucket
+  until it is sealed. For other large uploads, the browser `PUT`s to a presigned URL
+  under an `incoming/` prefix and the app then calls
+  `seal_uploaded(scope, "incoming/…", "files/…")`, which encrypts it into its final key
+  and deletes the upload, verified. Give
+  `incoming/` a lifecycle rule that expires objects after a day, so an upload never
+  sealed does not linger. A presigned URL is only as reachable as the endpoint it
+  signs: for an in-cluster bucket, sign against the endpoint browsers reach (a Route
+  to the gateway), not the Service name. A presigned URL limits neither size nor content type, and
+  stays valid until its TTL ends even after the object is sealed and deleted, so
+  whoever holds it can upload plaintext again: keep upload TTLs to minutes, use an
+  unguessable key per upload, and seal after the URL has expired. A zero TTL is
+  refused.
+- **Use an unversioned bucket for anything `delete_verified` must remove.** Verified
+  deletion deletes, then requires a `HEAD` of 404. On an unversioned bucket (the
+  default for MinIO, ODF and R2) that 404 means the bytes are gone. On a versioned
+  bucket a delete only *hides* the object: its bytes stay recoverable with the
+  bucket's credentials, the 404 proves nothing, and no S3-API call `owt-storage`
+  makes can delete a specific version. So keep media and presigned uploads in a bucket
+  with versioning and Object Lock off, and check that setting when the bucket is
+  made.
+- **Backups on Backblaze B2.** B2 buckets are versioned by default. When a backup
+  of the bucket (or of anything holding ciphertext) goes to B2, give that bucket the
+  lifecycle rule "keep only the last version" (`daysFromHidingToDeleting: 1`), and
+  count deletions as complete only after the backup's own retention ends: B2 applies
+  lifecycle rules about once a day, so a hidden object stays recoverable for at least
+  a day and up to about two.
+- **Interrupted uploads.** A failed `upload_sealed` aborts its multipart upload, but a
+  dropped future (a client disconnect, a timeout) leaves an incomplete one that is
+  billed and invisible to listing. Give the bucket the lifecycle rule "abort incomplete
+  multipart uploads after 1 day".
+- **Configuration.** The endpoint is `https`; plain `http` is accepted only for the IP
+  literals `127.0.0.1` and `[::1]`, not the name `localhost`; an in-cluster Service over
+  plain `http` uses `Storage::s3_in_cluster`. `S3Config`'s `Debug`
+  redacts the secret.
+- **Verified deletion** deletes, then requires the store to answer that the object is
+  gone, which proves deletion on an unversioned bucket only (above).
+- `Storage::from_store` takes any `object_store` store: `InMemory` in tests, a
+  directory in development (neither presigns).
+
+### Audit log
+
+`owt-audit` records who did what to which record, why, and how it went, in an
+append-only table where any later change shows. Each event joins its tenant's chain
+(events with no tenant share the chain `""`): its `seq` follows the chain's last,
+its `prev` is that event's hash, and its `hash` is SHA-256 over a canonical encoding
+of all its fields (`owt_audit::canonical`). The database assigns all four as the row
+is inserted, whoever inserts it, and `record_in` checks the database's hash against
+the crate's. Triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` while they stand; only
+the tables' owner can drop or disable them, which anchoring (below) exposes. A role
+that may insert can still record false events, as it can make false changes; the log
+shows what was recorded, and that nothing recorded was altered since.
+
+```rust,no_run
+use owt_audit::{ActorKind, Audit, Event, Outcome};
+
+# async fn demo(pool: sqlx::PgPool, ip: std::net::IpAddr) -> anyhow::Result<()> {
+owt_audit::migrate(&pool).await?; // as the migration role, at start
+let audit = Audit::new(pool.clone());
+
+// A clinician opens a chart: references and codes only.
+audit
+    .record(
+        &Event::new(ActorKind::Account, "17", "record.view", "chart")
+            .tenant("practice-3")
+            .subject("patient:4821")
+            .resource_id("4821")
+            .purpose("treatment")
+            .client(Some(ip), Some("Mozilla/5.0 …"), Some("req-7f3a")),
+    )
+    .await?;
+
+// With the change it records: both commit, or neither.
+let mut tx = pool.begin().await?;
+// ... sign the note in `tx` ...
+let signed = Event::new(ActorKind::Account, "17", "note.sign", "note")
+    .tenant("practice-3")
+    .subject("patient:4821")
+    .resource_id("note:991");
+owt_audit::record_in(&mut tx, &signed).await?;
+tx.commit().await?;
+
+// Refusals are events too.
+let denied = Event::new(ActorKind::Account, "23", "record.view", "chart")
+    .tenant("practice-3")
+    .subject("patient:4821")
+    .outcome(Outcome::Denied);
+audit.record(&denied).await?;
+# Ok(()) }
+```
+
+**What goes in an event.** Ids, never content: an account id, the patient's record
+id, a resource's id, and codes (`[a-z0-9_.:-]`, up to 100) for the action, the
+resource type and the purpose of use. Never a name, a diagnosis, a note's text or a
+search term; the log is kept for years and erases nothing. The fields are short (200
+characters, a user agent 512) and `Event::check` refuses control characters and
+malformed codes; the table's own constraints refuse control characters and malformed
+addresses too. `record_in` holds its tenant's chain until the transaction ends, so
+call it last in the transaction, and the transaction must be READ COMMITTED (the
+default; the database refuses others, whose snapshot could miss the chain's last
+event).
+
+**Roles.** Run the migrations as the role that owns the schema. Give the app's role
+`INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
+or disable the triggers, which takes ownership. Only the role that runs the anchoring
+job inserts anchors, so the app cannot record a manifest of its own:
+
+```sql
+GRANT USAGE ON SCHEMA public TO myapp_app, myapp_anchor;
+GRANT SELECT, INSERT ON owt_audit_events TO myapp_app;
+GRANT SELECT ON owt_audit_anchors TO myapp_app;
+GRANT SELECT ON owt_audit_events TO myapp_anchor;
+GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
+-- Nothing else: no UPDATE, DELETE, TRUNCATE, TRIGGER or ownership.
+```
+
+**Anchoring.** The schema's owner can still drop the triggers and rewrite a chain
+from some event on, recomputing every hash after it; the chain still verifies on its
+own. So, on a schedule, write every chain's head to storage the database's owner
+cannot change: `anchor::anchor(&pool, &store)` verifies each chain since the previous
+manifest (so a broken chain is never anchored), builds a manifest of the heads
+(naming the previous manifest's digest), stores it through an `anchor::Anchor`, and
+records it in `owt_audit_anchors`; runs are serialized by an advisory lock. `verify_anchor` then fails for any chain that no longer
+holds an anchored head. `NoAnchor` records manifests in the database only, for
+development and tests; production implements `Anchor` over a bucket under a
+compliance-mode retention lock (an S3-compatible provider for that follows
+`owt-storage`). The database's copy of a manifest is checked against its recorded
+digest, but it is only as trustworthy as the roles that may insert anchors; an
+independent check verifies against the copy in the store
+(`myapp audit verify --manifest m.json`).
+
+```rust,no_run
+use std::time::Duration;
+use owt_audit::anchor::{self, NoAnchor};
+use owt_runtime::jobs::{CancellationToken, Every, Jobs};
+
+# async fn demo(pool: sqlx::PgPool) {
+let jobs = Jobs::new(CancellationToken::new());
+let p = pool.clone();
+jobs.singleton("audit_anchor", Every::new(Duration::from_hours(1)), pool.clone(), 7_210_010, move || {
+    let p = p.clone();
+    async move {
+        anchor::anchor(&p, &NoAnchor).await?; // the app's WORM store in production
+        Ok(())
+    }
+});
+# }
+```
+
+**Verifying.** `owt_audit::verify(&pool, tenant)` walks a chain and names the first
+event that was edited (`Broken::Hash`), removed (`Broken::Gap`) or swapped
+(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads. With
+the `cli` feature the app gets both as operator commands (`myapp audit verify`,
+`myapp audit verify --manifest m.json` for a manifest fetched from the store, and
+`myapp audit heads`):
+
+```rust,no_run
+use clap::{Parser, Subcommand};
+use owt_audit::cli::AuditCommand;
+
+#[derive(Parser)]
+struct Cli { #[command(subcommand)] command: Command }
+
+#[derive(Subcommand)]
+enum Command {
+    /// The audit log.
+    #[command(subcommand)]
+    Audit(AuditCommand),
+}
+
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+match Cli::parse().command {
+    Command::Audit(cmd) => owt_audit::cli::run(&pool, cmd).await?,
+}
+# Ok(()) }
+```
+
 ### Change requests
 
 `owt-change` lets a site's signed-in admins ask for a change from the page itself. A
@@ -2900,6 +3501,111 @@ jobs.singleton("close_week", weekly, pool.clone(), 7_210_002, move || {
 });
 # }
 ```
+
+### Durable job queue
+
+`jobs` runs periodic work; `owt_runtime::queue` runs work items that must survive
+crashes and deploys (a message to send, a file to process). Delivery is **at least
+once**: a crash, a stale recovery, a heartbeat lost to a database blip or a put-back at
+shutdown runs a job again, perhaps after the first run had its side effects. Handlers
+must be idempotent; the enqueue key deduplicates enqueues, not executions.
+Each job is a row of `owt_jobs`, a table the library migrates into its own ledger
+(`_owt_runtime_migrations`): await `queue::migrate(&pool)` at start, before the first
+enqueue.
+
+- **Enqueue** with `Queue::enqueue`, or `enqueue_in(&mut tx, ..)` inside the app's
+  own transaction, so the job exists exactly when the change that wants it commits.
+  `Job::key` is an idempotency key: enqueueing the same key again returns the first
+  job (`Enqueued { fresh: false, .. }`) for as long as its row lasts, a dead job's
+  included: nothing new is queued until the dead job is discarded or redriven.
+  `Job::delay` and `Job::run_at` schedule it. A keyed `enqueue_in` needs a
+  `READ COMMITTED` transaction (the default); under `REPEATABLE READ` or
+  `SERIALIZABLE` it returns an error saying so.
+- **Claims** take due jobs oldest first with `FOR UPDATE SKIP LOCKED`, so replicas
+  never take the same job or wait on each other. Each claim counts an attempt and
+  takes the next number of the job's claim counter, which only rises. That number
+  fences the claim (`Claimed::claim`): a claim that went stale and was given to
+  another worker can no longer complete, fail, release or heartbeat the job. Fencing
+  stops a stale worker from recording a result, not from running, hence the
+  idempotence above; a `lost` outcome means the side effect may have happened twice.
+- **Retries** back off exponentially with jitter (`Retry`, default 5 attempts from
+  about 10 s, capped at an hour). After the last attempt, or when the handler returns
+  `JobError::permanent(..)`, the job is **dead**: kept with its payload and last error
+  for `Queue::dead`, `Queue::redrive` (queued again with fresh attempts) or
+  `Queue::discard_dead`.
+- **The worker** claims while it has free slots (`concurrency`), runs each job in its
+  own task (a panic is a failed attempt), renews running jobs' heartbeats every third
+  of `stale_after`, and puts back jobs whose heartbeat went stale on any replica (a
+  replica that died). Heartbeats and housekeeping run in tasks of their own, so a slow
+  claim or purge never delays a heartbeat. Done jobs are purged after `retain_done`
+  (7 days) in batches, which frees their keys. On shutdown it claims nothing more,
+  gives running jobs `shutdown_grace` to finish, then aborts the rest and queues them
+  again. The aborted attempt stays counted, so a handler that never returns reaches
+  `max_attempts` and the job goes dead.
+
+```rust,no_run
+use std::time::Duration;
+use owt_runtime::jobs::{CancellationToken, Jobs};
+use owt_runtime::queue::{self, Claimed, Job, JobError, Queue, QueueMetrics, Retry};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SendReminder { appointment: i64 }
+
+async fn send_reminder(job: Claimed) -> Result<(), JobError> {
+    // A payload that never parses will not parse next time either.
+    let r: SendReminder = job.json().map_err(JobError::permanent)?;
+    let _ = r.appointment; // look the appointment up, send, ... (`?` retries)
+    Ok(())
+}
+
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+queue::migrate(&pool).await?;
+let reminders = Queue::new(pool.clone(), "reminders")?.retry(Retry {
+    max_attempts: 8,
+    base: Duration::from_secs(30),
+    cap: Duration::from_hours(2),
+});
+
+// In the transaction that books the appointment: one job per appointment.
+let mut tx = pool.begin().await?;
+let job = Job::json(&SendReminder { appointment: 42 })?
+    .key("reminder:42")
+    .delay(Duration::from_hours(23));
+reminders.enqueue_in(&mut tx, job).await?;
+tx.commit().await?;
+
+let shutdown = CancellationToken::new();
+let jobs = Jobs::new(shutdown.clone());
+reminders
+    .worker(send_reminder)
+    .concurrency(8)
+    .metrics(QueueMetrics::prefixed("myapp"))
+    .spawn(&jobs);
+
+owt_runtime::serve::shutdown_signal().await;
+shutdown.cancel();
+jobs.stopped().await; // running jobs finish, or go back to the queue
+# Ok(()) }
+```
+
+**Payloads are not encrypted.** The table, its backups and its replicas hold them as
+they are. A payload carries references (an id the handler looks up), not personal or
+health data; one that must carry such data is encrypted by the app before it is
+enqueued. A done job's payload is emptied at once; a dead job's is kept for
+redriving, so discard dead jobs the app will not redrive. The last error is stored
+(cut to `queue::MAX_ERROR_CHARS`) and logged, so a handler keeps personal data out of
+its error messages too.
+
+`QueueMetrics::prefixed("myapp")` records `<prefix>_queue_jobs_total{queue,outcome}`
+(`done`, `retried`, `dead` (a released job on its last attempt included), `lost`,
+`released`, `recovered`),
+`<prefix>_queue_job_seconds{queue}`, and, at each housekeeping pass,
+`<prefix>_queue_depth{queue,state}` and `<prefix>_queue_lag_seconds{queue}` (how long
+the oldest due job has waited); call its `describe()` inside the closure passed to
+`owt_runtime::metrics::install`. Alert on lag and on dead jobs.
+
+A worker without `Jobs` is `worker.run(shutdown).await`; `Queue::claim`,
+`complete`, `fail` and `heartbeat` are there for an app that drives jobs itself.
 
 ### Front-end assets
 
@@ -3325,7 +4031,7 @@ jobs:
   image:
     needs: release
     if: needs.release.outputs.version != ''
-    permissions: {contents: read, packages: write}
+    permissions: {contents: read, packages: write, id-token: write}
     uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.10.0
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
@@ -3365,7 +4071,7 @@ jobs:
         floating-tags: {description: "Also move the channel's floating tags", type: boolean, default: false}
   jobs:
     image:
-      permissions: {contents: read, packages: write}
+      permissions: {contents: read, packages: write, id-token: write}
       uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.10.0
       with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
@@ -3512,8 +4218,10 @@ the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
 (0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The
 read-only `verify` job checks the layer's paths and modes and that the base has
-`base-requires` and a glibc at least as new as the binary needs. The `push` job confirms the layer is the one verified and runs
-none of the app's code and alone holds `packages: write`: with
+`base-requires` and a glibc at least as new as the binary needs. The `push` job
+confirms the layer is the one verified and runs none of the app's code; of the
+`crane` builder's jobs it alone holds `packages: write` (the `docker` builder's job
+and `attest` hold it too): with
 [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) (pinned
 by version and SHA-256) appends the layer to the base pinned by its linux/amd64
 digest, sets the configuration, pushes by digest, reads the version label back and
@@ -3539,6 +4247,53 @@ the template's:
 | `port` | `8000` (empty: neither) | `ENV BIND_ADDR=0.0.0.0:<port>`, `EXPOSE <port>` |
 | `entrypoint` / `cmd` | `["/usr/local/bin/server"]` / `[]` | `ENTRYPOINT` / `CMD` (JSON arrays) |
 | `env` / `labels` | none | more `ENV` / `LABEL` lines, `KEY=VALUE` each |
+| `vuln-fail-on` | `critical` | none (the scan below); `negligible`, `low`, `medium`, `high`, `critical`, or `none` to report only |
+| `vuln-ignore-file` | none | none; a grype configuration file in the repository whose `ignore:` rules waive findings |
+| `attest` | `true` | none; `false` skips the signature and the SBOM (`image.yml` only) |
+
+**Supply chain:** each image is scanned, signed and given an SBOM.
+
+- **Scan:** grype runs before anything is pushed, so a finding of `vuln-fail-on`
+  severity or worse (`critical` by default) pushes and tags nothing. With `crane`, a
+  `scan` job assembles the image as `push` would make it (the base pinned by digest,
+  the layer on top) and `push` waits for it. With `docker`, the image is pushed
+  once under a temporary tag (`scan-<run id>-<attempt>`), scanned there by digest, and only then given its
+  version and floating tags (the same digest, retagged); a failing scan leaves
+  the temporary tag and no other. `vuln-fail-on: none` still prints the
+  findings and never fails; any other value than `negligible`, `low`, `medium`,
+  `high`, `critical` or `none` fails the job. grype reads exactly the configuration
+  `vuln-ignore-file` names, and none when it is empty: a `.grype.yaml` in the
+  repository is not picked up unasked. A finding with no fix, or a false positive,
+  is waived in that file:
+
+  ```yaml
+  # .grype.yaml, named by vuln-ignore-file
+  ignore:
+    - vulnerability: CVE-2026-0001   # a finding id
+    - fix-state: not-fixed           # or every finding that has no fix yet
+  ```
+- **Signature:** the `attest` job signs the pushed digest, never a tag, with
+  [cosign](https://github.com/sigstore/cosign) keyless: the run's OIDC token, which
+  Sigstore exchanges for a short-lived certificate, and a record in the public
+  transparency log. The certificate's identity is the reusable workflow, not the
+  app's workflow, and the app's repository is its source repository:
+
+  ```sh
+  cosign verify ghcr.io/<owner>/<app>@<digest> \
+    --certificate-identity-regexp '^https://github.com/onewaytek/owt-stack/\.github/workflows/image\.yml@' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-github-workflow-repository <owner>/<app>
+  ```
+- **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
+  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact and attaches
+  it to the image as a signed attestation (`cosign verify-attestation --type
+  spdxjson ...`, with the same identity flags).
+
+The caller's job therefore grants `id-token: write` besides `packages: write`
+(`permissions: {contents: read, packages: write, id-token: write}`): a reusable
+workflow cannot take a permission its caller withholds, and a caller that grants
+less fails to start, `attest: false` or not. `attest: false` skips the signature and
+the SBOM, not the scan.
 
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
@@ -3629,7 +4384,10 @@ commit the way a release does and verifies all but the push: with `builder: cran
 (the default) the compile, the npm assets, the packed layer, and the base's tools and
 glibc, by the same `build` and `verify` jobs as `image.yml`'s (`just image-check`
 keeps them identical); with `builder: docker` the Dockerfile is built with BuildKit
-and pushed nowhere. It takes `image.yml`'s inputs that shape the build (`bin`,
+and pushed nowhere. It also scans the image with grype, as `image.yml` does, with the
+same `vuln-fail-on` and `vuln-ignore-file` inputs: this is where a vulnerable base image
+is most useful to learn of, before the release. Nothing is signed and no SBOM is made
+here, and the caller still grants `contents: read` only. It takes `image.yml`'s inputs that shape the build (`bin`,
 `cargo-args`, `files`, `base-image`, ...) and none that shape the push.
 `cargo-profile` makes the check cheaper: a pull request can build with `dev`, or with a
 profile of the app's own that turns off fat LTO and sets many codegen units
@@ -4278,6 +5036,13 @@ this command, run when the app adopts a release, is the only thing that moves it
   dashboards and load-test reports keep their names.
 - **Bus channel names** (`<prefix>:<topic>`, `~changed`, `~beat`) are a wire format
   between replicas. Changing one is a rollout hazard: old and new replicas must agree.
+- **One audit chain per tenant**, not one global chain. Appends to a chain are
+  serialized, so a global chain would make every tenant's writes wait on one lock;
+  per tenant, they never wait on each other. A tenant's chain verifies and exports
+  on its own, without revealing other tenants' events, and a tenant's log can be
+  handed over or retired at the end of its contract without breaking anyone else's.
+  What a global chain adds, evidence across tenants, comes from anchoring: each
+  manifest holds every chain's head and names the previous manifest.
 - **OpenShift Template, not Kustomize**, for the deployment: the app's name must reach
   the image trigger annotation and the CNPG Secret's name, which Kustomize's name
   transformers do not rewrite.
@@ -4576,7 +5341,7 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `fix(web): Drop the cache` does not; an app without a commitlint configuration of
 its own is checked by the same rules (`commitlint.config.mjs`). Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
-`accounts`, `change`, `tailwind`, `deps`, `release` (release-please and its configuration).
+`accounts`, `audit`, `change`, `crypt`, `storage`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it

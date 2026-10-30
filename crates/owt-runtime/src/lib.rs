@@ -11,6 +11,9 @@
 //! * [`db`]: the Postgres pool, and migrations under an advisory lock.
 //! * [`jobs`]: background work on every replica, on one at a time (an advisory lock),
 //!   or on the replica holding a Redis lease (feature `redis`).
+//! * [`queue`]: a durable job queue in Postgres: idempotent enqueue, `SKIP LOCKED`
+//!   claims, retries with backoff, dead jobs, stale-claim recovery, a worker that
+//!   stops gracefully.
 //! * [`serve`]: bind, serve with client addresses, stop on SIGTERM or Ctrl-C.
 
 #[cfg(feature = "redis")]
@@ -21,6 +24,7 @@ pub mod jobs;
 pub mod logging;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+pub mod queue;
 pub mod serve;
 
 /// A Redis key prefix that names one deployment and nothing nested under it: ASCII
