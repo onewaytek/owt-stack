@@ -374,6 +374,20 @@ impl SignedData for Data {
     fn set_signature(&mut self, signature: Option<session::Signature>) {
         self.signed.set_signature(signature);
     }
+
+    fn on_sign_in(&mut self) {
+        self.signed.on_sign_in();
+    }
+}
+
+impl crate::mfa::MfaSession for Data {
+    fn mfa(&self) -> &crate::mfa::State {
+        &self.signed.mfa
+    }
+
+    fn mfa_mut(&mut self) -> &mut crate::mfa::State {
+        &mut self.signed.mfa
+    }
 }
 
 impl Social for Data {

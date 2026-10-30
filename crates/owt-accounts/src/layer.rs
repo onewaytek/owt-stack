@@ -30,6 +30,9 @@ use owt_web::Error;
 use owt_web::session::Session;
 use sqlx::PgPool;
 
+use std::sync::Arc;
+
+use crate::mfa::{Mfa, MfaSession};
 use crate::session::Signed as SignedData;
 use crate::store::{self, Account, Extra};
 
@@ -38,6 +41,31 @@ use crate::store::{self, Account, Extra};
 pub struct Accounts {
     pool: PgPool,
     sign_in: String,
+    reauth: String,
+    enroll: String,
+    mfa: Option<MfaGate>,
+}
+
+/// The second-factor gate [`Accounts::require_mfa`] fixes for one session data type.
+type GateFn<T> = dyn Fn(PgPool, Session<T>, Account) -> GateFuture + Send + Sync;
+
+#[derive(Clone, Debug)]
+struct MfaGate {
+    /// The session data type the gate was made for.
+    data: std::any::TypeId,
+    /// An `Arc<GateFn<T>>` of that type.
+    gate: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// The second-factor gate's answer, in flight.
+type GateFuture = std::pin::Pin<Box<dyn Future<Output = sqlx::Result<Gate>> + Send>>;
+
+/// What the second-factor gate decided about a signature.
+enum Gate {
+    /// It stands; whether the account has a second factor, if the gate looked.
+    Open(Option<bool>),
+    /// It does not (yet): the visitor is anonymous.
+    Held,
 }
 
 impl Accounts {
@@ -47,7 +75,56 @@ impl Accounts {
         Self {
             pool,
             sign_in: sign_in.into(),
+            reauth: "/reauth".to_owned(),
+            enroll: "/mfa/enroll".to_owned(),
+            mfa: None,
         }
+    }
+
+    /// Hold every signature to the second factor, wherever it came from. [`load`](Self::load)
+    /// and [`load_with`](Self::load_with) then treat a signature for an account that has a
+    /// confirmed factor, or that `mfa`'s policy requires to have one, as signed in only when
+    /// the session shows a second factor passed for that account and epoch. Until then the
+    /// request is anonymous, and the session becomes the pending sign-in a challenge or
+    /// enrollment page continues ([`Mfa::pending_account`]). A password sign-in, a link, a
+    /// provider and [`session::password_gate`](crate::session::password_gate) are all
+    /// closed by it, including an old `/login` route left in place.
+    ///
+    /// `T` is the session data type, and must be the one `load::<T>` is installed with:
+    /// `load::<Other>` on an `Accounts` that requires MFA for `T` logs an error and answers
+    /// 503 to anyone signed in, rather than run single-factor.
+    #[must_use]
+    pub fn require_mfa<T: MfaSession>(mut self, mfa: Mfa) -> Self {
+        let gate: Arc<GateFn<T>> = Arc::new(move |pool, session, account| {
+            let mfa = mfa.clone();
+            Box::pin(async move {
+                Ok(match mfa.gate(&pool, &session, &account).await? {
+                    Some(has) => Gate::Open(Some(has)),
+                    None => Gate::Held,
+                })
+            })
+        });
+        self.mfa = Some(MfaGate {
+            data: std::any::TypeId::of::<T>(),
+            gate: Arc::new(gate),
+        });
+        self
+    }
+
+    /// Where [`RecentMfa`](crate::mfa::RecentMfa) sends an account that has no second
+    /// factor (a path, `/mfa/enroll` by default), with `?next=` set.
+    #[must_use]
+    pub fn enroll_at(mut self, path: impl Into<String>) -> Self {
+        self.enroll = path.into();
+        self
+    }
+
+    /// Where [`Recent`](crate::mfa::Recent) sends a visitor whose last sign-in is too
+    /// old for the page (a path, `/reauth` by default), with `?next=` set.
+    #[must_use]
+    pub fn reauth_at(mut self, path: impl Into<String>) -> Self {
+        self.reauth = path.into();
+        self
     }
 
     /// The middleware. Install it with
@@ -81,6 +158,31 @@ impl Accounts {
         .await
     }
 
+    /// What the second-factor gate, if one is required, makes of this signature.
+    async fn hold<T: SignedData>(
+        &self,
+        session: Option<&Session<T>>,
+        account: &Account,
+    ) -> sqlx::Result<Gate> {
+        let (Some(required), Some(session)) = (&self.mfa, session) else {
+            return Ok(Gate::Open(None));
+        };
+        let gate = (required.data == std::any::TypeId::of::<T>())
+            .then(|| required.gate.downcast_ref::<Arc<GateFn<T>>>())
+            .flatten();
+        let Some(gate) = gate else {
+            tracing::error!(
+                data = std::any::type_name::<T>(),
+                "Accounts::require_mfa was made for another session data type than the one \
+                 load is installed with: refusing every signed-in request"
+            );
+            return Err(sqlx::Error::Configuration(
+                "require_mfa and load name different session data types".into(),
+            ));
+        };
+        gate(self.pool.clone(), session.clone(), account.clone()).await
+    }
+
     /// The middleware, with `read` asking for the session's account (by id, in its
     /// epoch) and what comes with it.
     async fn load_by<T, X, F, R>(self, mut req: Request, next: Next, read: R) -> Response
@@ -96,8 +198,21 @@ impl Accounts {
             Some(signature) => {
                 match read(self.pool.clone(), signature.account, signature.epoch).await {
                     Ok(Some((account, extra))) => {
-                        req.extensions_mut().insert(LoadedExtra(extra));
-                        Loaded::Account(account)
+                        let held = self.hold::<T>(session.as_ref(), &account).await;
+                        match held {
+                            Ok(Gate::Open(has_factor)) => {
+                                req.extensions_mut().insert(LoadedExtra(extra));
+                                if let Some(has) = has_factor {
+                                    req.extensions_mut().insert(HasFactor(has));
+                                }
+                                Loaded::Account(account)
+                            }
+                            Ok(Gate::Held) => Loaded::Anonymous,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "the session's second factor could not be read");
+                                Loaded::Unknown
+                            }
+                        }
                     }
                     Ok(None) => {
                         // Revoked: the cookie must stop carrying it.
@@ -115,6 +230,8 @@ impl Accounts {
         };
         req.extensions_mut().insert(loaded);
         req.extensions_mut().insert(SignInAt(self.sign_in.clone()));
+        req.extensions_mut().insert(ReauthAt(self.reauth.clone()));
+        req.extensions_mut().insert(EnrollAt(self.enroll.clone()));
         let htmx = HtmxWall::of(&req, &self.sign_in);
         let mut response = next.run(req).await;
         if let Some(htmx) = htmx {
@@ -181,7 +298,7 @@ impl HtmxWall {
 /// The path and query the client sent (`OriginalUri`): under `Router::nest`, the
 /// request's own URI has had the prefix removed. Only its path and query, so an
 /// absolute-form request target cannot put a host into `next`.
-fn asked_for<'a>(extensions: &'a Extensions, uri: &'a Uri) -> &'a str {
+pub(crate) fn asked_for<'a>(extensions: &'a Extensions, uri: &'a Uri) -> &'a str {
     let uri = extensions.get::<OriginalUri>().map_or(uri, |u| &u.0);
     uri.path_and_query().map_or("/", |p| p.as_str())
 }
@@ -205,6 +322,19 @@ struct LoadedExtra<X>(X);
 /// Where the sign-in page is, for the extractors' redirect.
 #[derive(Clone, Debug)]
 struct SignInAt(String);
+
+/// Where the re-authentication page is, for [`Recent`](crate::mfa::Recent)'s redirect.
+#[derive(Clone, Debug)]
+pub(crate) struct ReauthAt(pub(crate) String);
+
+/// Where the enrollment page is, for [`RecentMfa`](crate::mfa::RecentMfa)'s redirect.
+#[derive(Clone, Debug)]
+pub(crate) struct EnrollAt(pub(crate) String);
+
+/// Whether the signed-in account has a second factor, when the layer looked
+/// ([`Accounts::require_mfa`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HasFactor(pub(crate) bool);
 
 /// The signed-in account, if any. Available to anything with the request's
 /// extensions (a page-context extractor, say), not only as a handler argument.
@@ -271,7 +401,7 @@ const UNAVAILABLE: &str = "Signing in is unavailable for a moment. Please try ag
 /// `?next=` is the URI the client sent ([`asked_for`]): a visitor sent back to
 /// `/profile` instead of `/es/profile` lands on a 404 or another page. On an htmx
 /// request [`Accounts::load`] turns the redirect into [`HtmxWall`]'s.
-fn wall(parts: &Parts) -> Error {
+pub(crate) fn wall(parts: &Parts) -> Error {
     if matches!(parts.extensions.get::<Loaded>(), Some(Loaded::Unknown)) {
         return Error::unavailable(UNAVAILABLE);
     }
