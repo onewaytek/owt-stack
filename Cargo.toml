@@ -25,6 +25,8 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 cookie = { version = "0.18", features = ["private", "percent-encode"] }
 futures = "0.3"
 hkdf = "0.13"
+hmac = "0.13"
+getrandom = "0.3"
 governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
 html-escape = "0.3"
 http = "1"
@@ -32,6 +34,7 @@ http-body-util = "0.1"
 hyper = { version = "1.11", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
 jsonwebtoken = { version = "11", default-features = false }
+log = "0.4"
 metrics = { version = "0.24", default-features = false }
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 metrics-process = "2.4"
@@ -41,6 +44,7 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 regex = "1"
 proptest = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.10"
 redis = { version = "1.7", default-features = false, features = ["tokio-comp", "tokio-rustls-comp", "aio", "connection-manager"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
@@ -50,6 +54,7 @@ rsa = "0.9"
 scraper = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.11"
 sha2 = "0.11"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "migrate"] }
 subtle = "2"
@@ -59,12 +64,13 @@ tokio-util = { version = "0.7", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", default-features = false, features = ["timeout"] }
 tracing = "0.1"
+tracing-log = "0.2"
 tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 unicode-security = "0.1.2"
 url = "2.5"
-zeroize = "1.8"
+zeroize = "1"
 
 owt-web = { path = "crates/owt-web" }
 owt-runtime = { path = "crates/owt-runtime" }
@@ -74,6 +80,8 @@ owt-accounts = { path = "crates/owt-accounts" }
 owt-bus = { path = "crates/owt-bus" }
 owt-test = { path = "crates/owt-test" }
 owt-change = { path = "crates/owt-change" }
+owt-crypt = { path = "crates/owt-crypt" }
+owt-storage = { path = "crates/owt-storage" }
 owt-audit = { path = "crates/owt-audit" }
 
 [workspace.lints.rust]

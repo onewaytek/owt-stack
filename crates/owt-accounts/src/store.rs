@@ -304,6 +304,23 @@ pub async fn create_in(conn: &mut sqlx::PgConnection, new: New<'_>) -> Result<Ac
 /// sign-in with the old password that finishes after the change fails, rather than
 /// taking the new session epoch (and, with a rehash, writing the old password back).
 pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<Option<Account>> {
+    authenticate_as(pool, login, password, true).await
+}
+
+/// [`authenticate`] without stamping `last_sign_in`: for a way in that is not complete
+/// until a second factor passes ([`crate::mfa`] stamps it then), so that a password
+/// alone does not move the time the admin shows. The password is checked, and an
+/// outdated hash replaced, exactly as in [`authenticate`]. Throttle first, the same.
+pub async fn check_password(pool: &PgPool, login: &str, password: &str) -> Result<Option<Account>> {
+    authenticate_as(pool, login, password, false).await
+}
+
+async fn authenticate_as(
+    pool: &PgPool,
+    login: &str,
+    password: &str,
+    stamp: bool,
+) -> Result<Option<Account>> {
     let login = normalize(login);
     // At most one row: no username has an `@`, every email does, and each is unique.
     let row = sqlx::query_as::<_, (i64, String)>(
@@ -318,14 +335,17 @@ pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<
         .as_ref()
         .map(|(_, hash)| hash.as_str())
         .filter(|hash| !hash.is_empty());
-    if !owt_auth::password::verify_or_decoy(password, stored).await {
+    let checked = owt_auth::password::check_or_decoy(password, stored).await;
+    if !checked.matched() {
         return Ok(None);
     }
     let Some((id, hash)) = row else {
         return Ok(None);
     };
     let mut current = hash;
-    if owt_auth::password::needs_rehash(&current)
+    // Also a hash of the password as typed, made before passwords were normalized.
+    if (owt_auth::password::needs_rehash(&current)
+        || checked == owt_auth::password::Check::MatchRaw)
         && let Ok(rehashed) = owt_auth::password::hash(password).await
     {
         let done = sqlx::query(
@@ -340,8 +360,13 @@ pub async fn authenticate(pool: &PgPool, login: &str, password: &str) -> Result<
             current = rehashed;
         }
     }
+    let stamped = if stamp {
+        "last_sign_in = now()"
+    } else {
+        "last_sign_in = last_sign_in"
+    };
     Ok(sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "UPDATE accounts SET last_sign_in = now()
+        "UPDATE accounts SET {stamped}
          WHERE id = $1 AND is_active AND password_sign_in AND password_hash = $2
          RETURNING {COLUMNS}"
     )))

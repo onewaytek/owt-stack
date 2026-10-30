@@ -36,6 +36,11 @@ pub trait Signed: SessionData {
     fn signature(&self) -> Option<Signature>;
     /// Sign in as `signature`, or out with `None`.
     fn set_signature(&mut self, signature: Option<Signature>);
+    /// Called by [`sign_in`] before it sets the signature: forget what the session
+    /// remembered about an earlier sign-in (when it happened, which factor, a second
+    /// factor still pending), so none of it carries over to the new one. [`Data`]
+    /// clears its [`mfa::State`](crate::mfa::State). The default does nothing.
+    fn on_sign_in(&mut self) {}
 }
 
 /// Session data that holds a signature and the flash messages for the next page
@@ -52,6 +57,14 @@ pub struct Data {
     /// The messages for the next page ([`Session::flash`]).
     #[serde(rename = "f", default, skip_serializing_if = "Vec::is_empty")]
     pub flashes: Vec<Flash>,
+    /// A second factor pending, and when the person last proved who they are
+    /// ([`crate::mfa`]).
+    #[serde(
+        rename = "m",
+        default,
+        skip_serializing_if = "crate::mfa::State::is_empty"
+    )]
+    pub mfa: crate::mfa::State,
 }
 
 impl HasFlashes for Data {
@@ -86,13 +99,23 @@ impl Signed for Data {
             self.epoch = 0;
         }
     }
+
+    fn on_sign_in(&mut self) {
+        self.mfa = crate::mfa::State::default();
+    }
 }
 
 /// Sign the session in as `account`: a new session id (against fixation), the
 /// account's id and current epoch. The handler then redirects.
+///
+/// This records nothing about *how* the person proved who they are: a session signed in
+/// by it has no [`mfa::State`](crate::mfa::State) times, and [`crate::mfa::require_recent`]
+/// refuses it until [`crate::mfa::mark_authenticated`] stamps them. The way in that checks
+/// a password and a second factor is [`crate::mfa::Mfa::password_sign_in`].
 pub fn sign_in<T: Signed>(session: &Session<T>, account: &Account) {
     session.cycle_id();
     session.update(|data| {
+        data.on_sign_in();
         data.set_signature(Some(Signature {
             account: account.id,
             epoch: account.session_epoch,
@@ -112,6 +135,10 @@ pub enum SignInRefused {
     /// It does not say which was wrong, nor whether the account exists.
     #[error("That username or email and password do not match an account.")]
     Mismatch,
+    /// The shared throttle could not be reached and fails closed (see
+    /// [`owt_auth::throttle::shared`]): nothing was checked. Answer 503.
+    #[error("Signing in is unavailable for a moment. Please try again shortly.")]
+    Unavailable,
     /// A fault: the database. Its message says only that; log its source, which
     /// may name tables and columns, and never show it.
     #[error("The sign-in could not be checked. Try again in a moment.")]
@@ -130,6 +157,7 @@ impl SignInRefused {
         match self {
             Self::Throttled => StatusCode::TOO_MANY_REQUESTS,
             Self::Mismatch => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Fault(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -137,7 +165,9 @@ impl SignInRefused {
 
 /// The whole password sign-in: charge `throttle` for a sign-in to `login` from `ip`
 /// (the client's address, [`owt_web::client_ip`]), check the password only if it
-/// allows one ([`store::authenticate`], which stamps the account's `last_sign_in`),
+/// allows one ([`store::authenticate`], which stamps the account's `last_sign_in` at the
+/// password, before any second factor: [`crate::mfa::Mfa::password_sign_in`] stamps it
+/// after, and the layer holds a session that skipped the factor),
 /// and sign `session` in ([`sign_in`]). `login` is a username or an email. The
 /// handler then redirects, or shows the form again with the refusal's message and
 /// [`SignInRefused::status`].
@@ -218,8 +248,16 @@ pub async fn password_gate<T: Signed>(
     if !throttle.sign_in(ip, &format!("\0gate\0{}", gate.account)) {
         return Err(SignInRefused::Throttled);
     }
-    if !owt_auth::password::verify_or_decoy(password, Some(gate.hash)).await {
+    let checked = owt_auth::password::check_or_decoy(password, Some(gate.hash)).await;
+    if !checked.matched() {
         return Err(SignInRefused::Mismatch);
+    }
+    if checked == owt_auth::password::Check::MatchRaw {
+        // The hash is the app's, not stored here: it can only be told to make a new one.
+        tracing::warn!(
+            "the gate's hash was made from the password as typed, before passwords were \
+             normalized: make it again with owt_auth::password::hash"
+        );
     }
     let account = store::open_active(pool, gate.account)
         .await
