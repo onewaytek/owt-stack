@@ -13,12 +13,14 @@
 //! * **Enqueue** ([`Queue::enqueue`], or [`Queue::enqueue_in`] inside the app's own
 //!   transaction, so a job exists exactly when the change that wants it commits). An
 //!   idempotency key ([`Job::key`]) makes a second enqueue of the same work return the
-//!   first job instead of adding one. [`Job::delay`] and [`Job::run_at`] schedule it.
+//!   first job instead of adding one; it does not make the work run once (see
+//!   below). [`Job::delay`] and [`Job::run_at`] schedule it.
 //! * **Claim** ([`Queue::claim`]) takes up to `n` due jobs, oldest first, with
 //!   `FOR UPDATE SKIP LOCKED`: replicas claiming at once never take the same job and
-//!   never wait on each other. Each claim counts an attempt, and the attempt number is
-//!   the claim's fencing token: [`Queue::complete`] and [`Queue::fail`] act only while
-//!   the job is still running under that attempt.
+//!   never wait on each other. Each claim counts an attempt and takes the next number
+//!   of the job's claim counter, which only rises: that number is the claim's fencing
+//!   token, and [`Queue::complete`], [`Queue::fail`], [`Queue::release`] and
+//!   [`Queue::heartbeat`] act only while the job is still running under it.
 //! * **Retry.** A failed attempt is queued again after an exponential backoff with
 //!   jitter ([`Retry`]); after its last attempt, or on a [`JobError::permanent`] error,
 //!   the job is dead: kept, payload and error, for [`Queue::dead`] and
@@ -31,7 +33,17 @@
 //!   slots, runs the handler for each job in a task of its own, heartbeats, recovers
 //!   stale claims, purges old done jobs, and stops gracefully: on shutdown it claims
 //!   nothing more, lets running jobs finish for a grace period, then aborts the rest
-//!   and puts them back in the queue without counting the attempt.
+//!   and puts them back in the queue. The aborted attempt stays counted, so a handler
+//!   that never returns reaches `max_attempts` and the job goes dead. Heartbeats and
+//!   housekeeping run in tasks of their own, so a slow claim or purge never delays a
+//!   heartbeat.
+//!
+//! **Delivery is at least once.** Stale recovery, a heartbeat lost to a database
+//! blip, and the put-back at shutdown all run a job again, perhaps after the first run
+//! had its side effects. Fencing stops a stale worker from *recording* a result, not
+//! from running: a handler must be idempotent, and an idempotency key deduplicates
+//! enqueues, not executions. A claim lost before the result was recorded (the `lost`
+//! outcome) means the side effect may have happened twice.
 //!
 //! **Payloads are opaque bytes** ([`Job::bytes`], or JSON with [`Job::json`]). The
 //! table is not encrypted, and backups and replicas hold it: a payload carries
@@ -44,7 +56,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::RngExt;
@@ -60,6 +72,9 @@ pub const LEDGER: &str = "_owt_runtime_migrations";
 
 /// The advisory lock [`migrate`] holds while it migrates.
 pub const LOCK_ID: i64 = 0x6f77_745f_7175_6575;
+
+/// The most rows one statement of [`Queue::purge_done`] deletes.
+const PURGE_BATCH: i64 = 1000;
 
 /// The longest error a job records; a longer one is cut at a character boundary.
 pub const MAX_ERROR_CHARS: usize = 2000;
@@ -180,7 +195,10 @@ impl Job {
     }
 
     /// An idempotency key (1 to 200 characters): while a job of this queue with the same
-    /// key is in the table, enqueueing returns it instead of adding another.
+    /// key is in the table, enqueueing returns it instead of adding another. A key held
+    /// by a dead job returns that dead job (`fresh: false`), and nothing new is queued,
+    /// until it is discarded ([`Queue::discard_dead`]) or redriven ([`Queue::redrive`]).
+    /// The key deduplicates enqueues only; execution is at least once.
     #[must_use]
     pub fn key(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
@@ -228,8 +246,11 @@ pub struct Claimed {
     pub key: Option<String>,
     /// Its payload.
     pub payload: Vec<u8>,
-    /// This attempt (1 for the first), the claim's fencing token.
+    /// This attempt (1 for the first).
     pub attempt: u32,
+    /// The job's claim counter at this claim: the fencing token. It rises with every
+    /// claim and never falls, so no two claims of a job share one.
+    pub claim: i64,
     /// Its attempts in all.
     pub max_attempts: u32,
 }
@@ -241,6 +262,7 @@ impl std::fmt::Debug for Claimed {
             .field("key", &self.key)
             .field("payload", &format_args!("{} bytes", self.payload.len()))
             .field("attempt", &self.attempt)
+            .field("claim", &self.claim)
             .field("max_attempts", &self.max_attempts)
             .finish()
     }
@@ -311,8 +333,8 @@ pub enum Failed {
     Retrying(Duration),
     /// Dead: out of attempts, or a permanent error.
     Dead,
-    /// The claim was no longer this attempt's (recovered as stale, and perhaps claimed
-    /// again); nothing changed.
+    /// The claim was no longer current (recovered as stale, and perhaps claimed again);
+    /// nothing changed.
     Lost,
 }
 
@@ -406,11 +428,35 @@ impl Queue {
 
     /// Enqueue `job` on `conn`: inside a transaction (`&mut *tx`), it exists exactly
     /// when the transaction commits.
+    ///
+    /// A keyed job needs the connection's transaction to be `READ COMMITTED`, the
+    /// default: the enqueue finds a key that a concurrent transaction committed only
+    /// with a snapshot per statement. Under `REPEATABLE READ` or `SERIALIZABLE` such a
+    /// collision is an error, so a keyed enqueue there returns an error saying so
+    /// (checked with `current_setting('transaction_isolation')`) rather than risk it.
+    /// A job without a key has no collision and enqueues under any level.
+    ///
+    /// A key held by a dead job returns the dead job with `fresh: false`, until it is
+    /// discarded or redriven.
     pub async fn enqueue_in(&self, conn: &mut PgConnection, job: Job) -> sqlx::Result<Enqueued> {
         let max = job.max_attempts.unwrap_or(self.retry.max_attempts).max(1);
         let at = job.at.map(epoch_seconds);
+        if job.key.is_some() {
+            let level: String =
+                sqlx::query_scalar("SELECT current_setting('transaction_isolation')")
+                    .fetch_one(&mut *conn)
+                    .await?;
+            if level != "read committed" {
+                return Err(sqlx::Error::Protocol(format!(
+                    "enqueue_in with an idempotency key needs a READ COMMITTED transaction, \
+                     not {}",
+                    level.to_uppercase()
+                )));
+            }
+        }
         // A key held by a transaction that commits while this statement waits on it is
-        // not in this statement's snapshot: the next statement sees it.
+        // not in this statement's snapshot: under READ COMMITTED the next statement
+        // sees it.
         for _ in 0..3 {
             let row: Option<(i64, bool)> = sqlx::query_as(
                 "WITH ins AS (
@@ -438,7 +484,7 @@ impl Queue {
             }
         }
         Err(sqlx::Error::Protocol(
-            "the job's idempotency key kept changing hands".into(),
+            "the job's idempotency key conflicted with a row that stayed invisible".into(),
         ))
     }
 
@@ -448,14 +494,16 @@ impl Queue {
             return Ok(Vec::new());
         }
         let rows: Vec<ClaimRow> = sqlx::query_as(
-            "UPDATE owt_jobs SET state = 'running', attempts = attempts + 1,
-                    claimed_at = now(), heartbeat_at = now()
-             WHERE id IN (SELECT id FROM owt_jobs
-                          WHERE queue = $1 AND state = 'queued' AND run_at <= now()
-                          ORDER BY run_at, id
-                          FOR UPDATE SKIP LOCKED
-                          LIMIT $2)
-             RETURNING id, idempotency_key, payload, attempts, max_attempts",
+            "WITH picked AS MATERIALIZED (
+                 SELECT id FROM owt_jobs
+                 WHERE queue = $1 AND state = 'queued' AND run_at <= now()
+                 ORDER BY run_at, id
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT $2)
+             UPDATE owt_jobs j SET state = 'running', attempts = j.attempts + 1,
+                    claim = j.claim + 1, claimed_at = now(), heartbeat_at = now()
+             FROM picked WHERE j.id = picked.id
+             RETURNING j.id, j.idempotency_key, j.payload, j.attempts, j.max_attempts, j.claim",
         )
         .bind(&*self.name)
         .bind(i64::from(n))
@@ -463,11 +511,12 @@ impl Queue {
         .await?;
         let mut claimed: Vec<Claimed> = rows
             .into_iter()
-            .map(|(id, key, payload, attempt, max)| Claimed {
+            .map(|(id, key, payload, attempt, max, claim)| Claimed {
                 id,
                 key,
                 payload,
                 attempt: to_u32(attempt),
+                claim,
                 max_attempts: to_u32(max),
             })
             .collect();
@@ -476,15 +525,15 @@ impl Queue {
     }
 
     /// Mark a claimed job done, emptying its payload. False when the claim was no
-    /// longer this attempt's.
+    /// longer current.
     pub async fn complete(&self, job: &Claimed) -> sqlx::Result<bool> {
         let done = sqlx::query(
             "UPDATE owt_jobs SET state = 'done', payload = ''::bytea, finished_at = now(),
                     claimed_at = NULL, heartbeat_at = NULL, last_error = NULL
-             WHERE id = $1 AND state = 'running' AND attempts = $2",
+             WHERE id = $1 AND state = 'running' AND claim = $2",
         )
         .bind(job.id)
-        .bind(to_i32(job.attempt))
+        .bind(job.claim)
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected() == 1)
@@ -500,11 +549,11 @@ impl Queue {
                  finished_at = CASE WHEN $3 OR attempts >= max_attempts THEN now() END,
                  run_at = now() + make_interval(secs => $4),
                  last_error = $5, claimed_at = NULL, heartbeat_at = NULL
-             WHERE id = $1 AND state = 'running' AND attempts = $2
+             WHERE id = $1 AND state = 'running' AND claim = $2
              RETURNING state",
         )
         .bind(job.id)
-        .bind(to_i32(job.attempt))
+        .bind(job.claim)
         .bind(error.permanent)
         .bind(pause.as_secs_f64())
         .bind(cut(&error.to_string()))
@@ -517,27 +566,27 @@ impl Queue {
         })
     }
 
-    /// Put a claimed job back in the queue, due now, without counting its attempt
-    /// (a worker shutting down). False when the claim was no longer this attempt's.
+    /// Put a claimed job back in the queue, due now (a worker shutting down). The
+    /// attempt stays counted, so a handler that never returns still runs out of
+    /// attempts. False when the claim was no longer current.
     pub async fn release(&self, job: &Claimed) -> sqlx::Result<bool> {
-        release(&self.pool, job.id, job.attempt).await
+        release(&self.pool, job.id, job.claim).await
     }
 
-    /// Renew the heartbeat of each claimed job, as `(id, attempt)`, that is still
-    /// running under that attempt. How many were.
-    pub async fn heartbeat(&self, held: &[(i64, u32)]) -> sqlx::Result<u64> {
+    /// Renew the heartbeat of each claimed job, as `(id, claim)`, that is still running
+    /// under that claim. How many were.
+    pub async fn heartbeat(&self, held: &[(i64, i64)]) -> sqlx::Result<u64> {
         if held.is_empty() {
             return Ok(0);
         }
-        let (ids, attempts): (Vec<i64>, Vec<i32>) =
-            held.iter().map(|&(id, a)| (id, to_i32(a))).unzip();
+        let (ids, claims): (Vec<i64>, Vec<i64>) = held.iter().copied().unzip();
         let done = sqlx::query(
             "UPDATE owt_jobs j SET heartbeat_at = now()
-             FROM unnest($1::int8[], $2::int4[]) AS h(id, attempts)
-             WHERE j.id = h.id AND j.attempts = h.attempts AND j.state = 'running'",
+             FROM unnest($1::int8[], $2::int8[]) AS h(id, claim)
+             WHERE j.id = h.id AND j.claim = h.claim AND j.state = 'running'",
         )
         .bind(ids)
-        .bind(attempts)
+        .bind(claims)
         .execute(&self.pool)
         .await?;
         Ok(done.rows_affected())
@@ -618,17 +667,29 @@ impl Queue {
     }
 
     /// Delete done jobs that finished more than `older_than` ago, freeing their
-    /// idempotency keys. How many went.
+    /// idempotency keys, [`PURGE_BATCH`] rows per statement so no delete holds locks
+    /// for long. How many went.
     pub async fn purge_done(&self, older_than: Duration) -> sqlx::Result<u64> {
-        let done = sqlx::query(
-            "DELETE FROM owt_jobs WHERE queue = $1 AND state = 'done'
-                   AND finished_at < now() - make_interval(secs => $2)",
-        )
-        .bind(&*self.name)
-        .bind(older_than.as_secs_f64())
-        .execute(&self.pool)
-        .await?;
-        Ok(done.rows_affected())
+        let mut total = 0;
+        loop {
+            let done = sqlx::query(
+                "DELETE FROM owt_jobs WHERE id IN (
+                     SELECT id FROM owt_jobs
+                     WHERE queue = $1 AND state = 'done'
+                           AND finished_at < now() - make_interval(secs => $2)
+                     LIMIT $3)",
+            )
+            .bind(&*self.name)
+            .bind(older_than.as_secs_f64())
+            .bind(PURGE_BATCH)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            total += done;
+            if done < PURGE_BATCH.unsigned_abs() {
+                return Ok(total);
+            }
+        }
     }
 
     /// The queue's jobs by state.
@@ -678,21 +739,21 @@ impl Queue {
     }
 }
 
-async fn release(pool: &PgPool, id: i64, attempt: u32) -> sqlx::Result<bool> {
+async fn release(pool: &PgPool, id: i64, claim: i64) -> sqlx::Result<bool> {
     let done = sqlx::query(
-        "UPDATE owt_jobs SET state = 'queued', attempts = attempts - 1, run_at = now(),
+        "UPDATE owt_jobs SET state = 'queued', run_at = now(),
                 claimed_at = NULL, heartbeat_at = NULL
-         WHERE id = $1 AND state = 'running' AND attempts = $2",
+         WHERE id = $1 AND state = 'running' AND claim = $2",
     )
     .bind(id)
-    .bind(to_i32(attempt))
+    .bind(claim)
     .execute(pool)
     .await?;
     Ok(done.rows_affected() == 1)
 }
 
-/// A claimed row: id, key, payload, attempt, max attempts.
-type ClaimRow = (i64, Option<String>, Vec<u8>, i32, i32);
+/// A claimed row: id, key, payload, attempt, max attempts, claim.
+type ClaimRow = (i64, Option<String>, Vec<u8>, i32, i32, i64);
 
 type Handler = Arc<
     dyn Fn(Claimed) -> Pin<Box<dyn Future<Output = Result<(), JobError>> + Send>> + Send + Sync,
@@ -800,7 +861,10 @@ impl Worker {
     }
 
     /// How long running jobs get to finish at shutdown (default 30 s) before they are
-    /// aborted and put back in the queue.
+    /// aborted and put back in the queue. An aborted attempt stays counted, so a handler
+    /// that never returns reaches its last attempt over a few deploys and the job goes
+    /// dead. Aborting stops the handler at its next await point only: work it detached
+    /// keeps running, which is one more reason handlers are idempotent.
     #[must_use]
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
@@ -833,37 +897,44 @@ impl Worker {
     /// Run the worker in this task until `shutdown` is cancelled and its jobs have
     /// finished or been put back.
     pub async fn run(self, shutdown: CancellationToken) {
-        let mut running = Running::default();
+        let this = Arc::new(self);
+        let held = Held::default();
+        // Heartbeats and housekeeping each get a task, so a slow claim or purge never
+        // delays a heartbeat. Housekeeping stops at shutdown; heartbeats go on through
+        // the drain. The guard stops both tasks if this future is dropped.
+        let stop = CancellationToken::new();
+        let _guard = stop.clone().drop_guard();
+        let heartbeats = tokio::spawn(this.clone().heartbeat_loop(held.clone(), stop.clone()));
+        let housekeeping = tokio::spawn(
+            this.clone()
+                .housekeeping_loop(shutdown.clone(), stop.clone()),
+        );
+        let mut running = Running::new(held);
         let mut next_claim = tokio::time::Instant::now();
-        let mut heartbeat = tokio::time::interval(self.stale_after / 3);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut housekeeping =
-            tokio::time::interval(Duration::from_secs(30).min(self.stale_after / 2));
-        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
                 Some(joined) = running.set.join_next_with_id(), if !running.set.is_empty() => {
-                    self.joined(&mut running, joined).await;
+                    this.joined(&mut running, joined).await;
                 }
-                _ = heartbeat.tick() => self.heartbeat(&running).await,
-                _ = housekeeping.tick() => self.housekeep().await,
                 () = tokio::time::sleep_until(next_claim) => {
-                    let free = self.concurrency.saturating_sub(running.len());
-                    let full = free > 0 && self.claim(&mut running, free).await == free;
+                    let free = this.concurrency.saturating_sub(running.len());
+                    let full = free > 0 && this.claim(&mut running, free).await == free;
                     next_claim = tokio::time::Instant::now()
-                        + if full { Duration::ZERO } else { self.poll };
+                        + if full { Duration::ZERO } else { this.poll };
                 }
             }
             // A slot came free after a claim that filled every slot: there is likely
             // more due, so claim now rather than at the next poll.
-            if running.len() < self.concurrency && running.backlog {
+            if running.len() < this.concurrency && running.backlog {
                 next_claim = tokio::time::Instant::now();
                 running.backlog = false;
             }
         }
-        self.drain(running).await;
+        this.drain(running).await;
+        stop.cancel();
+        let _ = tokio::join!(heartbeats, housekeeping);
     }
 
     /// Claim up to `free` jobs and start them; how many it claimed.
@@ -880,7 +951,7 @@ impl Worker {
         for job in claimed {
             let queue = self.queue.clone();
             let handler = self.handler.clone();
-            let held = (job.id, job.attempt);
+            let held = (job.id, job.claim, job.attempt);
             #[cfg(feature = "metrics")]
             let metrics = self.metrics.clone();
             let handle = running.set.spawn(async move {
@@ -894,7 +965,7 @@ impl Worker {
                 #[cfg(not(feature = "metrics"))]
                 let _ = (outcome, started);
             });
-            running.held.insert(handle.id(), held);
+            running.held.lock().insert(handle.id(), held);
         }
         n
     }
@@ -909,7 +980,7 @@ impl Worker {
             Ok((id, ())) => (id, None),
             Err(e) => (e.id(), e.is_panic().then_some(e)),
         };
-        let Some((job_id, attempt)) = running.held.remove(&id) else {
+        let Some((job_id, claim, attempt)) = running.held.lock().remove(&id) else {
             return;
         };
         if panic.is_some() {
@@ -918,6 +989,7 @@ impl Worker {
                 key: None,
                 payload: Vec::new(),
                 attempt,
+                claim,
                 max_attempts: attempt,
             };
             let error = JobError::from(anyhow::anyhow!("the handler panicked"));
@@ -933,10 +1005,45 @@ impl Worker {
         }
     }
 
-    async fn heartbeat(&self, running: &Running) {
-        let held: Vec<(i64, u32)> = running.held.values().copied().collect();
-        if let Err(error) = self.queue.heartbeat(&held).await {
-            tracing::warn!(queue = %self.queue.name, %error, "renewing job heartbeats failed");
+    /// Renew the held jobs' heartbeats every third of `stale_after` until `stop`.
+    async fn heartbeat_loop(self: Arc<Self>, held: Held, stop: CancellationToken) {
+        let mut tick = tokio::time::interval(self.stale_after / 3);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = stop.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            let beats: Vec<(i64, i64)> = held
+                .lock()
+                .values()
+                .map(|&(id, claim, _)| (id, claim))
+                .collect();
+            if let Err(error) = self.queue.heartbeat(&beats).await {
+                tracing::warn!(queue = %self.queue.name, %error, "renewing job heartbeats failed");
+            }
+        }
+    }
+
+    /// Housekeeping passes until `shutdown` or `stop`.
+    async fn housekeeping_loop(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+        stop: CancellationToken,
+    ) {
+        let mut tick = tokio::time::interval(Duration::from_secs(30).min(self.stale_after / 2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = stop.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = stop.cancelled() => return,
+                () = self.housekeep() => {}
+            }
         }
     }
 
@@ -985,23 +1092,30 @@ impl Worker {
     }
 
     /// Shutdown: let running jobs finish within the grace period, then abort the rest
-    /// and put them back.
+    /// and put back those the abort cancelled. The heartbeat task keeps the held jobs
+    /// alive meanwhile.
     async fn drain(&self, mut running: Running) {
         let deadline = tokio::time::Instant::now() + self.grace;
-        let mut heartbeat = tokio::time::interval(self.stale_after / 3);
         while !running.set.is_empty() {
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => break,
-                _ = heartbeat.tick() => self.heartbeat(&running).await,
                 Some(joined) = running.set.join_next_with_id() => {
                     self.joined(&mut running, joined).await;
                 }
             }
         }
         running.set.abort_all();
-        while running.set.join_next().await.is_some() {}
-        for (_, (id, attempt)) in running.held.drain() {
-            match release(&self.queue.pool, id, attempt).await {
+        while let Some(joined) = running.set.join_next_with_id().await {
+            // A task that finished in this window recorded itself, and one that
+            // panicked is recorded as failed; only a cancelled one stays held.
+            if matches!(&joined, Err(e) if e.is_cancelled()) {
+                continue;
+            }
+            self.joined(&mut running, joined).await;
+        }
+        let cancelled: Vec<(i64, i64, u32)> = running.held.lock().drain().map(|(_, h)| h).collect();
+        for (id, claim, _) in cancelled {
+            match release(&self.queue.pool, id, claim).await {
                 Ok(true) => self.record("released", None),
                 Ok(false) => {}
                 Err(error) => {
@@ -1025,16 +1139,39 @@ impl Worker {
     }
 }
 
-#[derive(Default)]
+/// The jobs a worker's tasks hold, as `(id, claim, attempt)` by task, shared with the
+/// heartbeat task.
+#[derive(Clone, Default)]
+struct Held(Arc<Mutex<HashMap<Id, Hold>>>);
+
+/// One held job: `(id, claim, attempt)`.
+type Hold = (i64, i64, u32);
+
+impl Held {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Id, Hold>> {
+        // The map holds plain values, so a panic while it was locked left it intact.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 struct Running {
     set: JoinSet<()>,
-    /// Each task's job, as `(id, attempt)`.
-    held: HashMap<Id, (i64, u32)>,
+    held: Held,
     /// The last claim filled every free slot.
     backlog: bool,
 }
 
 impl Running {
+    fn new(held: Held) -> Self {
+        Self {
+            set: JoinSet::new(),
+            held,
+            backlog: false,
+        }
+    }
+
     fn len(&self) -> u32 {
         u32::try_from(self.set.len()).unwrap_or(u32::MAX)
     }
@@ -1142,8 +1279,8 @@ mod tests {
         assert_eq!(cut("short"), "short");
     }
 
-    #[test]
-    fn names_are_checked() {
+    #[tokio::test]
+    async fn names_are_checked() {
         let pool = sqlx::PgPool::connect_lazy("postgres://localhost/x").unwrap();
         for ok in ["emails", "a", "media.transcode-2_x"] {
             assert!(Queue::new(pool.clone(), ok).is_ok(), "{ok}");
@@ -1162,6 +1299,7 @@ mod tests {
             key: None,
             payload: b"secret".to_vec(),
             attempt: 1,
+            claim: 1,
             max_attempts: 1,
         };
         assert!(!format!("{c:?}").contains("secret"));

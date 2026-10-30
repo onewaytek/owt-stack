@@ -2551,8 +2551,11 @@ jobs.singleton("close_week", weekly, pool.clone(), 7_210_002, move || {
 
 ### Durable job queue
 
-`jobs` runs periodic work; `owt_runtime::queue` runs work items that must each
-happen once even across crashes and deploys (a message to send, a file to process).
+`jobs` runs periodic work; `owt_runtime::queue` runs work items that must survive
+crashes and deploys (a message to send, a file to process). Delivery is **at least
+once**: a crash, a stale recovery, a heartbeat lost to a database blip or a put-back at
+shutdown runs a job again, perhaps after the first run had its side effects. Handlers
+must be idempotent; the enqueue key deduplicates enqueues, not executions.
 Each job is a row of `owt_jobs`, a table the library migrates into its own ledger
 (`_owt_runtime_migrations`): await `queue::migrate(&pool)` at start, before the first
 enqueue.
@@ -2560,12 +2563,18 @@ enqueue.
 - **Enqueue** with `Queue::enqueue`, or `enqueue_in(&mut tx, ..)` inside the app's
   own transaction, so the job exists exactly when the change that wants it commits.
   `Job::key` is an idempotency key: enqueueing the same key again returns the first
-  job (`Enqueued { fresh: false, .. }`) for as long as its row lasts. `Job::delay`
-  and `Job::run_at` schedule it.
+  job (`Enqueued { fresh: false, .. }`) for as long as its row lasts, a dead job's
+  included: nothing new is queued until the dead job is discarded or redriven.
+  `Job::delay` and `Job::run_at` schedule it. A keyed `enqueue_in` needs a
+  `READ COMMITTED` transaction (the default); under `REPEATABLE READ` or
+  `SERIALIZABLE` it returns an error saying so.
 - **Claims** take due jobs oldest first with `FOR UPDATE SKIP LOCKED`, so replicas
-  never take the same job or wait on each other. Each claim counts an attempt, and
-  that attempt number fences it: a claim that went stale and was given to another
-  worker can no longer complete or fail the job.
+  never take the same job or wait on each other. Each claim counts an attempt and
+  takes the next number of the job's claim counter, which only rises. That number
+  fences the claim (`Claimed::claim`): a claim that went stale and was given to
+  another worker can no longer complete, fail, release or heartbeat the job. Fencing
+  stops a stale worker from recording a result, not from running, hence the
+  idempotence above; a `lost` outcome means the side effect may have happened twice.
 - **Retries** back off exponentially with jitter (`Retry`, default 5 attempts from
   about 10 s, capped at an hour). After the last attempt, or when the handler returns
   `JobError::permanent(..)`, the job is **dead**: kept with its payload and last error
@@ -2574,10 +2583,12 @@ enqueue.
 - **The worker** claims while it has free slots (`concurrency`), runs each job in its
   own task (a panic is a failed attempt), renews running jobs' heartbeats every third
   of `stale_after`, and puts back jobs whose heartbeat went stale on any replica (a
-  replica that died). Done jobs are purged after `retain_done` (7 days), which frees
-  their keys. On shutdown it claims nothing more, gives running jobs
-  `shutdown_grace` to finish, then aborts the rest and queues them again without
-  counting the attempt.
+  replica that died). Heartbeats and housekeeping run in tasks of their own, so a slow
+  claim or purge never delays a heartbeat. Done jobs are purged after `retain_done`
+  (7 days) in batches, which frees their keys. On shutdown it claims nothing more,
+  gives running jobs `shutdown_grace` to finish, then aborts the rest and queues them
+  again. The aborted attempt stays counted, so a handler that never returns reaches
+  `max_attempts` and the job goes dead.
 
 ```rust,no_run
 use std::time::Duration;
@@ -2602,7 +2613,7 @@ let reminders = Queue::new(pool.clone(), "reminders")?.retry(Retry {
     cap: Duration::from_hours(2),
 });
 
-// In the transaction that books the appointment: once per appointment.
+// In the transaction that books the appointment: one job per appointment.
 let mut tx = pool.begin().await?;
 let job = Job::json(&SendReminder { appointment: 42 })?
     .key("reminder:42")

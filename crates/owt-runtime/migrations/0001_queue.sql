@@ -7,8 +7,11 @@ CREATE TABLE owt_jobs (
     payload bytea NOT NULL,
     state text NOT NULL DEFAULT 'queued'
         CHECK (state IN ('queued', 'running', 'done', 'dead')),
-    -- Claims so far, the current one included; also the claim's fencing token.
+    -- Attempts so far, the current one included: the retry budget. A redrive resets it.
     attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    -- Claims so far: the fencing token. Every claim adds one; nothing lowers it, so a
+    -- claim number names one claim for the life of the row.
+    claim bigint NOT NULL DEFAULT 0 CHECK (claim >= 0),
     max_attempts integer NOT NULL CHECK (max_attempts >= 1),
     run_at timestamptz NOT NULL DEFAULT now(),
     claimed_at timestamptz,

@@ -271,7 +271,7 @@ async fn a_stale_claim_is_recovered_and_its_old_attempt_is_fenced() {
     });
     let e = q.enqueue(Job::bytes(vec![])).await.unwrap();
     let first = q.claim(1).await.unwrap().pop().unwrap();
-    assert_eq!(q.heartbeat(&[(first.id, first.attempt)]).await.unwrap(), 1);
+    assert_eq!(q.heartbeat(&[(first.id, first.claim)]).await.unwrap(), 1);
     assert_eq!(
         q.recover_stale(Duration::from_hours(1))
             .await
@@ -291,7 +291,7 @@ async fn a_stale_claim_is_recovered_and_its_old_attempt_is_fenced() {
         Failed::Lost
     );
     assert!(!q.release(&first).await.unwrap());
-    assert_eq!(q.heartbeat(&[(first.id, first.attempt)]).await.unwrap(), 0);
+    assert_eq!(q.heartbeat(&[(first.id, first.claim)]).await.unwrap(), 0);
     // Out of attempts, a stale claim is dead.
     tokio::time::sleep(Duration::from_millis(20)).await;
     let r = q.recover_stale(Duration::from_millis(1)).await.unwrap();
@@ -386,9 +386,184 @@ async fn shutdown_puts_back_a_job_that_outlasts_the_grace() {
     let (state, attempts, payload, _) = db.state(slow.id).await;
     assert_eq!(
         (state.as_str(), attempts),
-        ("queued", 0),
-        "put back, its attempt uncounted"
+        ("queued", 1),
+        "put back, its aborted attempt still counted"
     );
     assert_eq!(payload, b"slow");
+    db.drop().await;
+}
+
+async fn wait_for(q: &Queue, secs: u64, ok: impl Fn(&queue::Counts) -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        let c = q.counts().await.unwrap();
+        if ok(&c) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the queue stalled: {c:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn heartbeats_keep_a_long_job_from_being_recovered() {
+    let Some(db) = Db::new().await else { return };
+    let q = Queue::new(db.pool.clone(), "work").unwrap();
+    let job = q.enqueue(Job::bytes(b"long".to_vec())).await.unwrap();
+    let runs = Arc::new(AtomicU32::new(0));
+    let shutdown = CancellationToken::new();
+    let jobs = Jobs::new(shutdown.clone());
+    // Two replicas, each recovering stale claims every 1.5 s; the job outlasts
+    // `stale_after` by two thirds.
+    for _ in 0..2 {
+        let runs = runs.clone();
+        q.worker(move |_| {
+            let runs = runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            }
+        })
+        .poll(Duration::from_millis(20))
+        .stale_after(Duration::from_secs(3))
+        .spawn(&jobs);
+    }
+    wait_for(&q, 90, |c| c.done == 1).await;
+    let (state, attempts, _, _) = db.state(job.id).await;
+    assert_eq!((state.as_str(), attempts), ("done", 1));
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "no other replica stole it");
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), jobs.stopped())
+        .await
+        .expect("the workers stop");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_worker_never_runs_more_jobs_than_its_concurrency() {
+    let Some(db) = Db::new().await else { return };
+    let q = Queue::new(db.pool.clone(), "work").unwrap();
+    for i in 0..6_u8 {
+        q.enqueue(Job::bytes(vec![i])).await.unwrap();
+    }
+    let (now, peak) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+    let (n, p) = (now.clone(), peak.clone());
+    let shutdown = CancellationToken::new();
+    let jobs = Jobs::new(shutdown.clone());
+    q.worker(move |_| {
+        let (n, p) = (n.clone(), p.clone());
+        async move {
+            let inflight = n.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(inflight, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            n.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .concurrency(2)
+    .poll(Duration::from_millis(20))
+    .spawn(&jobs);
+    wait_for(&q, 60, |c| c.done == 6).await;
+    let peak = peak.load(Ordering::SeqCst);
+    assert!((1..=2).contains(&peak), "peak in flight was {peak}");
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), jobs.stopped())
+        .await
+        .expect("the worker stops");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn an_old_claim_cannot_touch_a_later_one_of_the_same_job() {
+    let Some(db) = Db::new().await else { return };
+    let q = Queue::new(db.pool.clone(), "mail").unwrap().retry(quick());
+    let e = q.enqueue(Job::bytes(b"p".to_vec())).await.unwrap();
+    let boom = || JobError::from(anyhow::anyhow!("zombie"));
+
+    // Released, then claimed again: the retry counter steps back, the claim does not.
+    let first = q.claim(1).await.unwrap().pop().unwrap();
+    assert!(q.release(&first).await.unwrap());
+    let second = q.claim(1).await.unwrap().pop().unwrap();
+    assert_eq!((first.attempt, second.attempt), (1, 2));
+    assert!(second.claim > first.claim);
+    assert!(!q.complete(&first).await.unwrap());
+    assert_eq!(q.fail(&first, &boom()).await.unwrap(), Failed::Lost);
+    assert!(!q.release(&first).await.unwrap());
+    assert_eq!(q.heartbeat(&[(e.id, first.claim)]).await.unwrap(), 0);
+    assert_eq!(q.heartbeat(&[(e.id, second.claim)]).await.unwrap(), 1);
+    assert_eq!(db.state(e.id).await.0, "running");
+
+    // Dead, redriven (attempts reset), claimed again.
+    assert_eq!(
+        q.fail(&second, &JobError::permanent(anyhow::anyhow!("x")))
+            .await
+            .unwrap(),
+        Failed::Dead
+    );
+    assert!(q.redrive(e.id).await.unwrap());
+    let third = q.claim(1).await.unwrap().pop().unwrap();
+    assert_eq!(third.attempt, 1);
+    assert!(third.claim > second.claim);
+    for old in [&first, &second] {
+        assert!(!q.complete(old).await.unwrap());
+        assert_eq!(q.fail(old, &boom()).await.unwrap(), Failed::Lost);
+        assert!(!q.release(old).await.unwrap());
+        assert_eq!(q.heartbeat(&[(e.id, old.claim)]).await.unwrap(), 0);
+    }
+    assert_eq!(db.state(e.id).await.0, "running");
+    assert!(q.complete(&third).await.unwrap());
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_keyed_enqueue_refuses_a_snapshot_isolation_level() {
+    let Some(db) = Db::new().await else { return };
+    let q = Queue::new(db.pool.clone(), "mail").unwrap();
+    for level in ["REPEATABLE READ", "SERIALIZABLE"] {
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET TRANSACTION ISOLATION LEVEL {level}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let err = q
+            .enqueue_in(&mut tx, Job::bytes(vec![1]).key("k"))
+            .await
+            .expect_err("refused");
+        let message = err.to_string();
+        assert!(message.contains("READ COMMITTED"), "{message}");
+        assert!(message.contains(level), "{message}");
+        tx.rollback().await.unwrap();
+
+        // Without a key nothing can collide.
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET TRANSACTION ISOLATION LEVEL {level}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        assert!(
+            q.enqueue_in(&mut tx, Job::bytes(vec![2]))
+                .await
+                .unwrap()
+                .fresh
+        );
+        tx.commit().await.unwrap();
+    }
+    let mut tx = db.pool.begin().await.unwrap();
+    assert!(
+        q.enqueue_in(&mut tx, Job::bytes(vec![3]).key("k"))
+            .await
+            .unwrap()
+            .fresh,
+        "READ COMMITTED is the default"
+    );
+    tx.commit().await.unwrap();
     db.drop().await;
 }
