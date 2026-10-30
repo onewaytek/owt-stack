@@ -9,6 +9,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
+| `owt-audit` | an append-only, hash-chained audit log: one chain per tenant, SHA-256 over a canonical encoding, triggers that refuse changes, a verifier (and its clap subcommand, feature `cli`), and anchoring of the chain heads to external write-once storage |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar, signed in as an account without Argon2; account fixtures; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -56,6 +57,7 @@ owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
+owt-audit = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
@@ -2298,6 +2300,143 @@ let social = social.on_arrival(move |arrived| {
 | Connect always lands on `?social=sign-in-again` | The session began longer ago than `connect_within`; the person signs in again first. If it repeats right after signing in, the sign-in page is not signing a signed-in person in again (it redirects them away instead). |
 | Start-up fails naming a variable | A pair half-set, `PUBLIC_BASE_URL` missing or not an `https` origin, a callback path without `{provider}` (or with another capture), or an OIDC issuer or endpoint that is not `https`. |
 
+### Audit log
+
+`owt-audit` records who did what to which record, why, and how it went, in an
+append-only table where any later change shows. Each event joins its tenant's chain
+(events with no tenant share the chain `""`): its `seq` follows the chain's last,
+its `prev` is that event's hash, and its `hash` is SHA-256 over a canonical encoding
+of all its fields (`owt_audit::canonical`). The database assigns all four as the row
+is inserted, whoever inserts it, and `record_in` checks the database's hash against
+the crate's. Triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` while they stand; only
+the tables' owner can drop or disable them, which anchoring (below) exposes. A role
+that may insert can still record false events, as it can make false changes; the log
+shows what was recorded, and that nothing recorded was altered since.
+
+```rust,no_run
+use owt_audit::{ActorKind, Audit, Event, Outcome};
+
+# async fn demo(pool: sqlx::PgPool, ip: std::net::IpAddr) -> anyhow::Result<()> {
+owt_audit::migrate(&pool).await?; // as the migration role, at start
+let audit = Audit::new(pool.clone());
+
+// A clinician opens a chart: references and codes only.
+audit
+    .record(
+        &Event::new(ActorKind::Account, "17", "record.view", "chart")
+            .tenant("practice-3")
+            .subject("patient:4821")
+            .resource_id("4821")
+            .purpose("treatment")
+            .client(Some(ip), Some("Mozilla/5.0 …"), Some("req-7f3a")),
+    )
+    .await?;
+
+// With the change it records: both commit, or neither.
+let mut tx = pool.begin().await?;
+// ... sign the note in `tx` ...
+let signed = Event::new(ActorKind::Account, "17", "note.sign", "note")
+    .tenant("practice-3")
+    .subject("patient:4821")
+    .resource_id("note:991");
+owt_audit::record_in(&mut tx, &signed).await?;
+tx.commit().await?;
+
+// Refusals are events too.
+let denied = Event::new(ActorKind::Account, "23", "record.view", "chart")
+    .tenant("practice-3")
+    .subject("patient:4821")
+    .outcome(Outcome::Denied);
+audit.record(&denied).await?;
+# Ok(()) }
+```
+
+**What goes in an event.** Ids, never content: an account id, the patient's record
+id, a resource's id, and codes (`[a-z0-9_.:-]`, up to 100) for the action, the
+resource type and the purpose of use. Never a name, a diagnosis, a note's text or a
+search term; the log is kept for years and erases nothing. The fields are short (200
+characters, a user agent 512) and `Event::check` refuses control characters and
+malformed codes; the table's own constraints refuse control characters and malformed
+addresses too. `record_in` holds its tenant's chain until the transaction ends, so
+call it last in the transaction, and the transaction must be READ COMMITTED (the
+default; the database refuses others, whose snapshot could miss the chain's last
+event).
+
+**Roles.** Run the migrations as the role that owns the schema. Give the app's role
+`INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
+or disable the triggers, which takes ownership. Only the role that runs the anchoring
+job inserts anchors, so the app cannot record a manifest of its own:
+
+```sql
+GRANT USAGE ON SCHEMA public TO myapp_app, myapp_anchor;
+GRANT SELECT, INSERT ON owt_audit_events TO myapp_app;
+GRANT SELECT ON owt_audit_anchors TO myapp_app;
+GRANT SELECT ON owt_audit_events TO myapp_anchor;
+GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
+-- Nothing else: no UPDATE, DELETE, TRUNCATE, TRIGGER or ownership.
+```
+
+**Anchoring.** The schema's owner can still drop the triggers and rewrite a chain
+from some event on, recomputing every hash after it; the chain still verifies on its
+own. So, on a schedule, write every chain's head to storage the database's owner
+cannot change: `anchor::anchor(&pool, &store)` verifies each chain since the previous
+manifest (so a broken chain is never anchored), builds a manifest of the heads
+(naming the previous manifest's digest), stores it through an `anchor::Anchor`, and
+records it in `owt_audit_anchors`; runs are serialized by an advisory lock. `verify_anchor` then fails for any chain that no longer
+holds an anchored head. `NoAnchor` records manifests in the database only, for
+development and tests; production implements `Anchor` over a bucket under a
+compliance-mode retention lock (an S3-compatible provider for that follows
+`owt-storage`). The database's copy of a manifest is checked against its recorded
+digest, but it is only as trustworthy as the roles that may insert anchors; an
+independent check verifies against the copy in the store
+(`myapp audit verify --manifest m.json`).
+
+```rust,no_run
+use std::time::Duration;
+use owt_audit::anchor::{self, NoAnchor};
+use owt_runtime::jobs::{CancellationToken, Every, Jobs};
+
+# async fn demo(pool: sqlx::PgPool) {
+let jobs = Jobs::new(CancellationToken::new());
+let p = pool.clone();
+jobs.singleton("audit_anchor", Every::new(Duration::from_hours(1)), pool.clone(), 7_210_010, move || {
+    let p = p.clone();
+    async move {
+        anchor::anchor(&p, &NoAnchor).await?; // the app's WORM store in production
+        Ok(())
+    }
+});
+# }
+```
+
+**Verifying.** `owt_audit::verify(&pool, tenant)` walks a chain and names the first
+event that was edited (`Broken::Hash`), removed (`Broken::Gap`) or swapped
+(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads. With
+the `cli` feature the app gets both as operator commands (`myapp audit verify`,
+`myapp audit verify --manifest m.json` for a manifest fetched from the store, and
+`myapp audit heads`):
+
+```rust,no_run
+use clap::{Parser, Subcommand};
+use owt_audit::cli::AuditCommand;
+
+#[derive(Parser)]
+struct Cli { #[command(subcommand)] command: Command }
+
+#[derive(Subcommand)]
+enum Command {
+    /// The audit log.
+    #[command(subcommand)]
+    Audit(AuditCommand),
+}
+
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+match Cli::parse().command {
+    Command::Audit(cmd) => owt_audit::cli::run(&pool, cmd).await?,
+}
+# Ok(()) }
+```
+
 ### Change requests
 
 `owt-change` lets a site's signed-in admins ask for a change from the page itself. A
@@ -3896,6 +4035,13 @@ this command, run when the app adopts a release, is the only thing that moves it
   dashboards and load-test reports keep their names.
 - **Bus channel names** (`<prefix>:<topic>`, `~changed`, `~beat`) are a wire format
   between replicas. Changing one is a rollout hazard: old and new replicas must agree.
+- **One audit chain per tenant**, not one global chain. Appends to a chain are
+  serialized, so a global chain would make every tenant's writes wait on one lock;
+  per tenant, they never wait on each other. A tenant's chain verifies and exports
+  on its own, without revealing other tenants' events, and a tenant's log can be
+  handed over or retired at the end of its contract without breaking anyone else's.
+  What a global chain adds, evidence across tenants, comes from anchoring: each
+  manifest holds every chain's head and names the previous manifest.
 - **OpenShift Template, not Kustomize**, for the deployment: the app's name must reach
   the image trigger annotation and the CNPG Secret's name, which Kustomize's name
   transformers do not rewrite.
@@ -4190,7 +4336,7 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `fix(web): Drop the cache` does not; an app without a commitlint configuration of
 its own is checked by the same rules (`commitlint.config.mjs`). Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
-`accounts`, `change`, `tailwind`, `deps`, `release` (release-please and its configuration).
+`accounts`, `audit`, `change`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it

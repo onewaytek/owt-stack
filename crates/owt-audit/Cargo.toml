@@ -1,0 +1,31 @@
+[package]
+name = "owt-audit"
+description = "Append-only, hash-chained audit events for apps on owt-stack: one chain per tenant, SHA-256 over a canonical encoding, Postgres triggers that refuse changes, a verifier, and anchoring of the chain heads to external write-once storage."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# `cli::AuditCommand`, the verifier as a clap `Subcommand` an app nests in its own CLI.
+cli = ["dep:clap"]
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, optional = true }
+futures.workspace = true
+owt-runtime = { workspace = true, default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
