@@ -212,13 +212,13 @@ async fn latest_in(conn: &mut sqlx::PgConnection) -> anyhow::Result<Option<(Mani
             let stored: Hash = digest.as_slice().try_into().ok()?;
             (m.format == FORMAT && m.digest() == stored).then_some((m, stored))
         });
-        match valid {
-            Some(found) => return Ok(Some(found)),
-            None => tracing::warn!(
-                id,
-                "an audit anchor's manifest does not match its digest; skipped"
-            ),
+        if let Some(found) = valid {
+            return Ok(Some(found));
         }
+        tracing::warn!(
+            id,
+            "an audit anchor's manifest does not match its digest; skipped"
+        );
     }
     Ok(None)
 }
