@@ -256,6 +256,80 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
 }
 ```
 
+**Idle timeout and lifetimes.** Three limits end a session, and an app handling
+health data sets all three: `max_age` (how long a cookie lives without being
+resealed), `absolute_lifetime` (from sign-in, however active: 30 days unless set),
+and `idle_timeout` (since the person's last activity). Revocation is the epoch above:
+`sign_out_everywhere`, a password change or a deactivation moves the account's
+`session_epoch`, and the validator refuses every session sealed under the old one on
+its next request, on every replica.
+
+With `idle_timeout`, the cookie also carries the last-active time. Activity (a
+request that carries the session, is not passive and does not fail) refreshes it at
+most once per `idle_refresh` (a tenth of the timeout, at least 15 s, by default;
+never more than half the timeout), so a busy page does not rewrite a cookie on every
+request, and a session ends between the timeout less one refresh and the timeout
+after the last activity, give or take the replicas' clock skew. An activity-only
+refresh sets a second cookie (`<name>-seen`), sealed and bound to the session's id,
+and leaves the session cookie alone: a slow request in one tab cannot put back a
+session another tab has since signed out of. Activity alone does not extend `max_age`: the
+session cookie's own expiry moves only when a handler changes the session, so set
+`max_age` to the longest working day the app allows, and let the idle timeout end
+sessions sooner.
+
+A session past the timeout is no session: its cookies are removed, and
+`Session::idle_expired()` is true for that request, so a guard on the app's pages
+can redirect to `/login?reason=idle` (the next request carries no cookie to tell).
+A request with `owt-passive: 1` (`session::PASSIVE_HEADER`), or whose handler calls
+`Session::passive()`, is not activity, so a poll cannot keep an unattended screen
+signed in. Every response to a request whose session stands carries
+`owt-idle-remaining: <seconds>` (`session::IDLE_REMAINING_HEADER`), with
+`Cache-Control: no-store` and `Vary: cookie`, since the value is one person's.
+
+Turning the timeout on ends every session older than it (a cookie sealed without the
+last-active time counts from its sign-in), and replicas without it drop the time
+when they reseal: enable it once every replica runs a build that knows it.
+
+```rust,no_run
+use std::time::Duration;
+use axum::{Router, routing::get};
+use owt_web::session::{Session, Sessions};
+
+# #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+# struct SessionData {}
+# fn demo(key: cookie::Key) -> (Sessions<SessionData>, Router) {
+let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_hours(12), true)
+    .absolute_lifetime(Duration::from_hours(12))
+    .idle_timeout(Duration::from_mins(15));
+
+// The page polls this (passively) and shows a warning in the last two minutes.
+let routes = Router::new().route("/session/idle", get(|session: Session<SessionData>| async move {
+    session.passive();
+    match session.idle_remaining() {
+        Some(left) if left <= Duration::from_mins(2) => format!(
+            r#"<div role="alert">Signing you out in {} s for inactivity.
+               <button hx-post="/session/stay" hx-swap="none">Stay signed in</button></div>"#,
+            left.as_secs()
+        ),
+        _ => String::new(),
+    }
+}))
+// Any request that is not passive extends the session; this one does nothing else.
+.route("/session/stay", axum::routing::post(|| async { "" }));
+# (sessions, routes) }
+```
+
+The poller is a sibling of the warning it fills, so the "Stay signed in" button
+does not inherit its passive header (htmx inherits `hx-headers` from ancestors), and
+its click counts as activity. Cross-origin protection needs no token here (see
+"Decisions").
+
+```html
+<span hx-get="/session/idle" hx-trigger="every 30s" hx-target="#idle-warning"
+      hx-headers='{"owt-passive": "1"}'></span>
+<div id="idle-warning" aria-live="polite"></div>
+```
+
 **The same stack as a builder.** `owt_web::stack::Stack` applies these layers, and the
 rest of the order the prose above implies, in the one correct order, so an app does not
 re-derive it (axum runs the layers in the reverse of the order they are written, and a

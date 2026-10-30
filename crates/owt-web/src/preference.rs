@@ -53,7 +53,7 @@ pub enum BadName {
     #[error("the allowed values must be a non-empty set of plain cookie values")]
     Allowed,
     /// The session's cookie, or the same name without its `__Host-`/`__Secure-` prefix.
-    #[error("{0:?} is the session cookie's name")]
+    #[error("{0:?} is the name of the session's cookie or its last-active cookie")]
     Session(String),
 }
 
@@ -94,7 +94,8 @@ fn is_value(v: &str) -> bool {
 impl Preference {
     /// A preference cookie `name` that holds one of `allowed`, kept for `max_age`
     /// (at most [`MAX_AGE`], at least a second). `session_cookie` is the session's
-    /// cookie name (`Sessions::cookie_name`); the name must differ from it. `allowed`
+    /// cookie name (`Sessions::cookie_name`); the name must differ from it and from
+    /// its last-active cookie, `<session>-seen`. `allowed`
     /// is not empty and holds plain cookie values (letters, digits, `-`, `_`, ...).
     pub fn new(
         name: &str,
@@ -108,7 +109,10 @@ impl Preference {
         if allowed.is_empty() || !allowed.iter().all(|v| is_value(v)) {
             return Err(BadName::Allowed);
         }
-        if bare(name) == bare(session_cookie) {
+        // The session's last-active cookie (`<session>-seen`) is the session's too.
+        let bare_name = bare(name);
+        let session = bare(session_cookie);
+        if bare_name == session || bare_name == format!("{session}-seen") {
             return Err(BadName::Session(name.to_owned()));
         }
         Ok(Self {
@@ -265,6 +269,10 @@ mod tests {
             );
         }
         assert!(matches!(ok("__Host-sid", "sid"), Err(BadName::Session(_))));
+        assert!(matches!(
+            ok("sid-seen", "__Host-sid"),
+            Err(BadName::Session(_))
+        ));
         assert!(ok("__Host-theme", "__Host-session").is_ok());
     }
 
