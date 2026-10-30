@@ -1,6 +1,6 @@
 [package]
 name = "owt-runtime"
-description = "Process plumbing apps on owt-stack share: configuration from the environment, logging and tracing, Prometheus metrics, the Postgres pool and locked migrations, background jobs across replicas, serving with graceful shutdown."
+description = "Process plumbing apps on owt-stack share: configuration from the environment, logging and tracing, Prometheus metrics, the Postgres pool and locked migrations, background jobs across replicas, a durable job queue, serving with graceful shutdown."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
