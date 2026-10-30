@@ -1,7 +1,12 @@
 //! Authentication apps on owt-stack share.
 //!
 //! * [`password`]: Argon2id hashing off the async runtime, a bounded number at once.
-//! * [`throttle`]: budgets for sign-in attempts, by address and by account.
+//! * [`password::Policy`]: what a new password must satisfy (NIST SP 800-63B), with an
+//!   offline breached-password check.
+//! * [`totp`] and [`recovery`]: the second factor, a six-digit authenticator code and
+//!   the single-use codes for a lost authenticator.
+//! * [`throttle`]: budgets for sign-in attempts, by address and by account; with the
+//!   `redis` feature, counted in Redis so they hold across replicas.
 //! * [`bots`]: a guard for anonymous forms: a honeypot, Turnstile, and a budget per
 //!   address, answering bots as if they were people.
 //! * [`oauth`]: the authorization-code flow (with PKCE where the provider supports
@@ -17,7 +22,9 @@ pub mod bots;
 pub mod jwt;
 pub mod oauth;
 pub mod password;
+pub mod recovery;
 pub mod throttle;
+pub mod totp;
 
 /// `len` URL-safe random characters (RFC 3986 unreserved): states and verifiers.
 pub(crate) fn random_token(len: usize) -> String {

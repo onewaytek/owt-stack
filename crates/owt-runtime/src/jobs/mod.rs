@@ -304,7 +304,7 @@ impl Jobs {
         let _ = (name, outcome, took);
     }
 
-    fn spawn<F>(&self, fut: F)
+    pub(crate) fn spawn<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
