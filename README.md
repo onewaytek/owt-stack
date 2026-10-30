@@ -79,7 +79,9 @@ owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 view models an `example()` each, for an app's tests of its own templates, and
 `policies::agree_to_current` for fixtures (`owt-test` turns it on).
 `owt-auth`'s: `jwt` (default) for bearer-token verification, which brings `rsa` and an
-audit ignore (see "Authentication").
+audit ignore (see "Authentication"); `redis` for a sign-in throttle counted in Redis, so
+its budgets hold across replicas (see "Authentication"). The TOTP, recovery-code and
+password-policy modules need no feature.
 
 A shared crate is only shared while the majors agree: an app that names `axum`, `sqlx`,
 `askama` or `redis` directly must use the major in this workspace's `Cargo.toml`.
@@ -953,9 +955,11 @@ if !throttle.sign_in(ip, account) {
 }
 // Argon2id on the blocking pool, a bounded number at once. An unknown account
 // (`None`) costs a real check too, so timing does not tell which accounts exist.
-if password::verify_or_decoy(given, stored_hash).await {
-    // A hash made with weaker parameters than today's: store a fresh one.
-    if stored_hash.is_some_and(password::needs_rehash) {
+let checked = password::check_or_decoy(given, stored_hash).await;
+if checked.matched() {
+    // A hash made with weaker parameters than today's, or of the password as typed
+    // before passwords were normalized (`Check::MatchRaw`): store a fresh one.
+    if checked == password::Check::MatchRaw || stored_hash.is_some_and(password::needs_rehash) {
         let _new_hash = password::hash(given).await?;
     }
     // Then `session.cycle_id()` before storing who signed in: a session id fixed
@@ -1175,6 +1179,142 @@ match guard.check(ip, &form.company_url, &form.token).await {
     _ => { /* render the form again: "please try the check again" */ }
 }
 # let _ = form.message;
+# Ok(())
+# }
+```
+
+#### A password policy, a second factor and a throttle across replicas
+
+`password::Policy` is NIST SP 800-63B-4's rules for a new password (a sign-up, a change,
+a reset), not for a sign-in: a stored password that no longer passes is not refused.
+Revision 4 sets the minimum by use: **15 characters** when the password is the only
+authenticator (`Policy::single_factor()`), **8** only as one factor of a pair. `Policy::new()`
+is 8, so use it only where every account it covers must have a second factor; raise
+either with `min_len`. At most 128, counted in Unicode code points after NFKC
+normalization (`password::hash` and `verify` normalize too, so a composed and a decomposed
+`é` are one password, and hashes made before that still open and are reported by
+`password::check` as `Check::MatchRaw`, to be rehashed); every character allowed,
+spaces included; **no composition rules and no expiry** (see "Decisions"). It refuses a
+password that contains the username, the email's name part or a word the app lists, and
+one in a breached-password corpus the app supplies. The check is offline: no password,
+and no prefix of its hash, ever leaves the process.
+
+```rust,no_run
+# fn demo(new_password: &str) -> anyhow::Result<()> {
+use owt_auth::password::{Bloom, Context, Policy, Refusal, SortedHashes};
+
+// The corpus is a file of SHA-1 hex lines, `HASH` or `HASH:count`: the Pwned Passwords
+// download (sorted, ~30 GB for all of it), or the top of it. `SortedHashes` reads the
+// file into memory at 20 bytes a hash and answers exactly (200 MB for 10 million
+// passwords). `Bloom` is 3.6 bytes a hash at a one in a million false-positive rate (a
+// good password sometimes refused, a breached one never accepted); build it once, offline.
+Bloom::build_from_file("pwned-sha1.txt", 1e-6)?.save("pwned.bloom")?;
+let _exact = SortedHashes::open("pwned-sha1.txt")?;
+
+// At start, then in the app's state.
+let policy = Policy::new().min_len(12).breached(Bloom::load("pwned.bloom")?);
+
+let ctx = Context::new()
+    .username("ann")
+    .email("ann.lee@example.com")
+    .word("Sunrise Clinic");
+if let Err(refusals) = policy.check(new_password, &ctx) {
+    // Each `Refusal` displays as a sentence a form can show.
+    let messages: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+    let _too_short = refusals.contains(&Refusal::TooShort { min: 12 });
+    println!("{}", messages.join(" "));
+}
+# Ok(())
+# }
+```
+
+`totp` is the six-digit code an authenticator app shows (RFC 6238: HMAC-SHA1, 30
+seconds, the parameters every app implements). `Secret::generate()` is 20 bytes from
+the operating system, zeroed on drop, with a `Debug` that prints nothing; store its
+bytes sealed. `verify` accepts the current step and one either side, compares in
+constant time, and refuses any step at or before `last_used_step`: it returns the
+matched step, which the app stores with the sign-in so that a code works once. Throttle
+the attempts per account (below): six digits are a one in a million guess.
+
+```rust,no_run
+# fn demo(now: std::time::SystemTime, typed: &str, stored: &[u8], last_step: Option<u64>) {
+use owt_auth::totp::{self, Secret};
+
+// Enrollment: show the secret once (QR code of the URI, or the base32 to type in),
+// and store `secret.as_bytes()` only after a first code verifies.
+let secret = Secret::generate().unwrap();
+let _uri = totp::otpauth_uri("Acme Health", "ann@example.com", &secret);
+let _typed_in = secret.to_base32();
+
+// Sign-in: the matched step is stored as `last_used_step`, in the transaction that
+// signs the person in; a replay of the same code finds it spent.
+let secret = Secret::from_bytes(stored).unwrap();
+if let Some(step) = totp::verify(&secret, typed, now, last_step) {
+    let _store_this = step;
+}
+# }
+```
+
+`recovery` makes the codes for a lost authenticator: ten characters of Crockford
+base32 (50 bits), shown once as `XXXXX-XXXXX`, stored as Argon2id hashes through the
+password hasher. Argon2id rather than a peppered HMAC: at 50 bits a bare fast hash is too weak
+to store, a pepper is one more secret to hold and rotate, and the memory-hard hash
+needs nothing beyond the table. `find_match` normalizes what was typed (case, hyphens,
+spaces, `I` and `L` as `1`, `O` as `0`) and says which stored hash it matches. **Single use is the
+caller's:** pass only unused hashes, and mark the row used with a conditional update
+(`UPDATE … SET used_at = now() WHERE id = $1 AND used_at IS NULL`), signing in only if it
+changed a row.
+
+```rust,no_run
+# async fn demo(typed: &str, unused: Vec<(i64, String)>) -> anyhow::Result<()> {
+use owt_auth::recovery;
+
+// Enrollment: show `code`s once; store the `hash`es.
+let codes = recovery::generate(recovery::DEFAULT_COUNT).await?;
+let _show_once: Vec<&str> = codes.iter().map(|c| c.code.as_str()).collect();
+let _store: Vec<&str> = codes.iter().map(|c| c.hash.as_str()).collect();
+
+// Sign-in: which unused code, if any, was typed.
+let hashes: Vec<&str> = unused.iter().map(|(_, hash)| hash.as_str()).collect();
+if let Some(i) = recovery::find_match(typed, &hashes).await {
+    let _row_to_mark_used = unused[i].0;
+}
+# Ok(())
+# }
+```
+
+`throttle::shared::SharedThrottle` (the `redis` feature) is `Throttle` counted in Redis, so
+a budget holds across replicas instead of multiplying by their number. It has the same
+budgets and keys, in the same order, charged before the password is checked; its calls
+are async and return a `Refusal`. Counters are fixed windows in one Lua script (a window never slides, and a budget spent
+at the end of one and again at the start of the next gives twice it within moments), and an
+account's name is stored as a hash. Keys carry `{prefix}` as a hash tag, so it works on Redis
+Cluster; the counters expire, so the Redis needs `maxmemory-policy noeviction` (or to be
+its own), as the leases do. **When Redis
+fails, sign-in fails closed** (`Refusal::Unavailable`: answer 503, not "too many
+attempts"): the throttle is all that bounds online guessing, and an outage that locks
+people out is a better failure for health records than one that lets an attacker guess;
+`FailMode::Open` reverses it. `on_lockout` is called once per window when an account
+crosses its limit, the moment to email its owner.
+
+```rust,no_run
+# async fn demo(url: &str, ip: std::net::IpAddr, account: &str) -> anyhow::Result<()> {
+use owt_auth::throttle::{Budgets, shared::{FailMode, Refusal, SharedThrottle}};
+
+// The prefix is the deployment's, as for `Cache`, `Leases` and `Bus`.
+let throttle = SharedThrottle::connect(url, "myapp", Budgets::default())
+    .await?
+    .fail_mode(FailMode::Closed) // the default
+    .on_lockout(|lockout| {
+        // Queue "someone is trying to sign in to your account" for `lockout.account`.
+        eprintln!("sign-ins locked: {}", lockout.account);
+    });
+
+match throttle.sign_in(ip, account).await {
+    Ok(()) => { /* check the password */ }
+    Err(Refusal::Unavailable) => { /* 503, and page whoever runs Redis */ }
+    Err(_) => { /* 429 */ }
+}
 # Ok(())
 # }
 ```
@@ -4648,6 +4788,25 @@ this command, run when the app adopts a release, is the only thing that moves it
   is re-sealed, and a response that sets the cookie is never cacheable.
 - **Fragments have their own URLs.** Nothing varies by request header, so every
   response stays cacheable behind a CDN that ignores `Vary`.
+- **Password policy: NIST SP 800-63B-4, not folklore.** 15 characters at least for a password
+  that signs in alone (`Policy::single_factor`), 8 only where a second factor is required
+  (`Policy::new`), configurable upward with `Policy::min_len`; 128 at most, never under 64; counted in code points after NFKC. Every
+  character is allowed, spaces included. **No composition rules** (a mix of cases,
+  digits and symbols yields `Password1!`, and 800-63B-4 §3.1.1.2 says verifiers SHOULD NOT
+  impose them) and **no periodic expiry** (SHOULD NOT require arbitrary change: forced
+  rotation yields `Summer2026`, then `Autumn2026`; change on evidence of compromise).
+  Passwords are refused for being in a breach corpus, or containing the username, the
+  email's name part or a context word (of four characters or more, so `ed` does not
+  ban a great many good passwords). The breach check is offline, against a file the
+  app ships: the Pwned Passwords range API would send a hash prefix of every new
+  password to a third party. A `Bloom` filter's errors fail safe (a good password
+  refused, never a breached one accepted).
+- **Recovery codes are Argon2id hashes**, not a peppered HMAC: 50 bits is too little for
+  a fast hash, and a pepper is a secret to keep and rotate; the table alone then
+  protects them.
+- **The shared throttle fails closed.** If Redis is unreachable, sign-in is refused
+  (`Refusal::Unavailable`) rather than allowed unthrottled: the throttle is the only
+  bound on online guessing. `FailMode::Open` is the app's choice to make.
 - **Library code holds no `query!` macros**, so it needs no `.sqlx/` metadata and builds
   offline anywhere.
 - **Metric names belong to the app.** The library takes them as arguments, so an app's
@@ -4681,6 +4840,10 @@ The router example under "Wiring an app" composes the layers; beyond it:
   refused sign-in checks no password), keyed on `client_ip::Source::client_ip`
   (configured for the proxies actually in front of the app), and
   `redirect::local_or` on `?next=` before redirecting to it (see "Authentication").
+- Passwords and second factors: `password::Policy` on every new password (see
+  "Authentication"), and on a system holding health records `totp` or a passkey on top,
+  `SharedThrottle` once there is more than one replica, and the TOTP secret sealed at
+  rest.
 - Anonymous forms: `owt_auth::bots::Guard` (see "Anonymous forms"); a form anyone can
   post, with no budget, is a free write into the database or an inbox.
 - OAuth: use `owt_accounts::social` rather than hand-written handlers (see "Sign-in
