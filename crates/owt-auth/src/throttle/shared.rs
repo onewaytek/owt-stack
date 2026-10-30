@@ -9,13 +9,24 @@
 //! * **Calls are async and return a [`Refusal`]**, not a `bool`, so a caller can tell a
 //!   spent budget from an unreachable Redis.
 //! * **Fixed windows.** Each budget is a counter that `INCR`s and expires a window after
-//!   its first hit, in one Lua script, so concurrent replicas cannot race. A fixed
-//!   window allows up to twice its budget across a boundary; the in-process throttle
-//!   refills evenly instead. Refused attempts count too, so a client that keeps
-//!   hammering keeps its window shut until it stops for a whole window.
+//!   its *first* hit, in one Lua script, so concurrent replicas cannot race. The window
+//!   never slides: refused attempts are counted but do not extend it, and a client gets a
+//!   fresh full budget when it ends, however hard it hammered. A client that spends a
+//!   budget at the end of one window and again at the start of the next gets twice it
+//!   within moments (10 guesses in a second at 5 a minute); the in-process throttle
+//!   refills evenly instead. Size budgets with that in mind.
 //! * **Nothing readable is stored.** An account's key is the SHA-256 of its name, so an
 //!   email address (a patient's, perhaps) never sits in Redis; an address is stored as
 //!   itself, which is the same data the access log holds.
+//!
+//! # Redis topology
+//!
+//! Every key carries the deployment prefix as a hash tag (`{prefix}:throttle:...`), so
+//! the three keys of one sign-in live in one slot and the script runs on Redis Cluster
+//! as it does on one node. The counters have TTLs, so an eviction policy that drops
+//! expiring keys under memory pressure (`allkeys-lru`, `volatile-lru`, `volatile-ttl`)
+//! silently resets budgets, a throttle bypass. Use an instance with
+//! `maxmemory-policy noeviction` (as `owt_runtime`'s leases need), or a dedicated one.
 //!
 //! # When Redis fails
 //!
@@ -209,7 +220,7 @@ impl SharedThrottle {
     }
 
     fn key(&self, kind: &str, name: &str) -> String {
-        format!("{}:throttle:{kind}:{name}", self.prefix)
+        format!("{{{}}}:throttle:{kind}:{name}", self.prefix)
     }
 
     fn account_slot(account: &str) -> String {
@@ -494,7 +505,7 @@ mod tests {
         t.sign_in(ip(1), "patient@example.com").await.unwrap();
         let mut conn = t.redis.clone();
         let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(format!("{}:*", t.prefix))
+            .arg(format!("{{{}}}:*", t.prefix))
             .query_async(&mut conn)
             .await
             .unwrap();

@@ -6,8 +6,9 @@
 //! resistance, and the apps ignore any other algorithm named in the URI.)
 //!
 //! A [`Secret`] is 20 random bytes from the operating system's generator, wrapped in
-//! `Zeroizing` so the memory is wiped when it drops, with a `Debug` that prints nothing
-//! of it. Show the person [`Secret::to_base32`] or [`otpauth_uri`] (for a QR code) once,
+//! `Zeroizing` so the memory is wiped when it drops (as are the copies made decoding
+//! base32 and the HMAC key schedule), a constant-time `==`, and a `Debug` that prints
+//! nothing of it. Show the person [`Secret::to_base32`] or [`otpauth_uri`] (for a QR code) once,
 //! at enrollment; store the bytes sealed at rest.
 //!
 //! [`verify`] accepts the current step and one either side (clock skew), compares in
@@ -39,8 +40,17 @@ pub const SECRET_BYTES: usize = 20;
 const KEY_LEN: std::ops::RangeInclusive<usize> = 16..=64;
 
 /// A TOTP shared secret. Dropping it zeroes its memory; `Debug` redacts it.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Secret(Zeroizing<Vec<u8>>);
+
+impl PartialEq for Secret {
+    /// In constant time for secrets of one length.
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && bool::from(self.0.ct_eq(&other.0))
+    }
+}
+
+impl Eq for Secret {}
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -108,8 +118,8 @@ fn base32_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn base32_decode(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 5 / 8);
+fn base32_decode(text: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(text.len() * 5 / 8));
     let (mut buf, mut bits) = (0u32, 0u32);
     for c in text.trim_end_matches('=').chars() {
         if c == ' ' || c == '-' {
@@ -366,9 +376,9 @@ mod tests {
             (b"foobar", "MZXW6YTBOI"),
         ] {
             assert_eq!(base32_encode(raw), enc);
-            assert_eq!(base32_decode(enc).unwrap(), raw);
+            assert_eq!(*base32_decode(enc).unwrap(), raw);
         }
-        assert_eq!(base32_decode("mzxw 6ytb-OI====").unwrap(), b"foobar");
+        assert_eq!(*base32_decode("mzxw 6ytb-OI====").unwrap(), b"foobar");
         assert_eq!(base32_decode("MZXW1"), None, "1 is not in the alphabet");
         assert_eq!(base32_decode("MZ"), None, "non-zero trailing bits");
         let s = secret();

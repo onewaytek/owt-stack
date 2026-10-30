@@ -24,7 +24,7 @@ argon2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
 governor.workspace = true
-hmac.workspace = true
+hmac = { workspace = true, features = ["zeroize"] }
 jsonwebtoken = { workspace = true, features = ["rust_crypto"], optional = true }
 rand.workspace = true
 redis = { workspace = true, optional = true, features = ["script"] }
