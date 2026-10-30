@@ -3160,8 +3160,10 @@ the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
 (0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The
 read-only `verify` job checks the layer's paths and modes and that the base has
-`base-requires` and a glibc at least as new as the binary needs. The `push` job confirms the layer is the one verified and runs
-none of the app's code and alone holds `packages: write` while it builds: with
+`base-requires` and a glibc at least as new as the binary needs. The `push` job
+confirms the layer is the one verified and runs none of the app's code; of the
+`crane` builder's jobs it alone holds `packages: write` (the `docker` builder's job
+and `attest` hold it too): with
 [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) (pinned
 by version and SHA-256) appends the layer to the base pinned by its linux/amd64
 digest, sets the configuration, pushes by digest, reads the version label back and
@@ -3193,38 +3195,46 @@ the template's:
 
 **Supply chain:** each image is scanned, signed and given an SBOM.
 
-- **Scan:** a `scan` job assembles the image as `push` would make it (the base pinned
-  by digest, the layer on top) and runs [grype](https://github.com/anchore/grype) on
-  it before `push` runs, so a finding of `vuln-fail-on` severity or worse (`critical`
-  by default) pushes and tags nothing. `vuln-fail-on: none` still prints the findings
-  and never fails. The `docker` builder pushes in the same step it builds, so its image
-  is scanned right after the push; the job fails but the image is already in ghcr,
-  unsigned and without an SBOM. A finding with no fix, or a false positive, is waived
-  in the file `vuln-ignore-file` names (`.grype.yaml`):
+- **Scan:** grype runs before anything is pushed, so a finding of `vuln-fail-on`
+  severity or worse (`critical` by default) pushes and tags nothing. With `crane`, a
+  `scan` job assembles the image as `push` would make it (the base pinned by digest,
+  the layer on top) and `push` waits for it. With `docker`, the Dockerfile is first
+  built into the runner's daemon and scanned there, and only then built again, from
+  the same cache, and pushed with its tags. `vuln-fail-on: none` still prints the
+  findings and never fails; any other value than `negligible`, `low`, `medium`,
+  `high`, `critical` or `none` fails the job. grype reads exactly the configuration
+  `vuln-ignore-file` names, and none when it is empty: a `.grype.yaml` in the
+  repository is not picked up unasked. A finding with no fix, or a false positive,
+  is waived in that file:
 
   ```yaml
-  # .grype.yaml
+  # .grype.yaml, named by vuln-ignore-file
   ignore:
     - vulnerability: CVE-2026-0001   # a finding id
     - fix-state: not-fixed           # or every finding that has no fix yet
   ```
 - **Signature:** the `attest` job signs the pushed digest, never a tag, with
   [cosign](https://github.com/sigstore/cosign) keyless: the run's OIDC token, which
-  Sigstore exchanges for a short-lived certificate naming the workflow, and a record in
-  the public transparency log. Verify it with
-  `cosign verify ghcr.io/<owner>/<repo>@<digest> --certificate-identity-regexp
-  '^https://github.com/<owner>/<repo>/' --certificate-oidc-issuer
-  https://token.actions.githubusercontent.com`.
+  Sigstore exchanges for a short-lived certificate, and a record in the public
+  transparency log. The certificate's identity is the reusable workflow, not the
+  app's workflow, and the app's repository is its source repository:
+
+  ```sh
+  cosign verify ghcr.io/<owner>/<app>@<digest> \
+    --certificate-identity-regexp '^https://github.com/onewaytek/owt-stack/\.github/workflows/image\.yml@' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-github-workflow-repository <owner>/<app>
+  ```
 - **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
-  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact and attaches it
-  to the image as a signed attestation
-  (`cosign verify-attestation --type spdxjson ...`, with the identity flags above).
+  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact and attaches
+  it to the image as a signed attestation (`cosign verify-attestation --type
+  spdxjson ...`, with the same identity flags).
 
 The caller's job therefore grants `id-token: write` besides `packages: write`
-(`permissions: {contents: read, packages: write, id-token: write}`): a reusable workflow
-cannot take a permission its caller withholds, and a caller that grants less fails to
-start, `attest: false` or not. `attest: false` skips the signature and the SBOM, not
-the scan.
+(`permissions: {contents: read, packages: write, id-token: write}`): a reusable
+workflow cannot take a permission its caller withholds, and a caller that grants
+less fails to start, `attest: false` or not. `attest: false` skips the signature and
+the SBOM, not the scan.
 
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust

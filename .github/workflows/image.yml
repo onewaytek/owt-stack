@@ -38,9 +38,10 @@ name: Image
 # - `docker` builds the app's Dockerfile with BuildKit on a GitHub-hosted runner, for
 #   an image the inputs cannot describe. The ARC runners have no Docker daemon.
 #
-# Supply chain, for either builder: a `scan` job (grype) fails the run on a
-# vulnerability of `vuln-fail-on` severity or worse, critical by default, before
-# `push` pushes the crane image (the docker builder is scanned right after its push).
+# Supply chain, for either builder: grype fails the run on a vulnerability of
+# `vuln-fail-on` severity or worse, critical by default, before
+# anything is pushed: the crane image before `push` runs, the docker builder's before
+# its push step.
 # The `attest` job then signs the pushed digest with cosign, keyless through the
 # run's OIDC token, and attaches a syft SBOM (SPDX JSON) to the image as an
 # attestation and to the run as an artifact. The caller grants `id-token: write` and
@@ -618,14 +619,29 @@ jobs:
         with:
           ref: ${{ needs.build.outputs.commit }}
           persist-credentials: false
-      - name: The ignore file is in the checkout
-        if: ${{ inputs.vuln-ignore-file != '' }}
+      - name: Scan configuration
+        env:
+          IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
+          FAIL_ON: ${{ inputs.vuln-fail-on }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
-            echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+          case "$FAIL_ON" in
+            negligible|low|medium|high|critical|none) ;;
+            *) echo "::error::vuln-fail-on must be negligible, low, medium, high, critical or none ('$FAIL_ON')"; exit 1 ;;
+          esac
+          # An explicit configuration in every job, so a .grype.yaml in the checkout
+          # (or the runner's home) is never picked up unasked.
+          config="$RUNNER_TEMP/grype.yaml"
+          if [ -n "$IGNORE_FILE" ]; then
+            if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
+              echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+            fi
+            config="$GITHUB_WORKSPACE/$IGNORE_FILE"
+          else
+            echo '{}' > "$config"
           fi
+          echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: image-layer
@@ -656,7 +672,7 @@ jobs:
           severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
           fail-build: ${{ inputs.vuln-fail-on != 'none' }}
           output-format: table
-          config: ${{ inputs.vuln-ignore-file }}
+          config: ${{ env.GRYPE_CONFIG }}
 
   push:
     needs: [build, verify, scan]
@@ -950,6 +966,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Built into the runner's daemon first and scanned there; nothing reaches ghcr
+      # (no digest, no floating tag) until the scan passes. The push below rebuilds from
+      # the same cache.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: false
+          load: true
+          tags: image-scan:local
+          platforms: linux/amd64
+          build-args: VERSION=${{ env.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Scan configuration
+        env:
+          IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
+          FAIL_ON: ${{ inputs.vuln-fail-on }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$FAIL_ON" in
+            negligible|low|medium|high|critical|none) ;;
+            *) echo "::error::vuln-fail-on must be negligible, low, medium, high, critical or none ('$FAIL_ON')"; exit 1 ;;
+          esac
+          # An explicit configuration in every job, so a .grype.yaml in the checkout
+          # (or the runner's home) is never picked up unasked.
+          config="$RUNNER_TEMP/grype.yaml"
+          if [ -n "$IGNORE_FILE" ]; then
+            if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
+              echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+            fi
+            config="$GITHUB_WORKSPACE/$IGNORE_FILE"
+          else
+            echo '{}' > "$config"
+          fi
+          echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
+      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: image-scan:local
+          severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
+          fail-build: ${{ inputs.vuln-fail-on != 'none' }}
+          output-format: table
+          config: ${{ env.GRYPE_CONFIG }}
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -960,31 +1020,6 @@ jobs:
           tags: ${{ steps.tags.outputs.list }}
           build-args: VERSION=${{ env.VERSION }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
-      # The Dockerfile's image is built and pushed in one step, so it is scanned after
-      # the push; a finding fails the job, and attest (needs this job) then neither
-      # signs the image nor attaches an SBOM.
-      - name: The ignore file is in the checkout
-        if: ${{ inputs.vuln-ignore-file != '' }}
-        env:
-          IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
-            echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
-          fi
-      - name: Image reference
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}" >> "$GITHUB_ENV"
-      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
-        with:
-          image: registry:${{ env.IMAGE }}
-          severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
-          fail-build: ${{ inputs.vuln-fail-on != 'none' }}
-          output-format: table
-          config: ${{ inputs.vuln-ignore-file }}
 
   # The pushed image, by digest: an SBOM (syft, SPDX JSON) kept as a workflow artifact and
   # attached to the image as a cosign attestation, and a keyless cosign signature (the
@@ -998,7 +1033,6 @@ jobs:
     needs: [push, docker]
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
-      contents: read
       packages: write
       id-token: write
     env:

@@ -549,14 +549,29 @@ jobs:
         if: ${{ inputs.vuln-ignore-file != '' }}
         with:
           persist-credentials: false
-      - name: The ignore file is in the checkout
-        if: ${{ inputs.vuln-ignore-file != '' }}
+      - name: Scan configuration
+        env:
+          IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
+          FAIL_ON: ${{ inputs.vuln-fail-on }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
-            echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+          case "$FAIL_ON" in
+            negligible|low|medium|high|critical|none) ;;
+            *) echo "::error::vuln-fail-on must be negligible, low, medium, high, critical or none ('$FAIL_ON')"; exit 1 ;;
+          esac
+          # An explicit configuration in every job, so a .grype.yaml in the checkout
+          # (or the runner's home) is never picked up unasked.
+          config="$RUNNER_TEMP/grype.yaml"
+          if [ -n "$IGNORE_FILE" ]; then
+            if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
+              echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+            fi
+            config="$GITHUB_WORKSPACE/$IGNORE_FILE"
+          else
+            echo '{}' > "$config"
           fi
+          echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: image-layer
@@ -587,7 +602,7 @@ jobs:
           severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
           fail-build: ${{ inputs.vuln-fail-on != 'none' }}
           output-format: table
-          config: ${{ inputs.vuln-ignore-file }}
+          config: ${{ env.GRYPE_CONFIG }}
 
   docker:
     if: >-
@@ -613,23 +628,36 @@ jobs:
           tags: image-check:scan
           platforms: linux/amd64
           build-args: VERSION=check
-      - name: The ignore file is in the checkout
-        if: ${{ inputs.vuln-ignore-file != '' }}
+      - name: Scan configuration
         env:
           IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
+          FAIL_ON: ${{ inputs.vuln-fail-on }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
-            echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+          case "$FAIL_ON" in
+            negligible|low|medium|high|critical|none) ;;
+            *) echo "::error::vuln-fail-on must be negligible, low, medium, high, critical or none ('$FAIL_ON')"; exit 1 ;;
+          esac
+          # An explicit configuration in every job, so a .grype.yaml in the checkout
+          # (or the runner's home) is never picked up unasked.
+          config="$RUNNER_TEMP/grype.yaml"
+          if [ -n "$IGNORE_FILE" ]; then
+            if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
+              echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+            fi
+            config="$GITHUB_WORKSPACE/$IGNORE_FILE"
+          else
+            echo '{}' > "$config"
           fi
+          echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
       - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: image-check:scan
           severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
           fail-build: ${{ inputs.vuln-fail-on != 'none' }}
           output-format: table
-          config: ${{ inputs.vuln-ignore-file }}
+          config: ${{ env.GRYPE_CONFIG }}
 
   # Says why when nothing would run, rather than succeed with no check.
   refused:
