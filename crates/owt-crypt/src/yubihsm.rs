@@ -66,10 +66,12 @@ trait Device: Send + Sync {
 
 impl Device for Client {
     fn wrap_data(&self, wrap_key: object::Id, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-        // The yubihsm API takes an owned Vec and drops it without zeroizing, so this
-        // one copy cannot be wrapped in `Zeroizing` or wiped. It holds the whole
-        // frame: the context digest followed by the key being wrapped (a data key's
-        // plaintext when a data key is wrapped). It lives only for the HSM call.
+        // The yubihsm API takes an owned Vec: the copy moves into yubihsm's command,
+        // which serializes it into further buffers that are freed unwiped, so neither
+        // this copy nor those can be zeroized from here. They hold the whole frame (the
+        // context digest followed by the key being wrapped, a data key's plaintext when
+        // one is wrapped) for the HSM call. This is an upstream limitation, noted in
+        // its command.rs.
         Client::wrap_data(self, wrap_key, plaintext.to_vec())
             .map(wrap::Message::into_vec)
             .map_err(|e| e.to_string())

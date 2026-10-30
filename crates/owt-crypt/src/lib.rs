@@ -774,6 +774,7 @@ impl Crypt {
 
 /// What [`Crypt::reencrypt_column`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Reencrypted {
     /// How many rows it re-encrypted.
     pub moved: u64,

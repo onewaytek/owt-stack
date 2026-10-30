@@ -2909,7 +2909,8 @@ assert!(crypt.software_wrapped_keys().await?.is_empty());
 # Ok(()) }
 ```
 
-`reencrypt_column` returns `Reencrypted { moved, failed, no_key, complete }`. A row that does
+`reencrypt_column` returns a `Reencrypted` (non-exhaustive) with `moved`, `failed`,
+`no_key` and `complete`. A row that does
 not decrypt (malformed, an older key version shredded, refused) is listed in `failed`
 by id and skipped, and the job stops after 10,000 failures or a pass that moves
 nothing (a trigger or policy swallowing the update, or live writers winning every

@@ -56,6 +56,8 @@ use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
+use crate::sealed::{CHUNK, Chunks, Header, MAX_HEADER, PREFIX, TAG};
+
 /// The most [`Storage::get_sealed`] reserves up front from a store's reported size.
 const PREALLOC_MAX: u64 = 64 << 20;
 
@@ -94,8 +96,6 @@ impl AsyncWrite for WipingBuffer {
         std::task::Poll::Ready(Ok(()))
     }
 }
-
-use crate::sealed::{CHUNK, Chunks, Header, MAX_HEADER, PREFIX, TAG};
 
 /// The longest a presigned URL lives.
 pub const MAX_PRESIGN: Duration = Duration::from_hours(1);
@@ -451,6 +451,15 @@ impl Storage {
     }
 
     /// The decrypted object at `key`, sealed for `scope`.
+    ///
+    /// The buffer reserves at most 64 MiB from the store's reported size and grows
+    /// beyond that only as authenticated chunks arrive, doubling each time. A growth
+    /// step holds the old buffer, the new one and the chunk in flight at once (about
+    /// three times the plaintext at the step above 64 MiB), and the finished buffer
+    /// can carry up to twice the plaintext in unused capacity. Do not call
+    /// `shrink_to_fit` on the result: that reallocates and frees the plaintext
+    /// unwiped. For an object too large to hold, stream it with
+    /// [`Storage::download_sealed`].
     pub async fn get_sealed(
         &self,
         scope: &str,
@@ -717,6 +726,31 @@ fn path(key: &str) -> Result<ObjectPath, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wiping_buffer_grows_geometrically_and_keeps_its_contents() {
+        let mut buf = WipingBuffer(Zeroizing::new(Vec::new()));
+        assert_eq!(buf.0.capacity(), 0);
+        let mut expected = Vec::new();
+        let mut capacity = 0;
+        for n in [1_usize, 7, 100, 0] {
+            let chunk: Vec<u8> = (0..n).map(|i| u8::try_from(i).unwrap() + 1).collect();
+            buf.write_all(&chunk).await.unwrap();
+            expected.extend_from_slice(&chunk);
+            assert_eq!(&buf.0[..], &expected[..]);
+            assert!(buf.0.capacity() >= expected.len());
+            assert!(
+                buf.0.capacity() >= capacity,
+                "capacity never shrinks: {} after {capacity}",
+                buf.0.capacity()
+            );
+            if capacity > 0 && buf.0.capacity() > capacity {
+                assert!(buf.0.capacity() >= 2 * capacity, "growth at least doubles");
+            }
+            capacity = buf.0.capacity();
+        }
+        assert_eq!(expected.len(), 108);
+    }
 
     #[test]
     fn keys_are_checked() {

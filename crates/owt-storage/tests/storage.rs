@@ -447,6 +447,6 @@ async fn get_sealed_does_not_trust_the_reported_size() {
     let lying = Storage::from_store(Arc::new(Liar(f.store.clone()))).encrypted(f.crypt.clone());
     let got = lying.get_sealed("t1", "rec/big").await.unwrap();
     assert_eq!(&got[..], &plain[..]);
-    assert!(got.capacity() < 1 << 30);
+    assert!(got.capacity() as u64 <= 64 << 20);
     f.drop().await;
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use owt_crypt::kek::{KekChain, KekProvider, LocalKek};
 use std::time::Duration;
 
-use owt_crypt::{Column, Crypt, CryptError, Field, Purpose, Reencrypted, Scope};
+use owt_crypt::{Column, Crypt, CryptError, Field, Purpose, Scope};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Executor, PgPool};
 
@@ -168,14 +168,10 @@ async fn rotation_keeps_old_values_readable_and_the_job_moves_them() {
         12,
         "tenant a's rows"
     );
+    let left = crypt.reencrypt_column(&column, 5).await.unwrap();
     assert_eq!(
-        crypt.reencrypt_column(&column, 5).await.unwrap(),
-        Reencrypted {
-            moved: 0,
-            failed: Vec::new(),
-            no_key: 0,
-            complete: true
-        },
+        (left.moved, left.failed, left.no_key, left.complete),
+        (0, Vec::new(), 0, true),
         "nothing left"
     );
     let rows: Vec<(i64, String, Vec<u8>)> =
