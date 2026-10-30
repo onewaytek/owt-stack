@@ -2491,10 +2491,14 @@ name = "owt-audit"
 version = "0.10.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "clap",
  "futures",
+ "hmac 0.13.0",
+ "md-5",
  "owt-runtime",
  "rand 0.10.3",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -2502,6 +2506,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

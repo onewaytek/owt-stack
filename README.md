@@ -3198,9 +3198,8 @@ manifest (so a broken chain is never anchored), builds a manifest of the heads
 (naming the previous manifest's digest), stores it through an `anchor::Anchor`, and
 records it in `owt_audit_anchors`; runs are serialized by an advisory lock. `verify_anchor` then fails for any chain that no longer
 holds an anchored head. `NoAnchor` records manifests in the database only, for
-development and tests; production implements `Anchor` over a bucket under a
-compliance-mode retention lock (an S3-compatible provider for that follows
-`owt-storage`). The database's copy of a manifest is checked against its recorded
+development and tests; production uses `S3ObjectLock` (feature `s3`, below),
+or implements `Anchor` over another write-once store. The database's copy of a manifest is checked against its recorded
 digest, but it is only as trustworthy as the roles that may insert anchors; an
 independent check verifies against the copy in the store
 (`myapp audit verify --manifest m.json`).
@@ -3221,6 +3220,96 @@ jobs.singleton("audit_anchor", Every::new(Duration::from_hours(1)), pool.clone()
     }
 });
 # }
+```
+
+**Anchoring to S3 Object Lock.** With feature `s3`, `anchor::S3ObjectLock` PUTs each
+manifest to a bucket with `x-amz-object-lock-mode: COMPLIANCE` and a
+`retain-until-date` of now plus the retention you configure (one day to 100 years;
+seven years covers HIPAA's six, with a margin), a `Content-MD5` and
+`If-None-Match: *`. Until the date passes, nothing can overwrite or delete the
+object, the bucket owner included. The requests are signed in the crate (AWS
+Signature V4, path-style).
+
+`put` does not trust the PUT's success. A missing `x-amz-version-id` is an error
+(Object Lock implies versioning, so a store that returns none is not locking), and
+it then reads the stored version's retention back and fails unless the mode is
+COMPLIANCE and the retain-until date is no earlier than the one requested. The
+first `put` also runs `verify_bucket()`, which fails unless the bucket reports
+Object Lock enabled; it tells a bucket without Object Lock (404) from a refused
+credential or a server error, and names the S3 error code. The receipt is the
+version id.
+
+The retain-until date follows this host's clock, so a clock set back shortens the
+lock: every response's `Date` header is compared with the local clock, a response
+without a valid one is refused, and a difference over five minutes fails the
+request. On a `put` that error can arrive after the object is locked, to a date that
+follows the wrong clock; write a new key once the clock is fixed. Keep the host on
+NTP.
+
+The readback proves the store reports the lock, not that it enforces it: the
+retention document is parsed structurally (a `Retention` root with `Mode` and
+`RetainUntilDate` children), so a store that returns the object or any other body
+fails, but a store that fabricates a well-formed one cannot be detected from the
+client. Use a store you trust to honor Object Lock.
+
+Tested against MinIO only (`bitnamilegacy/minio`, a bucket made with
+`mc mb --with-lock`). Backblaze B2 and AWS S3 follow the same API and the signer is
+checked against AWS's published examples, but neither was exercised.
+
+Set the bucket up once:
+
+1. Create it with Object Lock enabled (it enables versioning). AWS can also enable
+   Object Lock on an existing versioned bucket; B2: "Object Lock" at creation;
+   MinIO: `mc mb --with-lock <alias>/<bucket>`.
+2. Give the anchoring job a credential of its own, restricted to this bucket and to
+   `s3:PutObject`, `s3:PutObjectRetention` (a PUT carrying lock headers needs it; it
+   can only extend a COMPLIANCE retention, never shorten it), `s3:GetObject`,
+   `s3:GetObjectVersion`, `s3:GetObjectRetention` and
+   `s3:GetBucketObjectLockConfiguration`. Grant no `s3:DeleteObject`,
+   `s3:DeleteObjectVersion`, `s3:BypassGovernanceRetention` or
+   `s3:PutBucketObjectLockConfiguration`. On B2 the application key's capabilities
+   are `writeFiles`, `readFiles`, `writeFileRetentions`, `readFileRetentions` and
+   `readBucketRetentions`, and not `deleteFiles`. Keep it out of the app's
+   environment and the database host's reach.
+3. Use `https://`. A plain `http://` endpoint is refused unless its host is a
+   loopback IP literal or `allow_insecure_http` is set, which is for a MinIO on the
+   cluster's own network only. Redirects are not followed; a 3xx is an error that
+   usually means the wrong region or endpoint. The endpoint is an origin: no path,
+   userinfo or query.
+
+`If-None-Match: *` keeps a second `put` of a key from replacing the first, where the
+store honors it: AWS and MinIO do, B2's S3 API does not document it. Do not rely on
+it; the version check above and `fetch` by version id are the guarantee. A `put`
+retried after a lost response gets a 412 (the key exists) although the object is
+anchored; `anchor` mints a new key on each run, so only a caller that retries `put`
+itself sees this. Keys must be non-empty, not start with `/`, and have no empty, `.`
+or `..` segment.
+
+`fetch(key, version_id)` reads a manifest back (at most 16 MiB), to save as the file
+`audit verify --manifest` takes. Pass the receipt: without a version id the latest
+version is read, which a credential that can write the key again could have replaced.
+
+```rust,no_run
+use std::time::Duration;
+use owt_audit::anchor::{self, S3Config, S3ObjectLock};
+
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+let store = S3ObjectLock::new(S3Config {
+    endpoint: "https://s3.us-west-004.backblazeb2.com".into(),
+    bucket: "myapp-audit-anchors".into(),
+    region: "us-west-004".into(),
+    access_key: owt_runtime::env::required("MYAPP_ANCHOR_KEY_ID")?,
+    secret_key: owt_runtime::env::required("MYAPP_ANCHOR_KEY")?.into(),
+    allow_insecure_http: false,
+    retention: Duration::from_hours(7 * 365 * 24),
+})?;
+store.verify_bucket().await?;
+
+let anchored = anchor::anchor(&pool, &store).await?;
+// Later, for `myapp audit verify --manifest m.json`:
+let key = anchored.manifest.key();
+std::fs::write("m.json", store.fetch(&key, Some(&anchored.receipt)).await?)?;
+# Ok(()) }
 ```
 
 **Verifying.** `owt_audit::verify(&pool, tenant)` walks a chain and names the first

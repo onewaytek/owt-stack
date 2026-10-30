@@ -20,6 +20,11 @@ use sqlx::PgPool;
 
 use crate::{Hash, Head, micros};
 
+#[cfg(feature = "s3")]
+mod s3;
+#[cfg(feature = "s3")]
+pub use s3::{S3Config, S3ObjectLock};
+
 /// The manifest's format.
 pub const FORMAT: &str = "owt-audit/manifest/v1";
 
