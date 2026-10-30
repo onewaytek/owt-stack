@@ -32,6 +32,7 @@ http-body-util = "0.1"
 hyper = { version = "1.11", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
 jsonwebtoken = { version = "11", default-features = false }
+log = "0.4"
 metrics = { version = "0.24", default-features = false }
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 metrics-process = "2.4"
@@ -59,6 +60,7 @@ tokio-util = { version = "0.7", default-features = false }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", default-features = false, features = ["timeout"] }
 tracing = "0.1"
+tracing-log = "0.2"
 tracing-opentelemetry = "0.34"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
@@ -75,6 +77,7 @@ owt-test = { path = "crates/owt-test" }
 owt-change = { path = "crates/owt-change" }
 owt-crypt = { path = "crates/owt-crypt" }
 owt-storage = { path = "crates/owt-storage" }
+owt-audit = { path = "crates/owt-audit" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
