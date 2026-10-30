@@ -215,8 +215,12 @@ impl S3ObjectLock {
     /// `put` returned as `version_id`: without it the latest version is read, which
     /// a credential able to write the key again could have replaced. With it, the
     /// response must name that same version in `x-amz-version-id`, and the version's
-    /// retention must still be COMPLIANCE and in the future, so only a locked
-    /// version is trusted.
+    /// retention must read back as COMPLIANCE with a valid retain-until date, so
+    /// only a version that was locked is trusted. An expired date is accepted: a
+    /// version id names immutable content, a COMPLIANCE date cannot be shortened,
+    /// and a deleted version reads 404. Once the date passes, though, nothing
+    /// prevents deleting the version, so the retention should exceed the audit
+    /// horizon.
     pub async fn fetch(&self, key: &str, version_id: Option<&str>) -> anyhow::Result<Vec<u8>> {
         validate_key(key)?;
         let query: Vec<(&str, &str)> = version_id.map(|v| ("versionId", v)).into_iter().collect();
@@ -228,6 +232,9 @@ impl S3ObjectLock {
                 "reading {key:?} from the anchor bucket failed: {}",
                 error_detail(resp).await
             );
+        }
+        if status != reqwest::StatusCode::OK {
+            bail!("reading {key:?} answered {status} where 200 was expected");
         }
         if let Some(pinned) = version_id {
             let served = resp
@@ -241,11 +248,10 @@ impl S3ObjectLock {
                 );
             }
         }
-        let body = read_capped(resp, MAX_MANIFEST).await?;
         if let Some(pinned) = version_id {
-            self.check_lock(key, pinned, SystemTime::now()).await?;
+            self.check_lock(key, pinned, None).await?;
         }
-        Ok(body)
+        read_capped(resp, MAX_MANIFEST).await
     }
 
     /// The signed PUT of `bytes` under `key`, as of `now`.
@@ -330,7 +336,8 @@ impl S3ObjectLock {
 
     /// Send a signed request. A redirect is an error, and so is a success response
     /// whose `Date` is missing or far from this host's clock. Other failures are
-    /// returned for the caller to report.
+    /// returned for the caller to report: they skip the `Date` check, so a caller
+    /// must check the status before it trusts the response.
     async fn send(
         &self,
         req: &Prepared,
@@ -380,13 +387,13 @@ impl S3ObjectLock {
         Ok(resp)
     }
 
-    /// Read the stored version's retention back and require COMPLIANCE until at
-    /// least `until`.
+    /// Read the stored version's retention back and require COMPLIANCE with a valid
+    /// retain-until date, no earlier than `until` when that is given.
     async fn check_lock(
         &self,
         key: &str,
         version_id: &str,
-        until: SystemTime,
+        until: Option<SystemTime>,
     ) -> anyhow::Result<()> {
         let req = self.prepare(
             "GET",
@@ -407,11 +414,14 @@ impl S3ObjectLock {
         let mode = xml_child(&body, "Retention", "Mode");
         let until_text = xml_child(&body, "Retention", "RetainUntilDate");
         let held = until_text.as_deref().and_then(parse_iso8601);
-        let wanted = secs(until);
-        match (mode.as_deref(), held) {
-            (Some("COMPLIANCE"), Some(held)) if secs(held) >= wanted => Ok(()),
-            _ => bail!(
-                "{key:?} is held without the required lock (mode {mode:?}, retain-until {until_text:?}): the store ignores Object Lock or the bucket does not enforce it",
+        match (mode.as_deref(), held, until) {
+            (Some("COMPLIANCE"), Some(_), None) => Ok(()),
+            (Some("COMPLIANCE"), Some(held), Some(until)) if secs(held) >= secs(until) => Ok(()),
+            (_, _, Some(_)) => bail!(
+                "{key:?} was stored without the requested lock (mode {mode:?}, retain-until {until_text:?}): the store ignores Object Lock or the bucket does not enforce it",
+            ),
+            (_, _, None) => bail!(
+                "{key:?} is not held in COMPLIANCE mode with a retain-until date (mode {mode:?}, retain-until {until_text:?}): it was not locked, or the lock is not the one that was anchored",
             ),
         }
     }
@@ -456,7 +466,7 @@ impl Anchor for S3ObjectLock {
             .filter(|v| !v.is_empty() && *v != "null")
             .map(str::to_owned)
             .context("the store returned no version id, so no Object Lock is in effect")?;
-        self.check_lock(key, &version, until).await?;
+        self.check_lock(key, &version, Some(until)).await?;
         Ok(version)
     }
 }
@@ -552,12 +562,19 @@ async fn error_detail(mut resp: reqwest::Response) -> S3Error {
 /// not plain XML: comments, CDATA and DTDs are refused, every element must close in
 /// order, and the root's close tag must end the document.
 fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
-    let mut s = xml.trim_start();
-    if s.starts_with("<?xml") {
-        s = s[s.find("?>")? + 2..].trim_start();
+    let ws = |c: char| c.is_ascii_whitespace();
+    let mut s = xml.trim_start_matches(ws);
+    if let Some(after) = s.strip_prefix("<?xml") {
+        // The declaration is `<?xml` and whitespace or `?>`, not `<?xmlfoo`.
+        if !after.starts_with(ws) && !after.starts_with("?>") {
+            return None;
+        }
+        s = s[s.find("?>")? + 2..].trim_start_matches(ws);
     }
     let open = s.strip_prefix('<')?.strip_prefix(root)?;
-    if !open.starts_with(['>', ' ', '\t', '\r', '\n', '/']) {
+    // The name ends at `>` or whitespace (before attributes such as `xmlns`), never
+    // at `/` or a longer name.
+    if !open.starts_with('>') && !open.starts_with(ws) {
         return None;
     }
     let end = tag_end(open)?;
@@ -580,10 +597,10 @@ fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
             return None;
         }
         if let Some(name) = tag.strip_prefix('/') {
-            let name = name.trim();
+            let name = name.trim_matches(ws);
             let Some(open_name) = stack.pop() else {
                 // The root's close tag ends the document.
-                return (name == root && after.trim().is_empty())
+                return (name == root && after.trim_matches(ws).is_empty())
                     .then_some(found)
                     .flatten();
             };
@@ -594,19 +611,25 @@ fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
                 if nested {
                     return None;
                 }
-                found.get_or_insert_with(|| before.trim().to_owned());
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(before.trim_matches(ws).to_owned());
             }
         } else {
             let self_closing = tag.ends_with('/');
-            let name = tag
-                .trim_end_matches('/')
-                .split(|c: char| c.is_whitespace())
-                .next()?;
+            let name = tag.trim_end_matches('/').split(ws).next()?;
+            if name.is_empty() || name.contains(['"', '\'']) {
+                return None;
+            }
             if stack.is_empty() {
                 nested = false;
                 if self_closing {
                     if name == child {
-                        found.get_or_insert_with(String::new);
+                        if found.is_some() {
+                            return None;
+                        }
+                        found = Some(String::new());
                     }
                 } else {
                     stack.push(name);
@@ -1413,7 +1436,7 @@ mod tests {
             ok(&[], &retention("GOVERNANCE", years(8))),
         ])
         .await);
-        assert!(e.contains("without the required lock"), "{e}");
+        assert!(e.contains("without the requested lock"), "{e}");
     }
 
     #[tokio::test]
@@ -1424,7 +1447,7 @@ mod tests {
             ok(&[], &retention("COMPLIANCE", years(1))),
         ])
         .await);
-        assert!(e.contains("without the required lock"), "{e}");
+        assert!(e.contains("without the requested lock"), "{e}");
     }
 
     #[tokio::test]
@@ -1440,7 +1463,7 @@ mod tests {
             ),
         ])
         .await);
-        assert!(e.contains("without the required lock"), "{e}");
+        assert!(e.contains("without the requested lock"), "{e}");
     }
 
     #[tokio::test]
@@ -1572,7 +1595,10 @@ mod tests {
         )
         .await;
         let e = format!("{:#}", governance.unwrap_err());
-        assert!(e.contains("without the required lock"), "{e}");
+        assert!(
+            e.contains("not held in COMPLIANCE mode") && !e.contains("ignores"),
+            "{e}"
+        );
 
         let expired = fetch(
             Some("v1"),
@@ -1585,7 +1611,66 @@ mod tests {
             ],
         )
         .await;
-        assert!(expired.is_err());
+        assert_eq!(expired.unwrap(), b"m");
+    }
+
+    #[tokio::test]
+    async fn fetch_checks_the_lock_before_the_body_and_wants_a_200() {
+        // A lock that fails is reported although the body follows.
+        let e = fetch(
+            Some("v1"),
+            vec![
+                ok(&[("x-amz-version-id", "v1")], "m"),
+                ok(&[], "<Retention><Mode>COMPLIANCE</Mode></Retention>"),
+            ],
+        )
+        .await;
+        assert!(e.is_err());
+        for status in ["204 No Content", "206 Partial Content"] {
+            let r = fetch(None, vec![reply(status, &[], "", Some(SystemTime::now()))]).await;
+            let e = format!("{:#}", r.unwrap_err());
+            assert!(e.contains("200 was expected"), "{e}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicates_and_odd_prologs() {
+        let get = |x| xml_child(x, "Retention", "Mode");
+        assert_eq!(
+            get("<Retention><Mode>A</Mode><Mode>B</Mode></Retention>"),
+            None
+        );
+        assert_eq!(get("<Retention><Mode>A</Mode><Mode/></Retention>"), None);
+        // The root.
+        assert_eq!(get("<Retention/>"), None);
+        assert_eq!(get("<Retention/x><Mode>A</Mode></Retention>"), None);
+        assert_eq!(get("<Retention/><Mode>A</Mode></Retention>"), None);
+        assert_eq!(
+            get("<Retention><Retention><Mode>A</Mode></Retention></Retention>"),
+            None
+        );
+        // Same-name nesting inside the child.
+        assert_eq!(
+            get("<Retention><Mode><Mode>A</Mode></Mode></Retention>"),
+            None
+        );
+        // The prolog.
+        assert_eq!(
+            get("<?xml version=\"1.0\"?><Retention xmlns=\"urn:x\"><Mode>A</Mode></Retention>")
+                .as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            get("<?xml?><Retention><Mode>A</Mode></Retention>").as_deref(),
+            Some("A")
+        );
+        assert_eq!(get("<?xmlfoo?><Retention><Mode>A</Mode></Retention>"), None);
+        // A byte order mark and non-ASCII whitespace are not skipped.
+        assert_eq!(get("\u{feff}<Retention><Mode>A</Mode></Retention>"), None);
+        assert_eq!(get("<Retention><Mode>A</Mode></Retention>\u{a0}"), None);
+        // Quotes in a tag name, and an unterminated single-quoted attribute.
+        assert_eq!(get("<Retention><Mode\"x>A</Mode\"x></Retention>"), None);
+        assert_eq!(get("<Retention><Mode a='x>A</Mode></Retention>"), None);
     }
 
     #[tokio::test]

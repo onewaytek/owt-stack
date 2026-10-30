@@ -3296,9 +3296,12 @@ or `..` segment.
 `fetch(key, version_id)` reads a manifest back (at most 16 MiB), to save as the file
 `audit verify --manifest` takes. Pass the receipt: without a version id the latest
 version is read, which a credential that can write the key again could have replaced.
-With a version id, `fetch` fails unless the response's `x-amz-version-id` equals it
-and the version's retention reads back as COMPLIANCE and still in the future, so
-only a locked version is trusted.
+With a version id, `fetch` fails unless the response is a 200 whose
+`x-amz-version-id` equals it and the version's retention reads back as COMPLIANCE
+with a valid retain-until date, checked before the body is read, so only a version
+that was locked is trusted. An expired date is accepted: a version id names immutable
+content and a COMPLIANCE date cannot be shortened. Once it passes, though, nothing
+prevents deleting the version, so set the retention beyond your audit horizon.
 
 Requests go straight to the endpoint: the HTTP client ignores `HTTPS_PROXY`,
 `HTTP_PROXY` and `ALL_PROXY`, so the environment cannot route signed requests
