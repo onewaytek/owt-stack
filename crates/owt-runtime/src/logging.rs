@@ -20,6 +20,8 @@
 //!   violation names the duplicate value). Wrap struct members in [`Sensitive`], whose
 //!   `Debug` stays redacted inside a derived one, and log an error's code or kind
 //!   where data may appear in its message.
+//! * With feature `otel`, span names, event names and status descriptions are
+//!   exported as written, like a message.
 //! * The list is a floor. A field named for something the list does not know is
 //!   logged.
 //!
@@ -63,10 +65,20 @@ pub struct Options {
     /// a name ending `_secret`, `_token` or `_password`; a name that is, or ends in
     /// `_`, one of `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key`
     /// and `encryption_key`; a name starting `ssn` or `authorization`; and a name with
-    /// a `_`-separated word `password`, `passwd`, `pwd` or `secret`.
+    /// a `_`-separated word (trailing digits ignored) `password`, `passwd`, `pwd`,
+    /// `secret`, `token`, `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`,
+    /// `phone`, `address`, `name`, `diagnosis`, `note`, `notes`, `transcript` or
+    /// `mrn`, so `user_email`, `phone_number` and `password1` are caught. Operational
+    /// names the word rule would catch are listed in `redact_allow`.
     pub redact_fields: Vec<String>,
     /// Whether the defaults apply. `false` redacts exactly `redact_fields`.
     pub redact_defaults: bool,
+    /// Names that are never redacted, normalized like `redact_fields`; it wins over
+    /// every other rule. The defaults already pass the attributes the tracing layers
+    /// write (`code.*`, `otel.*`, `thread.id`, `thread.name`, `target`, `level`,
+    /// `message`) and a few operational names (`server.address`, `host.name`,
+    /// `db.name`, `service.name`, `token_count`, `max_tokens`).
+    pub redact_allow: Vec<String>,
 }
 
 impl Default for Options {
@@ -79,6 +91,7 @@ impl Default for Options {
             otel_endpoint: None,
             redact_fields: Vec::new(),
             redact_defaults: true,
+            redact_allow: Vec::new(),
         }
     }
 }
@@ -90,7 +103,11 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    let redactor = Redactor::new(opts.redact_defaults, &opts.redact_fields);
+    let redactor = Redactor::new(
+        opts.redact_defaults,
+        &opts.redact_fields,
+        &opts.redact_allow,
+    );
     if opts.json {
         fmt::layer()
             .fmt_fields(RedactingJsonFields::new(redactor.clone()))
@@ -172,7 +189,11 @@ pub fn init(opts: &Options) -> Guard {
                 opentelemetry_sdk::trace::SdkTracerProvider::builder()
                     .with_batch_exporter(redaction::RedactingExporter::new(
                         exporter,
-                        Redactor::new(opts.redact_defaults, &opts.redact_fields),
+                        Redactor::new(
+                            opts.redact_defaults,
+                            &opts.redact_fields,
+                            &opts.redact_allow,
+                        ),
                     ))
                     .with_resource(
                         opentelemetry_sdk::Resource::builder()
@@ -313,7 +334,7 @@ mod tests {
 
     #[test]
     fn matcher_normalizes_names() {
-        let r = redaction::Redactor::new(true, &[]);
+        let r = redaction::Redactor::new(true, &[], &[]);
         for name in [
             "PASSWORD",
             "passwordHash",
@@ -337,6 +358,24 @@ mod tests {
             "secret.hint",
             "r#name",
             "APIKey",
+            "user_email",
+            "patient_email",
+            "emailAddress",
+            "phone_number",
+            "full_name",
+            "customer_name",
+            "home_address",
+            "patient_dob",
+            "dob_year",
+            "mrn_number",
+            "diagnosis_code",
+            "password1",
+            "token2",
+            "secret2",
+            "access_token2",
+            "thread.password",
+            "thread.token",
+            "user.name",
         ] {
             assert!(r.denies(name), "{name} should be denied");
         }
@@ -351,10 +390,39 @@ mod tests {
             "user",
             "route",
             "thread.id",
+            "thread.name",
             "status",
+            "code.module.name",
+            "code.filepath",
+            "code.lineno",
+            "code.namespace",
+            "otel.name",
+            "otel.status_code",
+            "target",
+            "level",
+            "message",
+            "server.address",
+            "host.name",
+            "db.name",
+            "content_type",
         ] {
             assert!(!r.denies(name), "{name} should pass");
         }
+    }
+
+    #[test]
+    fn allow_beats_every_rule_and_extra_beats_the_default_allowlist() {
+        let allow = redaction::Redactor::new(true, &[], &["customer_name".into(), "Email".into()]);
+        assert!(!allow.denies("customerName"));
+        assert!(!allow.denies("email"));
+        assert!(allow.denies("user_email"));
+
+        let extra = redaction::Redactor::new(true, &["host_name".into()], &[]);
+        assert!(extra.denies("host.name"));
+
+        let none = redaction::Redactor::new(false, &["user_email".into()], &[]);
+        assert!(none.denies("userEmail"));
+        assert!(!none.denies("password"));
     }
 
     #[test]
@@ -540,14 +608,18 @@ mod tests {
     #[cfg(feature = "otel")]
     #[test]
     fn exported_attributes_are_redacted() {
-        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::{
+            SpanContext, SpanId, TraceFlags, TraceId, TraceState, TracerProvider as _,
+        };
         use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
         let memory = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(redaction::RedactingExporter::new(
+            .with_batch_exporter(redaction::RedactingExporter::new(
                 memory.clone(),
-                Redactor::new(true, &["nickname".into()]),
+                Redactor::new(true, &["nickname".into()], &["route_name".into()]),
             ))
             .build();
         let subscriber = tracing_subscriber::registry()
@@ -557,18 +629,64 @@ mod tests {
                 "req",
                 password = "p4ss",
                 route = "/x",
+                route_name = "kept",
+                thread.password = "tp",
                 late_token = tracing::field::Empty,
             );
             let _g = span.enter();
             span.record("late_token", "t0k");
-            tracing::info!(email = "e@x", nickname = "nick0", visible = "fine", "event");
+            span.add_link_with_attributes(
+                SpanContext::new(
+                    TraceId::from(7_u128),
+                    SpanId::from(7_u64),
+                    TraceFlags::SAMPLED,
+                    false,
+                    TraceState::default(),
+                ),
+                vec![
+                    KeyValue::new("email", "link@x"),
+                    KeyValue::new("kind", "follows"),
+                ],
+            );
+            tracing::info!(
+                email = "e@x",
+                nickname = "nick0",
+                visible = "fine",
+                "bad zed.msg"
+            );
         });
         provider.force_flush().unwrap();
-        let dump = format!("{:?}", memory.get_finished_spans().unwrap());
-        for leaked in ["p4ss", "t0k", "e@x", "nick0"] {
+        let spans = memory.get_finished_spans().unwrap();
+        let dump = format!("{spans:?}");
+        for leaked in ["p4ss", "t0k", "e@x", "nick0", "\"tp\"", "link@x"] {
             assert!(!dump.contains(leaked), "leaked {leaked}: {dump}");
         }
-        assert!(dump.contains("/x") && dump.contains("fine"), "{dump}");
+        for kept in ["/x", "fine", "kept", "follows"] {
+            assert!(dump.contains(kept), "lost {kept}: {dump}");
+        }
         assert!(dump.contains("[redacted]"), "{dump}");
+
+        // The layer's own attributes pass; `thread.password` is an application field.
+        let span = &spans[0];
+        let value = |key: &str| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+        };
+        assert_ne!(value("thread.name").as_deref(), Some("[redacted]"));
+        assert!(value("thread.id").is_some_and(|v| v != "[redacted]"));
+        assert_eq!(value("thread.password").as_deref(), Some("[redacted]"));
+        assert!(
+            value("code.module.name").is_some_and(|v| v != "[redacted]"),
+            "{dump}"
+        );
+        assert!(
+            value("code.file.path").is_some_and(|v| v != "[redacted]"),
+            "{dump}"
+        );
+
+        // Names are exported as written, like a message.
+        assert!(dump.contains("bad zed.msg"), "{dump}");
     }
 }

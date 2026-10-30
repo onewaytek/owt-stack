@@ -6,8 +6,9 @@
 //! visitor. The JSON formatter is a streaming visitor and an event formatter of its
 //! own, because tracing-subscriber's JSON event formatter serializes event fields
 //! without consulting the configured field formatter. With feature `otel`, an
-//! exporter wrapper applies the same matcher to span and event attributes before
-//! they leave the process.
+//! exporter wrapper applies the same matcher to span, event and link attributes
+//! before they leave the process. Span names, event names and status descriptions are
+//! exported as written, so they must never carry data.
 //!
 //! Only names are judged. A `Debug` or `Display` value is not inspected, so a struct
 //! logged as one field prints all of its members and an error's message prints
@@ -80,25 +81,71 @@ const DEFAULT_SUFFIXES: &[&str] = &["_secret", "_token", "_password"];
 /// Name prefixes redacted by default.
 const DEFAULT_PREFIXES: &[&str] = &["ssn", "authorization"];
 
-/// `_`-separated words that redact a name wherever they appear in it.
-const DEFAULT_WORDS: &[&str] = &["password", "passwd", "pwd", "secret"];
+/// `_`-separated words that redact a name wherever they appear in it, with trailing
+/// digits ignored (`user_email`, `phone_number`, `password1`).
+const DEFAULT_WORDS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "authorization",
+    "cookie",
+    "apikey",
+    "ssn",
+    "dob",
+    "email",
+    "phone",
+    "address",
+    "name",
+    "diagnosis",
+    "note",
+    "notes",
+    "transcript",
+    "mrn",
+];
 
-/// Decides which field names are redacted.
+/// Normalized names the defaults never redact: the attributes the tracing layers
+/// write, OpenTelemetry's operational ones, and names the word rule would catch by
+/// accident.
+const DEFAULT_ALLOW: &[&str] = &[
+    "thread_id",
+    "thread_name",
+    "target",
+    "level",
+    "message",
+    "busy_ns",
+    "idle_ns",
+    "token_count",
+    "max_tokens",
+    "server_address",
+    "host_name",
+    "db_name",
+    "service_name",
+];
+
+/// Dotted prefixes the defaults never redact (`code.module.name`, `otel.status_code`).
+const DEFAULT_ALLOW_PREFIXES: &[&str] = &["code.", "otel."];
+
+/// Decides which field names are redacted. The order of precedence is `allow`, then
+/// `extra`, then the defaults' own allowlist, then the default rules.
 #[derive(Clone, Debug)]
 pub(crate) struct Redactor {
-    names: Arc<HashSet<String>>,
+    extra: Arc<HashSet<String>>,
+    allow: Arc<HashSet<String>>,
     defaults: bool,
 }
 
 impl Redactor {
-    /// The default rules when `defaults`, plus the `extra` names.
-    pub(crate) fn new(defaults: bool, extra: &[String]) -> Self {
-        let mut names: HashSet<String> = extra.iter().map(|n| normalize(n).into_owned()).collect();
-        if defaults {
-            names.extend(DEFAULT_NAMES.iter().map(|n| (*n).to_owned()));
-        }
+    /// The default rules when `defaults`, plus the `extra` names, minus the `allow`
+    /// names.
+    pub(crate) fn new(defaults: bool, extra: &[String], allow: &[String]) -> Self {
+        let set = |names: &[String]| -> Arc<HashSet<String>> {
+            Arc::new(names.iter().map(|n| normalize(n).into_owned()).collect())
+        };
         Self {
-            names: Arc::new(names),
+            extra: set(extra),
+            allow: set(allow),
             defaults,
         }
     }
@@ -107,23 +154,39 @@ impl Redactor {
     /// judged, and each segment of a dotted one (`password.value`).
     pub(crate) fn denies(&self, name: &str) -> bool {
         let name = name.strip_prefix("r#").unwrap_or(name);
-        self.judge(&normalize(name))
+        let whole = normalize(name);
+        if self.allow.contains(&*whole) {
+            return false;
+        }
+        if self.extra.contains(&*whole) {
+            return true;
+        }
+        if self.defaults
+            && (DEFAULT_ALLOW.contains(&&*whole)
+                || DEFAULT_ALLOW_PREFIXES.iter().any(|p| name.starts_with(p)))
+        {
+            return false;
+        }
+        self.judge(&whole)
             || (name.contains('.') && name.split('.').any(|s| self.judge(&normalize(s))))
     }
 
-    /// Judges a normalized name.
+    /// Judges a normalized name against the rules.
     fn judge(&self, n: &str) -> bool {
-        if self.names.contains(n) {
+        if self.extra.contains(n) {
             return true;
         }
         self.defaults
-            && (DEFAULT_SUFFIXES.iter().any(|s| n.ends_with(s))
+            && (DEFAULT_NAMES.contains(&n)
+                || DEFAULT_SUFFIXES.iter().any(|s| n.ends_with(s))
                 || DEFAULT_KEYS.iter().any(|k| {
                     n.strip_suffix(k)
                         .is_some_and(|p| p.is_empty() || p.ends_with('_'))
                 })
                 || DEFAULT_PREFIXES.iter().any(|p| n.starts_with(p))
-                || n.split('_').any(|w| DEFAULT_WORDS.contains(&w)))
+                || n.split('_').any(|w| {
+                    DEFAULT_WORDS.contains(&w.trim_end_matches(|c: char| c.is_ascii_digit()))
+                }))
     }
 }
 
@@ -504,8 +567,11 @@ where
 
 // === OTLP ===
 
-/// Wraps a span exporter and replaces the value of every span and event attribute
-/// whose key matches, before the batch reaches the exporter.
+/// Wraps a span exporter and replaces the value of every span, event and link
+/// attribute whose key matches, before the batch reaches the exporter. Span names,
+/// event names (a tracing event's message) and status descriptions are exported as
+/// written, like a message. The resource is not rewritten: it holds the service name
+/// and what the SDK reads from `OTEL_RESOURCE_ATTRIBUTES`.
 #[cfg(feature = "otel")]
 #[derive(Debug)]
 pub(crate) struct RedactingExporter<E> {
@@ -521,9 +587,7 @@ impl<E> RedactingExporter<E> {
 
     fn redact(&self, attributes: &mut [opentelemetry::KeyValue]) {
         for kv in attributes {
-            let key = kv.key.as_str();
-            // The tracing layer's own thread attributes are not application fields.
-            if !key.starts_with("thread.") && self.redactor.denies(key) {
+            if self.redactor.denies(kv.key.as_str()) {
                 kv.value = opentelemetry::Value::String(REDACTED.into());
             }
         }
@@ -542,6 +606,9 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
             self.redact(&mut span.attributes);
             for event in &mut span.events.events {
                 self.redact(&mut event.attributes);
+            }
+            for link in &mut span.links.links {
+                self.redact(&mut link.attributes);
             }
         }
         self.inner.export(batch)

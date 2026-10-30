@@ -488,7 +488,7 @@ the handler and write `<script nonce="{{ nonce }}">`.
 
 `logging::init` redacts by field name: a `tracing` event or span field whose name
 matches the denylist is logged as `[redacted]`, in the JSON and the text output and, with
-feature `otel`, in the span and event attributes exported over OTLP. The value is
+feature `otel`, in the span, event and link attributes exported over OTLP. The value is
 replaced before it is formatted, so the original never reaches the writer or the
 exporter. This includes fields added later with `span.record(..)`.
 
@@ -505,9 +505,17 @@ segment of a dotted name is judged on its own (`password.value`). Redacted by de
   `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key` or
   `encryption_key` (`cache_key` and `idempotency_key` are not);
 * a name starting `ssn` or `authorization`, and a name with a `_`-separated word
-  `password`, `passwd`, `pwd` or `secret`.
+  (trailing digits ignored) `password`, `passwd`, `pwd`, `secret`, `token`,
+  `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`, `phone`, `address`,
+  `name`, `diagnosis`, `note`, `notes`, `transcript` or `mrn`, so `user_email`,
+  `phone_number` and `password1` are caught.
 
-`Options::redact_fields` adds names; `redact_defaults: false` drops the defaults (and
+The word rule catches operational names too (`bind_address`, `file_name`), so a name can be
+allowed. The defaults never redact `code.*`, `otel.*`, `thread.id`, `thread.name`,
+`target`, `level`, `message`, `server.address`, `host.name`, `db.name`, `service.name`,
+`token_count` and `max_tokens`. `Options::redact_allow` lists names that are never
+redacted and wins over every other rule. `Options::redact_fields` adds names to redact,
+and wins over the defaults' allowlist. `redact_defaults: false` drops the defaults (and
 every rule above) so that exactly `redact_fields` applies.
 
 `logging::Sensitive<T>` wraps a value whose `Debug` and `Display` print `[redacted]`,
@@ -547,6 +555,8 @@ logged. Only names are judged:
 * A value inside a message, as in `info!("saw {}", name)`, is not a field and is
   logged as it is. A bridged `log` record is only a message, so it is logged as it is
   too.
+* With feature `otel`, span names, event names (a tracing event's message) and status
+  descriptions are exported as written, like a message, so they must never carry data.
 * A `Debug` or `Display` value is not inspected. `info!(req = ?login)` prints every
   member of `login`, because the field is named `req`; wrap the members in `Sensitive`.
   An error's message prints whatever it contains (a unique violation names the
