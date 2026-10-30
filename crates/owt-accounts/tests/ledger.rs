@@ -218,7 +218,7 @@ async fn an_apps_applied_copies_are_adopted_never_run_again() {
     // Once no binary carries the copies, their rows can go, and the app's migrator
     // no longer needs to ignore them.
     let forgotten = migrations::forget_copies(&db.pool).await.unwrap();
-    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11, 12]);
     let left: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
         .fetch_all(&db.pool)
         .await
