@@ -281,8 +281,8 @@ impl KekProvider for YubiHsmKek {
             if kek_id != self.id {
                 return Err(KekError::UnknownKek(kek_id.into()));
             }
-            // A device error is a refusal when the device still answers (a message that
-            // does not authenticate), and an outage when a probe of the wrap key fails.
+            // The device's own answer decides: a message it reports as not
+            // authenticating is a refusal, a transport or session failure an outage.
             let plain = tokio::task::spawn_blocking(move || device.unwrap_data(wrap_key, message))
                 .await
                 .map_err(|e| KekError::Unavailable(e.to_string()))?
