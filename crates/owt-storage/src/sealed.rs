@@ -85,8 +85,12 @@ impl Header {
             return Err(Malformed);
         }
         let chunk = u32::from_be_bytes(bytes[5..9].try_into().map_err(|_| Malformed)?) as usize;
-        let key_len = usize::from(u16::from_be_bytes(bytes[9..11].try_into().map_err(|_| Malformed)?));
-        if chunk == 0 || chunk > 64 * CHUNK || key_len > 256 {
+        let key_len = usize::from(u16::from_be_bytes(
+            bytes[9..11].try_into().map_err(|_| Malformed)?,
+        ));
+        // The writer always uses CHUNK; any other size would only let a crafted object
+        // choose how much memory a read allocates before anything authenticates.
+        if chunk != CHUNK || key_len > 256 {
             return Err(Malformed);
         }
         let end = 11 + key_len + PREFIX;
@@ -167,5 +171,21 @@ impl Chunks {
             .map_err(|_| Malformed)?;
         self.next = self.next.checked_add(1).ok_or(Malformed)?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_writers_chunk_size_parses() {
+        let header = Header::new(vec![7; 65], [1; PREFIX]);
+        assert!(Header::parse(&header.bytes).unwrap().is_some());
+        for chunk in [0_u32, 1, 1 << 19, (1 << 20) + 1, 64 << 20] {
+            let mut bent = header.bytes.clone();
+            bent[5..9].copy_from_slice(&chunk.to_be_bytes());
+            assert!(Header::parse(&bent).is_err(), "{chunk}");
+        }
     }
 }

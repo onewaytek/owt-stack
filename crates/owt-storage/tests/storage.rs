@@ -16,6 +16,7 @@ use sqlx::{Executor, PgPool};
 
 struct Fixture {
     storage: Storage,
+    crypt: Crypt,
     store: Arc<InMemory>,
     pool: PgPool,
     admin: PgPool,
@@ -43,9 +44,11 @@ async fn fixture() -> Option<Fixture> {
     owt_crypt::migrate(&pool).await.unwrap();
     let kek = Arc::new(LocalKek::parse(&LocalKek::generate_entry("k")).unwrap());
     let store = Arc::new(InMemory::new());
-    let storage = Storage::from_store(store.clone()).encrypted(Crypt::new(pool.clone(), kek));
+    let crypt = Crypt::new(pool.clone(), kek);
+    let storage = Storage::from_store(store.clone()).encrypted(crypt.clone());
     Some(Fixture {
         storage,
+        crypt,
         store,
         pool,
         admin,
@@ -215,4 +218,42 @@ async fn sealed_operations_need_a_crypt() {
         plain.put_sealed("t", "k", b"x").await,
         Err(StorageError::NoCrypt)
     ));
+}
+
+#[tokio::test]
+async fn reencrypt_moves_an_object_onto_the_current_data_key() {
+    let Some(f) = fixture().await else { return };
+    let plain = pattern(CHUNK + 5);
+    f.storage
+        .upload_sealed("t1", "rec/r1", &plain[..])
+        .await
+        .unwrap();
+    let before = f.raw("rec/r1").await;
+    f.crypt
+        .rotate("t1", owt_crypt::Purpose::Data)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.storage.reencrypt("t1", "rec/r1").await.unwrap(),
+        plain.len() as u64
+    );
+    let after = f.raw("rec/r1").await;
+    // The header carries the sealed content key, whose version is at offset 12.
+    assert_eq!(before[15], 1);
+    assert_eq!(after[15], 2);
+    assert_eq!(
+        &f.storage.get_sealed("t1", "rec/r1").await.unwrap()[..],
+        &plain[..]
+    );
+    // A damaged object is refused and left exactly as it was.
+    let mut bent = after.clone();
+    let last = bent.len() - 1;
+    bent[last] ^= 1;
+    f.set_raw("rec/r1", bent.clone()).await;
+    assert!(matches!(
+        f.storage.reencrypt("t1", "rec/r1").await,
+        Err(StorageError::Refused(_))
+    ));
+    assert_eq!(f.raw("rec/r1").await, bent);
+    f.drop().await;
 }

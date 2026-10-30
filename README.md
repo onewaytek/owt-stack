@@ -2524,7 +2524,16 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
   (the STREAM construction). Any edited byte, a chunk dropped from the end, swapped
   chunks, or the object copied under another key or tenant fails to open.
   `download_sealed` streams into a writer and writes each chunk only once it
-  authenticates; on an error, discard what it wrote.
+  authenticates; on an error, discard what it wrote. A reader rejects any chunk size
+  but the writer's.
+- **Rotating data keys.** The sealed content key is in the header, and the header is
+  every chunk's associated data, so an object cannot move to a newer `owt-crypt`
+  data-key version without being rewritten. `storage.reencrypt(scope, key)` does that:
+  it streams the object through `download_sealed` into `upload_sealed` at the same key
+  (the object's key is part of what the content key is bound to, so a copy from a
+  temporary key would not open), replacing it only after the last chunk verified. Run
+  it per object after `rotate` and `reencrypt_column`, before retiring an old version.
+  Readers see the old version until the replacement lands.
 - **Presigned URLs** live at most `MAX_PRESIGN` (an hour) and move bytes between the
   browser and the bucket without passing through the app, so the app cannot encrypt
   them. For health data, either stream uploads through the app (`upload_sealed`
@@ -2532,11 +2541,29 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
   `incoming/` prefix and then `seal_uploaded(scope, "incoming/…", "recordings/…")`,
   which encrypts it into its final key and deletes the plaintext, verified. Give
   `incoming/` a lifecycle rule that expires objects after a day, so an upload never
-  sealed does not linger. A presigned URL limits neither size nor content type.
+  sealed does not linger. A presigned URL limits neither size nor content type, and
+  stays valid until its TTL ends even after the object is sealed and deleted, so
+  whoever holds it can upload plaintext again: keep upload TTLs to minutes, use an
+  unguessable key per upload, and seal after the URL has expired. A zero TTL is
+  refused.
+- **Versioned buckets keep deleted plaintext.** Backblaze B2 is versioned by default
+  (Cloudflare R2 is not). There a delete only *hides* the object: the bytes stay
+  recoverable with the bucket's credentials, and `delete_verified`'s `HEAD` of 404 does
+  not mean they are gone. For `incoming/`, add a B2 lifecycle rule "keep only the last
+  version" (`daysFromHidingToDeleting: 1`), or put presigned uploads in a separate
+  unversioned bucket. Browser-side encryption remains the stronger route for health
+  data.
+- **Interrupted uploads.** A failed `upload_sealed` aborts its multipart upload, but a
+  dropped future (a client disconnect, a timeout) leaves an incomplete one that is
+  billed and invisible to listing. Give the bucket the lifecycle rule "abort incomplete
+  multipart uploads after 1 day".
+- **Configuration.** The endpoint is `https`; plain `http` is accepted only for the IP
+  literals `127.0.0.1` and `[::1]`, not the name `localhost`. `S3Config`'s `Debug`
+  redacts the secret.
 - **Verified deletion** deletes, then requires the store to answer that the object is
-  gone. In a bucket with versioning or Object Lock, earlier versions stay until the
-  bucket's lifecycle rules remove them; set those rules to match the retention the
-  app promises.
+  gone. In a bucket with versioning (B2's default) or Object Lock, the delete hides the
+  object and its bytes stay until the bucket's lifecycle rules remove them (above);
+  set those rules to match the retention the app promises.
 - `Storage::from_store` takes any `object_store` store: `InMemory` in tests, a
   directory in development (neither presigns).
 
