@@ -3943,6 +3943,36 @@ can run `cargo tree --edges normal,build -i owt-test` and `cargo tree --edges
 normal,build -e features -i owt-accounts` (looking for `feature "test-util"`) on its own
 workspace.
 
+**A schema per test.** `#[sqlx::test]` names its database from a hash of the test's
+module path alone and creates it on the server `DATABASE_URL` names, so the same test
+run from two worktrees, or from two apps with tests at one path, asks the shared server
+for the same name twice: one run drops the other's database, or fails with "database
+`_sqlx_test_…` already exists". A per-worktree `DATABASE_URL` does not help, because
+database names are server-wide, and sqlx offers no way to rename them. Tests that
+share a server use `owt_test::schema::TestSchema` instead: it creates
+`owt_test_<checkout>_<process>_<sequence>` (eight hex digits of a hash of the
+`CARGO_MANIFEST_DIR` you pass, the process id, and a counter; under 63 bytes) in the
+database `DATABASE_URL` names, puts it first on its pool's `search_path`, and drops it
+with its contents when the value drops. It needs `CREATE` on the database, not
+`CREATEDB`, and avoids the checkpoint each `DROP DATABASE` forces. It returns `None`
+when `DATABASE_URL` is unset, so the test skips. Queries that name `public.` bypass the
+`search_path`; leave the schema out of the app's SQL.
+
+```rust,no_run
+use owt_test::schema::TestSchema;
+
+# async fn run() {
+let Some(db) = TestSchema::create(env!("CARGO_MANIFEST_DIR")).await else {
+    return; // no DATABASE_URL: skip
+};
+let one: i32 = sqlx::query_scalar("SELECT 1").fetch_one(db.pool()).await.unwrap();
+assert_eq!(one, 1);
+// Apply the app's migrations to `db.pool()` as a production start does, then test.
+# }
+```
+
+Tests that keep `#[sqlx::test]` need a server of their own per checkout.
+
 `owt_test::Server::spawn(router)` serves on an ephemeral port for WebSocket and SSE
 tests. Test requests carry no `Origin`, so cross-origin protection lets them through;
 set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
