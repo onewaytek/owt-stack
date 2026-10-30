@@ -466,7 +466,7 @@ async fn reencrypt_column_counts_rows_whose_scope_has_no_key() {
     };
     let done = crypt.reencrypt_column(&column, 10).await.unwrap();
     assert_eq!((done.moved, done.no_key, done.complete), (1, 1, false));
-    assert!(done.failed.is_empty());
+    assert_eq!(done.failed, [] as [String; 0]);
     let fixed = Column {
         scope: Scope::Fixed("ghost"),
         ..column
