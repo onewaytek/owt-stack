@@ -21,6 +21,7 @@ url.workspace = true
 zeroize = { version = "1", features = ["std"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 owt-runtime.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

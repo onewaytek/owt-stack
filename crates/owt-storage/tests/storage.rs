@@ -257,3 +257,108 @@ async fn reencrypt_moves_an_object_onto_the_current_data_key() {
     assert_eq!(f.raw("rec/r1").await, bent);
     f.drop().await;
 }
+
+/// An in-memory store that overwrites one object just before the second `HEAD` of it,
+/// as a concurrent writer would.
+#[derive(Debug)]
+struct Racy {
+    inner: Arc<InMemory>,
+    heads: std::sync::atomic::AtomicUsize,
+    overwrite: Path,
+}
+
+impl std::fmt::Display for Racy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Racy")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for Racy {
+    async fn put_opts(
+        &self,
+        l: &Path,
+        p: PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(l, p, o).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        l: &Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(l, o).await
+    }
+
+    async fn get_opts(
+        &self,
+        l: &Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if o.head && self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.inner
+                .put(&self.overwrite, PutPayload::from_static(b"someone else"))
+                .await?;
+        }
+        self.inner.get_opts(l, o).await
+    }
+
+    fn delete_stream(
+        &self,
+        l: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(l)
+    }
+
+    fn list(
+        &self,
+        p: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(p)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+
+    async fn copy_opts(
+        &self,
+        f: &Path,
+        t: &Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(f, t, o).await
+    }
+}
+
+#[tokio::test]
+async fn reencrypt_backs_out_when_the_object_changes_underneath() {
+    let Some(f) = fixture().await else { return };
+    let plain = pattern(CHUNK + 5);
+    f.storage
+        .upload_sealed("t1", "rec/c1", &plain[..])
+        .await
+        .unwrap();
+    f.crypt
+        .rotate("t1", owt_crypt::Purpose::Data)
+        .await
+        .unwrap();
+    let racy = Storage::from_store(Arc::new(Racy {
+        inner: f.store.clone(),
+        heads: 0.into(),
+        overwrite: Path::from("rec/c1"),
+    }))
+    .encrypted(f.crypt.clone());
+    assert!(matches!(
+        racy.reencrypt("t1", "rec/c1").await,
+        Err(StorageError::Conflict(_))
+    ));
+    // The other writer's object is what stays.
+    assert_eq!(f.raw("rec/c1").await, b"someone else");
+    f.drop().await;
+}

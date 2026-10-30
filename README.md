@@ -2547,7 +2547,14 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
   (the object's key is part of what the content key is bound to, so a copy from a
   temporary key would not open), replacing it only after the last chunk verified. Run
   it per object after `rotate` and `reencrypt_column`, before retiring an old version.
-  Readers see the old version until the replacement lands.
+  Readers see the old version until the replacement lands. Hold an app-level lock on
+  the key (no concurrent writer) while it runs: it checks the object's size and etag
+  before and just before completing and fails with `StorageError::Conflict` on a
+  change, but a store's multipart completion has no `If-Match`, so only the lock closes
+  the race. The plaintext passes through a 1 MiB in-process pipe that is not zeroized
+  when freed.
+- **Size limit.** Uploads use 5 MiB parts and a multipart upload has at most 10,000, so
+  an object is limited to about 48 GiB; a larger limit needs a larger part size.
 - **Presigned URLs** live at most `MAX_PRESIGN` (an hour) and move bytes between the
   browser and the bucket without passing through the app, so the app cannot encrypt
   them. For health data, either stream uploads through the app (`upload_sealed`
@@ -2563,10 +2570,15 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
 - **Versioned buckets keep deleted plaintext.** Backblaze B2 is versioned by default
   (Cloudflare R2 is not). There a delete only *hides* the object: the bytes stay
   recoverable with the bucket's credentials, and `delete_verified`'s `HEAD` of 404 does
-  not mean they are gone. For `incoming/`, add a B2 lifecycle rule "keep only the last
-  version" (`daysFromHidingToDeleting: 1`), or put presigned uploads in a separate
-  unversioned bucket. Browser-side encryption remains the stronger route for health
-  data.
+  not mean they are gone. No S3-API call `owt-storage` makes can delete a specific
+  version. A B2 lifecycle rule "keep only the last version" (`daysFromHidingToDeleting:
+  1`) bounds the exposure but does not remove it: B2 applies lifecycle rules about once
+  a day, so a sealed upload's plaintext stays recoverable for **at least a day and up
+  to about two** after `delete_verified` reports success, and a "delete unsealed
+  uploads after a day" rule on `incoming/` adds another day before the hide even
+  starts. For health data, put presigned uploads in a **separate unversioned bucket**
+  (R2, or B2 with no versions kept) or encrypt in the browser; treat the lifecycle
+  rule as a fallback.
 - **Interrupted uploads.** A failed `upload_sealed` aborts its multipart upload, but a
   dropped future (a client disconnect, a timeout) leaves an incomplete one that is
   billed and invisible to listing. Give the bucket the lifecycle rule "abort incomplete

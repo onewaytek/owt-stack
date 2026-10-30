@@ -19,7 +19,10 @@
 //! does not mean they are gone, so [`Storage::delete_verified`] cannot tell. Add a
 //! lifecycle rule that removes hidden versions (B2: "keep only the last version",
 //! `daysFromHidingToDeleting: 1`) on any prefix that holds plaintext, such as
-//! `incoming/`, or use a separate unversioned bucket for presigned uploads.
+//! `incoming/`. That rule leaves the plaintext recoverable for at least a day and up
+//! to about two after a delete (B2 applies lifecycle rules about daily), and no call
+//! this crate makes can delete a specific version. For health data use a separate
+//! unversioned bucket for presigned uploads, or encrypt in the browser.
 //!
 //! **Interrupted uploads.** [`Storage::upload_sealed`] aborts its multipart upload when
 //! it fails, but a dropped future (a client disconnect, a timeout, a cancelled task)
@@ -88,6 +91,9 @@ pub enum StorageError {
     /// A key that is not acceptable.
     #[error("not an acceptable object key: {0:?}")]
     BadKey(String),
+    /// The object changed while it was being rewritten.
+    #[error("object {0:?} changed during the operation")]
+    Conflict(String),
     /// A configuration or argument that is not acceptable.
     #[error("{0}")]
     Invalid(String),
@@ -215,8 +221,9 @@ impl Storage {
     /// versioned by default (R2 is not): a delete only hides the object, a `HEAD` of 404
     /// is the hidden object's answer, and the bytes stay recoverable with the bucket's
     /// credentials until a lifecycle rule removes the hidden version (B2: "keep only the
-    /// last version", `daysFromHidingToDeleting: 1`). With an object lock they stay
-    /// until the lock expires. Set those rules to match what the app promises.
+    /// last version", `daysFromHidingToDeleting: 1`), which takes at least a day and up
+    /// to about two. With an object lock they stay until the lock expires. Set those
+    /// rules to match what the app promises.
     pub async fn delete_verified(&self, key: &str) -> Result<(), StorageError> {
         let p = path(key)?;
         match self.store.delete(&p).await {
@@ -288,11 +295,31 @@ impl Storage {
     /// Encrypt what `reader` yields for `scope`, a chunk at a time, into a multipart
     /// upload at `key`. The plaintext's length. A failure aborts the upload, leaving
     /// no object.
+    ///
+    /// Parts are 5 MiB and a multipart upload has at most 10,000 of them, so an object
+    /// is limited to about 48 GiB (the next part fails and the upload aborts); raising
+    /// the limit means a larger part size in `WriteMultipart`.
     pub async fn upload_sealed<R>(
         &self,
         scope: &str,
         key: &str,
+        reader: R,
+    ) -> Result<u64, StorageError>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        self.upload_inner(scope, key, reader, None).await
+    }
+
+    /// [`Storage::upload_sealed`], and when `expect` is given, a check just before the
+    /// upload completes that the object at `key` still has that size and etag: if not,
+    /// the upload is aborted with [`StorageError::Conflict`].
+    async fn upload_inner<R>(
+        &self,
+        scope: &str,
+        key: &str,
         mut reader: R,
+        expect: Option<&object_store::ObjectMeta>,
     ) -> Result<u64, StorageError>
     where
         R: AsyncRead + Unpin + Send,
@@ -337,6 +364,20 @@ impl Storage {
         .await;
         match result {
             Ok(total) => {
+                if let Some(expect) = expect {
+                    let now = self.store.head(&p).await;
+                    let same =
+                        matches!(&now, Ok(m) if m.size == expect.size && m.e_tag == expect.e_tag);
+                    if !same {
+                        let _ = upload.abort().await;
+                        return match now {
+                            Err(e) if !matches!(e, object_store::Error::NotFound { .. }) => {
+                                Err(e.into())
+                            }
+                            _ => Err(StorageError::Conflict(key.into())),
+                        };
+                    }
+                }
                 // `finish` aborts the upload itself when completing it fails.
                 upload.finish().await?;
                 Ok(total)
@@ -356,7 +397,13 @@ impl Storage {
         scope: &str,
         key: &str,
     ) -> Result<Zeroizing<Vec<u8>>, StorageError> {
-        let mut out = Zeroizing::new(Vec::new());
+        // Sized from the object (the plaintext is smaller than the ciphertext), so the
+        // buffer never grows: a reallocation would free plaintext without zeroizing it.
+        let size = self
+            .head(key)
+            .await?
+            .ok_or_else(|| StorageError::NotFound(key.into()))?;
+        let mut out = Zeroizing::new(Vec::with_capacity(usize::try_from(size).unwrap_or(0)));
         self.download_sealed(scope, key, &mut *out).await?;
         Ok(out)
     }
@@ -472,15 +519,36 @@ impl Storage {
     /// header, which is every chunk's associated data, and it is bound to the object's
     /// key. Re-wrapping the content key alone would change the header and so every
     /// chunk, and a copy to a temporary key would not open at the original key. So
-    /// this streams [`Storage::download_sealed`] into [`Storage::upload_sealed`] at the
-    /// same key, with a fresh content key. The upload replaces the object only when it
-    /// completes, and it completes only after the download authenticated the last
-    /// chunk and the lengths agree; any failure aborts it and leaves the original.
-    /// Readers see the old version until the replacement lands (a short window, which
-    /// is acceptable), and on a versioned bucket the old version stays recoverable
-    /// until the lifecycle rules remove it (see the module docs). Bounded memory. The
-    /// plaintext's length.
+    /// this streams [`Storage::download_sealed`] into the upload at the same key, with
+    /// a fresh content key. The upload replaces the object only when it completes, and
+    /// it completes only after the download authenticated the last chunk; any failure
+    /// aborts it and leaves the original. Readers see the old version until the
+    /// replacement lands (a short window, which is acceptable), and on a versioned
+    /// bucket the old version stays recoverable until the lifecycle rules remove it
+    /// (see the module docs).
+    ///
+    /// **The caller must hold an app-level lock on `key`** (a Postgres advisory lock
+    /// around every writer of the key and this call): the replacement is the version
+    /// read at the start, so a write landing meanwhile would be lost. As a backstop it
+    /// takes the object's size and etag before reading and again just before the
+    /// upload completes, and aborts with [`StorageError::Conflict`] on a change; a
+    /// store's multipart completion has no `If-Match`, so that narrows the race and
+    /// only the lock closes it.
+    ///
+    /// Memory is bounded, but the plaintext passes through a 1 MiB in-process pipe
+    /// that is not zeroized when freed (a residual). The plaintext's length.
+    ///
+    /// # Errors
+    ///
+    /// The upload's error when it failed; otherwise the download's.
     pub async fn reencrypt(&self, scope: &str, key: &str) -> Result<u64, StorageError> {
+        let meta = match self.store.head(&path(key)?).await {
+            Ok(m) => m,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(StorageError::NotFound(key.into()));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let (writer, reader) = tokio::io::duplex(CHUNK);
         let failed = Arc::new(AtomicBool::new(false));
         let download = {
@@ -495,21 +563,27 @@ impl Storage {
                 r
             }
         };
-        let upload = self.upload_sealed(
+        let upload = self.upload_inner(
             scope,
             key,
             FailingEof {
                 inner: reader,
                 failed,
             },
+            Some(&meta),
         );
         let (downloaded, uploaded) = tokio::join!(download, upload);
-        let downloaded = downloaded?;
-        let uploaded = uploaded?;
-        if downloaded != uploaded {
-            return Err(StorageError::Refused(key.into()));
+        match (downloaded, uploaded) {
+            (Ok(_), Ok(n)) => Ok(n),
+            // The download's own failure (a chunk that does not authenticate) is the
+            // cause of the upload's "download failed" error; a store or key error in the
+            // upload is the cause of the download's broken pipe.
+            (Err(d), Err(u)) => Err(match d {
+                StorageError::Io(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => u,
+                d => d,
+            }),
+            (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
         }
-        Ok(uploaded)
     }
 }
 

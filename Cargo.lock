@@ -2594,6 +2594,7 @@ name = "owt-storage"
 version = "0.10.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "bytes",
  "futures",
  "object_store",
