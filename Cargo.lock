@@ -3290,6 +3290,7 @@ dependencies = [
  "owt-change",
  "owt-crypt",
  "owt-runtime",
+ "owt-storage",
  "owt-test",
  "owt-web",
  "redis",
