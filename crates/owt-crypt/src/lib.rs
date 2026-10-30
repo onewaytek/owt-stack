@@ -22,6 +22,9 @@
 //!   (five minutes by default, or until [`Crypt::forget_keys`]), so the KEK is asked
 //!   once per key per interval. Long-lived key material comes from the operating
 //!   system's random generator; nonces from the thread generator.
+//! * **Sealers.** [`Crypt::sealer`] loads a scope's keys once, and the [`Sealer`] seals,
+//!   opens and computes blind indexes synchronously, for code that cannot `.await`. It is
+//!   a snapshot: a rotation or shred makes it refuse to seal, and so does its age.
 //! * **Shredding.** [`Crypt::shred`] deletes a scope's keys and records a tombstone, so
 //!   the scope can never get keys again. Another replica's cache can still decrypt for
 //!   up to the cache TTL after a shred; that TTL is the shred's latency.
@@ -43,12 +46,13 @@
 pub mod format;
 pub mod kek;
 mod migrations;
+mod sealer;
 #[cfg(feature = "yubihsm")]
 pub mod yubihsm;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,6 +66,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub use migrations::{LEDGER, LOCK_ID, migrate, migrator};
+pub use sealer::Sealer;
 pub use zeroize;
 
 use crate::format::{Sealed, lp};
@@ -128,6 +133,19 @@ pub enum CryptError {
     /// The scope was shredded: it has no keys and can never get any.
     #[error("scope {0:?} was shredded")]
     Shredded(String),
+    /// A [`Sealer`] is past its maximum age, or its scope was rotated since it loaded:
+    /// [`Sealer::refresh`] it.
+    #[error("the sealer for scope {0:?} is stale: refresh it")]
+    Stale(String),
+    /// A [`Sealer`] did not load that data key version, which was made after it
+    /// loaded: [`Sealer::refresh`] it.
+    #[error("the sealer for scope {scope:?} has not loaded data key version {version}: refresh it")]
+    NotLoaded {
+        /// The scope.
+        scope: String,
+        /// The version.
+        version: u32,
+    },
     /// The scope has no key of that purpose and version (never made, or shredded).
     #[error("scope {scope:?} has no {purpose:?} key version {version}")]
     NoKey {
@@ -164,6 +182,15 @@ impl fmt::Debug for Key {
     }
 }
 
+/// What [`Sealer`]s of one scope check, shared with the [`Crypt`] that made them.
+#[derive(Debug, Default)]
+struct ScopeState {
+    /// Bumped by every `rotate` and `shred` of the scope.
+    generation: AtomicU64,
+    /// Set by `shred`; a shredded scope never returns.
+    shredded: AtomicBool,
+}
+
 /// A cached key and when it was cached.
 type Cache = HashMap<(String, Purpose, u32), (Arc<Key>, Instant)>;
 
@@ -184,7 +211,10 @@ pub struct Crypt {
     cache: Arc<Mutex<Cache>>,
     /// Bumped by every `shred`; a key unwrapped across a bump is not cached.
     shreds: Arc<AtomicU64>,
+    /// What each scope's sealers check.
+    scopes: Arc<Mutex<HashMap<String, Arc<ScopeState>>>>,
     cache_ttl: Duration,
+    sealer_max_age: Option<Duration>,
 }
 
 impl fmt::Debug for Crypt {
@@ -204,7 +234,9 @@ impl Crypt {
             kek,
             cache: Arc::default(),
             shreds: Arc::default(),
+            scopes: Arc::default(),
             cache_ttl: DEFAULT_CACHE_TTL,
+            sealer_max_age: None,
         }
     }
 
@@ -361,6 +393,7 @@ impl Crypt {
                 .copied()
                 .unwrap_or(0);
             if let Some(v) = self.create(scope, purpose, latest + 1).await? {
+                self.invalidate(scope, false);
                 return Ok(v);
             }
         }
@@ -601,6 +634,7 @@ impl Crypt {
         // Bump first: a key unwrapped before the bump is refused by `remember`, and one
         // cached before it is dropped by the retain.
         self.shreds.fetch_add(1, Ordering::SeqCst);
+        self.invalidate(scope, true);
         self.cache().retain(|(s, _, _), _| s != scope);
         Ok(gone)
     }

@@ -562,3 +562,181 @@ async fn a_chain_with_software_rows_fails_the_hardware_check() {
     ));
     db.drop().await;
 }
+
+#[tokio::test]
+async fn a_sealer_and_the_async_api_read_each_others_values() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    let f = Field::new("s1", "notes", "body", "1");
+    let sealer = crypt.sealer("s1").await.unwrap();
+    assert_eq!((sealer.scope(), sealer.version()), ("s1", 1));
+    let ct = sealer.seal_str(&f, "by the sealer").unwrap();
+    assert_eq!(
+        &crypt.decrypt_string(&f, &ct).await.unwrap()[..],
+        "by the sealer"
+    );
+    assert_eq!(&sealer.open(&f, &ct).unwrap()[..], b"by the sealer");
+    let async_ct = crypt.encrypt_str(&f, "by crypt").await.unwrap();
+    assert_eq!(&sealer.open_string(&f, &async_ct).unwrap()[..], "by crypt");
+    // The blind index is the async one.
+    assert_eq!(
+        sealer
+            .blind_index("patients", "email", b"a@example.com")
+            .unwrap(),
+        crypt
+            .blind_index("s1", "patients", "email", b"a@example.com")
+            .await
+            .unwrap()
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_sealer_refuses_another_field_scope_or_row() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    let f = Field::new("s1", "notes", "body", "1");
+    let sealer = crypt.sealer("s1").await.unwrap();
+    let ct = sealer.seal(&f, b"x").unwrap();
+    for other in [
+        Field::new("s1", "notes", "body", "2"),
+        Field::new("s1", "notes", "title", "1"),
+        Field::new("s1", "notez", "body", "1"),
+    ] {
+        assert!(matches!(
+            sealer.open(&other, &ct),
+            Err(CryptError::Refused { .. })
+        ));
+    }
+    let foreign = Field::new("s2", "notes", "body", "1");
+    assert!(matches!(
+        sealer.seal(&foreign, b"x"),
+        Err(CryptError::Invalid(_))
+    ));
+    assert!(matches!(
+        sealer.open(&foreign, &ct),
+        Err(CryptError::Invalid(_))
+    ));
+    assert!(matches!(
+        sealer.open(&f, b"not a ciphertext at all, but long enough......"),
+        Err(CryptError::Malformed)
+    ));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_sealer_opens_older_versions_and_names_one_it_lacks() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    let f = Field::new("s1", "notes", "body", "1");
+    let old = crypt.encrypt(&f, b"v1").await.unwrap();
+    crypt.rotate("s1", Purpose::Data).await.unwrap();
+    let sealer = crypt.sealer("s1").await.unwrap();
+    assert_eq!(sealer.version(), 2);
+    assert_eq!(&sealer.open(&f, &old).unwrap()[..], b"v1");
+    // A version made after loading is not held.
+    crypt.rotate("s1", Purpose::Data).await.unwrap();
+    let v3 = crypt.encrypt(&f, b"v3").await.unwrap();
+    assert!(matches!(
+        sealer.open(&f, &v3),
+        Err(CryptError::NotLoaded { version: 3, .. })
+    ));
+    assert_eq!(
+        &sealer.refresh(&crypt).await.unwrap().open(&f, &v3).unwrap()[..],
+        b"v3"
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_rotation_makes_a_sealer_refuse_to_seal_until_refreshed() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    let f = Field::new("s1", "notes", "body", "1");
+    let sealer = crypt.sealer("s1").await.unwrap();
+    let clone = sealer.clone();
+    let ct = sealer.seal(&f, b"before").unwrap();
+    assert!(!sealer.is_stale());
+    // Another scope's rotation is not this one's.
+    crypt.rotate("s2", Purpose::Data).await.unwrap();
+    assert!(!sealer.is_stale());
+    crypt.rotate("s1", Purpose::Data).await.unwrap();
+    for s in [&sealer, &clone] {
+        assert!(s.is_stale());
+        assert!(matches!(s.seal(&f, b"x"), Err(CryptError::Stale(_))));
+        assert!(matches!(
+            s.blind_index("patients", "email", b"x"),
+            Err(CryptError::Stale(_))
+        ));
+        assert_eq!(&s.open(&f, &ct).unwrap()[..], b"before");
+    }
+    let fresh = sealer.refresh(&crypt).await.unwrap();
+    assert_eq!(fresh.version(), 2);
+    let new = fresh.seal(&f, b"after").unwrap();
+    assert_eq!(new[1..5], 2_u32.to_be_bytes());
+    assert_eq!(&crypt.decrypt(&f, &new).await.unwrap()[..], b"after");
+    assert_eq!(&fresh.open(&f, &ct).unwrap()[..], b"before");
+    // The index key rotating counts too.
+    crypt.rotate("s1", Purpose::Index).await.unwrap();
+    assert!(matches!(
+        fresh.blind_index("patients", "email", b"x"),
+        Err(CryptError::Stale(_))
+    ));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_shredded_scope_is_refused_by_its_sealers() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    let f = Field::new("leaving", "notes", "body", "1");
+    let sealer = crypt.sealer("leaving").await.unwrap();
+    let ct = sealer.seal(&f, b"gone").unwrap();
+    crypt.shred("leaving").await.unwrap();
+    assert!(sealer.is_stale());
+    assert!(matches!(
+        sealer.seal(&f, b"x"),
+        Err(CryptError::Shredded(_))
+    ));
+    assert!(matches!(sealer.open(&f, &ct), Err(CryptError::Shredded(_))));
+    assert!(matches!(
+        sealer.blind_index("t", "c", b"x"),
+        Err(CryptError::Shredded(_))
+    ));
+    assert!(matches!(
+        crypt.sealer("leaving").await,
+        Err(CryptError::Shredded(_))
+    ));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_sealer_is_stale_past_its_maximum_age() {
+    let Some(db) = Db::new().await else { return };
+    let f = Field::new("s1", "notes", "body", "1");
+    let kek = local("k1");
+    let crypt = Crypt::new(db.pool.clone(), kek.clone()).sealer_max_age(Duration::from_millis(300));
+    let sealer = crypt.sealer("s1").await.unwrap();
+    let ct = sealer.seal(&f, b"x").unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(sealer.is_stale());
+    assert!(matches!(sealer.seal(&f, b"x"), Err(CryptError::Stale(_))));
+    assert!(matches!(sealer.open(&f, &ct), Err(CryptError::Stale(_))));
+    assert!(sealer.refresh(&crypt).await.unwrap().seal(&f, b"x").is_ok());
+    // By default the bound is the key cache's.
+    let crypt = Crypt::new(db.pool.clone(), kek).cache_ttl(Duration::from_millis(300));
+    let sealer = crypt.sealer("s1").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(sealer.is_stale());
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_sealer_does_not_print_its_keys() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    let text = format!("{:?}", crypt.sealer("s1").await.unwrap());
+    assert!(text.contains("redacted") && text.contains("s1"), "{text}");
+    assert!(!text.contains("Key("), "{text}");
+    db.drop().await;
+}
