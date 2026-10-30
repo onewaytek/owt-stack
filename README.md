@@ -2973,7 +2973,7 @@ jobs:
   image:
     needs: release
     if: needs.release.outputs.version != ''
-    permissions: {contents: read, packages: write}
+    permissions: {contents: read, packages: write, id-token: write}
     uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.10.0
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
@@ -3013,7 +3013,7 @@ jobs:
         floating-tags: {description: "Also move the channel's floating tags", type: boolean, default: false}
   jobs:
     image:
-      permissions: {contents: read, packages: write}
+      permissions: {contents: read, packages: write, id-token: write}
       uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.10.0
       with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
@@ -3161,7 +3161,7 @@ the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 (0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The
 read-only `verify` job checks the layer's paths and modes and that the base has
 `base-requires` and a glibc at least as new as the binary needs. The `push` job confirms the layer is the one verified and runs
-none of the app's code and alone holds `packages: write`: with
+none of the app's code and alone holds `packages: write` while it builds: with
 [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) (pinned
 by version and SHA-256) appends the layer to the base pinned by its linux/amd64
 digest, sets the configuration, pushes by digest, reads the version label back and
@@ -3187,6 +3187,44 @@ the template's:
 | `port` | `8000` (empty: neither) | `ENV BIND_ADDR=0.0.0.0:<port>`, `EXPOSE <port>` |
 | `entrypoint` / `cmd` | `["/usr/local/bin/server"]` / `[]` | `ENTRYPOINT` / `CMD` (JSON arrays) |
 | `env` / `labels` | none | more `ENV` / `LABEL` lines, `KEY=VALUE` each |
+| `vuln-fail-on` | `critical` | none (the scan below); `negligible`, `low`, `medium`, `high`, `critical`, or `none` to report only |
+| `vuln-ignore-file` | none | none; a grype configuration file in the repository whose `ignore:` rules waive findings |
+| `attest` | `true` | none; `false` skips the signature and the SBOM (`image.yml` only) |
+
+**Supply chain:** each image is scanned, signed and given an SBOM.
+
+- **Scan:** a `scan` job assembles the image as `push` would make it (the base pinned
+  by digest, the layer on top) and runs [grype](https://github.com/anchore/grype) on
+  it before `push` runs, so a finding of `vuln-fail-on` severity or worse (`critical`
+  by default) pushes and tags nothing. `vuln-fail-on: none` still prints the findings
+  and never fails. The `docker` builder pushes in the same step it builds, so its image
+  is scanned right after the push; the job fails but the image is already in ghcr,
+  unsigned and without an SBOM. A finding with no fix, or a false positive, is waived
+  in the file `vuln-ignore-file` names (`.grype.yaml`):
+
+  ```yaml
+  # .grype.yaml
+  ignore:
+    - vulnerability: CVE-2026-0001   # a finding id
+    - fix-state: not-fixed           # or every finding that has no fix yet
+  ```
+- **Signature:** the `attest` job signs the pushed digest, never a tag, with
+  [cosign](https://github.com/sigstore/cosign) keyless: the run's OIDC token, which
+  Sigstore exchanges for a short-lived certificate naming the workflow, and a record in
+  the public transparency log. Verify it with
+  `cosign verify ghcr.io/<owner>/<repo>@<digest> --certificate-identity-regexp
+  '^https://github.com/<owner>/<repo>/' --certificate-oidc-issuer
+  https://token.actions.githubusercontent.com`.
+- **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
+  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact and attaches it
+  to the image as a signed attestation
+  (`cosign verify-attestation --type spdxjson ...`, with the identity flags above).
+
+The caller's job therefore grants `id-token: write` besides `packages: write`
+(`permissions: {contents: read, packages: write, id-token: write}`): a reusable workflow
+cannot take a permission its caller withholds, and a caller that grants less fails to
+start, `attest: false` or not. `attest: false` skips the signature and the SBOM, not
+the scan.
 
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
@@ -3277,7 +3315,10 @@ commit the way a release does and verifies all but the push: with `builder: cran
 (the default) the compile, the npm assets, the packed layer, and the base's tools and
 glibc, by the same `build` and `verify` jobs as `image.yml`'s (`just image-check`
 keeps them identical); with `builder: docker` the Dockerfile is built with BuildKit
-and pushed nowhere. It takes `image.yml`'s inputs that shape the build (`bin`,
+and pushed nowhere. It also scans the image with grype, as `image.yml` does, with the
+same `vuln-fail-on` and `vuln-ignore-file` inputs: this is where a vulnerable base image
+is most useful to learn of, before the release. Nothing is signed and no SBOM is made
+here, and the caller still grants `contents: read` only. It takes `image.yml`'s inputs that shape the build (`bin`,
 `cargo-args`, `files`, `base-image`, ...) and none that shape the push.
 `cargo-profile` makes the check cheaper: a pull request can build with `dev`, or with a
 profile of the app's own that turns off fat LTO and sets many codegen units
