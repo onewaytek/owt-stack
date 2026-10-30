@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.11.0](https://github.com/onewaytek/owt-stack/compare/v0.10.0...v0.11.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** `session::Data` has a new public field `mfa`, so a struct literal of `Data` must end with `..Default::default()`. A custom session type that implements `session::Signed` is unaffected unless it adopts `mfa::MfaSession`.
+* **runtime:** logging::Options has three new fields; an app that builds it as a struct literal adds `..logging::Options::default()`. Fields on the default denylist (name, address, email, note and others) now log as [redacted]; rename one that must stay visible, or set redact_defaults to false. JSON log output comes from a custom formatter (a bridged `log` record keeps its own target and drops its `log.*` fields; a span field named `name` is written as `field.name`), and the OTLP exporter redacts matching span, event and link attributes (span names, event names and status descriptions are exported as written).
+* **ci:** the app's image job calling image.yml grants id-token: write besides contents: read and packages: write. A reusable workflow cannot take a permission its caller withholds, so without it the call fails to start. An image with a critical vulnerability now fails the job; set vuln-fail-on: none to report only, or waive a finding in a grype configuration named by vuln-ignore-file.
+
+### Features
+
+* **accounts:** add a TOTP second factor, recovery codes and step-up re-authentication ([#256](https://github.com/onewaytek/owt-stack/issues/256)) ([3852996](https://github.com/onewaytek/owt-stack/commit/38529960926459db214d8b1187adae71a570ef54))
+* **audit:** add owt-audit, an append-only hash-chained audit log ([#251](https://github.com/onewaytek/owt-stack/issues/251)) ([0553364](https://github.com/onewaytek/owt-stack/commit/0553364781cb2ccca7771830ccf7e8efbdab9b49))
+* **audit:** anchor to an S3 bucket under Object Lock ([#261](https://github.com/onewaytek/owt-stack/issues/261)) ([e74b7f0](https://github.com/onewaytek/owt-stack/commit/e74b7f0649b6fc92adf53d8bc4e800b433b62ae9))
+* **auth:** add TOTP, recovery codes, a NIST password policy and a Redis throttle ([#255](https://github.com/onewaytek/owt-stack/issues/255)) ([eba19b3](https://github.com/onewaytek/owt-stack/commit/eba19b3eb3dfec8126a1409ea508ca2a33e0157a))
+* **ci:** sign images with cosign, attach an SBOM, and fail on critical vulnerabilities ([#249](https://github.com/onewaytek/owt-stack/issues/249)) ([d2e968d](https://github.com/onewaytek/owt-stack/commit/d2e968d548e517c991c55400e8ba904a5b0a9b2f))
+* **crypt:** add owt-crypt, envelope field encryption with a YubiHSM 2 KEK ([#252](https://github.com/onewaytek/owt-stack/issues/252)) ([529eac2](https://github.com/onewaytek/owt-stack/commit/529eac2c27965c868c0410a53f186617db8d1262))
+* **runtime:** add a durable job queue in Postgres ([#250](https://github.com/onewaytek/owt-stack/issues/250)) ([2fbb988](https://github.com/onewaytek/owt-stack/commit/2fbb9884ed73f3727127e997e8d07cd4b6955ca2))
+* **runtime:** redact sensitive fields in logs ([#257](https://github.com/onewaytek/owt-stack/issues/257)) ([d23cb1b](https://github.com/onewaytek/owt-stack/commit/d23cb1bd910ef995aea09e3a6676b15354b4965d))
+* **storage:** add owt-storage, encrypted objects in S3-compatible buckets ([626e7c1](https://github.com/onewaytek/owt-stack/commit/626e7c1518d668fa40be13d66cc01d615aa7879d))
+* **web:** end sessions after an idle timeout ([#254](https://github.com/onewaytek/owt-stack/issues/254)) ([1e24d39](https://github.com/onewaytek/owt-stack/commit/1e24d39f6fdbe05a225667d1e28641f2efed025c))
+
+
+### Bug Fixes
+
+* **accounts:** index every recovery code by account and test concurrent single-use ([#267](https://github.com/onewaytek/owt-stack/issues/267)) ([3d4cafe](https://github.com/onewaytek/owt-stack/commit/3d4cafe57b2bf8d32c7a3ff1e3a86396d4a88038))
+* **crypt:** report rows without a key, bound get_sealed's reservation ([#263](https://github.com/onewaytek/owt-stack/issues/263)) ([4ee71b3](https://github.com/onewaytek/owt-stack/commit/4ee71b32254a1bd61c7010f411c933044f443bf2))
+* **runtime:** count queue states from their partial indexes; pin the image signer ref ([#264](https://github.com/onewaytek/owt-stack/issues/264)) ([467db10](https://github.com/onewaytek/owt-stack/commit/467db104cb7f4a7c3951abb0428efcc083d1558a))
+
+
+### Performance Improvements
+
+* optimize crypto dependencies in dev and test builds ([#262](https://github.com/onewaytek/owt-stack/issues/262)) ([85bb5d2](https://github.com/onewaytek/owt-stack/commit/85bb5d2c14264ce2e2b57f3bea2c1b23e6c6c9b5))
+
 ## [0.10.0](https://github.com/onewaytek/owt-stack/compare/v0.9.0...v0.10.0) (2026-10-27)
 
 
