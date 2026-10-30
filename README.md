@@ -3902,7 +3902,8 @@ opt-level = 3
 # likewise: blake2, password-hash, aes, aes-gcm, aead, ghash, polyval, universal-hash,
 # sha1, md-5, hmac, hkdf, chacha20, ctr, cipher, inout, digest, block-buffer,
 # crypto-common, cpufeatures, subtle, base64ct, curve25519-dalek, ed25519-dalek, rsa,
-# num-bigint-dig, crypto-bigint
+# num-bigint-dig, crypto-bigint, pbkdf2, p256, p384, elliptic-curve, primeorder, ecdsa,
+# ff, group, fiat-crypto
 ```
 
 It changes nothing about the lockfile, `cargo audit` or sccache (the optimised

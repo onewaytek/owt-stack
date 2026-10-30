@@ -156,3 +156,21 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.crypto-bigint]
 opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.p256]
+opt-level = 3
+[profile.dev.package.p384]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.primeorder]
+opt-level = 3
+[profile.dev.package.ecdsa]
+opt-level = 3
+[profile.dev.package.ff]
+opt-level = 3
+[profile.dev.package.group]
+opt-level = 3
+[profile.dev.package.fiat-crypto]
+opt-level = 3
