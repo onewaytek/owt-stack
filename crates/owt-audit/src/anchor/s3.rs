@@ -148,7 +148,12 @@ impl S3ObjectLock {
         if config.retention < MIN_RETENTION || config.retention > MAX_RETENTION {
             bail!("the retention must be between one day and 100 years");
         }
+        // Signed requests go straight to the endpoint: `.no_proxy()` ignores the
+        // `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` environment variables, so
+        // the environment cannot route them through a third party. A proxy is not
+        // supported.
         let http = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -208,7 +213,10 @@ impl S3ObjectLock {
 
     /// Read a stored manifest back, for `audit verify --manifest`. Pass the receipt
     /// `put` returned as `version_id`: without it the latest version is read, which
-    /// a credential able to write the key again could have replaced.
+    /// a credential able to write the key again could have replaced. With it, the
+    /// response must name that same version in `x-amz-version-id`, and the version's
+    /// retention must still be COMPLIANCE and in the future, so only a locked
+    /// version is trusted.
     pub async fn fetch(&self, key: &str, version_id: Option<&str>) -> anyhow::Result<Vec<u8>> {
         validate_key(key)?;
         let query: Vec<(&str, &str)> = version_id.map(|v| ("versionId", v)).into_iter().collect();
@@ -221,7 +229,23 @@ impl S3ObjectLock {
                 error_detail(resp).await
             );
         }
-        read_capped(resp, MAX_MANIFEST).await
+        if let Some(pinned) = version_id {
+            let served = resp
+                .headers()
+                .get("x-amz-version-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim);
+            if served != Some(pinned) {
+                bail!(
+                    "reading {key:?} returned version {served:?} where {pinned:?} was pinned: the store did not serve the receipt's version"
+                );
+            }
+        }
+        let body = read_capped(resp, MAX_MANIFEST).await?;
+        if let Some(pinned) = version_id {
+            self.check_lock(key, pinned, SystemTime::now()).await?;
+        }
+        Ok(body)
     }
 
     /// The signed PUT of `bytes` under `key`, as of `now`.
@@ -230,6 +254,10 @@ impl S3ObjectLock {
         let until = now
             .checked_add(self.config.retention)
             .context("the retention overflows the clock")?;
+        // S3 requires `Content-MD5` (or a checksum header) on a PUT that carries
+        // Object Lock headers. MD5 here is the integrity check the API demands, not
+        // a security primitive: the SigV4 signature and the `x-amz-content-sha256`
+        // payload hash are what authenticate the body.
         let extra = [
             (
                 "content-md5",
@@ -300,8 +328,9 @@ impl S3ObjectLock {
         Ok(Prepared { url, headers })
     }
 
-    /// Send a signed request. A redirect and a clock far from the store's are
-    /// errors.
+    /// Send a signed request. A redirect is an error, and so is a success response
+    /// whose `Date` is missing or far from this host's clock. Other failures are
+    /// returned for the caller to report.
     async fn send(
         &self,
         req: &Prepared,
@@ -325,8 +354,13 @@ impl S3ObjectLock {
                 resp.status()
             );
         }
+        if !resp.status().is_success() {
+            // The caller reports the store's error, which a missing or skewed
+            // `Date` on a failure must not hide.
+            return Ok(resp);
+        }
         // Every S3-compatible store sends `Date`; without it the clock cannot be
-        // checked, so the response is refused. On a PUT this can arrive after the
+        // checked, so a success response is refused. On a PUT this can arrive after the
         // object is locked, to a date that follows a wrong clock.
         let date = resp
             .headers()
@@ -365,7 +399,7 @@ impl S3ObjectLock {
         let resp = self.send(&req, "GET", Vec::new()).await?;
         if !resp.status().is_success() {
             bail!(
-                "{key:?} was stored but its retention could not be read back: {}",
+                "the retention of {key:?} could not be read back: {}",
                 error_detail(resp).await
             );
         }
@@ -377,7 +411,7 @@ impl S3ObjectLock {
         match (mode.as_deref(), held) {
             (Some("COMPLIANCE"), Some(held)) if secs(held) >= wanted => Ok(()),
             _ => bail!(
-                "{key:?} was stored without the requested lock (mode {mode:?}, retain-until {until_text:?}): the store ignores Object Lock or the bucket does not enforce it",
+                "{key:?} is held without the required lock (mode {mode:?}, retain-until {until_text:?}): the store ignores Object Lock or the bucket does not enforce it",
             ),
         }
     }
@@ -514,7 +548,9 @@ async fn error_detail(mut resp: reqwest::Response) -> S3Error {
 
 /// The trimmed text of the leaf element `child` directly under the document root
 /// `root`, or `None` when the document is not a `root` element, has no such child,
-/// or is not plain XML (comments, CDATA and DTDs are refused).
+/// the child has any element inside it (mixed content included), or the document is
+/// not plain XML: comments, CDATA and DTDs are refused, every element must close in
+/// order, and the root's close tag must end the document.
 fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
     let mut s = xml.trim_start();
     if s.starts_with("<?xml") {
@@ -524,38 +560,41 @@ fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
     if !open.starts_with(['>', ' ', '\t', '\r', '\n', '/']) {
         return None;
     }
-    let end = open.find('>')?;
+    let end = tag_end(open)?;
     if open[..end].ends_with('/') {
         return None;
     }
     let mut rest = &open[end + 1..];
-    let mut depth = 0usize;
-    // The name and start of the direct child being read, and whether it has children.
-    let mut current: Option<(&str, &str, bool)> = None;
+    // The names of the open elements below the root.
+    let mut stack: Vec<&str> = Vec::new();
+    // Whether the direct child being read holds an element.
+    let mut nested = false;
+    let mut found: Option<String> = None;
     loop {
         let lt = rest.find('<')?;
-        let tag_end = lt + rest[lt..].find('>')?;
-        let tag = &rest[lt + 1..tag_end];
         let before = &rest[..lt];
-        let after = &rest[tag_end + 1..];
+        let tag_len = tag_end(&rest[lt..])?;
+        let tag = &rest[lt + 1..lt + tag_len];
+        let after = &rest[lt + tag_len + 1..];
         if tag.starts_with(['!', '?']) {
             return None;
         }
         if let Some(name) = tag.strip_prefix('/') {
             let name = name.trim();
-            if depth == 0 {
-                let _ = (name, after);
+            let Some(open_name) = stack.pop() else {
+                // The root's close tag ends the document.
+                return (name == root && after.trim().is_empty())
+                    .then_some(found)
+                    .flatten();
+            };
+            if open_name != name {
                 return None;
             }
-            depth -= 1;
-            if depth == 0 {
-                let (n, _, nested) = current.take()?;
-                if n != name {
+            if stack.is_empty() && name == child {
+                if nested {
                     return None;
                 }
-                if n == child && !nested {
-                    return Some(before.trim().to_owned());
-                }
+                found.get_or_insert_with(|| before.trim().to_owned());
             }
         } else {
             let self_closing = tag.ends_with('/');
@@ -563,24 +602,40 @@ fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
                 .trim_end_matches('/')
                 .split(|c: char| c.is_whitespace())
                 .next()?;
-            if depth == 0 {
+            if stack.is_empty() {
+                nested = false;
                 if self_closing {
                     if name == child {
-                        return Some(String::new());
+                        found.get_or_insert_with(String::new);
                     }
                 } else {
-                    current = Some((name, after, false));
-                    depth = 1;
+                    stack.push(name);
                 }
-            } else if !self_closing {
-                depth += 1;
-                if let Some(c) = current.as_mut() {
-                    c.2 = true;
+            } else {
+                // Any element inside the child, self-closing or not.
+                nested = true;
+                if !self_closing {
+                    stack.push(name);
                 }
             }
         }
         rest = after;
     }
+}
+
+/// The index of the `>` that ends the tag starting at the `<` that opens `s`,
+/// skipping any inside a quoted attribute value.
+fn tag_end(s: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (None, '>') => return Some(i),
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            _ => {}
+        }
+    }
+    None
 }
 
 struct Creds<'a> {
@@ -746,6 +801,14 @@ fn from_civil(year: i64, month: i64, day: i64, h: u64, m: u64, s: u64) -> Option
     UNIX_EPOCH.checked_add(Duration::from_secs(total))
 }
 
+/// An unsigned decimal integer: digits only, so no sign, space or underscore.
+fn digits<T: std::str::FromStr>(s: &str) -> Option<T> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// `Fri, 24 May 2013 00:00:00 GMT`.
 fn parse_http_date(s: &str) -> Option<SystemTime> {
     let p: Vec<&str> = s.split_whitespace().collect();
@@ -759,12 +822,12 @@ fn parse_http_date(s: &str) -> Option<SystemTime> {
     .position(|m| *m == p[2])?;
     let mut t = p[4].split(':');
     from_civil(
-        p[3].parse().ok()?,
+        digits(p[3])?,
         i64::try_from(month).ok()? + 1,
-        p[1].parse().ok()?,
-        t.next()?.parse().ok()?,
-        t.next()?.parse().ok()?,
-        t.next()?.parse().ok()?,
+        digits(p[1])?,
+        digits(t.next()?)?,
+        digits(t.next()?)?,
+        digits(t.next()?)?,
     )
 }
 
@@ -776,12 +839,12 @@ fn parse_iso8601(s: &str) -> Option<SystemTime> {
     let mut d = date.split('-');
     let mut t = time.split(':');
     from_civil(
-        d.next()?.parse().ok()?,
-        d.next()?.parse().ok()?,
-        d.next()?.parse().ok()?,
-        t.next()?.parse().ok()?,
-        t.next()?.parse().ok()?,
-        t.next()?.parse().ok()?,
+        digits(d.next()?)?,
+        digits(d.next()?)?,
+        digits(d.next()?)?,
+        digits(t.next()?)?,
+        digits(t.next()?)?,
+        digits(t.next()?)?,
     )
 }
 
@@ -1147,6 +1210,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_documents() {
+        let get = |x| xml_child(x, "Retention", "Mode");
+        // Mixed content, with a self-closing or an open child.
+        assert_eq!(
+            get("<Retention><Mode>X<a/>COMPLIANCE</Mode></Retention>"),
+            None
+        );
+        assert_eq!(get("<Retention><Mode>X<a>y</a></Mode></Retention>"), None);
+        // No closing root, a wrong one, or trailing content.
+        assert_eq!(get("<Retention><Mode>A</Mode>"), None);
+        assert_eq!(get("<Retention><Mode>A</Mode></Other>"), None);
+        assert_eq!(get("<Retention><Mode>A</Mode></Retention><x/>"), None);
+        assert_eq!(
+            get("<Retention><Mode>A</Mode></Retention> \n").as_deref(),
+            Some("A")
+        );
+        // Mismatched nesting.
+        assert_eq!(
+            get("<Retention><Mode>A</Mode><b><c></b></c></Retention>"),
+            None
+        );
+        // A `>` inside a quoted attribute does not end the tag.
+        assert_eq!(
+            get("<Retention a=\"x>y\"><Mode b='>'>A</Mode></Retention>").as_deref(),
+            Some("A")
+        );
+        assert_eq!(get("<Retention><Mode b=\"x>A</Mode></Retention>"), None);
+    }
+
+    #[test]
+    fn integers_have_no_sign() {
+        assert_eq!(parse_iso8601("+2013-05-24T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("2013-+5-24T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("2013-05-24T+0:00:00Z"), None);
+        assert_eq!(parse_http_date("Fri, +4 May 2013 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Fri, 24 May +2013 00:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Fri, 24 May 2013 00:+0:00 GMT"), None);
+    }
+
+    #[test]
     fn parses_dates_without_panicking() {
         assert_eq!(
             parse_http_date("Fri, 24 May 2013 00:00:00 GMT"),
@@ -1277,6 +1380,10 @@ mod tests {
 
     use fake::{LOCK_ON, ok, put, reply, retention, years};
 
+    fn ok_status(status: &str, body: &str) -> String {
+        reply(status, &[], body, Some(SystemTime::now()))
+    }
+
     fn err(r: anyhow::Result<String>) -> String {
         format!("{:#}", r.unwrap_err())
     }
@@ -1306,7 +1413,7 @@ mod tests {
             ok(&[], &retention("GOVERNANCE", years(8))),
         ])
         .await);
-        assert!(e.contains("without the requested lock"), "{e}");
+        assert!(e.contains("without the required lock"), "{e}");
     }
 
     #[tokio::test]
@@ -1317,7 +1424,7 @@ mod tests {
             ok(&[], &retention("COMPLIANCE", years(1))),
         ])
         .await);
-        assert!(e.contains("without the requested lock"), "{e}");
+        assert!(e.contains("without the required lock"), "{e}");
     }
 
     #[tokio::test]
@@ -1333,7 +1440,7 @@ mod tests {
             ),
         ])
         .await);
-        assert!(e.contains("without the requested lock"), "{e}");
+        assert!(e.contains("without the required lock"), "{e}");
     }
 
     #[tokio::test]
@@ -1401,5 +1508,89 @@ mod tests {
             e.contains("403") && e.contains("AccessDenied") && !e.contains("create it"),
             "{e}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_precondition_failure_maps_to_an_existing_key() {
+        let e = err(put(vec![
+            ok(&[], LOCK_ON),
+            ok_status(
+                "412 Precondition Failed",
+                "<Error><Code>PreconditionFailed</Code></Error>",
+            ),
+        ])
+        .await);
+        assert!(
+            e.contains("key already exists") && e.contains("PreconditionFailed"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_without_a_date_reports_the_store_error() {
+        let denied = "<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
+        let e = err(put(vec![
+            ok(&[], LOCK_ON),
+            reply("403 Forbidden", &[], denied, None),
+        ])
+        .await);
+        assert!(e.contains("AccessDenied") && !e.contains("Date"), "{e}");
+    }
+
+    async fn fetch(version: Option<&str>, responses: Vec<String>) -> anyhow::Result<Vec<u8>> {
+        let endpoint = fake::serve(responses).await;
+        S3ObjectLock::new(config(&endpoint))
+            .unwrap()
+            .fetch("owt-audit/1.json", version)
+            .await
+    }
+
+    #[tokio::test]
+    async fn fetch_by_version_needs_the_same_version_and_a_lock() {
+        let got = fetch(
+            Some("v1"),
+            vec![
+                ok(&[("x-amz-version-id", "v1")], "manifest"),
+                ok(&[], &retention("COMPLIANCE", years(1))),
+            ],
+        )
+        .await;
+        assert_eq!(got.unwrap(), b"manifest");
+
+        let mismatch = fetch(Some("v1"), vec![ok(&[("x-amz-version-id", "v2")], "m")]).await;
+        let e = format!("{:#}", mismatch.unwrap_err());
+        assert!(e.contains("was pinned"), "{e}");
+        let missing = fetch(Some("v1"), vec![ok(&[], "m")]).await;
+        assert!(format!("{:#}", missing.unwrap_err()).contains("was pinned"));
+
+        let governance = fetch(
+            Some("v1"),
+            vec![
+                ok(&[("x-amz-version-id", "v1")], "m"),
+                ok(&[], &retention("GOVERNANCE", years(1))),
+            ],
+        )
+        .await;
+        let e = format!("{:#}", governance.unwrap_err());
+        assert!(e.contains("without the required lock"), "{e}");
+
+        let expired = fetch(
+            Some("v1"),
+            vec![
+                ok(&[("x-amz-version-id", "v1")], "m"),
+                ok(
+                    &[],
+                    &retention("COMPLIANCE", SystemTime::now() - Duration::from_hours(48)),
+                ),
+            ],
+        )
+        .await;
+        assert!(expired.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_of_the_latest_version_reads_one_object() {
+        let got = fetch(None, vec![ok(&[], "manifest")]).await;
+        assert_eq!(got.unwrap(), b"manifest");
     }
 }
