@@ -270,7 +270,10 @@ request, and a session ends between the timeout less one refresh and the timeout
 after the last activity, give or take the replicas' clock skew. An activity-only
 refresh sets a second cookie (`<name>-seen`), sealed and bound to the session's id,
 and leaves the session cookie alone: a slow request in one tab cannot put back a
-session another tab has since signed out of.
+session another tab has since signed out of. Activity alone does not extend `max_age`: the
+session cookie's own expiry moves only when a handler changes the session, so set
+`max_age` to the longest working day the app allows, and let the idle timeout end
+sessions sooner.
 
 A session past the timeout is no session: its cookies are removed, and
 `Session::idle_expired()` is true for that request, so a guard on the app's pages
