@@ -1,7 +1,9 @@
 //! A KEK inside a `YubiHSM 2` (feature `yubihsm`).
 //!
 //! The KEK is a wrap key object (AES-256-CCM) in the HSM with the `wrap-data` and
-//! `unwrap-data` capabilities. Data keys go to the HSM to be wrapped and come back
+//! `unwrap-data` capabilities, and optionally `exportable-under-wrap` (for the backup).
+//! [`YubiHsmKek::open`] refuses one that also has `export-wrapped` or `import-wrapped`,
+//! which would make it a transport key, and round-trips a random key before returning. Data keys go to the HSM to be wrapped and come back
 //! wrapped; the wrap key never leaves it. Each wrap carries SHA-256 of its context
 //! ahead of the key, checked on unwrap, since the HSM's wrap has no associated data.
 //!
@@ -24,23 +26,59 @@ use zeroize::Zeroizing;
 
 use crate::kek::{KekError, KekProvider};
 
-/// The two HSM commands the provider uses, so tests can stand in for a device.
+/// Why the device did not unwrap a message.
+enum Unwrapped {
+    /// The message is not even a wrap message.
+    Malformed,
+    /// The device answered with an error, or did not answer.
+    Device,
+}
+
+/// The HSM commands the provider uses, so tests can stand in for a device.
 trait Device: Send + Sync {
-    fn wrap_data(&self, wrap_key: object::Id, plaintext: Vec<u8>) -> Result<Vec<u8>, String>;
-    fn unwrap_data(&self, wrap_key: object::Id, message: Vec<u8>) -> Result<Vec<u8>, String>;
+    fn wrap_data(&self, wrap_key: object::Id, plaintext: &[u8]) -> Result<Vec<u8>, String>;
+    fn unwrap_data(
+        &self,
+        wrap_key: object::Id,
+        message: Vec<u8>,
+    ) -> Result<Zeroizing<Vec<u8>>, Unwrapped>;
+    /// Whether the device answers and the wrap key is there.
+    fn probe(&self, wrap_key: object::Id) -> Result<(), String>;
 }
 
 impl Device for Client {
-    fn wrap_data(&self, wrap_key: object::Id, plaintext: Vec<u8>) -> Result<Vec<u8>, String> {
-        Client::wrap_data(self, wrap_key, plaintext)
+    fn wrap_data(&self, wrap_key: object::Id, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        // The yubihsm API takes an owned Vec and drops it without zeroizing: this one
+        // copy of the plaintext is unavoidable. It is the digest and a wrapped key
+        // (never a data key's plaintext beyond the HSM call), and short-lived.
+        Client::wrap_data(self, wrap_key, plaintext.to_vec())
             .map(wrap::Message::into_vec)
             .map_err(|e| e.to_string())
     }
 
-    fn unwrap_data(&self, wrap_key: object::Id, message: Vec<u8>) -> Result<Vec<u8>, String> {
-        let message = wrap::Message::from_vec(message).map_err(|e| e.to_string())?;
-        Client::unwrap_data(self, wrap_key, message).map_err(|e| e.to_string())
+    fn unwrap_data(
+        &self,
+        wrap_key: object::Id,
+        message: Vec<u8>,
+    ) -> Result<Zeroizing<Vec<u8>>, Unwrapped> {
+        let message = wrap::Message::from_vec(message).map_err(|_| Unwrapped::Malformed)?;
+        Client::unwrap_data(self, wrap_key, message)
+            .map(Zeroizing::new)
+            .map_err(|_| Unwrapped::Device)
     }
+
+    fn probe(&self, wrap_key: object::Id) -> Result<(), String> {
+        self.get_object_info(wrap_key, object::Type::WrapKey)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// What the HSM wraps: SHA-256 of `context`, then `key`.
+fn frame(context: &[u8], key: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut plaintext = Zeroizing::new(Sha256::digest(context).to_vec());
+    plaintext.extend_from_slice(key);
+    plaintext
 }
 
 /// A KEK that is a wrap key in a `YubiHSM 2`. Its id is `yubihsm:<object id>`, as
@@ -62,12 +100,26 @@ impl fmt::Debug for YubiHsmKek {
 impl YubiHsmKek {
     /// Open a session through `connector` with `credentials` (an authentication key
     /// id and its password; never the factory default in production), and check that
-    /// `wrap_key` is an AES-256-CCM wrap key with `wrap-data` and `unwrap-data`.
+    /// `wrap_key` is an AES-256-CCM wrap key with `wrap-data` and `unwrap-data` and
+    /// without `export-wrapped` or `import-wrapped` (it may have
+    /// `exportable-under-wrap`). Then wrap and unwrap 32 random bytes as a self-test,
+    /// which also proves the session's authentication key may use the wrap key.
     /// Blocking: call it at startup, or in `spawn_blocking`.
     pub fn open(
         connector: Connector,
         credentials: Credentials,
         wrap_key: object::Id,
+    ) -> Result<Self, KekError> {
+        Self::open_checked(connector, credentials, wrap_key, true)
+    }
+
+    /// [`YubiHsmKek::open`], with the round trip optional: `MockHsm` has no
+    /// `wrap-data`, so tests of the checks skip it.
+    fn open_checked(
+        connector: Connector,
+        credentials: Credentials,
+        wrap_key: object::Id,
+        self_test: bool,
     ) -> Result<Self, KekError> {
         let client = Client::open(connector, credentials, true)
             .map_err(|e| KekError::Unavailable(e.to_string()))?;
@@ -85,7 +137,42 @@ impl YubiHsmKek {
                 "wrap key {wrap_key:#06x} is not AES-256-CCM"
             )));
         }
-        Ok(Self::with_device(Arc::new(client), wrap_key))
+        if info
+            .capabilities
+            .intersects(Capability::EXPORT_WRAPPED | Capability::IMPORT_WRAPPED)
+        {
+            return Err(KekError::Config(format!(
+                "wrap key {wrap_key:#06x} has export-wrapped or import-wrapped: \
+                 a KEK is not a transport key"
+            )));
+        }
+        let kek = Self::with_device(Arc::new(client), wrap_key);
+        if self_test {
+            kek.self_test()?;
+        }
+        Ok(kek)
+    }
+
+    /// Wrap and unwrap 32 random bytes under a test context.
+    fn self_test(&self) -> Result<(), KekError> {
+        let mut key = Zeroizing::new([0_u8; 32]);
+        getrandom::fill(&mut key[..]).map_err(|e| KekError::Unavailable(e.to_string()))?;
+        let context = b"owt-crypt/self-test";
+        let wrapped = self
+            .device
+            .wrap_data(self.wrap_key, &frame(context, &key[..]))
+            .map_err(|e| KekError::Config(format!("{} self-test wrap: {e}", self.id)))?;
+        let plain = self
+            .device
+            .unwrap_data(self.wrap_key, wrapped)
+            .map_err(|_| KekError::Config(format!("{} self-test unwrap failed", self.id)))?;
+        if !bool::from(plain[..].ct_eq(&frame(context, &key[..])[..])) {
+            return Err(KekError::Config(format!(
+                "{} self-test returned other bytes",
+                self.id
+            )));
+        }
+        Ok(())
     }
 
     /// [`YubiHsmKek::open`] through `yubihsm-connector` at `addr:port` (it listens on
@@ -136,12 +223,11 @@ impl KekProvider for YubiHsmKek {
         key: &'a [u8],
         context: &'a [u8],
     ) -> BoxFuture<'a, Result<Vec<u8>, KekError>> {
-        let mut plaintext = Zeroizing::new(Sha256::digest(context).to_vec());
-        plaintext.extend_from_slice(key);
+        let plaintext = frame(context, key);
         let device = self.device.clone();
         let wrap_key = self.wrap_key;
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || device.wrap_data(wrap_key, plaintext.to_vec()))
+            tokio::task::spawn_blocking(move || device.wrap_data(wrap_key, &plaintext))
                 .await
                 .map_err(|e| KekError::Unavailable(e.to_string()))?
                 .map_err(KekError::Unavailable)
@@ -161,13 +247,20 @@ impl KekProvider for YubiHsmKek {
             if kek_id != self.id {
                 return Err(KekError::UnknownKek(kek_id.into()));
             }
-            let plain = Zeroizing::new(
-                tokio::task::spawn_blocking(move || device.unwrap_data(wrap_key, message))
-                    .await
-                    .map_err(|e| KekError::Unavailable(e.to_string()))?
-                    // The HSM refuses a message that does not authenticate.
-                    .map_err(|_| KekError::Refused(kek_id.into()))?,
-            );
+            // A device error is a refusal when the device still answers (a message that
+            // does not authenticate), and an outage when a probe of the wrap key fails.
+            let id = kek_id.to_owned();
+            let plain = tokio::task::spawn_blocking(move || {
+                device.unwrap_data(wrap_key, message).map_err(|e| match e {
+                    Unwrapped::Malformed => KekError::Refused(id),
+                    Unwrapped::Device => match device.probe(wrap_key) {
+                        Ok(()) => KekError::Refused(id),
+                        Err(e) => KekError::Unavailable(e),
+                    },
+                })
+            })
+            .await
+            .map_err(|e| KekError::Unavailable(e.to_string()))??;
             let digest = Sha256::digest(context);
             if plain.len() < digest.len() || !bool::from(plain[..digest.len()].ct_eq(&digest)) {
                 return Err(KekError::Refused(kek_id.into()));
@@ -179,6 +272,8 @@ impl KekProvider for YubiHsmKek {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
     use yubihsm::{Domain, object};
@@ -186,30 +281,61 @@ mod tests {
     use super::*;
 
     /// Stands in for the HSM's wrap-data and unwrap-data, which `MockHsm` lacks.
-    struct Fake(Aes256Gcm);
+    struct Fake(Aes256Gcm, Arc<AtomicBool>);
 
     impl Device for Fake {
-        fn wrap_data(&self, _: object::Id, plaintext: Vec<u8>) -> Result<Vec<u8>, String> {
+        fn wrap_data(&self, _: object::Id, plaintext: &[u8]) -> Result<Vec<u8>, String> {
             let mut out = vec![7_u8; 12];
-            out.extend(
-                self.0
-                    .encrypt(&Nonce::from([7; 12]), &plaintext[..])
-                    .unwrap(),
-            );
+            out.extend(self.0.encrypt(&Nonce::from([7; 12]), plaintext).unwrap());
             Ok(out)
         }
 
-        fn unwrap_data(&self, _: object::Id, message: Vec<u8>) -> Result<Vec<u8>, String> {
+        fn unwrap_data(
+            &self,
+            _: object::Id,
+            message: Vec<u8>,
+        ) -> Result<Zeroizing<Vec<u8>>, Unwrapped> {
+            if !self.1.load(Ordering::SeqCst) {
+                return Err(Unwrapped::Device);
+            }
             let (nonce, sealed) = message.split_at(12);
-            let nonce: [u8; 12] = nonce.try_into().map_err(|_| "short".to_owned())?;
+            let nonce: [u8; 12] = nonce.try_into().map_err(|_| Unwrapped::Malformed)?;
             self.0
                 .decrypt(&Nonce::from(nonce), sealed)
-                .map_err(|_| "refused".into())
+                .map(Zeroizing::new)
+                .map_err(|_| Unwrapped::Device)
+        }
+
+        fn probe(&self, _: object::Id) -> Result<(), String> {
+            if self.1.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("usb gone".into())
+            }
         }
     }
 
     fn fake() -> YubiHsmKek {
-        YubiHsmKek::with_device(Arc::new(Fake(Aes256Gcm::new(&[3; 32].into()))), 0x64)
+        fake_with(Arc::default())
+    }
+
+    /// `up` false takes the fake device away: every command and probe fails.
+    fn fake_with(up: Arc<AtomicBool>) -> YubiHsmKek {
+        up.store(true, Ordering::SeqCst);
+        YubiHsmKek::with_device(Arc::new(Fake(Aes256Gcm::new(&[3; 32].into()), up)), 0x64)
+    }
+
+    #[tokio::test]
+    async fn an_outage_is_not_a_refusal() {
+        let up = Arc::new(AtomicBool::new(true));
+        let kek = fake_with(up.clone());
+        assert!(kek.self_test().is_ok());
+        let wrapped = kek.wrap(b"data key", b"ctx").await.unwrap();
+        up.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            kek.unwrap("yubihsm:0x0064", &wrapped, b"ctx").await,
+            Err(KekError::Unavailable(_))
+        ));
     }
 
     #[tokio::test]
@@ -262,35 +388,74 @@ mod tests {
         connector
     }
 
+    /// Opens with the self-test skipped, which `MockHsm` cannot run.
+    fn open(
+        connector: Connector,
+        credentials: Credentials,
+        id: object::Id,
+    ) -> Result<YubiHsmKek, KekError> {
+        YubiHsmKek::open_checked(connector, credentials, id, false)
+    }
+
+    #[test]
+    fn open_refuses_a_transport_key_and_runs_the_self_test() {
+        let both = Capability::WRAP_DATA | Capability::UNWRAP_DATA;
+        for extra in [Capability::EXPORT_WRAPPED, Capability::IMPORT_WRAPPED] {
+            let r = open(
+                mock_with_wrap_key(both | extra, wrap::Algorithm::Aes256Ccm),
+                Credentials::default(),
+                0x64,
+            );
+            assert!(matches!(r, Err(KekError::Config(_))), "{extra:?}");
+        }
+        // `exportable-under-wrap` is allowed (the backup needs it).
+        let ok = open(
+            mock_with_wrap_key(
+                both | Capability::EXPORTABLE_UNDER_WRAP,
+                wrap::Algorithm::Aes256Ccm,
+            ),
+            Credentials::default(),
+            0x64,
+        );
+        assert!(ok.is_ok());
+        // MockHsm has no wrap-data, so the real `open` fails its self-test.
+        let tested = YubiHsmKek::open(
+            mock_with_wrap_key(both, wrap::Algorithm::Aes256Ccm),
+            Credentials::default(),
+            0x64,
+        );
+        assert!(matches!(tested, Err(KekError::Config(_))));
+    }
+
     #[test]
     fn open_checks_the_wrap_key() {
         let both = Capability::WRAP_DATA | Capability::UNWRAP_DATA;
-        let ok = YubiHsmKek::open(
+        let ok = open(
             mock_with_wrap_key(both, wrap::Algorithm::Aes256Ccm),
             Credentials::default(),
             0x64,
         )
         .unwrap();
         assert_eq!(ok.kek_id(), "yubihsm:0x0064");
-        let missing = YubiHsmKek::open(
+        let missing = open(
             mock_with_wrap_key(both, wrap::Algorithm::Aes256Ccm),
             Credentials::default(),
             0x65,
         );
         assert!(matches!(missing, Err(KekError::Config(_))));
-        let wrap_only = YubiHsmKek::open(
+        let wrap_only = open(
             mock_with_wrap_key(Capability::WRAP_DATA, wrap::Algorithm::Aes256Ccm),
             Credentials::default(),
             0x64,
         );
         assert!(matches!(wrap_only, Err(KekError::Config(_))));
-        let short = YubiHsmKek::open(
+        let short = open(
             mock_with_wrap_key(both, wrap::Algorithm::Aes128Ccm),
             Credentials::default(),
             0x64,
         );
         assert!(matches!(short, Err(KekError::Config(_))));
-        let refused = YubiHsmKek::open(
+        let refused = open(
             mock_with_wrap_key(both, wrap::Algorithm::Aes256Ccm),
             Credentials::from_password(1, b"not the password"),
             0x64,

@@ -3,7 +3,8 @@
 //!
 //! A ciphertext is `0x01 || version (u32, big-endian) || nonce (12) || AES-256-GCM
 //! output (plaintext length + 16)`. Its associated data is
-//! `FIELD_DOMAIN || lp(scope) || lp(table) || lp(column) || lp(row) || version`, where
+//! `FIELD_DOMAIN || 0x01 || lp(scope) || lp(table) || lp(column) || lp(row) || version`,
+//! where `0x01` is the format byte (so a ciphertext cannot be read as another format's),
 //! `lp(x)` is `x`'s length as a big-endian u32, then `x`. A data key's wrap context
 //! is `WRAP_DOMAIN || lp(scope) || lp(purpose) || version`. A blind index is
 //! HMAC-SHA256 over `INDEX_DOMAIN || lp(table) || lp(column) || lp(value)`.
@@ -70,6 +71,7 @@ pub fn lp(x: &[u8]) -> Vec<u8> {
 #[must_use]
 pub fn aad(field: &Field<'_>, version: u32) -> Vec<u8> {
     let mut out = FIELD_DOMAIN.to_vec();
+    out.push(FORMAT);
     for part in [field.scope, field.table, field.column, field.row] {
         out.extend(lp(part.as_bytes()));
     }

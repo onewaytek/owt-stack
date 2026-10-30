@@ -55,6 +55,13 @@ pub trait KekProvider: Send + Sync + fmt::Debug {
     /// Whether the current KEK lives in hardware it cannot be read out of.
     fn is_hardware(&self) -> bool;
 
+    /// Whether keys wrapped under `kek_id` are protected by hardware. The default is
+    /// the current KEK's [`KekProvider::is_hardware`] for its own id, and false for any
+    /// other; [`KekChain`] asks the provider that knows the id.
+    fn is_hardware_kek(&self, kek_id: &str) -> bool {
+        self.is_hardware() && kek_id == self.kek_id()
+    }
+
     /// Whether this provider can unwrap keys wrapped under `kek_id`.
     fn knows(&self, kek_id: &str) -> bool;
 
@@ -124,11 +131,15 @@ impl LocalKek {
                     .decode(b64.trim())
                     .map_err(|_| KekError::Config(format!("the KEK {name:?} is not base64")))?,
             );
-            let key: [u8; 32] = bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| KekError::Config(format!("the KEK {name:?} is not 32 bytes")))?;
-            keys.push((id, Zeroizing::new(key)));
+            if bytes.len() != 32 {
+                return Err(KekError::Config(format!(
+                    "the KEK {name:?} is not 32 bytes"
+                )));
+            }
+            // Built in place: no stack copy of the key outlives this block.
+            let mut key = Zeroizing::new([0_u8; 32]);
+            key.copy_from_slice(&bytes);
+            keys.push((id, key));
         }
         if keys.is_empty() {
             return Err(KekError::Config("the keyring holds no KEK".into()));
@@ -153,14 +164,22 @@ impl LocalKek {
         Self::parse(&value)
     }
 
-    /// A fresh keyring entry, `name:base64`, from a cryptographically secure generator
-    /// (rand's thread generator, seeded by the OS): what an
-    /// operator puts first in the keyring to rotate.
+    /// A fresh keyring entry, `name:base64`, from the operating system's random
+    /// generator: what an operator puts first in the keyring to rotate.
+    ///
+    /// # Panics
+    ///
+    /// When the operating system cannot supply random bytes.
     #[must_use]
     pub fn generate_entry(name: &str) -> Zeroizing<String> {
         let mut key = Zeroizing::new([0_u8; 32]);
-        rand::rng().fill_bytes(&mut key[..]);
-        Zeroizing::new(format!("{name}:{}", STANDARD.encode(&key[..])))
+        getrandom::fill(&mut key[..]).expect("the operating system supplies random bytes");
+        // Sized up front, so encoding never reallocates and strands a copy.
+        let mut entry = Zeroizing::new(String::with_capacity(name.len() + 1 + 44));
+        entry.push_str(name);
+        entry.push(':');
+        STANDARD.encode_string(&key[..], &mut entry);
+        entry
     }
 
     fn key(&self, kek_id: &str) -> Option<&[u8; 32]> {
@@ -273,6 +292,11 @@ impl KekProvider for KekChain {
 
     fn is_hardware(&self) -> bool {
         self.current.is_hardware()
+    }
+
+    fn is_hardware_kek(&self, kek_id: &str) -> bool {
+        self.for_kek(kek_id)
+            .is_some_and(|p| p.is_hardware_kek(kek_id))
     }
 
     fn knows(&self, kek_id: &str) -> bool {

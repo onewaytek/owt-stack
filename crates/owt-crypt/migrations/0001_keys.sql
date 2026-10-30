@@ -11,3 +11,9 @@ CREATE TABLE owt_crypt_keys (
 );
 -- Rewrapping finds the keys under an old KEK.
 CREATE INDEX owt_crypt_keys_kek ON owt_crypt_keys (kek_id);
+-- A shredded scope never gets keys again: `shred` records it here in the same
+-- transaction that deletes the keys, and key creation refuses a recorded scope.
+CREATE TABLE owt_crypt_shredded (
+    scope text PRIMARY KEY CHECK (length(scope) BETWEEN 1 AND 200),
+    at timestamptz NOT NULL DEFAULT now()
+);
