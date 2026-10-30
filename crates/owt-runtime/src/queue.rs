@@ -571,7 +571,7 @@ impl Queue {
     /// handler that never returns still runs out of attempts, and a job never runs
     /// more than its attempts. False when the claim was no longer current.
     pub async fn release(&self, job: &Claimed) -> sqlx::Result<bool> {
-        release(&self.pool, job.id, job.claim).await
+        Ok(release(&self.pool, job.id, job.claim).await?.is_some())
     }
 
     /// Renew the heartbeat of each claimed job, as `(id, claim)`, that is still running
@@ -740,8 +740,10 @@ impl Queue {
     }
 }
 
-async fn release(pool: &PgPool, id: i64, claim: i64) -> sqlx::Result<bool> {
-    let done = sqlx::query(
+/// The state the job is left in (`queued`, or `dead` on its last attempt); `None` when
+/// the claim was no longer current.
+async fn release(pool: &PgPool, id: i64, claim: i64) -> sqlx::Result<Option<String>> {
+    sqlx::query_scalar(
         "UPDATE owt_jobs SET
                 state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
                 finished_at = CASE WHEN attempts >= max_attempts THEN now() END,
@@ -749,13 +751,13 @@ async fn release(pool: &PgPool, id: i64, claim: i64) -> sqlx::Result<bool> {
                                   THEN 'stopped at shutdown on its last attempt'
                                   ELSE last_error END,
                 run_at = now(), claimed_at = NULL, heartbeat_at = NULL
-         WHERE id = $1 AND state = 'running' AND claim = $2",
+         WHERE id = $1 AND state = 'running' AND claim = $2
+         RETURNING state",
     )
     .bind(id)
     .bind(claim)
-    .execute(pool)
-    .await?;
-    Ok(done.rows_affected() == 1)
+    .fetch_optional(pool)
+    .await
 }
 
 /// A claimed row: id, key, payload, attempt, max attempts, claim.
@@ -1122,8 +1124,10 @@ impl Worker {
         let cancelled: Vec<(i64, i64, u32)> = running.held.lock().drain().map(|(_, h)| h).collect();
         for (id, claim, _) in cancelled {
             match release(&self.queue.pool, id, claim).await {
-                Ok(true) => self.record("released", None),
-                Ok(false) => {}
+                Ok(Some(state)) => {
+                    self.record(if state == "dead" { "dead" } else { "released" }, None);
+                }
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(queue = %self.queue.name, job = id, %error, "putting a job back failed; it is recovered once stale");
                 }

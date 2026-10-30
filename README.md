@@ -2644,7 +2644,8 @@ redriving, so discard dead jobs the app will not redrive. The last error is stor
 its error messages too.
 
 `QueueMetrics::prefixed("myapp")` records `<prefix>_queue_jobs_total{queue,outcome}`
-(`done`, `retried`, `dead`, `lost`, `released`, `recovered`),
+(`done`, `retried`, `dead` (a released job on its last attempt included), `lost`,
+`released`, `recovered`),
 `<prefix>_queue_job_seconds{queue}`, and, at each housekeeping pass,
 `<prefix>_queue_depth{queue,state}` and `<prefix>_queue_lag_seconds{queue}` (how long
 the oldest due job has waited); call its `describe()` inside the closure passed to
