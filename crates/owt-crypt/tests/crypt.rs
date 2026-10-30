@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use owt_crypt::kek::{KekChain, KekProvider, LocalKek};
-use owt_crypt::{Column, Crypt, CryptError, Field, Purpose, Scope};
+use std::time::Duration;
+
+use owt_crypt::{Column, Crypt, CryptError, Field, Purpose, Reencrypted, Scope};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Executor, PgPool};
 
@@ -162,13 +164,13 @@ async fn rotation_keeps_old_values_readable_and_the_job_moves_them() {
         scope: Scope::Column("tenant"),
     };
     assert_eq!(
-        crypt.reencrypt_column(&column, 5).await.unwrap(),
+        crypt.reencrypt_column(&column, 5).await.unwrap().moved,
         12,
         "tenant a's rows"
     );
     assert_eq!(
         crypt.reencrypt_column(&column, 5).await.unwrap(),
-        0,
+        Reencrypted::default(),
         "nothing left"
     );
     let rows: Vec<(i64, String, Vec<u8>)> =
@@ -191,7 +193,7 @@ async fn rotation_keeps_old_values_readable_and_the_job_moves_them() {
         scope: Scope::Fixed("b"),
         ..column
     };
-    assert_eq!(crypt.reencrypt_column(&fixed, 100).await.unwrap(), 13);
+    assert_eq!(crypt.reencrypt_column(&fixed, 100).await.unwrap().moved, 13);
     let bad = Column {
         table: "notes; DROP TABLE notes",
         ..column
@@ -349,5 +351,116 @@ async fn production_refuses_a_software_kek() {
         Err(CryptError::SoftwareKek(id)) if id == "local:k1"
     ));
     assert!(crypt.require_hardware_kek(false).is_ok());
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn another_replica_stops_decrypting_a_shredded_scope_after_the_ttl() {
+    let Some(db) = Db::new().await else { return };
+    let kek = local("k1");
+    let ttl = Duration::from_millis(100);
+    let a = Crypt::new(db.pool.clone(), kek.clone()).cache_ttl(ttl);
+    let b = Crypt::new(db.pool.clone(), kek).cache_ttl(ttl);
+    let f = Field::new("leaving", "notes", "body", "1");
+    let ct = a.encrypt(&f, b"gone").await.unwrap();
+    assert_eq!(&b.decrypt(&f, &ct).await.unwrap()[..], b"gone");
+    a.shred("leaving").await.unwrap();
+    // Within the TTL b's cache still answers; after it, b asks the database.
+    tokio::time::sleep(ttl * 3).await;
+    assert!(matches!(
+        b.decrypt(&f, &ct).await,
+        Err(CryptError::NoKey { .. } | CryptError::Shredded(_))
+    ));
+    // Neither replica can bring the scope back.
+    for c in [&a, &b] {
+        assert!(matches!(
+            c.encrypt(&f, b"again").await,
+            Err(CryptError::Shredded(s)) if s == "leaving"
+        ));
+        assert!(matches!(
+            c.rotate("leaving", Purpose::Data).await,
+            Err(CryptError::Shredded(_))
+        ));
+    }
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM owt_crypt_keys WHERE scope = 'leaving'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn reencrypt_column_reports_a_bad_row_and_terminates() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    db.pool
+        .execute("CREATE TABLE notes (id bigint PRIMARY KEY, body bytea)")
+        .await
+        .unwrap();
+    for id in 1..=6_i64 {
+        let ct = crypt
+            .encrypt(&Field::new("a", "notes", "body", &id.to_string()), b"v")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO notes VALUES ($1, $2)")
+            .bind(id)
+            .bind(ct)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    // Rows that are not ciphertexts, ahead of good ones in a batch of two.
+    sqlx::query(
+        "INSERT INTO notes VALUES (7, '\\x0200000001'::bytea), (8, '\\x01000000010203'::bytea)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    crypt.rotate("a", Purpose::Data).await.unwrap();
+    let column = Column {
+        table: "notes",
+        id: "id",
+        column: "body",
+        scope: Scope::Fixed("a"),
+    };
+    let done = crypt.reencrypt_column(&column, 2).await.unwrap();
+    assert_eq!(done.moved, 6);
+    let mut failed = done.failed.clone();
+    failed.sort();
+    assert_eq!(failed, ["7", "8"]);
+    // A second run finds the same two and still ends.
+    let again = crypt.reencrypt_column(&column, 2).await.unwrap();
+    assert_eq!((again.moved, again.failed.len()), (0, 2));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn software_wrapped_keys_lists_local_kek_ids() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    assert_eq!(crypt.software_wrapped_keys().await.unwrap().len(), 0);
+    crypt
+        .encrypt(&Field::new("t", "n", "b", "1"), b"v")
+        .await
+        .unwrap();
+    assert_eq!(crypt.software_wrapped_keys().await.unwrap(), ["local:k1"]);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn empty_field_parts_are_refused() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    for f in [
+        Field::new("t", "n", "b", ""),
+        Field::new("t", "", "b", "1"),
+        Field::new("t", "n", "", "1"),
+    ] {
+        assert!(matches!(
+            crypt.encrypt(&f, b"v").await,
+            Err(CryptError::Invalid(_))
+        ));
+    }
     db.drop().await;
 }

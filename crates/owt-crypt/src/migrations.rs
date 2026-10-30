@@ -56,7 +56,7 @@ mod tests {
     /// an app's ledger.
     #[test]
     fn shipped_migrations_are_unchanged() {
-        let pinned = ["66dd61185c7cc4d6c341eb2dadcbf0d49302eb6b81978e5a47f19434708fbb22"];
+        let pinned = ["2f5067efb07a581dad7ec38dc70cb879c3e631cb5ebb2bd44a7e6ec1d3e349f6"];
         assert_eq!(super::ALL.len(), pinned.len());
         for ((name, sql), want) in super::ALL.iter().zip(pinned) {
             assert_eq!(hex(&Sha256::digest(sql.as_bytes())), want, "{name}");

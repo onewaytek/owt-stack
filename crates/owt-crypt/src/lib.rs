@@ -18,8 +18,27 @@
 //!   refuses a software KEK where the app requires hardware. [`Crypt::rewrap`] moves
 //!   every data key to the current KEK after a KEK rotation, without touching data.
 //! * **Memory.** Keys, unwrapped keys and decrypted values are zeroized when dropped
-//!   ([`zeroize::Zeroizing`]); unwrapped data keys are cached for the process's life
-//!   (or until [`Crypt::forget_keys`]), so the KEK is asked once per key.
+//!   ([`zeroize::Zeroizing`]); unwrapped data keys are cached for [`Crypt::cache_ttl`]
+//!   (five minutes by default, or until [`Crypt::forget_keys`]), so the KEK is asked
+//!   once per key per interval. Long-lived key material comes from the operating
+//!   system's random generator; nonces from the thread generator.
+//! * **Shredding.** [`Crypt::shred`] deletes a scope's keys and records a tombstone, so
+//!   the scope can never get keys again. Another replica's cache can still decrypt for
+//!   up to the cache TTL after a shred; that TTL is the shred's latency.
+//!
+//! # Limits
+//!
+//! * A data key seals with random 96-bit nonces, so one key is good for about 2^32
+//!   messages (NIST SP 800-38D). A high-volume scope, and every re-encryption, count
+//!   against it: [`Crypt::rotate`] data keys well before that, yearly or every N writes.
+//! * Concurrent [`Crypt::rotate`] calls may each add a version. That is harmless: the
+//!   newest encrypts and all decrypt.
+//! * AES-GCM is not key-committing. Keys are chosen by (scope, version) from the
+//!   database and the associated data carries both, so this has no practical attack
+//!   here.
+//! * The `hmac` and `sha2` states derived from an index key are not zeroized.
+//! * A `LocalKek` read from an environment variable leaves the secret in the process
+//!   environment for the process's life; prefer `from_file`.
 
 pub mod format;
 pub mod kek;
@@ -30,6 +49,7 @@ pub mod yubihsm;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -37,6 +57,7 @@ use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub use migrations::{LEDGER, LOCK_ID, migrate, migrator};
@@ -103,6 +124,9 @@ pub enum CryptError {
     /// The bytes are not an owt-crypt ciphertext.
     #[error("not an owt-crypt ciphertext")]
     Malformed,
+    /// The scope was shredded: it has no keys and can never get any.
+    #[error("scope {0:?} was shredded")]
+    Shredded(String),
     /// The scope has no key of that purpose and version (never made, or shredded).
     #[error("scope {scope:?} has no {purpose:?} key version {version}")]
     NoKey {
@@ -139,10 +163,17 @@ impl fmt::Debug for Key {
     }
 }
 
-type Cache = HashMap<(String, Purpose, u32), Arc<Key>>;
+/// A cached key and when it was cached.
+type Cache = HashMap<(String, Purpose, u32), (Arc<Key>, Instant)>;
 
-/// The most unwrapped keys cached; past it the cache starts over.
+/// The most unwrapped keys cached; past it expired entries go, then the oldest half.
 const CACHE_MAX: usize = 10_000;
+
+/// How long an unwrapped key is cached unless [`Crypt::cache_ttl`] says otherwise.
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// The most failed rows [`Crypt::reencrypt_column`] remembers before it stops.
+const FAILED_MAX: usize = 10_000;
 
 /// Field encryption for one database. Cheap to clone; clones share the key cache.
 #[derive(Clone)]
@@ -150,6 +181,7 @@ pub struct Crypt {
     pool: PgPool,
     kek: Arc<dyn KekProvider>,
     cache: Arc<Mutex<Cache>>,
+    cache_ttl: Duration,
 }
 
 impl fmt::Debug for Crypt {
@@ -168,17 +200,46 @@ impl Crypt {
             pool,
             kek,
             cache: Arc::default(),
+            cache_ttl: DEFAULT_CACHE_TTL,
         }
+    }
+
+    /// Cache unwrapped keys for `ttl` (five minutes by default). It bounds how long a
+    /// replica keeps decrypting after [`Crypt::shred`] or [`Crypt::rewrap`] ran on
+    /// another: the shred latency. A shorter TTL asks the KEK (the HSM) more often.
+    /// Writes are not delayed: the current version is read from the database each
+    /// time, and a shredded scope refuses new keys at once.
+    #[must_use]
+    pub fn cache_ttl(mut self, ttl: Duration) -> Self {
+        self.cache_ttl = ttl;
+        self
     }
 
     /// With `required` (production), refuse a KEK that is not in hardware. Call it
     /// at startup, from the app's configuration, so a production replica given a
-    /// software KEK does not start.
+    /// software KEK does not start. It checks the current KEK only: a [`kek::KekChain`]
+    /// whose previous provider is software passes while rows are still software-wrapped.
+    /// Production also treats a non-empty [`Crypt::software_wrapped_keys`] after
+    /// [`Crypt::rewrap`] as an alarm.
     pub fn require_hardware_kek(self, required: bool) -> Result<Self, CryptError> {
         if required && !self.kek.is_hardware() {
             return Err(CryptError::SoftwareKek(self.kek.kek_id().into()));
         }
         Ok(self)
+    }
+
+    /// The distinct KEK ids in `owt_crypt_keys` that are not hardware ones. After a
+    /// move to an HSM and [`Crypt::rewrap`] this is empty; anything left is a key a
+    /// software KEK still protects.
+    pub async fn software_wrapped_keys(&self) -> Result<Vec<String>, CryptError> {
+        let ids: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT kek_id FROM owt_crypt_keys ORDER BY kek_id")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(ids
+            .into_iter()
+            .filter(|id| !self.kek.is_hardware_kek(id))
+            .collect())
     }
 
     /// The KEK provider.
@@ -194,7 +255,7 @@ impl Crypt {
         field: &Field<'_>,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptError> {
-        check_scope(field.scope)?;
+        check_field(field)?;
         let (version, key) = self.current(field.scope, Purpose::Data).await?;
         Ok(seal(&key, version, field, plaintext))
     }
@@ -214,6 +275,7 @@ impl Crypt {
         field: &Field<'_>,
         ciphertext: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, CryptError> {
+        check_field(field)?;
         let sealed = Sealed::parse(ciphertext).ok_or(CryptError::Malformed)?;
         let key = self.key(field.scope, Purpose::Data, sealed.version).await?;
         open(&key, &sealed, field)
@@ -269,7 +331,8 @@ impl Crypt {
     }
 
     /// Add a new version of `scope`'s `purpose` key; new values use it from now on,
-    /// and older ones still decrypt. Its version.
+    /// and older ones still decrypt. Its version. Concurrent calls may each add a
+    /// version, which is harmless.
     pub async fn rotate(&self, scope: &str, purpose: Purpose) -> Result<u32, CryptError> {
         check_scope(scope)?;
         loop {
@@ -298,6 +361,7 @@ impl Crypt {
         field: &Field<'_>,
         ciphertext: &[u8],
     ) -> Result<Option<Vec<u8>>, CryptError> {
+        check_field(field)?;
         let sealed = Sealed::parse(ciphertext).ok_or(CryptError::Malformed)?;
         let (version, key) = self.current(field.scope, Purpose::Data).await?;
         if sealed.version == version {
@@ -311,21 +375,27 @@ impl Crypt {
     /// Re-encrypt every value of a column that is not under its scope's current data
     /// key, `batch` rows at a time: the job after [`Crypt::rotate`]. Each row is
     /// updated only if its value is still the one read, so it runs beside live
-    /// writes. How many rows it re-encrypted.
+    /// writes.
+    ///
+    /// A row that cannot be decrypted (malformed, its key shredded, or refused) is
+    /// recorded in [`Reencrypted::failed`] and left out of later passes; the job goes on
+    /// and stops after 10,000 failures. It also stops when a pass moves no row and
+    /// finds no new failure (a trigger, a policy or a view that swallows the update),
+    /// so it cannot loop forever. A database or KEK outage is an error.
     pub async fn reencrypt_column(
         &self,
         column: &Column<'_>,
         batch: u32,
-    ) -> Result<u64, CryptError> {
+    ) -> Result<Reencrypted, CryptError> {
         let table = ident(column.table)?;
         let id = ident(column.id)?;
         let value = ident(column.column)?;
-        let (scope_expr, scope_arg) = match column.scope {
+        let (scope_expr, scope_arg, skip_param) = match column.scope {
             Scope::Fixed(s) => {
                 check_scope(s)?;
-                ("$2::text".to_owned(), Some(s))
+                ("$2::text".to_owned(), Some(s), "$3")
             }
-            Scope::Column(c) => (format!("t.{}::text", ident(c)?), None),
+            Scope::Column(c) => (format!("t.{}::text", ident(c)?), None, "$2"),
         };
         let select = format!(
             "SELECT t.ctid::text, t.{id}::text, {scope_expr}, t.{value}
@@ -334,11 +404,14 @@ impl Crypt {
                    WHERE purpose = 'data' GROUP BY scope) k ON k.scope = {scope_expr}
              WHERE t.{value} IS NOT NULL
                AND substring(t.{value} FROM 2 FOR 4) <> int4send(k.v)
+               AND t.ctid::text <> ALL({skip_param}::text[])
              LIMIT $1"
         );
         let update =
             format!("UPDATE {table} SET {value} = $1 WHERE ctid = $2::tid AND {value} = $3");
-        let mut done = 0;
+        let mut moved = 0;
+        let mut failed = Vec::new();
+        let mut skip: Vec<String> = Vec::new();
         loop {
             let mut query = sqlx::query_as::<_, (String, String, String, Vec<u8>)>(
                 sqlx::AssertSqlSafe(select.clone()),
@@ -347,18 +420,34 @@ impl Crypt {
             if let Some(scope) = scope_arg {
                 query = query.bind(scope);
             }
-            let rows = query.fetch_all(&self.pool).await?;
+            let rows = query.bind(&skip).fetch_all(&self.pool).await?;
             if rows.is_empty() {
-                return Ok(done);
+                break;
             }
+            // The current version of each scope, asked once per pass.
+            let mut currents: HashMap<String, (u32, Arc<Key>)> = HashMap::new();
+            let (moved_before, failed_before) = (moved, failed.len());
             for (ctid, row, scope, old) in rows {
                 let field = Field::new(&scope, column.table, column.column, &row);
-                let Some(new) = self.reencrypt(&field, &old).await? else {
-                    continue;
+                let new = match self.reencrypt_with(&mut currents, &field, &old).await {
+                    Ok(Some(new)) => new,
+                    Ok(None) => continue,
+                    Err(
+                        CryptError::Malformed
+                        | CryptError::NoKey { .. }
+                        | CryptError::Refused { .. }
+                        | CryptError::Shredded(_)
+                        | CryptError::Kek(KekError::Refused(_) | KekError::UnknownKek(_)),
+                    ) => {
+                        failed.push(row);
+                        skip.push(ctid);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 };
                 // A row changed meanwhile keeps its new value; if that is under an old
                 // key, the next pass reads it again.
-                done += sqlx::query(sqlx::AssertSqlSafe(update.clone()))
+                moved += sqlx::query(sqlx::AssertSqlSafe(update.clone()))
                     .bind(&new)
                     .bind(&ctid)
                     .bind(&old)
@@ -366,7 +455,35 @@ impl Crypt {
                     .await?
                     .rows_affected();
             }
+            if failed.len() >= FAILED_MAX
+                || (moved == moved_before && failed.len() == failed_before)
+            {
+                break;
+            }
         }
+        Ok(Reencrypted { moved, failed })
+    }
+
+    /// [`Crypt::reencrypt`] with the scope's current key remembered in `currents`.
+    async fn reencrypt_with(
+        &self,
+        currents: &mut HashMap<String, (u32, Arc<Key>)>,
+        field: &Field<'_>,
+        ciphertext: &[u8],
+    ) -> Result<Option<Vec<u8>>, CryptError> {
+        check_field(field)?;
+        let sealed = Sealed::parse(ciphertext).ok_or(CryptError::Malformed)?;
+        if !currents.contains_key(field.scope) {
+            let current = self.current(field.scope, Purpose::Data).await?;
+            currents.insert(field.scope.to_owned(), current);
+        }
+        let (version, key) = &currents[field.scope];
+        if sealed.version == *version {
+            return Ok(None);
+        }
+        let old = self.key(field.scope, Purpose::Data, sealed.version).await?;
+        let plain = open(&old, &sealed, field)?;
+        Ok(Some(seal(key, *version, field, &plain)))
     }
 
     /// Wrap every key not under the current KEK under it: the job after a KEK
@@ -387,6 +504,12 @@ impl Crypt {
             let context = format::wrap_context(&scope, &purpose, version);
             let key = self.kek.unwrap(&kek_id, &wrapped, &context).await?;
             let rewrapped = self.kek.wrap(&key, &context).await?;
+            // The only wrapped copy is replaced, so check the new one unwraps to the
+            // same key before it is.
+            let check = self.kek.unwrap(&current, &rewrapped, &context).await?;
+            if !bool::from(check[..].ct_eq(&key[..])) {
+                return Err(KekError::Refused(current).into());
+            }
             done += sqlx::query(
                 "UPDATE owt_crypt_keys SET kek_id = $1, wrapped = $2
                  WHERE scope = $3 AND purpose = $4 AND version = $5 AND kek_id = $6
@@ -406,17 +529,28 @@ impl Crypt {
         Ok(done)
     }
 
-    /// Delete every key of `scope`: everything encrypted for it becomes unreadable
-    /// for good, here and in every backup taken after (crypto-shredding, for a tenant
-    /// that leaves). Backups taken before still hold the wrapped keys until they
-    /// expire. How many keys went.
+    /// Delete every key of `scope` and record it as shredded: everything encrypted for
+    /// it becomes unreadable for good, and the scope can never get keys again
+    /// (crypto-shredding, for a tenant that leaves). The tombstone and the deletion are
+    /// one transaction.
+    ///
+    /// Other replicas may decrypt from their key caches for up to [`Crypt::cache_ttl`].
+    /// Backups, WAL archives, replicas and logical-decoding slots hold the wrapped keys
+    /// until they expire; shredding does not reach them. How many keys went.
     pub async fn shred(&self, scope: &str) -> Result<u64, CryptError> {
         check_scope(scope)?;
+        let mut tx = self.pool.begin().await?;
+        lock_scope(&mut tx, scope).await?;
+        sqlx::query("INSERT INTO owt_crypt_shredded (scope) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(scope)
+            .execute(&mut *tx)
+            .await?;
         let gone = sqlx::query("DELETE FROM owt_crypt_keys WHERE scope = $1")
             .bind(scope)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+        tx.commit().await?;
         self.cache().retain(|(s, _, _), _| s != scope);
         Ok(gone)
     }
@@ -460,7 +594,7 @@ impl Crypt {
     }
 
     /// Make and store key `version`, unless it exists. Its version when this call
-    /// made it.
+    /// made it; [`CryptError::Shredded`] for a shredded scope.
     async fn create(
         &self,
         scope: &str,
@@ -468,27 +602,53 @@ impl Crypt {
         version: u32,
     ) -> Result<Option<u32>, CryptError> {
         let mut key = Zeroizing::new([0_u8; 32]);
-        rand::rng().fill_bytes(&mut key[..]);
+        getrandom::fill(&mut key[..]).map_err(|e| {
+            CryptError::Invalid(format!("the operating system's random generator: {e}"))
+        })?;
         let context = format::wrap_context(scope, purpose.as_str(), version);
         let wrapped = self.kek.wrap(&key[..], &context).await?;
+        // The lock orders this against `shred`: the insert's snapshot is taken after
+        // any shred in flight has committed, so it sees the tombstone.
+        let mut tx = self.pool.begin().await?;
+        lock_scope(&mut tx, scope).await?;
         let made = sqlx::query(
             "INSERT INTO owt_crypt_keys (scope, purpose, version, kek_id, wrapped)
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+             SELECT $1, $2, $3, $4, $5
+             WHERE NOT EXISTS (SELECT 1 FROM owt_crypt_shredded WHERE scope = $1)
+             ON CONFLICT DO NOTHING",
         )
         .bind(scope)
         .bind(purpose.as_str())
         .bind(to_i32(version))
         .bind(self.kek.kek_id())
         .bind(&wrapped)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected()
             == 1;
+        let shredded = !made && self.is_shredded(&mut tx, scope).await?;
+        tx.commit().await?;
+        if shredded {
+            return Err(CryptError::Shredded(scope.into()));
+        }
         if made {
             self.remember(scope, purpose, version, Arc::new(Key(key)));
             return Ok(Some(version));
         }
         Ok(None)
+    }
+
+    async fn is_shredded(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        scope: &str,
+    ) -> Result<bool, CryptError> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM owt_crypt_shredded WHERE scope = $1)")
+                .bind(scope)
+                .fetch_one(tx)
+                .await?,
+        )
     }
 
     /// Key `version` of `scope` for `purpose`, from the cache or unwrapped.
@@ -498,7 +658,9 @@ impl Crypt {
         purpose: Purpose,
         version: u32,
     ) -> Result<Arc<Key>, CryptError> {
-        if let Some(k) = self.cache().get(&(scope.to_owned(), purpose, version)) {
+        if let Some((k, at)) = self.cache().get(&(scope.to_owned(), purpose, version))
+            && at.elapsed() < self.cache_ttl
+        {
             return Ok(k.clone());
         }
         let row: Option<(String, Vec<u8>)> = sqlx::query_as(
@@ -511,6 +673,7 @@ impl Crypt {
         .fetch_optional(&self.pool)
         .await?;
         let Some((kek_id, wrapped)) = row else {
+            self.cache().remove(&(scope.to_owned(), purpose, version));
             return Err(CryptError::NoKey {
                 scope: scope.into(),
                 purpose,
@@ -519,11 +682,21 @@ impl Crypt {
         };
         let context = format::wrap_context(scope, purpose.as_str(), version);
         let bytes = self.kek.unwrap(&kek_id, &wrapped, &context).await?;
-        let key: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| KekError::Refused(kek_id.clone()))?;
-        let key = Arc::new(Key(Zeroizing::new(key)));
+        if bytes.len() != 32 {
+            return Err(KekError::Refused(kek_id).into());
+        }
+        let mut raw = Zeroizing::new([0_u8; 32]);
+        raw.copy_from_slice(&bytes);
+        let key = Arc::new(Key(raw));
+        // A shred that landed during the unwrap must not be undone by caching.
+        let shredded: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM owt_crypt_shredded WHERE scope = $1)")
+                .bind(scope)
+                .fetch_one(&self.pool)
+                .await?;
+        if shredded {
+            return Err(CryptError::Shredded(scope.into()));
+        }
         self.remember(scope, purpose, version, key.clone());
         Ok(key)
     }
@@ -531,10 +704,36 @@ impl Crypt {
     fn remember(&self, scope: &str, purpose: Purpose, version: u32, key: Arc<Key>) {
         let mut cache = self.cache();
         if cache.len() >= CACHE_MAX {
-            cache.clear();
+            let ttl = self.cache_ttl;
+            cache.retain(|_, (_, at)| at.elapsed() < ttl);
         }
-        cache.insert((scope.to_owned(), purpose, version), key);
+        if cache.len() >= CACHE_MAX {
+            let mut ages: Vec<Instant> = cache.values().map(|(_, at)| *at).collect();
+            ages.sort_unstable();
+            let cutoff = ages[ages.len() / 2];
+            cache.retain(|_, (_, at)| *at > cutoff);
+        }
+        cache.insert((scope.to_owned(), purpose, version), (key, Instant::now()));
     }
+}
+
+/// What [`Crypt::reencrypt_column`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reencrypted {
+    /// How many rows it re-encrypted.
+    pub moved: u64,
+    /// The ids of rows that could not be decrypted (malformed, shredded or refused),
+    /// left as they were. It stops collecting at 10,000.
+    pub failed: Vec<String>,
+}
+
+/// Serialize key creation against `shred` for `scope` until the transaction ends.
+async fn lock_scope(tx: &mut sqlx::PgConnection, scope: &str) -> Result<(), CryptError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('owt_crypt/' || $1, 0))")
+        .bind(scope)
+        .execute(tx)
+        .await?;
+    Ok(())
 }
 
 /// A column [`Crypt::reencrypt_column`] walks.
@@ -607,6 +806,22 @@ fn mac(key: &Key, table: &str, column: &str, value: &[u8]) -> [u8; 32] {
     m.update(&lp(column.as_bytes()));
     m.update(&lp(value));
     m.finalize().into_bytes().into()
+}
+
+fn check_field(field: &Field<'_>) -> Result<(), CryptError> {
+    check_scope(field.scope)?;
+    for (name, part) in [
+        ("table", field.table),
+        ("column", field.column),
+        ("row", field.row),
+    ] {
+        if part.is_empty() {
+            return Err(CryptError::Invalid(format!(
+                "a field's {name} is not empty"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn check_scope(scope: &str) -> Result<(), CryptError> {

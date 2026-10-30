@@ -2363,7 +2363,9 @@ read). Rotating the index key changes every index: search with
 `blind_index_candidates` (`= ANY($1)`) until the column's indexes are recomputed. A
 KEK rotation touches no data: put the new KEK first (a keyring entry, or a
 `KekChain` of the new provider and the old) and run `rewrap`, which wraps every data
-key under the new KEK; then retire the old one.
+key under the new KEK, checking that each rewrapped key unwraps to the same bytes
+before replacing the old; then retire the old one. Rotating to a new HSM wrap key is
+a new object id, so a new KEK id: chain the two providers and rewrap.
 
 ```rust,no_run
 use owt_crypt::{Column, Purpose, Scope};
@@ -2375,9 +2377,40 @@ let rewrapped = crypt.rewrap().await?; // after a KEK change
 # let _ = (moved, rewrapped); Ok(()) }
 ```
 
-`crypt.shred(scope)` deletes a tenant's keys, so everything encrypted for it is
-unreadable for good (backups taken before still hold the wrapped keys until they
-expire).
+```rust,no_run
+use std::sync::Arc;
+use owt_crypt::Crypt;
+use owt_crypt::kek::{KekChain, KekProvider};
+use owt_crypt::yubihsm::YubiHsmKek;
+
+# async fn demo(pool: sqlx::PgPool, password: &str) -> anyhow::Result<()> {
+// Rotating from wrap key 0x0064 to 0x0065: the new one wraps, the old one still unwraps.
+let old: Arc<dyn KekProvider> = Arc::new(YubiHsmKek::http("127.0.0.1", 12345, 0x0002, password.as_bytes(), 0x0064)?);
+let new: Arc<dyn KekProvider> = Arc::new(YubiHsmKek::http("127.0.0.1", 12345, 0x0002, password.as_bytes(), 0x0065)?);
+let crypt = Crypt::new(pool, Arc::new(KekChain::new(new, vec![old])));
+crypt.rewrap().await?;
+// Nothing may stay under a software KEK in production: alarm on a non-empty list.
+assert!(crypt.software_wrapped_keys().await?.is_empty());
+# Ok(()) }
+```
+
+`reencrypt_column` returns `Reencrypted { moved, failed }`. A row that does not
+decrypt (malformed, its key shredded, refused) is listed in `failed` by id and
+skipped, and the job stops after 10,000 failures or a pass that moves nothing, so a
+bad row cannot wedge it. A data key seals with random 96-bit nonces, which is safe for
+about 2^32 messages per key (NIST SP 800-38D): rotate data keys well before that,
+yearly or every N writes. Two concurrent `rotate` calls may each add a version; that
+is harmless.
+
+**Shredding.** `crypt.shred(scope)` deletes a tenant's keys and records a tombstone
+in `owt_crypt_shredded`, in one transaction, so everything encrypted for the tenant is
+unreadable and the scope can never get keys again (`encrypt` and `rotate` fail with
+`CryptError::Shredded`). Each `Crypt` caches unwrapped keys for `cache_ttl` (default
+five minutes, `Crypt::new(..).cache_ttl(Duration::from_secs(60))`), so another
+replica can still decrypt for up to that long after a shred, or notice a `rewrap`:
+the TTL is the shred latency, and a shorter one asks the HSM more often. Shredding
+does not reach WAL archives, replicas, logical-decoding slots or backups; they hold
+the wrapped keys until they expire, so set their retention with that in mind.
 
 **The software KEK** (`LocalKek`) is for development, CI and staging: a keyring of
 `name:base64key` entries, the current first, from an environment variable
@@ -2385,15 +2418,24 @@ expire).
 `LocalKek::generate_entry("2026-10")`; to rotate, put a new entry first, deploy, run
 `rewrap`, then drop the old entry. Anyone who can read the variable can read every
 key it wraps, so production sets `require_hardware_kek(true)` and starts only with a
-hardware KEK.
+hardware KEK. `require_hardware_kek` checks the current KEK only: a `KekChain` from a
+software KEK to an HSM passes it while rows are still software-wrapped. So production
+runs `require_hardware_kek(true)` and treats a non-empty
+`crypt.software_wrapped_keys()` (the stored KEK ids that are not hardware) after
+`rewrap` as an alarm.
 
 **The YubiHSM KEK** (feature `yubihsm`). The KEK is an AES-256-CCM wrap key inside
-a YubiHSM 2 (FIPS) on the node; it never leaves the device. Data keys are sent to it
+a YubiHSM 2 on the node (the YubiHSM 2 FIPS model where FIPS 140-2 validation is required, which adds restrictions on algorithms and authentication keys); it never leaves the device. Data keys are sent to it
 to be wrapped and unwrapped, and unwrapped keys are cached in memory (zeroized when
-dropped), so the HSM is asked once per key per process. The app reaches it through
+dropped) for `cache_ttl`, so the HSM is asked once per key per interval. The app reaches it through
 `yubihsm-connector` on the node (HTTP, `127.0.0.1:12345` by default) or USB, with an
 authentication key that has only the `wrap-data` and `unwrap-data` capabilities over
-the wrap key's domain, never the factory default key:
+the wrap key's domain, never the factory default key. `YubiHsmKek` refuses, at start,
+a wrap key that is not AES-256-CCM, lacks `wrap-data` or `unwrap-data`, or has
+`export-wrapped` or `import-wrapped`, and wraps and unwraps 32 random bytes as a
+self-test, so a wrongly provisioned authentication key fails at startup. A device
+failure while unwrapping is `Unavailable` when the device stops answering, and
+`Refused` only when it answers and rejects the message:
 
 ```rust,no_run
 use std::sync::Arc;
@@ -2410,8 +2452,9 @@ let kek: Arc<dyn KekProvider> = Arc::new(YubiHsmKek::http("127.0.0.1", 12345, 0x
 Provision once, with Yubico's `yubihsm-shell`, on an offline machine: an AES-256-CCM
 wrap key (`aes256-ccm-wrap`) with the capabilities `wrap-data`, `unwrap-data` and
 `exportable-under-wrap` (for the backup, below), and an authentication key for the
-app with `wrap-data` and `unwrap-data` only. Change or delete the factory
-authentication key.
+app with `wrap-data` and `unwrap-data` only, and without `export-wrapped`. Change or
+delete the factory authentication key. `exportable-under-wrap` stays on the KEK only
+while a backup copy is being made.
 
 **Backup and disaster recovery.** The wrap key exists only inside HSMs, so losing the
 HSM without a second copy loses every key it wraps, and so all encrypted data.
@@ -2419,10 +2462,17 @@ Before production holds any, keep a second YubiHSM 2, offline and in a safe away
 from the node, holding the same wrap key under the same object id (so the KEK id,
 `yubihsm:0x0064`, matches):
 
-1. Put the same *transport* wrap key on both devices: key material generated on the
-   offline machine, imported into each HSM as a wrap key with `export-wrapped` and
-   `import-wrapped` (delegating the KEK's capabilities), then destroyed, or kept
-   only as shares split between officers (Yubico's `yubihsm-setup ksp` does this).
+0. Create the app's authentication key on the backup HSM as well, with the same id
+   and password (and capabilities and domains): authentication keys are not exported,
+   and without it the backup cannot be used.
+1. Put the same *transport* wrap key on both devices (`yubihsm-shell`, `put wrapkey`):
+   key material generated on the offline machine, imported into each HSM as a wrap key
+   with `export-wrapped` and `import-wrapped`, and with *delegated* capabilities that
+   include `exportable-under-wrap`, `wrap-data` and `unwrap-data` (the ceiling on what
+   it may carry; without `exportable-under-wrap` the KEK cannot be exported again on
+   the next rotation). The transport key itself needs no `wrap-data` or `unwrap-data`.
+   Then destroy the material, or keep it as split custody: key shares held by
+   different officers.
 2. Export the KEK from the primary under the transport key (`get wrapped`) and
    import it on the backup (`put wrapped`). The KEK leaves an HSM only encrypted.
 3. Test the backup: plug it into a staging node, point a staging app at a copy of
