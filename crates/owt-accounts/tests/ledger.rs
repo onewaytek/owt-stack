@@ -116,7 +116,9 @@ async fn tables(pool: &PgPool) -> Vec<String> {
 const LIBRARY_TABLES: &[&str] = &[
     "account_identities",
     "account_local_identities",
+    "account_recovery_codes",
     "account_roles",
+    "account_totp",
     "accounts",
     "policy_acceptance_events",
     "policy_acceptances",
@@ -216,7 +218,7 @@ async fn an_apps_applied_copies_are_adopted_never_run_again() {
     // Once no binary carries the copies, their rows can go, and the app's migrator
     // no longer needs to ignore them.
     let forgotten = migrations::forget_copies(&db.pool).await.unwrap();
-    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10]);
+    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11]);
     let left: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
         .fetch_all(&db.pool)
         .await
@@ -247,7 +249,10 @@ async fn a_partly_applied_set_of_copies_is_adopted_and_the_rest_applied() {
     }
     let done = migrations::run(&db.pool).await.unwrap();
     assert_eq!(done.adopted, [ALL[0].name, ALL[1].name, ALL[2].name]);
-    assert_eq!(done.applied, [ALL[3].name, ALL[4].name, ALL[5].name]);
+    assert_eq!(
+        done.applied,
+        [ALL[3].name, ALL[4].name, ALL[5].name, ALL[6].name]
+    );
     assert_eq!(tables(&db.pool).await.len(), LIBRARY_TABLES.len() + 1);
     assert!(migrations::complete(&db.pool).await.unwrap().validated);
     db.drop().await;
@@ -551,7 +556,10 @@ async fn an_adoption_cut_short_resumes() {
     .await
     .unwrap();
     let done = migrations::run(&db.pool).await.unwrap();
-    assert_eq!(done.adopted, [ALL[3].name, ALL[4].name, ALL[5].name]);
+    assert_eq!(
+        done.adopted,
+        [ALL[3].name, ALL[4].name, ALL[5].name, ALL[6].name]
+    );
     assert_eq!(done.applied, Vec::<&str>::new());
     assert_eq!(db.ledger().await.len(), ALL.len());
     db.drop().await;
