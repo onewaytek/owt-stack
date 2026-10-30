@@ -5,16 +5,19 @@ use std::fmt;
 /// The text every redacted value prints as.
 pub(crate) const REDACTED: &str = "[redacted]";
 
-/// A value that cannot reach a log, a panic message or a serialized response by
-/// accident.
+/// A value that cannot reach a log or a panic message by accident.
 ///
-/// `Debug`, `Display` and `Serialize` all produce `[redacted]`, whatever `T` is.
-/// There is no `Deref` and no `AsRef`: reading the value is an explicit
+/// `Debug` and `Display` both print `[redacted]`, whatever `T` is, so a derived
+/// `Debug` on a struct that holds a `Sensitive` member redacts that member too. There
+/// is no `Deref` and no `AsRef`: reading the value is an explicit
 /// [`expose`](Self::expose) or [`into_inner`](Self::into_inner), which a reviewer can
-/// search for. `Deserialize` is transparent, so a configuration or form struct can
-/// hold a `Sensitive<String>` and read it from the same input as a `String`.
+/// search for.
 ///
-/// Derived `Debug` on a struct that holds a `Sensitive` field redacts that field too.
+/// `Deserialize` is transparent, so a configuration or form struct can hold a
+/// `Sensitive<String>` and read it from the same input as a `String`. There is no
+/// `Serialize`: writing `"[redacted]"` into a cache, a queue or a stored document
+/// would corrupt the value without an error, so persisting one is a compile error and
+/// the code that stores it calls `expose()` on purpose.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Sensitive<T>(T);
 
@@ -50,12 +53,6 @@ impl<T> fmt::Debug for Sensitive<T> {
 impl<T> fmt::Display for Sensitive<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(REDACTED)
-    }
-}
-
-impl<T> serde::Serialize for Sensitive<T> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(REDACTED)
     }
 }
 
@@ -103,17 +100,13 @@ mod tests {
     }
 
     #[test]
-    fn serializes_redacted_and_deserializes_transparently() {
-        #[derive(serde::Deserialize, serde::Serialize)]
+    fn deserializes_transparently() {
+        #[derive(serde::Deserialize)]
         struct Form {
             pass: Sensitive<String>,
         }
         let form: Form = serde_json::from_str(r#"{"pass":"hunter2"}"#).unwrap();
         assert_eq!(form.pass.expose(), "hunter2");
-        assert_eq!(
-            serde_json::to_string(&form).unwrap(),
-            r#"{"pass":"[redacted]"}"#
-        );
     }
 
     #[test]
@@ -132,7 +125,6 @@ mod tests {
             prop_assert_eq!(format!("{v}"), "[redacted]");
             prop_assert_eq!(format!("{v:?}"), "[redacted]");
             prop_assert_eq!(format!("{v:#?}"), "[redacted]");
-            prop_assert_eq!(serde_json::to_string(&v).unwrap(), "\"[redacted]\"");
         }
     }
 }

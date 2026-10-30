@@ -1,31 +1,40 @@
-//! Field-name redaction for the subscriber's formatters.
+//! Field-name redaction for the subscriber's formatters and the OTLP exporter.
 //!
-//! A field whose name is on the denylist is recorded as `[redacted]`: the visitor
-//! that formats a field's value replaces it before the value is formatted, so the
-//! original never reaches a writer. The text formatter wraps tracing-subscriber's
-//! default visitor; the JSON formatter is a visitor and an event formatter of its
+//! A field whose name matches the denylist is recorded as `[redacted]`: the visitor
+//! that formats a value replaces it before the value is formatted, so the original
+//! never reaches a writer. The text formatter wraps tracing-subscriber's default
+//! visitor. The JSON formatter is a streaming visitor and an event formatter of its
 //! own, because tracing-subscriber's JSON event formatter serializes event fields
-//! without consulting the configured field formatter.
+//! without consulting the configured field formatter. With feature `otel`, an
+//! exporter wrapper applies the same matcher to span and event attributes before
+//! they leave the process.
+//!
+//! Only names are judged. A `Debug` or `Display` value is not inspected, so a struct
+//! logged as one field prints all of its members and an error's message prints
+//! whatever it contains.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::field::{MakeVisitor, RecordFields, VisitOutput};
 use tracing_subscriber::fmt::format::{DefaultFields, FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
 use tracing_subscriber::fmt::{FmtContext, FormattedFields};
-use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::registry::{LookupSpan, SpanRef};
 
 use super::sensitive::REDACTED;
 
-/// Field names redacted by default, compared case-insensitively.
+/// Normalized names redacted by default.
 const DEFAULT_NAMES: &[&str] = &[
     "password",
     "passwd",
+    "pwd",
     "secret",
     "token",
     "access_token",
@@ -49,51 +58,107 @@ const DEFAULT_NAMES: &[&str] = &[
     "diagnosis",
     "note",
     "notes",
-    "body",
     "content",
     "transcript",
     "mrn",
     "patient_name",
 ];
 
-/// Name endings redacted by default, compared case-insensitively.
-const DEFAULT_SUFFIXES: &[&str] = &["_secret", "_token", "_password", "_key"];
+/// Key names redacted when they are the whole name or its last `_` segment.
+const DEFAULT_KEYS: &[&str] = &[
+    "api_key",
+    "private_key",
+    "secret_key",
+    "access_key",
+    "signing_key",
+    "encryption_key",
+];
+
+/// Name endings redacted by default.
+const DEFAULT_SUFFIXES: &[&str] = &["_secret", "_token", "_password"];
+
+/// Name prefixes redacted by default.
+const DEFAULT_PREFIXES: &[&str] = &["ssn", "authorization"];
+
+/// `_`-separated words that redact a name wherever they appear in it.
+const DEFAULT_WORDS: &[&str] = &["password", "passwd", "pwd", "secret"];
 
 /// Decides which field names are redacted.
 #[derive(Clone, Debug)]
 pub(crate) struct Redactor {
     names: Arc<HashSet<String>>,
-    suffixes: bool,
+    defaults: bool,
 }
 
 impl Redactor {
-    /// The default names and suffixes when `defaults`, plus `extra` names.
+    /// The default rules when `defaults`, plus the `extra` names.
     pub(crate) fn new(defaults: bool, extra: &[String]) -> Self {
-        let mut names: HashSet<String> = extra.iter().map(|n| n.to_ascii_lowercase()).collect();
+        let mut names: HashSet<String> = extra.iter().map(|n| normalize(n).into_owned()).collect();
         if defaults {
             names.extend(DEFAULT_NAMES.iter().map(|n| (*n).to_owned()));
         }
         Self {
             names: Arc::new(names),
-            suffixes: defaults,
+            defaults,
         }
     }
 
-    /// Whether the value of the field called `name` is redacted. A dotted name
-    /// (`user.email`) is judged by its last segment as well as whole.
+    /// Whether the value of the field called `name` is redacted. The whole name is
+    /// judged, and each segment of a dotted one (`password.value`).
     pub(crate) fn denies(&self, name: &str) -> bool {
-        let name = name.strip_prefix("r#").unwrap_or(name).to_ascii_lowercase();
-        self.denies_exact(&name)
-            || name
-                .rsplit('.')
-                .next()
-                .is_some_and(|s| self.denies_exact(s))
+        let name = name.strip_prefix("r#").unwrap_or(name);
+        self.judge(&normalize(name))
+            || (name.contains('.') && name.split('.').any(|s| self.judge(&normalize(s))))
     }
 
-    fn denies_exact(&self, name: &str) -> bool {
-        self.names.contains(name)
-            || (self.suffixes && DEFAULT_SUFFIXES.iter().any(|s| name.ends_with(s)))
+    /// Judges a normalized name.
+    fn judge(&self, n: &str) -> bool {
+        if self.names.contains(n) {
+            return true;
+        }
+        self.defaults
+            && (DEFAULT_SUFFIXES.iter().any(|s| n.ends_with(s))
+                || DEFAULT_KEYS.iter().any(|k| {
+                    n.strip_suffix(k)
+                        .is_some_and(|p| p.is_empty() || p.ends_with('_'))
+                })
+                || DEFAULT_PREFIXES.iter().any(|p| n.starts_with(p))
+                || n.split('_').any(|w| DEFAULT_WORDS.contains(&w)))
     }
+}
+
+/// Lowercase snake case: `accessToken`, `x-api-key` and `set cookie` become
+/// `access_token`, `x_api_key` and `set_cookie`. A name already in that form is
+/// borrowed.
+fn normalize(name: &str) -> Cow<'_, str> {
+    if name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Cow::Borrowed(name);
+    }
+    let mut out = String::with_capacity(name.len() + 4);
+    let mut prev: Option<char> = None;
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if matches!(c, '-' | '.' | ' ') {
+            out.push('_');
+        } else if c.is_uppercase() {
+            let boundary = prev.is_some_and(|p| {
+                p.is_lowercase()
+                    || p.is_ascii_digit()
+                    || (p.is_uppercase() && chars.peek().is_some_and(|n| n.is_lowercase()))
+            });
+            if boundary {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+        prev = Some(c);
+    }
+    Cow::Owned(out)
 }
 
 /// A value whose `Debug` is the redaction marker, unquoted.
@@ -197,53 +262,128 @@ impl<V: Visit> Visit for TextVisitor<'_, V> {
 
 // === JSON ===
 
-/// Collects fields into a JSON object, denied values replaced.
-struct JsonVisitor<'a> {
-    map: &'a mut Map<String, Value>,
-    redactor: &'a Redactor,
+/// Appends `s` to `out` with JSON string escapes (no quotes).
+fn escape(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
 }
 
-impl JsonVisitor<'_> {
-    fn put(&mut self, field: &Field, value: impl FnOnce() -> Value) {
-        let name = field.name();
-        let value = if self.redactor.denies(name) {
-            Value::from(REDACTED)
+/// Appends `s` to `out` as a JSON string.
+fn push_str(out: &mut String, s: &str) {
+    out.push('"');
+    escape(out, s);
+    out.push('"');
+}
+
+/// A `fmt::Write` that JSON-escapes what it receives.
+struct Escaper<'a>(&'a mut String);
+
+impl fmt::Write for Escaper<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        escape(self.0, s);
+        Ok(())
+    }
+}
+
+/// Appends `"name":value` pairs, comma-separated, to a string, denied values
+/// replaced. The caller writes the braces.
+struct JsonVisitor<'a> {
+    out: &'a mut String,
+    redactor: &'a Redactor,
+    first: bool,
+    /// Keeps the key `name` free for a span object's own name.
+    rename_name: bool,
+}
+
+impl<'a> JsonVisitor<'a> {
+    fn new(out: &'a mut String, redactor: &'a Redactor, rename_name: bool) -> Self {
+        Self {
+            out,
+            redactor,
+            first: true,
+            rename_name,
+        }
+    }
+
+    fn put(&mut self, field: &Field, value: impl FnOnce(&mut String)) {
+        let raw = field.name();
+        if raw.starts_with("log.") {
+            return;
+        }
+        let name = raw.strip_prefix("r#").unwrap_or(raw);
+        if !std::mem::take(&mut self.first) {
+            self.out.push(',');
+        }
+        self.out.push('"');
+        if self.rename_name && name == "name" {
+            self.out.push_str("field.");
+        }
+        escape(self.out, name);
+        self.out.push_str("\":");
+        if self.redactor.denies(name) {
+            push_str(self.out, REDACTED);
         } else {
-            value()
-        };
-        self.map
-            .insert(name.strip_prefix("r#").unwrap_or(name).to_owned(), value);
+            value(self.out);
+        }
     }
 }
 
 impl Visit for JsonVisitor<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.put(field, || Value::from(format!("{value:?}")));
+        self.put(field, |out| {
+            out.push('"');
+            let _ = write!(Escaper(out), "{value:?}");
+            out.push('"');
+        });
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.put(field, || Value::from(value));
+        self.put(field, |out| push_str(out, value));
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        self.put(field, || Value::from(value));
+        self.put(field, |out| {
+            let _ = write!(out, "{value}");
+        });
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        self.put(field, || Value::from(value));
+        self.put(field, |out| {
+            let _ = write!(out, "{value}");
+        });
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.put(field, || Value::from(value));
+        self.put(field, |out| {
+            if value.is_finite() {
+                let _ = write!(out, "{value}");
+            } else {
+                out.push_str("null");
+            }
+        });
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
-        self.put(field, || Value::from(value));
+        self.put(field, |out| {
+            out.push_str(if value { "true" } else { "false" });
+        });
     }
 }
 
 /// The JSON formatter's field formatter. A span's fields are stored as one JSON
-/// object; a later `record` parses it, adds the new fields and writes it back.
+/// object, written once when the span is created. A later `record` parses it, adds
+/// the new fields and writes it back.
 #[derive(Clone, Debug)]
 pub(crate) struct RedactingJsonFields {
     redactor: Redactor,
@@ -254,19 +394,17 @@ impl RedactingJsonFields {
         Self { redactor }
     }
 
-    fn write(&self, mut map: Map<String, Value>, fields: impl RecordFields) -> String {
-        fields.record(&mut JsonVisitor {
-            map: &mut map,
-            redactor: &self.redactor,
-        });
-        Value::Object(map).to_string()
+    fn object(&self, fields: impl RecordFields) -> String {
+        let mut out = String::from("{");
+        fields.record(&mut JsonVisitor::new(&mut out, &self.redactor, true));
+        out.push('}');
+        out
     }
 }
 
 impl<'w> FormatFields<'w> for RedactingJsonFields {
     fn format_fields<R: RecordFields>(&self, mut writer: Writer<'w>, fields: R) -> fmt::Result {
-        let json = self.write(Map::new(), fields);
-        fmt::Write::write_str(&mut writer, &json)
+        writer.write_str(&self.object(fields))
     }
 
     fn add_fields(
@@ -274,18 +412,21 @@ impl<'w> FormatFields<'w> for RedactingJsonFields {
         current: &'w mut FormattedFields<Self>,
         fields: &tracing::span::Record<'_>,
     ) -> fmt::Result {
-        let map = if current.is_empty() {
-            Map::new()
-        } else {
-            serde_json::from_str(current).map_err(|_| fmt::Error)?
-        };
-        current.fields = self.write(map, fields);
+        // A stored object that fails to parse is replaced rather than allowed to
+        // drop the new fields; the formatter wrote it, so this does not happen.
+        let mut map: Map<String, Value> = serde_json::from_str(current).unwrap_or_default();
+        if let Ok(Value::Object(added)) = serde_json::from_str(&self.object(fields)) {
+            map.extend(added);
+        }
+        current.fields = Value::Object(map).to_string();
         Ok(())
     }
 }
 
 /// One JSON object per event: `timestamp`, `level`, `fields`, `target`, then `span`
-/// (the innermost) and `spans` (root first) when the event is inside a span.
+/// (the innermost) and `spans` (root first) when the event is inside a span. A
+/// bridged `log` record carries its own target and level, as in tracing-subscriber's
+/// JSON formatter.
 #[derive(Clone, Debug)]
 pub(crate) struct RedactingJsonEvent {
     redactor: Redactor,
@@ -295,6 +436,25 @@ impl RedactingJsonEvent {
     pub(crate) fn new(redactor: Redactor) -> Self {
         Self { redactor }
     }
+}
+
+/// Appends a span's stored fields with its `name`. The stored object is spliced in as
+/// written, not parsed.
+fn push_span<S: for<'a> LookupSpan<'a>>(out: &mut String, span: &SpanRef<'_, S>) {
+    let ext = span.extensions();
+    let stored = ext
+        .get::<FormattedFields<RedactingJsonFields>>()
+        .map_or("{}", |f| f.fields.as_str());
+    match stored.strip_suffix('}') {
+        Some(head) if head.starts_with('{') && head.len() > 1 => {
+            out.push_str(head);
+            out.push(',');
+        }
+        _ => out.push('{'),
+    }
+    out.push_str("\"name\":");
+    push_str(out, span.name());
+    out.push('}');
 }
 
 impl<S> FormatEvent<S, RedactingJsonFields> for RedactingJsonEvent
@@ -307,42 +467,98 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        let meta = event.metadata();
+        let normalized = event.normalized_metadata();
+        let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
         let mut timestamp = String::new();
         SystemTime.format_time(&mut Writer::new(&mut timestamp))?;
 
-        let mut fields = Map::new();
-        event.record(&mut JsonVisitor {
-            map: &mut fields,
-            redactor: &self.redactor,
-        });
-
-        let mut out = Map::new();
-        out.insert("timestamp".into(), timestamp.into());
-        out.insert("level".into(), meta.level().as_str().into());
-        out.insert("fields".into(), Value::Object(fields));
-        out.insert("target".into(), meta.target().into());
+        let mut out = String::with_capacity(256);
+        out.push_str("{\"timestamp\":");
+        push_str(&mut out, &timestamp);
+        out.push_str(",\"level\":");
+        push_str(&mut out, meta.level().as_str());
+        out.push_str(",\"fields\":{");
+        event.record(&mut JsonVisitor::new(&mut out, &self.redactor, false));
+        out.push_str("},\"target\":");
+        push_str(&mut out, meta.target());
 
         if let Some(scope) = ctx.event_scope() {
-            let mut spans: Vec<Value> = scope
-                .map(|span| {
-                    let mut object = span
-                        .extensions()
-                        .get::<FormattedFields<RedactingJsonFields>>()
-                        .and_then(|f| serde_json::from_str::<Map<String, Value>>(f).ok())
-                        .unwrap_or_default();
-                    object.insert("name".into(), span.name().into());
-                    Value::Object(object)
-                })
-                .collect();
-            if let Some(innermost) = spans.first().cloned() {
-                out.insert("span".into(), innermost);
-                spans.reverse();
-                out.insert("spans".into(), Value::Array(spans));
+            let spans: Vec<_> = scope.collect();
+            if let Some(innermost) = spans.first() {
+                out.push_str(",\"span\":");
+                push_span(&mut out, innermost);
+                out.push_str(",\"spans\":[");
+                for (i, span) in spans.iter().rev().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    push_span(&mut out, span);
+                }
+                out.push(']');
             }
         }
+        out.push_str("}\n");
+        writer.write_str(&out)
+    }
+}
 
-        fmt::Write::write_str(&mut writer, &Value::Object(out).to_string())?;
-        fmt::Write::write_char(&mut writer, '\n')
+// === OTLP ===
+
+/// Wraps a span exporter and replaces the value of every span and event attribute
+/// whose key matches, before the batch reaches the exporter.
+#[cfg(feature = "otel")]
+#[derive(Debug)]
+pub(crate) struct RedactingExporter<E> {
+    inner: E,
+    redactor: Redactor,
+}
+
+#[cfg(feature = "otel")]
+impl<E> RedactingExporter<E> {
+    pub(crate) fn new(inner: E, redactor: Redactor) -> Self {
+        Self { inner, redactor }
+    }
+
+    fn redact(&self, attributes: &mut [opentelemetry::KeyValue]) {
+        for kv in attributes {
+            let key = kv.key.as_str();
+            // The tracing layer's own thread attributes are not application fields.
+            if !key.starts_with("thread.") && self.redactor.denies(key) {
+                kv.value = opentelemetry::Value::String(REDACTED.into());
+            }
+        }
+    }
+}
+
+#[cfg(feature = "otel")]
+impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
+    for RedactingExporter<E>
+{
+    fn export(
+        &self,
+        mut batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+        for span in &mut batch {
+            self.redact(&mut span.attributes);
+            for event in &mut span.events.events {
+                self.redact(&mut event.attributes);
+            }
+        }
+        self.inner.export(batch)
+    }
+
+    fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+        self.inner.set_resource(resource);
     }
 }

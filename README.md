@@ -486,24 +486,36 @@ the handler and write `<script nonce="{{ nonce }}">`.
 
 ### Keeping sensitive values out of logs
 
-`logging::init` redacts by field name, in the JSON and the text output alike. A
-`tracing` event or span field whose name is on the denylist is logged as
-`[redacted]`; the value is replaced before it is formatted, so it never reaches the
-writer. This includes fields added later with `span.record(..)`. The names, compared
-case-insensitively, are `password`, `passwd`, `secret`, `token`, `access_token`,
-`refresh_token`, `id_token`, `authorization`, `cookie`, `set_cookie`, `api_key`,
-`apikey`, `private_key`, `ssn`, `dob`, `date_of_birth`, `email`, `phone`, `address`,
-`name`, `first_name`, `last_name`, `diagnosis`, `note`, `notes`, `body`, `content`,
-`transcript`, `mrn` and `patient_name`, and any name ending in `_secret`, `_token`,
-`_password` or `_key`. A dotted name (`user.email`) is also judged by its last segment.
+`logging::init` redacts by field name: a `tracing` event or span field whose name
+matches the denylist is logged as `[redacted]`, in the JSON and the text output and, with
+feature `otel`, in the span and event attributes exported over OTLP. The value is
+replaced before it is formatted, so the original never reaches the writer or the
+exporter. This includes fields added later with `span.record(..)`.
+
+A name is normalized before it is compared, so `passwordHash`, `Set-Cookie` and
+`access.token` are judged as `password_hash`, `set_cookie` and `access_token`, and each
+segment of a dotted name is judged on its own (`password.value`). Redacted by default:
+
+* the names `password`, `passwd`, `pwd`, `secret`, `token`, `access_token`,
+  `refresh_token`, `id_token`, `authorization`, `cookie`, `set_cookie`, `api_key`,
+  `apikey`, `private_key`, `ssn`, `dob`, `date_of_birth`, `email`, `phone`, `address`,
+  `name`, `first_name`, `last_name`, `diagnosis`, `note`, `notes`, `content`,
+  `transcript`, `mrn` and `patient_name`;
+* a name ending `_secret`, `_token` or `_password`, and one that is or ends in `_` and
+  `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key` or
+  `encryption_key` (`cache_key` and `idempotency_key` are not);
+* a name starting `ssn` or `authorization`, and a name with a `_`-separated word
+  `password`, `passwd`, `pwd` or `secret`.
 
 `Options::redact_fields` adds names; `redact_defaults: false` drops the defaults (and
-the suffix rules) so that exactly `redact_fields` applies.
+every rule above) so that exactly `redact_fields` applies.
 
-`logging::Sensitive<T>` wraps a value whose `Debug`, `Display` and `Serialize` all
-print `[redacted]`. It has no `Deref`: `expose()` and `into_inner()` are the only
-reads, so each is visible in review. `Deserialize` is transparent, so a form or
-configuration struct can hold one.
+`logging::Sensitive<T>` wraps a value whose `Debug` and `Display` print `[redacted]`,
+also inside a derived `Debug`. It has no `Deref`: `expose()` and `into_inner()` are the
+only reads, so each is visible in review. `Deserialize` is transparent, so a form or
+configuration struct can hold one. There is no `Serialize`: storing `"[redacted]"` in a
+cache or a queue would corrupt the value silently, so persisting one is a compile
+error and the code that stores it calls `expose()`.
 
 ```rust,no_run
 use owt_runtime::logging::{self, Sensitive};
@@ -521,17 +533,24 @@ let _logging = logging::init(&logging::Options {
     redact_fields: vec!["nickname".into()],
     ..logging::Options::default()
 });
-// Both fields are denied by name; `credential` is not, so `Sensitive` covers it.
+// `email` is denied by name; `credential` is not, so `Sensitive` keeps the password out.
 tracing::info!(email = %login.email, credential = ?login.password, "login attempt");
 let password: &str = login.password.expose();
 # let _ = password;
 # }
 ```
 
-Redaction is a safety net, not a policy. An app must still not log PHI or
-credentials on purpose. Only fields are checked: a value interpolated into the
-message, as in `info!("saw {}", name)`, is not a field and is logged as it is. Log
-identifiers as fields, and wrap anything sensitive in `Sensitive`.
+Redaction is a safety net, not a policy. An app must still not log PHI or credentials
+on purpose, and the list is a floor: a field named for something it does not know is
+logged. Only names are judged:
+
+* A value inside a message, as in `info!("saw {}", name)`, is not a field and is
+  logged as it is. A bridged `log` record is only a message, so it is logged as it is
+  too.
+* A `Debug` or `Display` value is not inspected. `info!(req = ?login)` prints every
+  member of `login`, because the field is named `req`; wrap the members in `Sensitive`.
+  An error's message prints whatever it contains (a unique violation names the
+  duplicate value), so log an error's code or kind where data may appear.
 
 ### Handlers, errors and pages
 

@@ -5,11 +5,23 @@
 //! logs are JSON lines; development logs are human-readable. `RUST_LOG` overrides the
 //! default filter.
 //!
-//! A field whose name is on a denylist (`password`, `token`, `email`, `name`, `note`
+//! A field whose name matches a denylist (`password`, `token`, `email`, `name`, `note`
 //! and others; see [`Options::redact_fields`]) is logged as `[redacted]` in both
-//! formats, and [`Sensitive`] wraps a value that must never print. Both are a safety
-//! net: a value interpolated into a message (`info!("saw {}", name)`) is not a field
-//! and is not caught.
+//! formats and, with feature `otel`, in the exported span and event attributes.
+//! [`Sensitive`] wraps a value that must never print.
+//!
+//! Both are a safety net, and they judge names only:
+//!
+//! * A value interpolated into a message (`info!("saw {}", name)`) is not a field and
+//!   is not caught. A bridged `log` record carries only a message, so it is not
+//!   caught either.
+//! * A `Debug` or `Display` value is not inspected. `info!(req = ?login)` prints every
+//!   member of `login`, and an error's message prints whatever it contains (a unique
+//!   violation names the duplicate value). Wrap struct members in [`Sensitive`], whose
+//!   `Debug` stays redacted inside a derived one, and log an error's code or kind
+//!   where data may appear in its message.
+//! * The list is a floor. A field named for something the list does not know is
+//!   logged.
 //!
 //! With feature `otel`, spans are exported over OTLP gRPC when `otel_endpoint` is set
 //! (the exporter itself reads the standard `OTEL_EXPORTER_OTLP_*` and
@@ -40,14 +52,18 @@ pub struct Options {
     pub json: bool,
     /// Where to export traces; `None` exports nothing.
     pub otel_endpoint: Option<String>,
-    /// Field names to redact in addition to the defaults, compared
-    /// case-insensitively (a dotted name such as `user.email` is also judged by its
-    /// last segment). The defaults are `password`, `passwd`, `secret`, `token`,
-    /// `access_token`, `refresh_token`, `id_token`, `authorization`, `cookie`,
-    /// `set_cookie`, `api_key`, `apikey`, `private_key`, `ssn`, `dob`, `date_of_birth`,
-    /// `email`, `phone`, `address`, `name`, `first_name`, `last_name`, `diagnosis`,
-    /// `note`, `notes`, `body`, `content`, `transcript`, `mrn` and `patient_name`, and
-    /// any name ending in `_secret`, `_token`, `_password` or `_key`.
+    /// Field names to redact in addition to the defaults. A name is normalized
+    /// before it is compared: `accessToken`, `Access-Token` and `access.token` all
+    /// become `access_token`, and each segment of a dotted name is judged on its own
+    /// (`password.value`). The defaults are the names `password`, `passwd`, `pwd`,
+    /// `secret`, `token`, `access_token`, `refresh_token`, `id_token`, `authorization`,
+    /// `cookie`, `set_cookie`, `api_key`, `apikey`, `private_key`, `ssn`, `dob`,
+    /// `date_of_birth`, `email`, `phone`, `address`, `name`, `first_name`, `last_name`,
+    /// `diagnosis`, `note`, `notes`, `content`, `transcript`, `mrn` and `patient_name`;
+    /// a name ending `_secret`, `_token` or `_password`; a name that is, or ends in
+    /// `_`, one of `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key`
+    /// and `encryption_key`; a name starting `ssn` or `authorization`; and a name with
+    /// a `_`-separated word `password`, `passwd`, `pwd` or `secret`.
     pub redact_fields: Vec<String>,
     /// Whether the defaults apply. `false` redacts exactly `redact_fields`.
     pub redact_defaults: bool,
@@ -67,8 +83,9 @@ impl Default for Options {
     }
 }
 
-/// The output layer: JSON lines or text, to `writer`, with `opts`' redaction.
-fn fmt_layer<S, W>(opts: &Options, writer: W, ansi: bool) -> Box<dyn Layer<S> + Send + Sync>
+/// The output layer: JSON lines or text, to `writer`, with `opts`' redaction. `None`
+/// leaves colour to tracing-subscriber's default (on unless `NO_COLOR` is set).
+fn fmt_layer<S, W>(opts: &Options, writer: W, ansi: Option<bool>) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
@@ -81,11 +98,13 @@ where
             .with_writer(writer)
             .boxed()
     } else {
-        fmt::layer()
+        let layer = fmt::layer()
             .fmt_fields(RedactingFields::new(redactor))
-            .with_ansi(ansi)
-            .with_writer(writer)
-            .boxed()
+            .with_writer(writer);
+        match ansi {
+            Some(ansi) => layer.with_ansi(ansi).boxed(),
+            None => layer.boxed(),
+        }
     }
 }
 
@@ -111,7 +130,7 @@ impl Drop for Guard {
 pub fn init(opts: &Options) -> Guard {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&opts.default_filter));
-    let fmt_layer = fmt_layer(opts, std::io::stderr, true);
+    let fmt_layer = fmt_layer(opts, std::io::stderr, None);
 
     #[cfg(feature = "otel")]
     {
@@ -151,7 +170,10 @@ pub fn init(opts: &Options) -> Guard {
             .ok()?;
             Some(
                 opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                    .with_batch_exporter(exporter)
+                    .with_batch_exporter(redaction::RedactingExporter::new(
+                        exporter,
+                        Redactor::new(opts.redact_defaults, &opts.redact_fields),
+                    ))
                     .with_resource(
                         opentelemetry_sdk::Resource::builder()
                             .with_service_name(opts.service)
@@ -215,10 +237,22 @@ mod tests {
     /// Runs `f` under a subscriber built from `opts` and returns what it wrote.
     fn capture(opts: &Options, f: impl FnOnce()) -> String {
         let out = Capture::default();
-        let subscriber = tracing_subscriber::registry().with(fmt_layer(opts, out.clone(), false));
+        let subscriber =
+            tracing_subscriber::registry().with(fmt_layer(opts, out.clone(), Some(false)));
         tracing::subscriber::with_default(subscriber, f);
         let bytes = out.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
+    }
+
+    fn json(f: impl FnOnce()) -> serde_json::Value {
+        let out = capture(
+            &Options {
+                json: true,
+                ..Options::default()
+            },
+            f,
+        );
+        serde_json::from_str(out.trim_end()).unwrap_or_else(|e| panic!("{e}: {out}"))
     }
 
     fn both(f: impl Fn() + Copy) -> [(bool, String); 2] {
@@ -260,7 +294,7 @@ mod tests {
                 phone = 5.55123,
                 note = true,
                 address = ?vec!["12 Elm St"],
-                body = %"free text",
+                content = %"free text",
             );
         }) {
             for leaked in [
@@ -278,22 +312,71 @@ mod tests {
     }
 
     #[test]
-    fn names_match_case_insensitively_by_suffix_and_by_last_segment() {
+    fn matcher_normalizes_names() {
+        let r = redaction::Redactor::new(true, &[]);
+        for name in [
+            "PASSWORD",
+            "passwordHash",
+            "accessToken",
+            "refreshToken",
+            "clientSecret",
+            "privateKey",
+            "x-api-key",
+            "set-cookie",
+            "Set Cookie",
+            "pwd",
+            "ssn_last4",
+            "ssnLast4",
+            "authorization_header",
+            "db_password",
+            "session_token",
+            "secret_key",
+            "stripe_secret_key",
+            "user.email",
+            "password.value",
+            "secret.hint",
+            "r#name",
+            "APIKey",
+        ] {
+            assert!(r.denies(name), "{name} should be denied");
+        }
+        for name in [
+            "keyboard",
+            "cache_key",
+            "primary_key",
+            "idempotency_key",
+            "max_tokens",
+            "token_count",
+            "body",
+            "user",
+            "route",
+            "thread.id",
+            "status",
+        ] {
+            assert!(!r.denies(name), "{name} should pass");
+        }
+    }
+
+    #[test]
+    fn denied_names_are_redacted_in_events() {
         for (json, out) in both(|| {
             tracing::info!(
                 PASSWORD = "v1",
                 session_token = "v2",
-                stripe_key = "v3",
+                secret_key = "v3",
                 db_password = "v4",
-                client_secret = "v5",
+                clientSecret = "v5",
                 user.email = "v6",
+                passwordHash = "v7",
+                password.value = "v8",
                 keyboard = "shown",
+                cache_key = "also_shown",
             );
         }) {
-            for leaked in ["v1", "v2", "v3", "v4", "v5", "v6"] {
+            for leaked in ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8"] {
                 assert!(!out.contains(leaked), "json={json} leaked {leaked}: {out}");
             }
-            assert!(out.contains("shown"), "{out}");
+            assert!(out.contains("shown") && out.contains("also_shown"), "{out}");
         }
     }
 
@@ -334,26 +417,79 @@ mod tests {
 
     #[test]
     fn json_output_is_valid_and_structured() {
-        let out = capture(
-            &Options {
-                json: true,
-                ..Options::default()
-            },
-            || {
-                let span = tracing::info_span!("req", id = 7, password = "p");
-                let _g = span.enter();
-                tracing::warn!(name = "n", ok = true, "hello");
-            },
-        );
-        let v: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        let v = json(|| {
+            let span =
+                tracing::info_span!("req", id = 7, password = "p", late = tracing::field::Empty);
+            let _g = span.enter();
+            span.record("late", "after");
+            tracing::warn!(name = "n", ok = true, ratio = 0.5, "he said \"hi\"\n");
+        });
         assert_eq!(v["level"], "WARN");
-        assert_eq!(v["fields"]["message"], "hello");
+        assert_eq!(v["fields"]["message"], "he said \"hi\"\n");
         assert_eq!(v["fields"]["name"], "[redacted]");
         assert_eq!(v["fields"]["ok"], true);
+        assert_eq!(v["fields"]["ratio"], 0.5);
         assert_eq!(v["span"]["name"], "req");
         assert_eq!(v["span"]["id"], 7);
+        assert_eq!(v["span"]["late"], "after");
         assert_eq!(v["spans"][0]["password"], "[redacted]");
         assert!(v["timestamp"].is_string() && v["target"].is_string());
+    }
+
+    #[test]
+    fn nested_spans_list_root_first() {
+        let v = json(|| {
+            let outer = tracing::info_span!("outer");
+            let _o = outer.enter();
+            let inner = tracing::info_span!("inner");
+            let _i = inner.enter();
+            tracing::info!("x");
+        });
+        assert_eq!(v["span"]["name"], "inner");
+        assert_eq!(v["spans"][0]["name"], "outer");
+        assert_eq!(v["spans"][1]["name"], "inner");
+    }
+
+    #[test]
+    fn a_span_field_called_name_does_not_replace_the_span_name() {
+        let opts = Options {
+            json: true,
+            redact_defaults: false,
+            ..Options::default()
+        };
+        let out = capture(&opts, || {
+            let span = tracing::info_span!("req", name = "kept");
+            let _g = span.enter();
+            tracing::info!("x");
+        });
+        let v: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(v["span"]["name"], "req");
+        assert_eq!(v["span"]["field.name"], "kept");
+    }
+
+    #[test]
+    fn a_bridged_log_record_keeps_its_target_and_drops_log_fields() {
+        let v = json(|| {
+            use log::Log as _;
+            tracing_log::LogTracer::new().log(
+                &log::Record::builder()
+                    .args(format_args!("select 1"))
+                    .level(log::Level::Warn)
+                    .target("sqlx::query")
+                    .build(),
+            );
+        });
+        assert_eq!(v["target"], "sqlx::query");
+        assert_eq!(v["level"], "WARN");
+        assert_eq!(v["fields"]["message"], "select 1");
+        assert!(
+            v["fields"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|k| !k.starts_with("log.")),
+            "{v}"
+        );
     }
 
     #[test]
@@ -373,7 +509,7 @@ mod tests {
             ..Options::default()
         };
         let out = capture(&only, || {
-            tracing::info!(nickname = "nv1", password = "pv2", a_key = "kv3");
+            tracing::info!(nickname = "nv1", password = "pv2", secret_key = "kv3");
         });
         assert!(
             !out.contains("nv1") && out.contains("pv2") && out.contains("kv3"),
@@ -381,12 +517,58 @@ mod tests {
         );
     }
 
+    /// The limits the module documentation states.
     #[test]
-    fn a_message_is_not_inspected() {
-        let out = capture(&Options::default(), || {
+    fn values_are_not_inspected() {
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Login {
+            email: &'static str,
+        }
+        for (json, out) in both(|| {
             let name = "ann";
             tracing::info!("saw {name}");
+            tracing::info!(req = ?Login { email: "member@example" });
+            tracing::info!(error = "Key (email)=(dup@example) already exists");
+        }) {
+            assert!(out.contains("saw ann"), "json={json}: {out}");
+            assert!(out.contains("member@example"), "json={json}: {out}");
+            assert!(out.contains("dup@example"), "json={json}: {out}");
+        }
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn exported_attributes_are_redacted() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+        let memory = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(redaction::RedactingExporter::new(
+                memory.clone(),
+                Redactor::new(true, &["nickname".into()]),
+            ))
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "req",
+                password = "p4ss",
+                route = "/x",
+                late_token = tracing::field::Empty,
+            );
+            let _g = span.enter();
+            span.record("late_token", "t0k");
+            tracing::info!(email = "e@x", nickname = "nick0", visible = "fine", "event");
         });
-        assert!(out.contains("saw ann"), "{out}");
+        provider.force_flush().unwrap();
+        let dump = format!("{:?}", memory.get_finished_spans().unwrap());
+        for leaked in ["p4ss", "t0k", "e@x", "nick0"] {
+            assert!(!dump.contains(leaked), "leaked {leaked}: {dump}");
+        }
+        assert!(dump.contains("/x") && dump.contains("fine"), "{dump}");
+        assert!(dump.contains("[redacted]"), "{dump}");
     }
 }
