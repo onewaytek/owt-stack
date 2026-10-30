@@ -1,6 +1,6 @@
 [package]
 name = "owt-auth"
-description = "Authentication apps on owt-stack share: Argon2id password hashing, sign-in throttling, a bot guard for anonymous forms, OAuth 2 sign-in with PKCE, and JWT bearer verification against a JWKS."
+description = "Authentication apps on owt-stack share: Argon2id password hashing and a NIST password policy, TOTP and recovery codes, sign-in throttling (in process or in Redis), a bot guard for anonymous forms, OAuth 2 sign-in with PKCE, and JWT bearer verification against a JWKS."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,23 +14,32 @@ default = ["jwt"]
 # (RUSTSEC-2026-0387), both ignored in .cargo/audit.toml with why; the rest
 # of the crate (oauth's ID-token checks included) needs neither.
 jwt = ["dep:jsonwebtoken"]
+# `redis`: a sign-in throttle whose counts live in Redis, so the budgets hold across
+# replicas (`throttle::shared`).
+redis = ["dep:redis"]
 
 [dependencies]
 anyhow.workspace = true
 argon2.workspace = true
 base64.workspace = true
+getrandom.workspace = true
 governor.workspace = true
+hmac.workspace = true
 jsonwebtoken = { workspace = true, features = ["rust_crypto"], optional = true }
 rand.workspace = true
+redis = { workspace = true, optional = true, features = ["script"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+unicode-normalization.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

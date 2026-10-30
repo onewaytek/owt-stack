@@ -11,6 +11,10 @@
 //! it. The permit moves into the blocking task, so a caller that gives up (a request
 //! timeout, a closed connection) does not free it while the hash is still running.
 //!
+//! What a new password must satisfy is [`Policy`]: NIST SP 800-63B's rules, with a
+//! breached-password check against a corpus the app supplies ([`SortedHashes`],
+//! [`Bloom`]).
+//!
 //! When [`hash`]'s parameters are raised, [`needs_rehash`] says which stored hashes are
 //! weaker: the app stores a fresh [`hash`] after the next successful check.
 
@@ -18,6 +22,9 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use std::sync::OnceLock;
+
+mod policy;
+pub use policy::{Bloom, Breached, Context, Policy, Refusal, SortedHashes};
 
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::spawn_blocking;
