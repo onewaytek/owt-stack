@@ -254,6 +254,59 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
 }
 ```
 
+**Idle timeout and lifetimes.** Three limits end a session, and an app handling
+health data sets all three: `max_age` (how long a cookie lives without being
+resealed), `absolute_lifetime` (from sign-in, however active: 30 days unless set),
+and `idle_timeout` (since the person's last activity). Revocation is the epoch above:
+`sign_out_everywhere`, a password change or a deactivation moves the account's
+`session_epoch`, and the validator refuses every session sealed under the old one on
+its next request, on every replica.
+
+With `idle_timeout`, the cookie also carries the last-active time. A request that
+carries the session and is not passive reseals it, at most once per `idle_refresh`
+(a tenth of the timeout, at least 15 s, by default), so a busy page does not rewrite
+the cookie on every request, and a session ends between the timeout less one refresh
+and the timeout after the last activity. A session past it is no session: its
+cookie is removed, and `Session::idle_expired()` lets the sign-in page say why. A
+request with the `owt-passive` header (`session::PASSIVE_HEADER`), or whose handler
+calls `Session::passive()`, is not activity, so a poll cannot keep an unattended
+screen signed in. Every response to a request with a session carries
+`owt-idle-remaining: <seconds>` (`session::IDLE_REMAINING_HEADER`).
+
+```rust,no_run
+use std::time::Duration;
+use axum::{Router, routing::get};
+use owt_web::session::{Session, Sessions};
+
+# #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+# struct SessionData {}
+# fn demo(key: cookie::Key) -> (Sessions<SessionData>, Router) {
+let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_hours(12), true)
+    .absolute_lifetime(Duration::from_hours(12))
+    .idle_timeout(Duration::from_mins(15));
+
+// The page polls this (passively) and shows a warning in the last two minutes.
+let routes = Router::new().route("/session/idle", get(|session: Session<SessionData>| async move {
+    session.passive();
+    match session.idle_remaining() {
+        Some(left) if left <= Duration::from_mins(2) => format!(
+            r#"<div role="alert">Signing you out in {} s for inactivity.
+               <button hx-post="/session/stay" hx-swap="none">Stay signed in</button></div>"#,
+            left.as_secs()
+        ),
+        _ => String::new(),
+    }
+}))
+// Any request that is not passive extends the session; this one does nothing else.
+.route("/session/stay", axum::routing::post(|| async { "" }));
+# (sessions, routes) }
+```
+
+```html
+<div id="idle-warning" hx-get="/session/idle" hx-trigger="every 30s"
+     hx-headers='{"owt-passive": "1"}' aria-live="polite"></div>
+```
+
 **The same stack as a builder.** `owt_web::stack::Stack` applies these layers, and the
 rest of the order the prose above implies, in the one correct order, so an app does not
 re-derive it (axum runs the layers in the reverse of the order they are written, and a

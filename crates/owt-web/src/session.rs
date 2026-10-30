@@ -16,6 +16,13 @@
 //! * **Lifetime.** A change re-seals the cookie for another `max_age`, but never past
 //!   [`Sessions::absolute_lifetime`] from when the session began (sign-in, or a
 //!   guest's first id).
+//! * **Idle timeout.** With [`Sessions::idle_timeout`], the cookie also carries when
+//!   its holder was last active, and a session idle longer than the timeout is no
+//!   session (its cookie is removed, and [`Session::idle_expired`] says why).
+//!   Activity reseals that time, at most once per [`Sessions::idle_refresh`], so a
+//!   busy page does not rewrite the cookie on every request. A request marked
+//!   passive (the [`PASSIVE_HEADER`] header, or [`Session::passive`]) is not
+//!   activity: a poll must not keep an unattended session alive.
 //! * **Secret rotation** signs everyone out, unless the old secret is kept for
 //!   opening with [`Sessions::also_open_with`] until its sessions have lapsed.
 //!
@@ -41,7 +48,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// What a session's data must be. Its serialized field names share the cookie with
-/// the envelope's, so none may be `k`, `x` or `i`.
+/// the envelope's, so none may be `k`, `x`, `i` or `$s`.
 pub trait SessionData:
     Serialize + DeserializeOwned + Default + Clone + Send + Sync + 'static
 {
@@ -209,8 +216,22 @@ struct Config {
     cookie: String,
     max_age: Duration,
     absolute: Duration,
+    /// A session idle this long is no session.
+    idle: Option<Duration>,
+    /// The least time between two reseals of the last-active time.
+    idle_refresh: Option<Duration>,
     secure: bool,
 }
+
+/// A request header that marks the request as passive: not the person's activity, so
+/// it does not extend an idle timeout (an htmx poll sends it with
+/// `hx-headers='{"owt-passive": "1"}'`).
+pub const PASSIVE_HEADER: &str = "owt-passive";
+
+/// The response header that tells the page how many whole seconds its session has
+/// left before the idle timeout, on every response to a request that carried a
+/// session, when [`Sessions::idle_timeout`] is set.
+pub const IDLE_REMAINING_HEADER: &str = "owt-idle-remaining";
 
 /// About the most a browser stores for one cookie, name and attributes included.
 const MAX_COOKIE_BYTES: usize = 4096;
@@ -236,6 +257,10 @@ struct Sealed<T> {
     /// Unix seconds at which the session began.
     #[serde(rename = "i")]
     issued: u64,
+    /// Unix seconds of the holder's last recorded activity; a cookie without it was
+    /// last active when it began. A name no Rust field serializes to unrenamed.
+    #[serde(rename = "$s", default, skip_serializing_if = "Option::is_none")]
+    seen: Option<u64>,
     #[serde(flatten)]
     data: T,
 }
@@ -261,6 +286,8 @@ impl<T: SessionData> Sessions<T> {
                 cookie,
                 max_age,
                 absolute: ABSOLUTE_LIFETIME.max(max_age),
+                idle: None,
+                idle_refresh: None,
                 secure,
             }),
             validator: None,
@@ -335,6 +362,41 @@ impl<T: SessionData> Sessions<T> {
         self
     }
 
+    /// End a session after `timeout` without activity (a workforce app handling
+    /// health data: 15 minutes, say). Activity is any request carrying the session
+    /// that is not passive ([`PASSIVE_HEADER`], [`Session::passive`]) and does not end
+    /// in a server error. The last-active time is resealed at most every
+    /// [`idle_refresh`](Self::idle_refresh) (a tenth of the timeout, at least 15 s, by
+    /// default), so a session ends between `timeout` minus that and `timeout` after
+    /// the last activity.
+    #[must_use]
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        Arc::make_mut(&mut self.inner).idle = Some(timeout.max(Duration::from_secs(1)));
+        self
+    }
+
+    /// Reseal the last-active time at most this often (see
+    /// [`idle_timeout`](Self::idle_timeout)).
+    #[must_use]
+    pub fn idle_refresh(mut self, every: Duration) -> Self {
+        Arc::make_mut(&mut self.inner).idle_refresh = Some(every);
+        self
+    }
+
+    /// The idle timeout, if set.
+    #[must_use]
+    pub fn idle(&self) -> Option<Duration> {
+        self.inner.idle
+    }
+
+    fn refresh(&self) -> u64 {
+        match (self.inner.idle_refresh, self.inner.idle) {
+            (Some(r), _) => r.as_secs(),
+            (None, Some(idle)) => (idle / 10).max(Duration::from_secs(15)).min(idle).as_secs(),
+            (None, None) => u64::MAX,
+        }
+    }
+
     /// Also open sessions sealed with `key`, the secret before a rotation. Drop it
     /// once `max_age` has passed since the rotation. Never after a compromise: a
     /// rotation because the old secret leaked must not open what it sealed, since its
@@ -389,17 +451,19 @@ impl<T: SessionData> Sessions<T> {
     /// The cookie value for a session with `id` and `data`, beginning now and
     /// expiring `max_age` from now: what a seeder hands a load generator.
     pub fn seal(&self, id: &str, data: &T) -> String {
-        self.seal_begun(id, now(), data)
+        let now = now();
+        self.seal_begun(id, now, now, data)
     }
 
-    /// The cookie value for a session that began at `issued`: good for `max_age`
-    /// from now, and never past its absolute lifetime.
-    fn seal_begun(&self, id: &str, issued: u64, data: &T) -> String {
+    /// The cookie value for a session that began at `issued` and was last active at
+    /// `seen`: good for `max_age` from now, and never past its absolute lifetime.
+    fn seal_begun(&self, id: &str, issued: u64, seen: u64, data: &T) -> String {
         let sealed = Sealed {
             id: id.to_owned(),
             expires: (now() + self.inner.max_age.as_secs())
                 .min(issued.saturating_add(self.inner.absolute.as_secs())),
             issued,
+            seen: self.inner.idle.map(|_| seen),
             data: data.clone(),
         };
         let plain = serde_json::to_string(&sealed).unwrap_or_default();
@@ -416,10 +480,13 @@ impl<T: SessionData> Sessions<T> {
     /// session.
     #[must_use]
     pub fn unseal(&self, value: &str) -> Option<(String, T)> {
-        self.unseal_presented(value).map(|p| (p.id, p.data))
+        match self.unseal_presented(value)? {
+            Opened::Live(p, _) => Some((p.id, p.data)),
+            Opened::Idle => None,
+        }
     }
 
-    fn unseal_presented(&self, value: &str) -> Option<Presented<T>> {
+    fn unseal_presented(&self, value: &str) -> Option<Opened<T>> {
         let mut jar = cookie::CookieJar::new();
         jar.add_original(Cookie::new(self.inner.cookie.clone(), value.to_owned()));
         let opened = std::iter::once(&self.inner.key)
@@ -429,14 +496,26 @@ impl<T: SessionData> Sessions<T> {
         let now = now();
         let alive = sealed.expires > now
             && sealed.issued.saturating_add(self.inner.absolute.as_secs()) > now;
-        alive.then_some(Presented {
-            id: sealed.id,
-            issued: sealed.issued,
-            data: sealed.data,
-        })
+        if !alive {
+            return None;
+        }
+        let seen = sealed.seen.unwrap_or(sealed.issued);
+        if let Some(idle) = self.inner.idle
+            && now.saturating_sub(seen) >= idle.as_secs()
+        {
+            return Some(Opened::Idle);
+        }
+        Some(Opened::Live(
+            Presented {
+                id: sealed.id,
+                issued: sealed.issued,
+                data: sealed.data,
+            },
+            seen,
+        ))
     }
 
-    fn open(&self, headers: &HeaderMap) -> Option<Presented<T>> {
+    fn open(&self, headers: &HeaderMap) -> Option<Opened<T>> {
         headers
             .get_all(header::COOKIE)
             .iter()
@@ -472,9 +551,9 @@ impl<T: SessionData> Sessions<T> {
     }
 
     /// The `Set-Cookie` value for a session.
-    fn set_cookie(&self, id: &str, issued: u64, data: &T) -> Option<HeaderValue> {
+    fn set_cookie(&self, id: &str, issued: u64, seen: u64, data: &T) -> Option<HeaderValue> {
         self.cookie(
-            self.seal_begun(id, issued, data),
+            self.seal_begun(id, issued, seen, data),
             self.inner.max_age.as_secs(),
         )
     }
@@ -489,26 +568,37 @@ impl<T: SessionData> Sessions<T> {
     /// seals an empty session, dropping anything the handler did after it.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
         let session = Session::<T>::default();
+        session.inner().idle = this.inner.idle;
         let (mut refused, mut unchecked) = (false, false);
-        if let Some(presented) = this.open(req.headers()) {
-            let verdict = match &this.validator {
-                Some(valid) => valid(presented.clone()).await,
-                None => Verdict::Valid,
-            };
-            match verdict {
-                Verdict::Valid => {
-                    let mut inner = session.inner();
-                    inner.id = Some(presented.id);
-                    inner.issued = Some(presented.issued);
-                    inner.data = presented.data;
+        let passive = req.headers().contains_key(PASSIVE_HEADER);
+        match this.open(req.headers()) {
+            Some(Opened::Live(presented, seen)) => {
+                let verdict = match &this.validator {
+                    Some(valid) => valid(presented.clone()).await,
+                    None => Verdict::Valid,
+                };
+                match verdict {
+                    Verdict::Valid => {
+                        let mut inner = session.inner();
+                        inner.id = Some(presented.id);
+                        inner.issued = Some(presented.issued);
+                        inner.seen = Some(seen);
+                        inner.data = presented.data;
+                    }
+                    Verdict::Revoked => refused = true,
+                    Verdict::Unknown => unchecked = true,
                 }
-                Verdict::Revoked => refused = true,
-                Verdict::Unknown => unchecked = true,
             }
+            Some(Opened::Idle) => {
+                refused = true;
+                session.inner().idle_expired = true;
+            }
+            None => {}
         }
         req.extensions_mut().insert(session.clone());
         let mut response = next.run(req).await;
         let failed = response.status().is_server_error();
+        let now = now();
         let changed = {
             let inner = session.inner();
             // A handler that saw no session because it could not be checked must not
@@ -517,20 +607,46 @@ impl<T: SessionData> Sessions<T> {
             // A server error keeps the session the request came with, except a
             // sign-out: failing after it leaves an empty session, whatever the
             // handler did after it (a sign-in into the emptied session included).
+            // Activity reseals the last-active time once it is a refresh old; a
+            // change reseals it in any case, unless the request was passive.
+            let active = !passive && !inner.passive;
+            let stale = inner
+                .seen
+                .is_some_and(|seen| now.saturating_sub(seen) >= this.refresh());
+            let touch = this.inner.idle.is_some() && active && stale && inner.id.is_some();
             if failed {
-                inner.flushed.then(|| (new_id(), now(), T::default()))
+                inner.flushed.then(|| (new_id(), now, now, T::default()))
             } else {
-                (inner.modified && (!unchecked || inner.replaced)).then(|| {
-                    (
-                        inner.id.clone().unwrap_or_else(new_id),
-                        inner.issued.unwrap_or_else(now),
-                        inner.data.clone(),
-                    )
-                })
+                ((inner.modified && (!unchecked || inner.replaced)) || (touch && !unchecked)).then(
+                    || {
+                        let seen = match inner.seen {
+                            Some(seen) if !active => seen,
+                            _ => now,
+                        };
+                        (
+                            inner.id.clone().unwrap_or_else(new_id),
+                            inner.issued.unwrap_or(now),
+                            if inner.issued.is_some() { seen } else { now },
+                            inner.data.clone(),
+                        )
+                    },
+                )
             }
         };
+        if let Some(idle) = this.inner.idle {
+            let seen = match &changed {
+                Some((_, _, seen, _)) => Some(*seen),
+                None => session.inner().seen,
+            };
+            if let Some(seen) = seen {
+                let left = idle.as_secs().saturating_sub(now.saturating_sub(seen));
+                response
+                    .headers_mut()
+                    .insert(IDLE_REMAINING_HEADER, HeaderValue::from(left));
+            }
+        }
         let set = match changed {
-            Some((id, issued, data)) => this.set_cookie(&id, issued, &data),
+            Some((id, issued, seen, data)) => this.set_cookie(&id, issued, seen, &data),
             // Take a refused session's cookie away rather than open it every request.
             None if refused => this.cookie(String::new(), 0),
             None => None,
@@ -547,10 +663,29 @@ impl<T: SessionData> Sessions<T> {
     }
 }
 
+/// A cookie that opened: a live session and its last-active time, or one past its
+/// idle timeout.
+enum Opened<T> {
+    Live(Presented<T>, u64),
+    Idle,
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about one request's session"
+)]
 struct Inner<T> {
     id: Option<String>,
     /// When the session began; `None` until it is first sealed.
     issued: Option<u64>,
+    /// When its holder was last active, as the cookie recorded it.
+    seen: Option<u64>,
+    /// The idle timeout in force.
+    idle: Option<Duration>,
+    /// The request presented a session that had passed its idle timeout.
+    idle_expired: bool,
+    /// The handler marked this request as not the person's activity.
+    passive: bool,
     data: T,
     modified: bool,
     /// The id was replaced ([`Session::cycle_id`], [`Session::flush`]): the handler
@@ -566,6 +701,10 @@ impl<T: Default> Default for Inner<T> {
         Self {
             id: None,
             issued: None,
+            seen: None,
+            idle: None,
+            idle_expired: false,
+            passive: false,
             data: T::default(),
             modified: false,
             replaced: false,
@@ -638,6 +777,29 @@ impl<T: Default + Clone> Session<T> {
     #[must_use]
     pub fn issued(&self) -> Option<u64> {
         self.inner().issued
+    }
+
+    /// Whether the request presented a session that had passed its idle timeout, and
+    /// so has none: what a sign-in page reads to say "signed out after inactivity".
+    #[must_use]
+    pub fn idle_expired(&self) -> bool {
+        self.inner().idle_expired
+    }
+
+    /// How long until the idle timeout ends this session, counted from its last
+    /// recorded activity; `None` without a timeout or a session. A handler that is
+    /// not passive extends it to the whole timeout when the response reseals.
+    #[must_use]
+    pub fn idle_remaining(&self) -> Option<Duration> {
+        let inner = self.inner();
+        let (idle, seen) = (inner.idle?, inner.seen?);
+        Some(idle.saturating_sub(Duration::from_secs(now().saturating_sub(seen))))
+    }
+
+    /// Mark this request as not the person's activity: it does not extend the idle
+    /// timeout (an endpoint the page polls to show the time left).
+    pub fn passive(&self) {
+        self.inner().passive = true;
     }
 
     /// Whether anything changed it, so the response will reseal it.
@@ -1126,6 +1288,130 @@ mod tests {
         assert_eq!(&body[..], b"Some(1)");
     }
 
+    fn idle_app(s: &Sessions<Data>) -> Router {
+        who()
+            .route(
+                "/expired",
+                get(|sess: Session<Data>| async move { format!("{}", sess.idle_expired()) }),
+            )
+            .route(
+                "/poll",
+                get(|sess: Session<Data>| async move {
+                    sess.passive();
+                    format!("{:?}", sess.idle_remaining().map(|d| d.as_secs() / 60))
+                }),
+            )
+            .layer(from_fn_with_state(s.clone(), Sessions::<Data>::layer))
+    }
+
+    fn idle_sessions() -> Sessions<Data> {
+        sessions()
+            .idle_timeout(Duration::from_mins(15))
+            .idle_refresh(Duration::from_mins(1))
+    }
+
+    /// A cookie for user 1 that began an hour ago and was last active `ago` ago.
+    fn cookie_seen(s: &Sessions<Data>, ago: u64) -> String {
+        let now = now();
+        format!(
+            "sid={}",
+            s.seal_begun("abc", now - 3600, now - ago, &Data { user: Some(1) })
+        )
+    }
+
+    #[tokio::test]
+    async fn an_idle_session_is_no_session_and_loses_its_cookie() {
+        let s = idle_sessions();
+        let stale = cookie_seen(&s, 15 * 60 + 1);
+        let res = get_with(idle_app(&s), "/who", Some(&stale)).await;
+        let set = res
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(set.contains("Max-Age=0"), "{set}");
+        assert!(!res.headers().contains_key(IDLE_REMAINING_HEADER));
+        assert_eq!(text(res).await, "None");
+        let res = get_with(idle_app(&s), "/expired", Some(&stale)).await;
+        assert_eq!(text(res).await, "true");
+        // Within the timeout it stands.
+        let fresh = cookie_seen(&s, 14 * 60);
+        assert_eq!(
+            text(get_with(idle_app(&s), "/who", Some(&fresh)).await).await,
+            "Some(1)"
+        );
+        assert_eq!(s.unseal(&stale["sid=".len()..]), None);
+    }
+
+    #[tokio::test]
+    async fn activity_reseals_the_last_active_time_at_most_once_a_refresh() {
+        let s = idle_sessions();
+        // Active a moment ago: nothing to reseal; the page learns the time left.
+        let res = get_with(idle_app(&s), "/who", Some(&cookie_seen(&s, 5))).await;
+        assert!(!res.headers().contains_key(header::SET_COOKIE));
+        let left: u64 = res.headers()[IDLE_REMAINING_HEADER]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((890..=895).contains(&left), "{left}");
+        // Active ten minutes ago: resealed now, the whole timeout left.
+        let res = get_with(idle_app(&s), "/who", Some(&cookie_seen(&s, 600))).await;
+        assert!(res.headers().contains_key(header::SET_COOKIE));
+        assert!(res.headers().contains_key(header::CACHE_CONTROL));
+        assert_eq!(res.headers()[IDLE_REMAINING_HEADER], "900");
+        let set = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        let resealed = Cookie::parse_encoded(set).unwrap();
+        let p = match s.unseal_presented(resealed.value()) {
+            Some(Opened::Live(p, seen)) => (p.issued, seen),
+            _ => panic!("live"),
+        };
+        assert!(now() - p.1 <= 1, "the last-active time moved to now");
+        assert!(now() - p.0 >= 3600, "the session's beginning did not");
+    }
+
+    #[tokio::test]
+    async fn a_passive_request_does_not_extend_the_session() {
+        let s = idle_sessions();
+        let ten_ago = cookie_seen(&s, 600);
+        // By header.
+        let app = idle_app(&s);
+        let req = Request::get("/who")
+            .header(header::COOKIE, &ten_ago)
+            .header(PASSIVE_HEADER, "1")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert!(!res.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(res.headers()[IDLE_REMAINING_HEADER], "300");
+        // By the handler.
+        let res = get_with(idle_app(&s), "/poll", Some(&ten_ago)).await;
+        assert!(!res.headers().contains_key(header::SET_COOKIE));
+        assert_eq!(text(res).await, "Some(5)");
+    }
+
+    #[tokio::test]
+    async fn without_an_idle_timeout_nothing_changes() {
+        let s = sessions();
+        let v = s.seal("abc", &Data { user: Some(1) });
+        assert!(s.unseal(&v).is_some());
+        let res = get_with(idle_app(&s), "/who", Some(&format!("sid={v}"))).await;
+        assert!(!res.headers().contains_key(IDLE_REMAINING_HEADER));
+        assert!(!res.headers().contains_key(header::SET_COOKIE));
+        // A cookie sealed before the timeout was set was last active when it began.
+        let old = format!(
+            "sid={}",
+            s.seal_begun("abc", now() - 3600, now(), &Data { user: Some(1) })
+        );
+        let idle = s.clone().idle_timeout(Duration::from_mins(15));
+        assert_eq!(
+            text(get_with(idle_app(&idle), "/who", Some(&old)).await).await,
+            "None"
+        );
+    }
+
     fn who() -> Router {
         Router::new()
             .route(
@@ -1174,12 +1460,12 @@ mod tests {
         let s = sessions().absolute_lifetime(Duration::from_secs(7200));
         let data = Data { user: Some(7) };
         assert!(
-            s.unseal(&s.seal_begun("abc", now() - 7000, &data))
+            s.unseal(&s.seal_begun("abc", now() - 7000, now(), &data))
                 .is_some()
         );
         // Sealed while the lifetime was longer, so its own expiry is still ahead.
         let lenient = s.clone().absolute_lifetime(ABSOLUTE_LIFETIME);
-        let v = lenient.seal_begun("abc", now() - 7300, &data);
+        let v = lenient.seal_begun("abc", now() - 7300, now(), &data);
         assert!(lenient.unseal(&v).is_some());
         assert_eq!(s.unseal(&v), None);
     }
@@ -1203,7 +1489,7 @@ mod tests {
             Duration::from_secs(60),
             false,
         );
-        let set = s.set_cookie("abc", now(), &Data::default()).unwrap();
+        let set = s.set_cookie("abc", now(), now(), &Data::default()).unwrap();
         assert!(set.to_str().unwrap().contains("Secure"));
     }
 
@@ -1313,7 +1599,7 @@ mod tests {
         let began = now() - 600;
         let cookie = format!(
             "sid={}",
-            s.seal_begun("abc", began, &Data { user: Some(7) })
+            s.seal_begun("abc", began, began, &Data { user: Some(7) })
         );
         let app =
             Router::new()
@@ -1336,7 +1622,9 @@ mod tests {
         let resealed = Cookie::parse_encoded(set).unwrap();
         assert_eq!(resealed.name(), s.cookie_name());
         assert_eq!(s.cookie_name(), "sid");
-        let opened = s.unseal_presented(resealed.value()).unwrap();
+        let Some(Opened::Live(opened, _)) = s.unseal_presented(resealed.value()) else {
+            panic!("a live session");
+        };
         assert_eq!((opened.id.as_str(), opened.issued), ("abc", began));
         assert_eq!(opened.data, Data { user: Some(8) });
     }
@@ -1358,15 +1646,15 @@ mod tests {
         let data = Data::default();
         // Begun exactly its lifetime ago: over. (If the clock ticks between the two
         // lines it is a second further over.)
-        let on_the_dot = lenient.seal_begun("abc", now() - 7200, &data);
+        let on_the_dot = lenient.seal_begun("abc", now() - 7200, now(), &data);
         assert_eq!(s.unseal(&on_the_dot), None);
-        let a_minute_left = lenient.seal_begun("abc", now() - 7140, &data);
+        let a_minute_left = lenient.seal_begun("abc", now() - 7140, now(), &data);
         assert!(s.unseal(&a_minute_left).is_some());
         // The default never undercuts a longer max_age.
         let year = Duration::from_hours(365 * 24);
         let long = Sessions::<Data>::new(Key::generate(), "sid", year, true);
         assert!(
-            long.unseal(&long.seal_begun("abc", now() - 200 * 86_400, &data))
+            long.unseal(&long.seal_begun("abc", now() - 200 * 86_400, now(), &data))
                 .is_some()
         );
     }
