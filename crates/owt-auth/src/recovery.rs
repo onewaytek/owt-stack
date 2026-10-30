@@ -16,8 +16,8 @@
 //! (the pepper and the table leaking together, as in one backup, leaves 50 bits). Argon2id
 //! needs nothing but the table, reuses [`password`](crate::password)'s hasher with its
 //! bound on concurrent hashes, and its `needs_rehash` raises old hashes when the cost
-//! is raised. The price is that [`find_match`] hashes against each unused code in turn
-//! (at most [`DEFAULT_COUNT`] checks, each on the blocking pool); an attempt is
+//! is raised. The price is that [`find_match`] checks every unused code (at least [`DEFAULT_COUNT`]
+//! checks, padded with a decoy, on one permit of the blocking pool); an attempt is
 //! throttled before this, as a password is.
 //!
 //! # Single use
@@ -104,16 +104,16 @@ pub fn normalize(input: &str) -> Option<String> {
 }
 
 /// The index in `hashes` of the one that `input` matches, or `None`. Pass only the
-/// hashes of unused codes. A malformed input returns at once; otherwise each hash is
-/// checked in turn until one matches.
+/// hashes of unused codes. A malformed input returns at once (its shape is public, and it
+/// costs nothing to refuse). Otherwise the work is the same whatever the input and
+/// however many codes are unused: at least [`DEFAULT_COUNT`] Argon2 checks, one after
+/// another under a single permit of the password hasher's pool, the missing ones against
+/// a decoy hash. So the time says neither how many codes an account has left nor which
+/// one matched, and one attempt takes one permit, not ten.
 pub async fn find_match<S: AsRef<str>>(input: &str, hashes: &[S]) -> Option<usize> {
     let code = normalize(input)?;
-    for (i, stored) in hashes.iter().enumerate() {
-        if crate::password::verify(&code, stored.as_ref()).await {
-            return Some(i);
-        }
-    }
-    None
+    let hashes: Vec<&str> = hashes.iter().map(AsRef::as_ref).collect();
+    crate::password::find_matching(&code, &hashes, DEFAULT_COUNT).await
 }
 
 #[cfg(test)]

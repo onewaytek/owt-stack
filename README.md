@@ -1019,10 +1019,15 @@ match guard.check(ip, &form.company_url, &form.token).await {
 
 #### A password policy, a second factor and a throttle across replicas
 
-`password::Policy` is NIST SP 800-63B's rules for a new password (a sign-up, a change,
+`password::Policy` is NIST SP 800-63B-4's rules for a new password (a sign-up, a change,
 a reset), not for a sign-in: a stored password that no longer passes is not refused.
-Eight characters at least (`min_len(12)` for anything holding health records), 128 at
-most, counted in Unicode code points after NFKC normalization; every character allowed,
+Revision 4 sets the minimum by use: **15 characters** when the password is the only
+authenticator (`Policy::single_factor()`), **8** only as one factor of a pair. `Policy::new()`
+is 8, so use it only where every account it covers must have a second factor; raise
+either with `min_len`. At most 128, counted in Unicode code points after NFKC
+normalization (`password::hash` and `verify` normalize too, so a composed and a decomposed
+`é` are one password, and hashes made before that still open and are reported by
+`password::check` as `Check::MatchRaw`, to be rehashed); every character allowed,
 spaces included; **no composition rules and no expiry** (see "Decisions"). It refuses a
 password that contains the username, the email's name part or a word the app lists, and
 one in a breached-password corpus the app supplies. The check is offline: no password,
@@ -1115,8 +1120,11 @@ if let Some(i) = recovery::find_match(typed, &hashes).await {
 `throttle::shared::SharedThrottle` (the `redis` feature) is `Throttle` counted in Redis, so
 a budget holds across replicas instead of multiplying by their number. It has the same
 budgets and keys, in the same order, charged before the password is checked; its calls
-are async and return a `Refusal`. Counters are fixed windows (up to twice a budget across
-a boundary) in one Lua script, and an account's name is stored as a hash. **When Redis
+are async and return a `Refusal`. Counters are fixed windows in one Lua script (a window never slides, and a budget spent
+at the end of one and again at the start of the next gives twice it within moments), and an
+account's name is stored as a hash. Keys carry `{prefix}` as a hash tag, so it works on Redis
+Cluster; the counters expire, so the Redis needs `maxmemory-policy noeviction` (or to be
+its own), as the leases do. **When Redis
 fails, sign-in fails closed** (`Refusal::Unavailable`: answer 503, not "too many
 attempts"): the throttle is all that bounds online guessing, and an outage that locks
 people out is a better failure for health records than one that lets an attacker guess;
@@ -4020,11 +4028,11 @@ this command, run when the app adopts a release, is the only thing that moves it
   is re-sealed, and a response that sets the cookie is never cacheable.
 - **Fragments have their own URLs.** Nothing varies by request header, so every
   response stays cacheable behind a CDN that ignores `Vary`.
-- **Password policy: NIST SP 800-63B, not folklore.** Eight characters at least (the
-  standard's floor), configurable upward with `Policy::min_len` (12 or more for health
-  records); 128 at most, never under 64; counted in code points after NFKC. Every
+- **Password policy: NIST SP 800-63B-4, not folklore.** 15 characters at least for a password
+  that signs in alone (`Policy::single_factor`), 8 only where a second factor is required
+  (`Policy::new`), configurable upward with `Policy::min_len`; 128 at most, never under 64; counted in code points after NFKC. Every
   character is allowed, spaces included. **No composition rules** (a mix of cases,
-  digits and symbols yields `Password1!`, and 800-63B §5.1.1.2 says verifiers SHOULD NOT
+  digits and symbols yields `Password1!`, and 800-63B-4 §3.1.1.2 says verifiers SHOULD NOT
   impose them) and **no periodic expiry** (SHOULD NOT require arbitrary change: forced
   rotation yields `Summer2026`, then `Autumn2026`; change on evidence of compromise).
   Passwords are refused for being in a breach corpus, or containing the username, the

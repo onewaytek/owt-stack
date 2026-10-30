@@ -23,6 +23,8 @@ use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use std::sync::OnceLock;
 
+use unicode_normalization::UnicodeNormalization;
+
 mod policy;
 pub use policy::{Bloom, Breached, Context, Policy, Refusal, SortedHashes};
 
@@ -52,9 +54,17 @@ async fn permit() -> SemaphorePermit<'static> {
         .expect("the semaphore is never closed")
 }
 
-/// An Argon2id PHC string for `password`.
+/// `password` as it is hashed and checked: NFKC-normalized, so a password typed from a
+/// composed keyboard (`é`, U+00E9) and from a decomposed one (`e` and U+0301) are one
+/// password, and the length [`Policy`] counts is the length that was hashed
+/// (SP 800-63B-4 §3.1.1.2: verifiers SHOULD apply Unicode normalization).
+fn normalized(password: &str) -> String {
+    password.nfkc().collect()
+}
+
+/// An Argon2id PHC string for `password`, hashed in its NFKC-normalized form.
 pub async fn hash(password: &str) -> anyhow::Result<String> {
-    let password = password.to_owned();
+    let password = normalized(password);
     let permit = permit().await;
     spawn_blocking(move || {
         let _permit = permit;
@@ -66,17 +76,57 @@ pub async fn hash(password: &str) -> anyhow::Result<String> {
     .await?
 }
 
-/// Whether `password` matches `stored`, an Argon2 PHC string.
-/// Anything unparseable matches nothing.
+/// What checking a password against a stored hash found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Check {
+    /// It does not match.
+    Mismatch,
+    /// It matches, and the hash is of the normalized form.
+    Match,
+    /// It matches only as typed, not normalized: the hash was made before passwords were
+    /// normalized (a password with a composed or compatibility character). Store a fresh
+    /// [`hash`] now, as for [`needs_rehash`].
+    MatchRaw,
+}
+
+impl Check {
+    /// Whether the password matched, either way.
+    #[must_use]
+    pub fn matched(self) -> bool {
+        self != Self::Mismatch
+    }
+}
+
+/// Whether `password` matches `stored`, an Argon2 PHC string. Anything unparseable
+/// matches nothing. The normalized form is tried, then (only if it differs) the
+/// password as typed, which is how hashes made before normalization still open; see
+/// [`check`] to learn which matched.
 pub async fn verify(password: &str, stored: &str) -> bool {
+    check(password, stored).await.matched()
+}
+
+/// [`verify`], saying whether a match needs the hash replaced ([`Check::MatchRaw`]).
+pub async fn check(password: &str, stored: &str) -> Check {
     let (password, stored) = (password.to_owned(), stored.to_owned());
     let permit = permit().await;
     spawn_blocking(move || {
         let _permit = permit;
-        verify_blocking(&password, &stored)
+        check_blocking(&password, &stored)
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(Check::Mismatch)
+}
+
+fn check_blocking(password: &str, stored: &str) -> Check {
+    let normalized = normalized(password);
+    if verify_blocking(&normalized, stored) {
+        Check::Match
+    } else if normalized != password && verify_blocking(password, stored) {
+        Check::MatchRaw
+    } else {
+        Check::Mismatch
+    }
 }
 
 fn verify_blocking(password: &str, stored: &str) -> bool {
@@ -87,24 +137,61 @@ fn verify_blocking(password: &str, stored: &str) -> bool {
     })
 }
 
+/// A hash nothing matches, made once with today's parameters, so a check against it
+/// costs what a real one costs.
+async fn decoy() -> Option<&'static str> {
+    static DECOY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    DECOY
+        .get_or_try_init(|| async { hash(&crate::random_token(32)).await })
+        .await
+        .ok()
+        .map(String::as_str)
+}
+
 /// Check `password` for an account that may not exist: `stored` is its hash, or `None`
 /// if no account matched. `None`, or a hash that is not one [`verify`] reads (a
 /// legacy format, an empty or damaged value), still costs a full Argon2 check
 /// against a hash nothing matches, so the time a sign-in takes says neither whether
 /// the account exists nor what its hash looks like.
 pub async fn verify_or_decoy(password: &str, stored: Option<&str>) -> bool {
-    static DECOY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
+    check_or_decoy(password, stored).await.matched()
+}
+
+/// [`verify_or_decoy`], saying whether a match needs the hash replaced.
+pub async fn check_or_decoy(password: &str, stored: Option<&str>) -> Check {
     if let Some(stored) = stored.filter(|s| usable(s)) {
-        return verify(password, stored).await;
+        return check(password, stored).await;
     }
-    // Hashed with today's parameters, so it costs what a real check costs.
-    let decoy = DECOY
-        .get_or_try_init(|| async { hash(&crate::random_token(32)).await })
-        .await;
-    if let Ok(decoy) = decoy {
-        verify(password, decoy).await;
+    if let Some(decoy) = decoy().await {
+        check(password, decoy).await;
     }
-    false
+    Check::Mismatch
+}
+
+/// The index of the hash in `hashes` that `secret` (ASCII, used as it is) matches, or
+/// `None`. Always checks `max(hashes.len(), pad)` hashes, one after another on one
+/// permit, the missing ones against a decoy, so the time taken does not say how many
+/// hashes there were or which matched. For secrets that are not passwords
+/// (recovery codes).
+pub(crate) async fn find_matching(secret: &str, hashes: &[&str], pad: usize) -> Option<usize> {
+    let decoy = decoy().await?.to_owned();
+    let hashes: Vec<String> = hashes.iter().map(|h| (*h).to_owned()).collect();
+    let secret = secret.to_owned();
+    let permit = permit().await;
+    spawn_blocking(move || {
+        let _permit = permit;
+        let mut found = None;
+        for i in 0..hashes.len().max(pad) {
+            let stored = hashes.get(i).unwrap_or(&decoy);
+            if verify_blocking(&secret, stored) && found.is_none() && i < hashes.len() {
+                found = Some(i);
+            }
+        }
+        found
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Whether `stored` is a hash [`verify`] can check: an Argon2 PHC string with an
@@ -139,6 +226,48 @@ pub fn needs_rehash(stored: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A password set from a composed `é` opens from a decomposed one and the reverse, and
+    /// a hash made from the raw bytes (before normalization) still opens, flagged.
+    #[tokio::test]
+    async fn composed_and_decomposed_forms_are_one_password() {
+        let composed = "caf\u{e9} au lait";
+        let decomposed = "cafe\u{301} au lait";
+        let h = hash(composed).await.unwrap();
+        assert!(verify(decomposed, &h).await && verify(composed, &h).await);
+        assert_eq!(check(decomposed, &h).await, Check::Match);
+        let h = hash(decomposed).await.unwrap();
+        assert!(verify(composed, &h).await);
+        // `ﬁ` is `fi` under NFKC.
+        let h = hash("\u{fb01}sh and chips").await.unwrap();
+        assert!(verify("fish and chips", &h).await);
+        assert!(!verify("fish and chip", &h).await);
+
+        // A hash of the raw decomposed bytes, as an older build wrote it.
+        let legacy = Argon2::default()
+            .hash_password(decomposed.as_bytes())
+            .unwrap()
+            .to_string();
+        assert_eq!(check(decomposed, &legacy).await, Check::MatchRaw);
+        assert_eq!(check("other", &legacy).await, Check::Mismatch);
+        assert_eq!(
+            check_or_decoy(decomposed, Some(&legacy)).await,
+            Check::MatchRaw
+        );
+        assert_eq!(check_or_decoy(decomposed, None).await, Check::Mismatch);
+    }
+
+    #[tokio::test]
+    async fn find_matching_finds_the_one_and_pads() {
+        let hashes = [
+            hash("AAAAAAAAAA").await.unwrap(),
+            hash("BBBBBBBBBB").await.unwrap(),
+        ];
+        let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
+        assert_eq!(find_matching("BBBBBBBBBB", &refs, 4).await, Some(1));
+        assert_eq!(find_matching("CCCCCCCCCC", &refs, 4).await, None);
+        assert_eq!(find_matching("AAAAAAAAAA", &[], 3).await, None);
+    }
 
     #[tokio::test]
     async fn argon2_round_trip() {

@@ -1,13 +1,20 @@
-//! The password policy: NIST SP 800-63B §5.1.1.2, "Memorized Secret Verifiers".
+//! The password policy: NIST SP 800-63B-4 (revision 4, 2025) §3.1.1.2, "Password
+//! Verifiers".
 //!
 //! What it requires, and what it deliberately does not:
 //!
-//! * **Length, in characters.** At least 8 (the standard's floor, the default;
-//!   [`Policy::min_len`] raises it, and 12 or more is sensible for a system holding
-//!   health records) and at most 128 ([`Policy::max_len`], never below 64, the minimum
-//!   the standard says to permit). Characters are Unicode code points after NFKC
-//!   normalization (§5.1.1.2: "Unicode normalization … SHOULD be applied"), so a
-//!   password counts the same however a keyboard composed it.
+//! * **Length, in characters.** Revision 4 sets the minimum by how the password is
+//!   used: **15** when it is the only authenticator, **8** only when it is one factor of
+//!   a multi-factor pair. The default [`Policy::new`] is 8, so use it only where a second
+//!   factor is *required* of every account the policy covers; for a password that can
+//!   sign in alone use [`Policy::single_factor`] (15). [`Policy::min_len`] raises either.
+//!   The maximum is 128 ([`Policy::max_len`], never below 64, the least the standard
+//!   says to permit). Characters are Unicode code points after NFKC normalization
+//!   ("Unicode normalization … SHOULD be applied"), and [`hash`](super::hash) and
+//!   [`verify`](super::verify) normalize the same way, so a password counts and opens
+//!   the same however a keyboard composed it. Callers bound the request body; `check`
+//!   refuses anything over four bytes per permitted character before it normalizes or
+//!   hashes a thing.
 //! * **Every printable character, spaces included.** No character is refused.
 //! * **No composition rules.** The standard says verifiers "SHOULD NOT impose other
 //!   composition rules (e.g., requiring mixtures of different character types)":
@@ -17,11 +24,16 @@
 //!   changed arbitrarily (e.g., periodically)"; change is forced only on evidence of
 //!   compromise. Forced rotation yields `Summer2026`, then `Autumn2026`. This type
 //!   has no age check, and an app should not add one.
+//! * **A blocklist is part of the minimum.** Revision 4 makes it a requirement, not an
+//!   option: give the policy a corpus ([`Policy::breached`]) in production. Without one it
+//!   checks length and context only.
 //! * **A blocklist, not a pattern.** A password is refused if it is in a corpus of
 //!   breached passwords, equals or contains the account's username or the local part
 //!   of its email, or contains a context word the app passes (the service's name, the
 //!   person's name): the standard's "context-specific words" and "values obtained from
-//!   previous breach corpuses".
+//!   previous breach corpuses". Names shorter than [`MIN_NEEDLE_LEN`] are not checked: a
+//!   short username inside a longer password is not caught, and the password is not
+//!   refused for being equal to one (it is too short already).
 //!
 //! The breach check is offline: the corpus is a file the app ships ([`SortedHashes`]
 //! or the smaller [`Bloom`]), and **no network request is ever made**: the Pwned
@@ -51,6 +63,8 @@ use unicode_normalization::UnicodeNormalization;
 pub const MIN_LEN_FLOOR: usize = 8;
 /// The smallest maximum length a [`Policy`] takes: a verifier must permit at least 64.
 pub const MAX_LEN_FLOOR: usize = 64;
+/// The minimum for a password that is the only authenticator (SP 800-63B-4 §3.1.1.2).
+pub const SINGLE_FACTOR_MIN_LEN: usize = 15;
 /// The shortest username, email local part or context word that a password is refused
 /// for containing. Shorter ones (`al`, `ed`) would refuse a great many good passwords;
 /// a password that is only such a name is refused for being too short anyway.
@@ -173,6 +187,13 @@ impl Policy {
         Self::default()
     }
 
+    /// The policy for a password that can sign in on its own: at least 15 characters
+    /// (SP 800-63B-4), otherwise [`new`](Self::new)'s.
+    #[must_use]
+    pub fn single_factor() -> Self {
+        Self::default().min_len(SINGLE_FACTOR_MIN_LEN)
+    }
+
     /// At least `n` characters (never fewer than 8).
     #[must_use]
     pub fn min_len(mut self, n: usize) -> Self {
@@ -199,6 +220,11 @@ impl Policy {
     /// # Errors
     /// Every rule it breaks, in a fixed order, for a form to list.
     pub fn check(&self, password: &str, context: &Context<'_>) -> Result<(), Vec<Refusal>> {
+        // The longest `max_len` characters can be in UTF-8 is four bytes each; beyond that
+        // nothing needs normalizing, scanning or hashing to be refused.
+        if password.len() > self.max_len.saturating_mul(4) {
+            return Err(vec![Refusal::TooLong { max: self.max_len }]);
+        }
         let normalized: String = password.nfkc().collect();
         let len = normalized.chars().count();
         let mut refusals = Vec::new();
@@ -274,8 +300,37 @@ fn parse_hash(hex: &str) -> Option<[u8; 20]> {
 /// The hash on a corpus line: `HASH` or `HASH:count`, as the Pwned Passwords downloads
 /// write it. Blank lines are skipped by the callers.
 fn line_hash(line: &str) -> anyhow::Result<[u8; 20]> {
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
     let hash = line.split(':').next().unwrap_or(line).trim();
-    parse_hash(hash).with_context(|| format!("not a SHA-1 hash: {hash:?}"))
+    parse_hash(hash).with_context(|| {
+        let shown: String = hash.chars().take(60).collect();
+        format!(
+            "not a SHA-1 hash: {shown:?}; expected 40 hexadecimal digits per line, optionally \
+             followed by `:count` (the Pwned Passwords download), not the 35-character suffixes \
+             of its range API"
+        )
+    })
+}
+
+/// The hashes in `reader`, one per line, a line at a time (a corpus can be gigabytes: no
+/// line is kept once parsed). `reserve` is a guess at how many, from the file's size.
+fn read_hashes(reader: impl BufRead, reserve: usize) -> anyhow::Result<Vec<[u8; 20]>> {
+    let mut hashes = Vec::with_capacity(reserve);
+    let mut line = String::new();
+    let mut reader = reader;
+    let mut number = 0usize;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        number += 1;
+        let text = line.trim();
+        if !text.is_empty() {
+            hashes.push(line_hash(text).with_context(|| format!("line {number}"))?);
+        }
+    }
+    Ok(hashes)
 }
 
 /// A corpus held in memory as sorted 20-byte hashes, searched by binary search.
@@ -310,20 +365,26 @@ impl SortedHashes {
         Ok(Self(hashes))
     }
 
-    /// Read a file of hash lines into memory.
+    /// Read a file of hash lines into memory, a line at a time: the memory used is
+    /// the 20 bytes a hash and nothing more (the sort is in place). A leading UTF-8 byte
+    /// order mark is ignored.
     ///
     /// # Errors
-    /// The file cannot be read, or has a line that is not a SHA-1 hash.
+    /// The file cannot be read, or a line (named) is not a SHA-1 hash.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let file =
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        Self::from_lines(
-            std::io::BufReader::new(file)
-                .lines()
-                .collect::<Result<Vec<_>, _>>()
-                .with_context(|| format!("reading {}", path.display()))?,
-        )
+        // A line is 40 hex digits and a newline at least; with `:count` it is longer.
+        let reserve = file
+            .metadata()
+            .map_or(0, |m| usize::try_from(m.len() / 46).unwrap_or(0));
+        let mut hashes = read_hashes(std::io::BufReader::new(file), reserve)
+            .with_context(|| format!("reading {}", path.display()))?;
+        hashes.sort_unstable();
+        hashes.dedup();
+        hashes.shrink_to_fit();
+        Ok(Self(hashes))
     }
 
     /// How many hashes are held.
@@ -632,6 +693,48 @@ mod tests {
         assert!(bloom.contains(&sha1_hex("123456")));
         assert!(SortedHashes::open(dir.join("missing")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_a_byte_order_mark_opens_and_a_bad_line_is_named() {
+        let dir = std::env::temp_dir().join(format!("owt-bom-{}", crate::random_token(8)));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("hashes.txt");
+        let mut text = String::from("\u{feff}");
+        text.push_str(&corpus().join("\n"));
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(SortedHashes::open(&path).unwrap().len(), 5);
+        assert!(
+            Bloom::build_from_file(&path, 1e-6)
+                .unwrap()
+                .contains(&sha1_hex("password"))
+        );
+        // The range API's 35-character suffixes are not this format.
+        std::fs::write(&path, format!("{}\n{}\n", corpus()[0], &sha1_hex("x")[5..])).unwrap();
+        let e = format!("{:#}", SortedHashes::open(&path).unwrap_err());
+        assert!(
+            e.contains("line 2") && e.contains("40 hexadecimal digits"),
+            "{e}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_single_factor_password_needs_15_and_oversized_input_is_refused_at_once() {
+        let none = Context::new();
+        let p = Policy::single_factor();
+        assert_eq!(
+            p.check("12345678901234", &none),
+            Err(vec![Refusal::TooShort { min: 15 }])
+        );
+        assert!(p.check("123456789012345", &none).is_ok());
+        let huge = "a".repeat(5 * 128);
+        assert_eq!(
+            Policy::new().check(&huge, &none),
+            Err(vec![Refusal::TooLong { max: 128 }])
+        );
+        // Four-byte characters at the maximum are not oversized.
+        assert!(Policy::new().check(&"\u{1f511}".repeat(128), &none).is_ok());
     }
 
     #[test]
