@@ -30,10 +30,12 @@
 //! Give every bucket the lifecycle rule "abort incomplete multipart uploads after 1
 //! day".
 //!
-//! A presigned URL moves bytes between the browser and the bucket without the app
-//! seeing them, so it cannot encrypt them: an object uploaded that way is plaintext
-//! until [`Storage::seal_uploaded`] encrypts it into its final key and deletes the
-//! upload (see the README for the pattern and its trade-offs).
+//! Health data streams through the app ([`Storage::upload_sealed`] from the request
+//! body), so it is encrypted before it touches storage. A presigned URL moves bytes
+//! between the browser and the bucket without the app seeing them, so it cannot
+//! encrypt them: an object uploaded that way is plaintext until
+//! [`Storage::seal_uploaded`] encrypts it into its final key and deletes the upload.
+//! That pattern is not for health data.
 
 pub mod sealed;
 
@@ -496,7 +498,8 @@ impl Storage {
     }
 
     /// Encrypt the plaintext object a presigned upload left at `from` into `to` for
-    /// `scope`, then delete `from`, verified. The plaintext's length. `from` and `to`
+    /// `scope`, then delete `from`, verified. Not for health data, which must never sit
+    /// in the bucket as plaintext: stream it through [`Storage::upload_sealed`]. The plaintext's length. `from` and `to`
     /// must differ ([`StorageError::BadKey`]). On a versioned bucket the delete only
     /// hides the upload (see the module docs), and the presigned URL that wrote it can
     /// write again until its TTL ends: seal after the URL has expired.

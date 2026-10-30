@@ -2519,7 +2519,8 @@ let storage = Storage::s3(&S3Config {
 })?
 .encrypted(crypt);
 
-// A recording of any length: encrypted 1 MiB at a time into a multipart upload.
+// A recording of any length, from the request body: encrypted 1 MiB at a time into
+// a multipart upload before anything reaches the bucket.
 let bytes = storage.upload_sealed("practice-3", "recordings/7f3a.webm", upload).await?;
 
 // Read it back (it refuses an object altered, truncated, or copied to another key).
@@ -2556,12 +2557,17 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
   when freed.
 - **Size limit.** Uploads use 5 MiB parts and a multipart upload has at most 10,000, so
   an object is limited to about 48 GiB; a larger limit needs a larger part size.
+- **Health data streams through the app.** Upload it with `upload_sealed` straight
+  from the request body, so it is encrypted before it touches storage, and serve it
+  with `download_sealed` into the response. Presigned URLs are for data that may sit
+  in the bucket as it is.
 - **Presigned URLs** live at most `MAX_PRESIGN` (an hour) and move bytes between the
   browser and the bucket without passing through the app, so the app cannot encrypt
-  them. For health data, either stream uploads through the app (`upload_sealed`
-  from the request body), or let the browser `PUT` to a presigned URL under an
-  `incoming/` prefix and then `seal_uploaded(scope, "incoming/…", "recordings/…")`,
-  which encrypts it into its final key and deletes the plaintext, verified. Give
+  them. **Not for health data:** the pattern below leaves plaintext in the bucket
+  until it is sealed. For other large uploads, the browser `PUT`s to a presigned URL
+  under an `incoming/` prefix and the app then calls
+  `seal_uploaded(scope, "incoming/…", "files/…")`, which encrypts it into its final key
+  and deletes the upload, verified. Give
   `incoming/` a lifecycle rule that expires objects after a day, so an upload never
   sealed does not linger. A presigned URL is only as reachable as the endpoint it
   signs: for an in-cluster bucket, sign against the endpoint browsers reach (a Route
