@@ -251,7 +251,13 @@ async fn a_partly_applied_set_of_copies_is_adopted_and_the_rest_applied() {
     assert_eq!(done.adopted, [ALL[0].name, ALL[1].name, ALL[2].name]);
     assert_eq!(
         done.applied,
-        [ALL[3].name, ALL[4].name, ALL[5].name, ALL[6].name]
+        [
+            ALL[3].name,
+            ALL[4].name,
+            ALL[5].name,
+            ALL[6].name,
+            ALL[7].name
+        ]
     );
     assert_eq!(tables(&db.pool).await.len(), LIBRARY_TABLES.len() + 1);
     assert!(migrations::complete(&db.pool).await.unwrap().validated);
@@ -558,7 +564,13 @@ async fn an_adoption_cut_short_resumes() {
     let done = migrations::run(&db.pool).await.unwrap();
     assert_eq!(
         done.adopted,
-        [ALL[3].name, ALL[4].name, ALL[5].name, ALL[6].name]
+        [
+            ALL[3].name,
+            ALL[4].name,
+            ALL[5].name,
+            ALL[6].name,
+            ALL[7].name
+        ]
     );
     assert_eq!(done.applied, Vec::<&str>::new());
     assert_eq!(db.ledger().await.len(), ALL.len());
