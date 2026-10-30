@@ -20,10 +20,11 @@ CREATE TABLE account_totp (
     secret bytea NOT NULL CHECK (octet_length(secret) > 0),
     -- The last time step accepted: a step at or before it is a replay.
     last_step bigint CHECK (last_step >= 0),
-    -- Wrong codes in a row. At 10 the factor is locked (locked_at): a recovery code, or
-    -- staff (owt_accounts::mfa::Mfa::unlock_totp), unlocks it.
+    -- Wrong codes in a row. At 10 the factor is locked until locked_until (15 minutes
+    -- on): a recovery code, or staff (owt_accounts::mfa::Mfa::unlock_totp), unlocks it
+    -- sooner. A lock that has passed is cleared by the next attempt.
     failed_attempts integer NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
-    locked_at timestamptz,
+    locked_until timestamptz,
     confirmed_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now()
 );

@@ -734,7 +734,7 @@ const SHIPPED_SHA256: &[&str] = &[
     "629cca392e80505f93a71a9eb9d13683ef82f31790d682363d346ebfb2f32f52",
     "2952542fa9af6f8c1c7ee21987676fd1ed42cb0d18c752b485d4f315f4eccb18",
     "78ba0baf7def1dd8206f5479f79c88549ecc809c82f7c7ed6421aaa8b7f47a33",
-    "20b1b26036a735bbc7288aca5ffb1a82fd81b6f0d1e6dde82593e0226f6ea276",
+    "936dcc0d4c1736b7631055589072d42e8bf966aeab73b2bc070d842a73850a17",
 ];
 
 /// The names each of [`ALL`] gives a relation (table, index, sequence) in the schema

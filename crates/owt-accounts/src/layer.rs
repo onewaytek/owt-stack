@@ -30,6 +30,8 @@ use owt_web::Error;
 use owt_web::session::Session;
 use sqlx::PgPool;
 
+use std::sync::Arc;
+
 use crate::mfa::{Mfa, MfaSession};
 use crate::session::Signed as SignedData;
 use crate::store::{self, Account, Extra};
@@ -41,7 +43,18 @@ pub struct Accounts {
     sign_in: String,
     reauth: String,
     enroll: String,
-    mfa: Option<Mfa>,
+    mfa: Option<MfaGate>,
+}
+
+/// The second-factor gate [`Accounts::require_mfa`] fixes for one session data type.
+type GateFn<T> = dyn Fn(PgPool, Session<T>, Account) -> GateFuture + Send + Sync;
+
+#[derive(Clone, Debug)]
+struct MfaGate {
+    /// The session data type the gate was made for.
+    data: std::any::TypeId,
+    /// An `Arc<GateFn<T>>` of that type.
+    gate: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 /// The second-factor gate's answer, in flight.
@@ -68,18 +81,33 @@ impl Accounts {
         }
     }
 
-    /// Hold every signature to the second factor, wherever it came from. Under
-    /// [`load_mfa`](Self::load_mfa) (or [`load_with_mfa`](Self::load_with_mfa)), a
-    /// signature for an account that has a confirmed factor, or that `mfa`'s policy
-    /// requires to have one, counts as signed in only when the session shows a second
-    /// factor passed for that account and epoch. Until then the request is anonymous, and
-    /// the session becomes the pending sign-in a challenge or enrollment page continues
-    /// ([`Mfa::pending_account`]). A password sign-in, a link, a provider and
-    /// [`session::password_gate`](crate::session::password_gate) are all closed by it,
-    /// including an old `/login` route left in place.
+    /// Hold every signature to the second factor, wherever it came from. [`load`](Self::load)
+    /// and [`load_with`](Self::load_with) then treat a signature for an account that has a
+    /// confirmed factor, or that `mfa`'s policy requires to have one, as signed in only when
+    /// the session shows a second factor passed for that account and epoch. Until then the
+    /// request is anonymous, and the session becomes the pending sign-in a challenge or
+    /// enrollment page continues ([`Mfa::pending_account`]). A password sign-in, a link, a
+    /// provider and [`session::password_gate`](crate::session::password_gate) are all
+    /// closed by it, including an old `/login` route left in place.
+    ///
+    /// `T` is the session data type, and must be the one `load::<T>` is installed with:
+    /// `load::<Other>` on an `Accounts` that requires MFA for `T` logs an error and answers
+    /// 503 to anyone signed in, rather than run single-factor.
     #[must_use]
-    pub fn require_mfa(mut self, mfa: Mfa) -> Self {
-        self.mfa = Some(mfa);
+    pub fn require_mfa<T: MfaSession>(mut self, mfa: Mfa) -> Self {
+        let gate: Arc<GateFn<T>> = Arc::new(move |pool, session, account| {
+            let mfa = mfa.clone();
+            Box::pin(async move {
+                Ok(match mfa.gate(&pool, &session, &account).await? {
+                    Some(has) => Gate::Open(Some(has)),
+                    None => Gate::Held,
+                })
+            })
+        });
+        self.mfa = Some(MfaGate {
+            data: std::any::TypeId::of::<T>(),
+            gate: Arc::new(gate),
+        });
         self
     }
 
@@ -108,73 +136,11 @@ impl Accounts {
         req: Request,
         next: Next,
     ) -> Response {
-        this.load_by::<T, _, _, _, _, _>(
-            req,
-            next,
-            |pool, id, epoch| async move {
-                let account = store::by_id_in_epoch(&pool, id, epoch).await?;
-                Ok(account.map(|account| (account, ())))
-            },
-            |_, _, _| async { Ok(Gate::Open(None)) },
-        )
+        this.load_by::<T, _, _, _>(req, next, |pool, id, epoch| async move {
+            let account = store::by_id_in_epoch(&pool, id, epoch).await?;
+            Ok(account.map(|account| (account, ())))
+        })
         .await
-    }
-
-    /// [`load`](Self::load), holding signatures to the second factor
-    /// ([`require_mfa`](Self::require_mfa)). Install it as `Accounts::load_mfa::<T>`; `T`
-    /// is a session data type that implements [`MfaSession`]. Without `require_mfa` it is
-    /// `load`.
-    pub async fn load_mfa<T: MfaSession>(
-        State(this): State<Self>,
-        req: Request,
-        next: Next,
-    ) -> Response {
-        let gate = this.gate::<T>();
-        this.load_by::<T, _, _, _, _, _>(
-            req,
-            next,
-            |pool, id, epoch| async move {
-                let account = store::by_id_in_epoch(&pool, id, epoch).await?;
-                Ok(account.map(|account| (account, ())))
-            },
-            gate,
-        )
-        .await
-    }
-
-    /// [`load_with`](Self::load_with) holding signatures to the second factor, as
-    /// [`load_mfa`](Self::load_mfa) does.
-    pub async fn load_with_mfa<T: MfaSession, X: Extra + Clone>(
-        State(this): State<Self>,
-        req: Request,
-        next: Next,
-    ) -> Response {
-        let gate = this.gate::<T>();
-        this.load_by::<T, _, _, _, _, _>(
-            req,
-            next,
-            |pool, id, epoch| async move { store::by_id_in_epoch_with::<X>(&pool, id, epoch).await },
-            gate,
-        )
-        .await
-    }
-
-    /// The second-factor check as the closure [`load_by`](Self::load_by) takes.
-    fn gate<T: MfaSession>(
-        &self,
-    ) -> impl FnOnce(PgPool, Session<T>, Account) -> GateFuture + use<T> {
-        let mfa = self.mfa.clone();
-        move |pool, session, account| {
-            Box::pin(async move {
-                let Some(mfa) = mfa else {
-                    return Ok(Gate::Open(None));
-                };
-                Ok(match mfa.gate(&pool, &session, &account).await? {
-                    Some(has) => Gate::Open(Some(has)),
-                    None => Gate::Held,
-                })
-            })
-        }
     }
 
     /// [`load`](Self::load), also reading `X` about the account in the same query as
@@ -186,31 +152,45 @@ impl Accounts {
         req: Request,
         next: Next,
     ) -> Response {
-        this.load_by::<T, _, _, _, _, _>(
-            req,
-            next,
-            |pool, id, epoch| async move { store::by_id_in_epoch_with::<X>(&pool, id, epoch).await },
-            |_, _, _| async { Ok(Gate::Open(None)) },
-        )
+        this.load_by::<T, _, _, _>(req, next, |pool, id, epoch| async move {
+            store::by_id_in_epoch_with::<X>(&pool, id, epoch).await
+        })
         .await
+    }
+
+    /// What the second-factor gate, if one is required, makes of this signature.
+    async fn hold<T: SignedData>(
+        &self,
+        session: Option<&Session<T>>,
+        account: &Account,
+    ) -> sqlx::Result<Gate> {
+        let (Some(required), Some(session)) = (&self.mfa, session) else {
+            return Ok(Gate::Open(None));
+        };
+        let gate = (required.data == std::any::TypeId::of::<T>())
+            .then(|| required.gate.downcast_ref::<Arc<GateFn<T>>>())
+            .flatten();
+        let Some(gate) = gate else {
+            tracing::error!(
+                data = std::any::type_name::<T>(),
+                "Accounts::require_mfa was made for another session data type than the one \
+                 load is installed with: refusing every signed-in request"
+            );
+            return Err(sqlx::Error::Configuration(
+                "require_mfa and load name different session data types".into(),
+            ));
+        };
+        gate(self.pool.clone(), session.clone(), account.clone()).await
     }
 
     /// The middleware, with `read` asking for the session's account (by id, in its
     /// epoch) and what comes with it.
-    async fn load_by<T, X, F, R, GF, G>(
-        self,
-        mut req: Request,
-        next: Next,
-        read: R,
-        gate: G,
-    ) -> Response
+    async fn load_by<T, X, F, R>(self, mut req: Request, next: Next, read: R) -> Response
     where
         T: SignedData,
         X: Clone + Send + Sync + 'static,
         F: Future<Output = sqlx::Result<Option<(Account, X)>>>,
         R: FnOnce(PgPool, i64, i32) -> F,
-        GF: Future<Output = sqlx::Result<Gate>>,
-        G: FnOnce(PgPool, Session<T>, Account) -> GF,
     {
         let session = req.extensions().get::<Session<T>>().cloned();
         let loaded = match session.as_ref().and_then(|s| s.read(SignedData::signature)) {
@@ -218,12 +198,7 @@ impl Accounts {
             Some(signature) => {
                 match read(self.pool.clone(), signature.account, signature.epoch).await {
                     Ok(Some((account, extra))) => {
-                        let held = match &session {
-                            Some(session) => {
-                                gate(self.pool.clone(), session.clone(), account.clone()).await
-                            }
-                            None => Ok(Gate::Open(None)),
-                        };
+                        let held = self.hold::<T>(session.as_ref(), &account).await;
                         match held {
                             Ok(Gate::Open(has_factor)) => {
                                 req.extensions_mut().insert(LoadedExtra(extra));

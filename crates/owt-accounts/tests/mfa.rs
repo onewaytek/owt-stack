@@ -732,7 +732,7 @@ fn http_app(db: &Db, sessions: &Sessions<Data>, mfa: Mfa) -> Router {
     };
     let accounts = Accounts::new(db.pool.clone(), "/login")
         .reauth_at("/reauth")
-        .require_mfa(mfa);
+        .require_mfa::<Data>(mfa);
     Router::new()
         .route("/login", post(login))
         .route("/challenge", post(challenge))
@@ -741,7 +741,7 @@ fn http_app(db: &Db, sessions: &Sessions<Data>, mfa: Mfa) -> Router {
         .route("/export", get(|_: Recent<60>, Signed(a): Signed| async move { format!("export for {}", a.username) }))
         .route("/factors", get(|_: RecentMfa<60>, Signed(a): Signed| async move { format!("factors of {}", a.username) }))
         .with_state(st)
-        .layer(from_fn_with_state(accounts, Accounts::load_mfa::<Data>))
+        .layer(from_fn_with_state(accounts, Accounts::load::<Data>))
         .layer(from_fn_with_state(sessions.clone(), Sessions::layer))
 }
 
@@ -1001,7 +1001,19 @@ async fn ten_wrong_codes_lock_the_authenticator_until_a_recovery_code_or_staff_u
         if i < owt_accounts::mfa::LOCK_AFTER {
             assert!(matches!(r, Err(MfaError::Invalid)), "{i}: {r:?}");
         } else {
-            assert!(matches!(r, Err(MfaError::Locked)), "{i}: {r:?}");
+            assert!(
+                matches!(
+                    r,
+                    Err(MfaError::Locked {
+                        just_locked: true,
+                        ..
+                    })
+                ),
+                "{i}: {r:?}"
+            );
+            // The answer that locked it carries the audit event to email the owner.
+            let event = r.unwrap_err().locked_event(ada.id).unwrap();
+            assert_eq!(event.name(), "mfa.factor.locked");
         }
     }
     assert!(mfa.factors(&db.pool, ada.id).await.unwrap().totp_locked);
@@ -1010,7 +1022,17 @@ async fn ten_wrong_codes_lock_the_authenticator_until_a_recovery_code_or_staff_u
     let r = mfa
         .challenge(&db.pool, &t, &s, IP, Answer::Totp(&right))
         .await;
-    assert!(matches!(r, Err(MfaError::Locked)), "{r:?}");
+    assert!(
+        matches!(
+            r,
+            Err(MfaError::Locked {
+                just_locked: false,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    assert!(r.unwrap_err().locked_event(ada.id).is_none());
     assert_eq!(s.read(Data::signature), None);
     // A recovery code signs in and unlocks it.
     let (_, events) = mfa
@@ -1030,7 +1052,7 @@ async fn ten_wrong_codes_lock_the_authenticator_until_a_recovery_code_or_staff_u
     );
 
     // Staff can unlock it too.
-    sqlx::query("UPDATE account_totp SET failed_attempts = 10, locked_at = now()")
+    sqlx::query("UPDATE account_totp SET failed_attempts = 10, locked_until = now() + interval '15 minutes'")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -1189,4 +1211,119 @@ fn a_lockout_key_names_its_account() {
     );
     assert_eq!(lockout_account(&Key::Reauth(7).as_throttle_key()), Some(7));
     assert_eq!(lockout_account(&Key::Login("ada").as_throttle_key()), None);
+}
+
+#[tokio::test]
+async fn a_lock_runs_out() {
+    let db = db!();
+    let ada = account(&db, "ada", false).await;
+    let mfa = mfa();
+    let Enrolled { secret, .. } = enroll(&db, &mfa, &ada).await;
+    let t = throttle();
+    sqlx::query("UPDATE account_totp SET failed_attempts = 10, locked_until = now() + interval '15 minutes'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let s = Session::<Data>::default();
+    mfa.password_sign_in(&db.pool, &t, &s, IP, "ada", PASSWORD)
+        .await
+        .unwrap();
+    let right = totp::code(&secret, step_now() + 1);
+    let r = mfa
+        .challenge(&db.pool, &t, &s, IP, Answer::Totp(&right))
+        .await;
+    assert!(matches!(r, Err(MfaError::Locked { .. })), "{r:?}");
+    // Fifteen minutes on: the next attempt clears it, and the count starts again.
+    sqlx::query("UPDATE account_totp SET locked_until = now() - interval '1 second'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(!mfa.factors(&db.pool, ada.id).await.unwrap().totp_locked);
+    assert!(
+        mfa.challenge(&db.pool, &t, &s, IP, Answer::Totp(&right))
+            .await
+            .is_ok()
+    );
+    let (n, until): (i32, Option<i64>) = sqlx::query_as(
+        "SELECT failed_attempts, EXTRACT(EPOCH FROM locked_until)::bigint FROM account_totp",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((n, until), (0, None));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_session_revoked_meanwhile_changes_nothing_and_gets_no_codes() {
+    let db = db!();
+    let ada = account(&db, "ada", false).await;
+    let mfa = mfa();
+    let session = Session::<Data>::default();
+    owt_accounts::session::sign_in(&session, &ada);
+    owt_accounts::mfa::mark_authenticated(&session, &ada);
+    let proof = mfa
+        .authorize_change(&db.pool, &session, &ada, Duration::from_secs(300))
+        .await
+        .unwrap();
+    let begun = mfa.begin_totp(&db.pool, &ada, &proof).await.unwrap();
+    let secret = Secret::from_base32(&begun.secret).unwrap();
+    // The owner signs out everywhere while this session is part way through.
+    store::sign_out_everywhere(&db.pool, ada.id).await.unwrap();
+    let r = mfa
+        .confirm_totp(
+            &db.pool,
+            &session,
+            &ada,
+            &proof,
+            &totp::code(&secret, step_now()),
+        )
+        .await;
+    assert!(matches!(r, Err(MfaError::NoChallenge)), "{r:?}");
+    let f = mfa.factors(&db.pool, ada.id).await.unwrap();
+    assert!(
+        !f.any() && f.recovery_codes_left == 0,
+        "nothing was enrolled or issued"
+    );
+    assert_eq!(
+        fresh(&db, ada.id).await.session_epoch,
+        ada.session_epoch + 1
+    );
+    // The session still carries the old epoch: it was not resealed into the new one.
+    assert_eq!(
+        session.read(Data::signature).map(|s| s.epoch),
+        Some(ada.session_epoch)
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_plain_row_is_refused_once_plaintext_is_turned_off() {
+    let db = db!();
+    let ada = account(&db, "ada", false).await;
+    let Enrolled { secret, .. } = enroll(&db, &mfa(), &ada).await;
+    let t = throttle();
+    let strict = mfa().sealer(Masked("k1")).accept_plaintext(false);
+    let s = Session::<Data>::default();
+    strict
+        .password_sign_in(&db.pool, &t, &s, IP, "ada", PASSWORD)
+        .await
+        .unwrap();
+    let r = strict
+        .challenge(
+            &db.pool,
+            &t,
+            &s,
+            IP,
+            Answer::Totp(&totp::code(&secret, step_now() + 1)),
+        )
+        .await;
+    assert!(matches!(r, Err(MfaError::Fault(_))), "{r:?}");
+    let plain: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM account_totp WHERE get_byte(secret, 0) = 0")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(plain, 1, "the query in the README counts it");
+    db.drop().await;
 }

@@ -10,7 +10,7 @@ use owt_web::session::Session;
 use sqlx::PgPool;
 
 use super::state::{self, Kind, MfaSession, State};
-use super::{Event, EventKind, Factor, Key, LOCK_AFTER, Limiter, Mfa, MfaError, Next};
+use super::{Event, EventKind, Factor, Key, LOCK_AFTER, LOCK_FOR, Limiter, Mfa, MfaError, Next};
 use crate::session::{self, Signed};
 use crate::store::{self, Account};
 
@@ -126,7 +126,9 @@ impl Mfa {
             session.update(|d| d.mfa_mut().pending = None);
         } else {
             session::sign_in(session, &account);
-            // The sign-in is complete only now, so this is the time it shows.
+            // The sign-in is complete only now, so this is the time it shows. (If the
+            // stamp fails the session holds no second factor and the layer holds it: the
+            // person starts again, and the code just used is a replay, so waits for the next.)
             store::signed_in(pool, account.id).await?;
         }
         state::record(session, &account, true, now);
@@ -142,18 +144,29 @@ impl Mfa {
         code: &str,
         now: SystemTime,
     ) -> Result<(), MfaError> {
-        let row: Option<(Vec<u8>, Option<i64>, bool)> = sqlx::query_as(
-            "SELECT secret, last_step, locked_at IS NOT NULL FROM account_totp
-             WHERE account_id = $1 AND confirmed_at IS NOT NULL",
+        // A lock that has run out is cleared, with the count that caused it.
+        sqlx::query(
+            "UPDATE account_totp SET failed_attempts = 0, locked_until = NULL
+             WHERE account_id = $1 AND locked_until <= now()",
+        )
+        .bind(account.id)
+        .execute(pool)
+        .await?;
+        let row: Option<(Vec<u8>, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT secret, last_step, EXTRACT(EPOCH FROM locked_until)::bigint
+             FROM account_totp WHERE account_id = $1 AND confirmed_at IS NOT NULL",
         )
         .bind(account.id)
         .fetch_optional(pool)
         .await?;
-        let Some((stored, last, locked)) = row else {
+        let Some((stored, last, locked_until)) = row else {
             return Err(MfaError::Invalid);
         };
-        if locked {
-            return Err(MfaError::Locked);
+        if let Some(until) = locked_until {
+            return Err(MfaError::Locked {
+                until,
+                just_locked: false,
+            });
         }
         let (secret, reseal) = self.open(&stored, account.id)?;
         let last = last.and_then(|s| u64::try_from(s).ok());
@@ -165,7 +178,7 @@ impl Mfa {
         // read the old step, and only one of them moves it forward.
         let moved = sqlx::query(
             "UPDATE account_totp SET last_step = $2, failed_attempts = 0
-             WHERE account_id = $1 AND locked_at IS NULL
+             WHERE account_id = $1 AND locked_until IS NULL
                AND (last_step IS NULL OR last_step < $2)",
         )
         .bind(account.id)
@@ -182,22 +195,28 @@ impl Mfa {
     }
 
     /// Count a wrong code; the error to answer with ([`MfaError::Locked`] when this one
-    /// locked the factor).
+    /// locked the factor, for [`LOCK_FOR`]).
     async fn count_failure(pool: &PgPool, account: i64) -> Result<MfaError, MfaError> {
-        let (locked,): (bool,) = sqlx::query_as(
+        let (until, just): (Option<i64>, bool) = sqlx::query_as(
             "UPDATE account_totp SET failed_attempts = failed_attempts + 1,
-                    locked_at = CASE WHEN failed_attempts + 1 >= $2 AND locked_at IS NULL
-                                     THEN now() ELSE locked_at END
-             WHERE account_id = $1 RETURNING locked_at IS NOT NULL",
+                    locked_until = CASE WHEN failed_attempts + 1 >= $2 AND locked_until IS NULL
+                                        THEN now() + make_interval(secs => $3)
+                                        ELSE locked_until END
+             WHERE account_id = $1
+             RETURNING EXTRACT(EPOCH FROM locked_until)::bigint,
+                       failed_attempts = $2 AND locked_until IS NOT NULL",
         )
         .bind(account)
         .bind(LOCK_AFTER)
+        .bind(LOCK_FOR.as_secs_f64())
         .fetch_one(pool)
         .await?;
-        Ok(if locked {
-            MfaError::Locked
-        } else {
-            MfaError::Invalid
+        Ok(match until {
+            Some(until) => MfaError::Locked {
+                until,
+                just_locked: just,
+            },
+            None => MfaError::Invalid,
         })
     }
 
@@ -205,11 +224,11 @@ impl Mfa {
     /// and it is unlocked. Whether it was locked.
     async fn unlock_by_recovery(pool: &PgPool, account: i64) -> Result<bool, MfaError> {
         let was: Option<(bool,)> = sqlx::query_as(
-            "WITH old AS (SELECT locked_at IS NOT NULL AS locked FROM account_totp
+            "WITH old AS (SELECT locked_until > now() AS locked FROM account_totp
                           WHERE account_id = $1 FOR UPDATE),
-                  done AS (UPDATE account_totp SET failed_attempts = 0, locked_at = NULL
+                  done AS (UPDATE account_totp SET failed_attempts = 0, locked_until = NULL
                            WHERE account_id = $1 RETURNING 1)
-             SELECT locked FROM old",
+             SELECT COALESCE(locked, false) FROM old",
         )
         .bind(account)
         .fetch_optional(pool)

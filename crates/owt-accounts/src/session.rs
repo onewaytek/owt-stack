@@ -165,7 +165,9 @@ impl SignInRefused {
 
 /// The whole password sign-in: charge `throttle` for a sign-in to `login` from `ip`
 /// (the client's address, [`owt_web::client_ip`]), check the password only if it
-/// allows one ([`store::authenticate`], which stamps the account's `last_sign_in`),
+/// allows one ([`store::authenticate`], which stamps the account's `last_sign_in` at the
+/// password, before any second factor: [`crate::mfa::Mfa::password_sign_in`] stamps it
+/// after, and the layer holds a session that skipped the factor),
 /// and sign `session` in ([`sign_in`]). `login` is a username or an email. The
 /// handler then redirects, or shows the form again with the refusal's message and
 /// [`SignInRefused::status`].
@@ -246,8 +248,16 @@ pub async fn password_gate<T: Signed>(
     if !throttle.sign_in(ip, &format!("\0gate\0{}", gate.account)) {
         return Err(SignInRefused::Throttled);
     }
-    if !owt_auth::password::verify_or_decoy(password, Some(gate.hash)).await {
+    let checked = owt_auth::password::check_or_decoy(password, Some(gate.hash)).await;
+    if !checked.matched() {
         return Err(SignInRefused::Mismatch);
+    }
+    if checked == owt_auth::password::Check::MatchRaw {
+        // The hash is the app's, not stored here: it can only be told to make a new one.
+        tracing::warn!(
+            "the gate's hash was made from the password as typed, before passwords were \
+             normalized: make it again with owt_auth::password::hash"
+        );
     }
     let account = store::open_active(pool, gate.account)
         .await
