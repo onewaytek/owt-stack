@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         default_filter: "myapp=info,tower_http=info".into(),
         json: !env::flag("DEBUG", false)?,
         otel_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        ..logging::Options::default()
     });
     let pool = PoolConfig { max: env::parse_or("DB_POOL_MAX", 10)?, ..PoolConfig::default() }
         .connect(&env::required("DATABASE_URL")?)
@@ -482,6 +483,55 @@ the handler and write `<script nonce="{{ nonce }}">`.
   `127.0.0.1:9464` on a workstation, and in a pod, where the scraper reaches the pod's
   address, `metrics::spawn_listener_on_all_interfaces(9464, sample)`, which says what it
   does. `metrics::serve` stays for an app that owns its listener.
+
+### Keeping sensitive values out of logs
+
+`logging::init` redacts by field name, in the JSON and the text output alike. A
+`tracing` event or span field whose name is on the denylist is logged as
+`[redacted]`; the value is replaced before it is formatted, so it never reaches the
+writer. This includes fields added later with `span.record(..)`. The names, compared
+case-insensitively, are `password`, `passwd`, `secret`, `token`, `access_token`,
+`refresh_token`, `id_token`, `authorization`, `cookie`, `set_cookie`, `api_key`,
+`apikey`, `private_key`, `ssn`, `dob`, `date_of_birth`, `email`, `phone`, `address`,
+`name`, `first_name`, `last_name`, `diagnosis`, `note`, `notes`, `body`, `content`,
+`transcript`, `mrn` and `patient_name`, and any name ending in `_secret`, `_token`,
+`_password` or `_key`. A dotted name (`user.email`) is also judged by its last segment.
+
+`Options::redact_fields` adds names; `redact_defaults: false` drops the defaults (and
+the suffix rules) so that exactly `redact_fields` applies.
+
+`logging::Sensitive<T>` wraps a value whose `Debug`, `Display` and `Serialize` all
+print `[redacted]`. It has no `Deref`: `expose()` and `into_inner()` are the only
+reads, so each is visible in review. `Deserialize` is transparent, so a form or
+configuration struct can hold one.
+
+```rust,no_run
+use owt_runtime::logging::{self, Sensitive};
+
+# #[derive(serde::Deserialize)]
+struct Login {
+    email: String,
+    password: Sensitive<String>,
+}
+
+# fn run(login: Login) {
+let _logging = logging::init(&logging::Options {
+    service: "myapp",
+    // Redacted in addition to the defaults.
+    redact_fields: vec!["nickname".into()],
+    ..logging::Options::default()
+});
+// Both fields are denied by name; `credential` is not, so `Sensitive` covers it.
+tracing::info!(email = %login.email, credential = ?login.password, "login attempt");
+let password: &str = login.password.expose();
+# let _ = password;
+# }
+```
+
+Redaction is a safety net, not a policy. An app must still not log PHI or
+credentials on purpose. Only fields are checked: a value interpolated into the
+message, as in `info!("saw {}", name)`, is not a field and is logged as it is. Log
+identifiers as fields, and wrap anything sensitive in `Sensitive`.
 
 ### Handlers, errors and pages
 
