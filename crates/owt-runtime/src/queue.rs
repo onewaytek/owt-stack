@@ -447,7 +447,7 @@ impl Queue {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let rows: Vec<(i64, Option<String>, Vec<u8>, i32, i32)> = sqlx::query_as(
+        let rows: Vec<ClaimRow> = sqlx::query_as(
             "UPDATE owt_jobs SET state = 'running', attempts = attempts + 1,
                     claimed_at = now(), heartbeat_at = now()
              WHERE id IN (SELECT id FROM owt_jobs
@@ -690,6 +690,9 @@ async fn release(pool: &PgPool, id: i64, attempt: u32) -> sqlx::Result<bool> {
     .await?;
     Ok(done.rows_affected() == 1)
 }
+
+/// A claimed row: id, key, payload, attempt, max attempts.
+type ClaimRow = (i64, Option<String>, Vec<u8>, i32, i32);
 
 type Handler = Arc<
     dyn Fn(Claimed) -> Pin<Box<dyn Future<Output = Result<(), JobError>> + Send>> + Send + Sync,
@@ -951,7 +954,7 @@ impl Worker {
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::warn!(queue = %name, %error, "recovering stale job claims failed")
+                tracing::warn!(queue = %name, %error, "recovering stale job claims failed");
             }
         }
         if let Some(retain) = self.retain_done
