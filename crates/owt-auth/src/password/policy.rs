@@ -32,7 +32,7 @@
 //! use owt_auth::password::{Context, Policy, Refusal};
 //!
 //! let policy = Policy::new().min_len(12);
-//! let ctx = Context::new().username("ann").email("ann.lee@example.com");
+//! let ctx = Context::new().username("annlee").email("ann.lee@example.com");
 //! assert!(policy.check("correct horse battery staple", &ctx).is_ok());
 //! let refusals = policy.check("annlee-2026", &ctx).unwrap_err();
 //! assert!(refusals.contains(&Refusal::TooShort { min: 12 }));
