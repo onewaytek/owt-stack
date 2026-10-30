@@ -3198,9 +3198,10 @@ the template's:
 - **Scan:** grype runs before anything is pushed, so a finding of `vuln-fail-on`
   severity or worse (`critical` by default) pushes and tags nothing. With `crane`, a
   `scan` job assembles the image as `push` would make it (the base pinned by digest,
-  the layer on top) and `push` waits for it. With `docker`, the Dockerfile is first
-  built into the runner's daemon and scanned there, and only then built again, from
-  the same cache, and pushed with its tags. `vuln-fail-on: none` still prints the
+  the layer on top) and `push` waits for it. With `docker`, the image is pushed
+  once under a temporary tag (`scan-<run id>-<attempt>`), scanned there by digest, and only then given its
+  version and floating tags (the same digest, retagged); a failing scan leaves
+  the temporary tag and no other. `vuln-fail-on: none` still prints the
   findings and never fails; any other value than `negligible`, `low`, `medium`,
   `high`, `critical` or `none` fails the job. grype reads exactly the configuration
   `vuln-ignore-file` names, and none when it is empty: a `.grype.yaml` in the

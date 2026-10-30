@@ -40,8 +40,9 @@ name: Image
 #
 # Supply chain, for either builder: grype fails the run on a vulnerability of
 # `vuln-fail-on` severity or worse, critical by default, before
-# anything is pushed: the crane image before `push` runs, the docker builder's before
-# its push step.
+# anything an app deploys from is tagged: the crane image before `push` runs, the docker
+# builder's image under a temporary `scan-<run>` tag, which gets the version and floating
+# tags only once it passes.
 # The `attest` job then signs the pushed digest with cosign, keyless through the
 # run's OIDC token, and attaches a syft SBOM (SPDX JSON) to the image as an
 # attestation and to the run as an artifact. The caller grants `id-token: write` and
@@ -955,6 +956,7 @@ jobs:
               fi
             fi
           fi
+          echo "REPO=${REPO}" >> "$GITHUB_ENV"
           { echo "list<<EOF"; printf '%s\n' "${tags[@]}"; echo "EOF"; } >> "$GITHUB_OUTPUT"
           printf 'tag %s\n' "${tags[@]}"
 
@@ -966,20 +968,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Built into the runner's daemon first and scanned there; nothing reaches ghcr
-      # (no digest, no floating tag) until the scan passes. The push below rebuilds from
-      # the same cache.
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: ${{ inputs.context }}
-          file: ${{ inputs.dockerfile }}
-          push: false
-          load: true
-          tags: image-scan:local
-          platforms: linux/amd64
-          build-args: VERSION=${{ env.VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
       - name: Scan configuration
         env:
           IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
@@ -1003,13 +991,9 @@ jobs:
             echo '{}' > "$config"
           fi
           echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
-      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
-        with:
-          image: image-scan:local
-          severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
-          fail-build: ${{ inputs.vuln-fail-on != 'none' }}
-          output-format: table
-          config: ${{ env.GRYPE_CONFIG }}
+      # Pushed once, under a temporary tag no app follows (not the version, not a
+      # floating tag), and scanned by digest there. The tags an app deploys from are
+      # added to that same digest only after the scan passes, and attest signs it.
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -1017,9 +1001,30 @@ jobs:
           file: ${{ inputs.dockerfile }}
           push: true
           platforms: linux/amd64
-          tags: ${{ steps.tags.outputs.list }}
+          tags: ${{ env.REPO }}:scan-${{ github.run_id }}-${{ github.run_attempt }}
           build-args: VERSION=${{ env.VERSION }}
           cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Image reference
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}" >> "$GITHUB_ENV"
+      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: registry:${{ env.IMAGE }}
+          severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
+          fail-build: ${{ inputs.vuln-fail-on != 'none' }}
+          output-format: table
+          config: ${{ env.GRYPE_CONFIG }}
+      - name: Tag the scanned image
+        env:
+          TAGS: ${{ steps.tags.outputs.list }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r t; do [ -n "$t" ] && args+=(--tag "$t"); done <<<"$TAGS"
+          docker buildx imagetools create "${args[@]}" "$IMAGE"
+          printf 'tagged %s\n' "$IMAGE" "${args[@]}"
 
   # The pushed image, by digest: an SBOM (syft, SPDX JSON) kept as a workflow artifact and
   # attached to the image as a cosign attestation, and a keyless cosign signature (the
