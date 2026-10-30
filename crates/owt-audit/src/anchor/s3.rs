@@ -62,7 +62,8 @@ pub struct S3Config {
     pub region: String,
     /// The access key id.
     pub access_key: String,
-    /// The secret access key, wiped from memory when dropped.
+    /// The secret access key, overwritten when dropped (best effort: the HMAC
+    /// implementation keeps its own copies of derived keys while it runs).
     pub secret_key: Zeroizing<String>,
     /// How long each manifest stays locked, counted from its upload on this host's
     /// clock: at least one day, at most 100 years.
@@ -105,7 +106,7 @@ impl std::fmt::Debug for S3ObjectLock {
 }
 
 /// A signed request, before it is sent.
-#[derive(Debug, PartialEq, Eq)]
+/// No `Debug`: the authorization header is a credential.
 struct Prepared {
     url: Url,
     headers: Vec<(String, String)>,
@@ -178,13 +179,16 @@ impl S3ObjectLock {
         let status = resp.status();
         if !status.is_success() {
             let detail = error_detail(resp).await;
-            if status == reqwest::StatusCode::NOT_FOUND
-                || detail.contains("ObjectLockConfigurationNotFoundError")
-            {
-                bail!(
+            match detail.code.as_deref() {
+                Some("ObjectLockConfigurationNotFoundError") => bail!(
                     "the bucket {:?} has no Object Lock configuration ({detail}): create it with Object Lock enabled",
                     self.config.bucket
-                );
+                ),
+                Some("NoSuchBucket") => bail!(
+                    "the bucket {:?} does not exist ({detail})",
+                    self.config.bucket
+                ),
+                _ => {}
             }
             bail!(
                 "reading the Object Lock configuration of the bucket {:?} failed: {detail}",
@@ -192,7 +196,8 @@ impl S3ObjectLock {
             );
         }
         let body = String::from_utf8_lossy(&read_capped(resp, MAX_DOCUMENT).await?).into_owned();
-        if xml_text(&body, "ObjectLockEnabled") != Some("Enabled") {
+        let enabled = xml_child(&body, "ObjectLockConfiguration", "ObjectLockEnabled");
+        if enabled.as_deref() != Some("Enabled") {
             bail!(
                 "Object Lock is not enabled on the bucket {:?}",
                 self.config.bucket
@@ -320,21 +325,23 @@ impl S3ObjectLock {
                 resp.status()
             );
         }
-        if let Some(date) = resp.headers().get("date") {
-            let date = date
-                .to_str()
-                .ok()
-                .and_then(parse_http_date)
-                .context("the store's Date header is not a valid HTTP date")?;
-            let drift = SystemTime::now()
-                .duration_since(date)
-                .unwrap_or_else(|e| e.duration());
-            if drift > MAX_DRIFT {
-                bail!(
-                    "this host's clock differs from the store's by {}s; the retain-until date follows the local clock, so fix it first",
-                    drift.as_secs()
-                );
-            }
+        // Every S3-compatible store sends `Date`; without it the clock cannot be
+        // checked, so the response is refused. On a PUT this can arrive after the
+        // object is locked, to a date that follows a wrong clock.
+        let date = resp
+            .headers()
+            .get("date")
+            .and_then(|d| d.to_str().ok())
+            .and_then(parse_http_date)
+            .context("the store's response has no valid Date header")?;
+        let drift = SystemTime::now()
+            .duration_since(date)
+            .unwrap_or_else(|e| e.duration());
+        if drift > MAX_DRIFT {
+            bail!(
+                "this host's clock differs from the store's by {}s; the retain-until date follows the local clock, so fix it first",
+                drift.as_secs()
+            );
         }
         Ok(resp)
     }
@@ -363,14 +370,14 @@ impl S3ObjectLock {
             );
         }
         let body = String::from_utf8_lossy(&read_capped(resp, MAX_DOCUMENT).await?).into_owned();
-        let mode = xml_text(&body, "Mode");
-        let held = xml_text(&body, "RetainUntilDate").and_then(parse_iso8601);
+        let mode = xml_child(&body, "Retention", "Mode");
+        let until_text = xml_child(&body, "Retention", "RetainUntilDate");
+        let held = until_text.as_deref().and_then(parse_iso8601);
         let wanted = secs(until);
-        match (mode, held) {
+        match (mode.as_deref(), held) {
             (Some("COMPLIANCE"), Some(held)) if secs(held) >= wanted => Ok(()),
             _ => bail!(
-                "{key:?} was stored without the requested lock (mode {mode:?}, retain-until {:?}): the store ignores Object Lock or the bucket does not enforce it",
-                xml_text(&body, "RetainUntilDate")
+                "{key:?} was stored without the requested lock (mode {mode:?}, retain-until {until_text:?}): the store ignores Object Lock or the bucket does not enforce it",
             ),
         }
     }
@@ -455,9 +462,27 @@ async fn read_capped(mut resp: reqwest::Response, cap: usize) -> anyhow::Result<
     Ok(out)
 }
 
-/// `404 Not Found (NoSuchKey: The specified key does not exist.)`, from a failed
-/// response: the status and only the S3 `<Code>` and `<Message>`.
-async fn error_detail(mut resp: reqwest::Response) -> String {
+/// A failed response's status and the S3 error document's `<Code>` and `<Message>`,
+/// reduced to printable text so a store cannot inject control characters or long
+/// lines into logs.
+struct S3Error {
+    status: reqwest::StatusCode,
+    code: Option<String>,
+    message: Option<String>,
+}
+
+impl std::fmt::Display for S3Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.status)?;
+        match (&self.code, &self.message) {
+            (Some(c), Some(m)) => write!(f, " ({c}: {m})"),
+            (Some(c), None) => write!(f, " ({c})"),
+            _ => Ok(()),
+        }
+    }
+}
+
+async fn error_detail(mut resp: reqwest::Response) -> S3Error {
     let status = resp.status();
     let mut body = Vec::new();
     while body.len() < MAX_ERROR {
@@ -468,24 +493,94 @@ async fn error_detail(mut resp: reqwest::Response) -> String {
     }
     body.truncate(MAX_ERROR);
     let body = String::from_utf8_lossy(&body);
-    match (xml_text(&body, "Code"), xml_text(&body, "Message")) {
-        (Some(code), Some(msg)) => {
-            format!(
-                "{status} ({code}: {})",
-                msg.chars().take(200).collect::<String>()
-            )
-        }
-        (Some(code), None) => format!("{status} ({code})"),
-        _ => status.to_string(),
+    let code = xml_child(&body, "Error", "Code").map(|c| {
+        c.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(64)
+            .collect::<String>()
+    });
+    let message = xml_child(&body, "Error", "Message").map(|m| {
+        m.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(200)
+            .collect::<String>()
+    });
+    S3Error {
+        status,
+        code: code.filter(|c| !c.is_empty()),
+        message,
     }
 }
 
-/// The trimmed text of the first `<tag>…</tag>` element.
-fn xml_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&format!("</{tag}>"))? + start;
-    Some(xml[start..end].trim())
+/// The trimmed text of the leaf element `child` directly under the document root
+/// `root`, or `None` when the document is not a `root` element, has no such child,
+/// or is not plain XML (comments, CDATA and DTDs are refused).
+fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
+    let mut s = xml.trim_start();
+    if s.starts_with("<?xml") {
+        s = s[s.find("?>")? + 2..].trim_start();
+    }
+    let open = s.strip_prefix('<')?.strip_prefix(root)?;
+    if !open.starts_with(['>', ' ', '\t', '\r', '\n', '/']) {
+        return None;
+    }
+    let end = open.find('>')?;
+    if open[..end].ends_with('/') {
+        return None;
+    }
+    let mut rest = &open[end + 1..];
+    let mut depth = 0usize;
+    // The name and start of the direct child being read, and whether it has children.
+    let mut current: Option<(&str, &str, bool)> = None;
+    loop {
+        let lt = rest.find('<')?;
+        let tag_end = lt + rest[lt..].find('>')?;
+        let tag = &rest[lt + 1..tag_end];
+        let before = &rest[..lt];
+        let after = &rest[tag_end + 1..];
+        if tag.starts_with(['!', '?']) {
+            return None;
+        }
+        if let Some(name) = tag.strip_prefix('/') {
+            let name = name.trim();
+            if depth == 0 {
+                let _ = (name, after);
+                return None;
+            }
+            depth -= 1;
+            if depth == 0 {
+                let (n, _, nested) = current.take()?;
+                if n != name {
+                    return None;
+                }
+                if n == child && !nested {
+                    return Some(before.trim().to_owned());
+                }
+            }
+        } else {
+            let self_closing = tag.ends_with('/');
+            let name = tag
+                .trim_end_matches('/')
+                .split(|c: char| c.is_whitespace())
+                .next()?;
+            if depth == 0 {
+                if self_closing {
+                    if name == child {
+                        return Some(String::new());
+                    }
+                } else {
+                    current = Some((name, after, false));
+                    depth = 1;
+                }
+            } else if !self_closing {
+                depth += 1;
+                if let Some(c) = current.as_mut() {
+                    c.2 = true;
+                }
+            }
+        }
+        rest = after;
+    }
 }
 
 struct Creds<'a> {
@@ -496,8 +591,11 @@ struct Creds<'a> {
 
 /// The `SigV4` signing key for `day` (`YYYYMMDD`).
 fn signing_key(secret_key: &str, day: &str, region: &str) -> Zeroizing<Vec<u8>> {
-    let seed = Zeroizing::new(format!("AWS4{secret_key}"));
-    let k = hmac(seed.as_bytes(), day.as_bytes());
+    // Built at its final size so growth does not leave unwiped copies behind.
+    let mut seed = Zeroizing::new(Vec::with_capacity(4 + secret_key.len()));
+    seed.extend_from_slice(b"AWS4");
+    seed.extend_from_slice(secret_key.as_bytes());
+    let k = hmac(&seed, day.as_bytes());
     let k = hmac(&k, region.as_bytes());
     let k = hmac(&k, b"s3");
     hmac(&k, b"aws4_request")
@@ -620,9 +718,20 @@ fn civil(t: SystemTime) -> Civil {
     }
 }
 
-/// The instant of a UTC date and time of day.
+/// The instant of a UTC date and time of day, for years 1970 to 9999 and real
+/// calendar days only.
 fn from_civil(year: i64, month: i64, day: i64, h: u64, m: u64, s: u64) -> Option<SystemTime> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || h > 23 || m > 59 || s > 60 {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=in_month).contains(&day) {
         return None;
     }
     let y = year - i64::from(month <= 2);
@@ -631,7 +740,10 @@ fn from_civil(year: i64, month: i64, day: i64, h: u64, m: u64, s: u64) -> Option
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = u64::try_from(era * 146_097 + doe - 719_468).ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(days * 86_400 + h * 3_600 + m * 60 + s))
+    let total = days
+        .checked_mul(86_400)?
+        .checked_add(h * 3_600 + m * 60 + s)?;
+    UNIX_EPOCH.checked_add(Duration::from_secs(total))
 }
 
 /// `Fri, 24 May 2013 00:00:00 GMT`.
@@ -997,10 +1109,45 @@ mod tests {
     }
 
     #[test]
-    fn parses_xml_and_dates() {
-        let xml = "<R>\n  <ObjectLockEnabled>\n Enabled\n </ObjectLockEnabled>\n</R>";
-        assert_eq!(xml_text(xml, "ObjectLockEnabled"), Some("Enabled"));
-        assert_eq!(xml_text(xml, "Mode"), None);
+    fn parses_xml_structurally() {
+        let xml = "<?xml version=\"1.0\"?>\n<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <ObjectLockEnabled>\n Enabled\n </ObjectLockEnabled>\n <Rule><DefaultRetention><Mode>X</Mode></DefaultRetention></Rule></ObjectLockConfiguration>";
+        let get = |r, c| xml_child(xml, r, c);
+        assert_eq!(
+            get("ObjectLockConfiguration", "ObjectLockEnabled").as_deref(),
+            Some("Enabled")
+        );
+        // Not a direct child, and not the root.
+        assert_eq!(get("ObjectLockConfiguration", "Mode"), None);
+        assert_eq!(get("Retention", "ObjectLockEnabled"), None);
+        // Comments, CDATA and bodies that are not the document are refused.
+        assert_eq!(
+            xml_child(
+                "<Retention><!-- x --><Mode>A</Mode></Retention>",
+                "Retention",
+                "Mode"
+            ),
+            None
+        );
+        assert_eq!(
+            xml_child("{\"Mode\":1}<Mode>COMPLIANCE</Mode>", "Retention", "Mode"),
+            None
+        );
+        assert_eq!(
+            xml_child(
+                "<RetentionX><Mode>A</Mode></RetentionX>",
+                "Retention",
+                "Mode"
+            ),
+            None
+        );
+        assert_eq!(
+            xml_child("<Retention><Mode>A</Mode></Retention>", "Retention", "Mode").as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
+    fn parses_dates_without_panicking() {
         assert_eq!(
             parse_http_date("Fri, 24 May 2013 00:00:00 GMT"),
             Some(at(1_369_353_600))
@@ -1010,10 +1157,249 @@ mod tests {
             Some(at(1_369_353_600))
         );
         assert_eq!(parse_iso8601("2013-05-24"), None);
+        assert_eq!(parse_iso8601("999999999999-01-01T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("10000-01-01T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("1969-12-31T23:59:59Z"), None);
+        assert_eq!(parse_iso8601("2013-02-31T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("2013-04-31T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("2013-02-29T00:00:00Z"), None);
+        assert!(parse_iso8601("2024-02-29T00:00:00Z").is_some());
+        assert_eq!(
+            parse_http_date("Fri, 24 May 999999999999 00:00:00 GMT"),
+            None
+        );
     }
 
     #[test]
     fn debug_hides_the_secret() {
         assert!(!format!("{:?}", anchor()).contains(SK));
+    }
+
+    // A loopback server that answers the n-th connection with the n-th canned
+    // response, for the branches that decide whether a lock is genuine.
+    mod fake {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        pub fn http_date(t: SystemTime) -> String {
+            // The weekday is not read by the parser.
+            let c = civil(t);
+            let mon = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ][usize::try_from(c.month - 1).unwrap()];
+            format!(
+                "Mon, {:02} {mon} {:04} {:02}:{:02}:{:02} GMT",
+                c.day, c.year, c.hour, c.minute, c.second
+            )
+        }
+
+        /// A response with a current `Date` unless `date` says otherwise.
+        pub fn reply(
+            status: &str,
+            headers: &[(&str, &str)],
+            body: &str,
+            date: Option<SystemTime>,
+        ) -> String {
+            let mut out = format!(
+                "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n",
+                body.len()
+            );
+            if let Some(d) = date {
+                let _ = write!(out, "Date: {}\r\n", http_date(d));
+            }
+            for (k, v) in headers {
+                let _ = write!(out, "{k}: {v}\r\n");
+            }
+            out + "\r\n" + body
+        }
+
+        pub fn ok(headers: &[(&str, &str)], body: &str) -> String {
+            reply("200 OK", headers, body, Some(SystemTime::now()))
+        }
+
+        pub async fn serve(responses: Vec<String>) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                for r in responses {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Read the head, then the body its Content-Length announces.
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_lowercase();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = sock.write_all(r.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        pub const LOCK_ON: &str = "<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>";
+
+        pub fn retention(mode: &str, until: SystemTime) -> String {
+            format!(
+                "<Retention><Mode>{mode}</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>",
+                iso8601(until)
+            )
+        }
+
+        pub fn years(n: u64) -> SystemTime {
+            SystemTime::now() + Duration::from_hours(n * 365 * 24)
+        }
+
+        pub async fn put(responses: Vec<String>) -> anyhow::Result<String> {
+            let endpoint = serve(responses).await;
+            S3ObjectLock::new(config(&endpoint))
+                .unwrap()
+                .put("owt-audit/1.json", b"{}")
+                .await
+        }
+    }
+
+    use fake::{LOCK_ON, ok, put, reply, retention, years};
+
+    fn err(r: anyhow::Result<String>) -> String {
+        format!("{:#}", r.unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn a_genuine_lock_is_accepted() {
+        let got = put(vec![
+            ok(&[], LOCK_ON),
+            ok(&[("x-amz-version-id", "v1")], ""),
+            ok(&[], &retention("COMPLIANCE", years(8))),
+        ])
+        .await;
+        assert_eq!(got.unwrap(), "v1");
+    }
+
+    #[tokio::test]
+    async fn a_put_without_a_version_id_fails() {
+        let e = err(put(vec![ok(&[], LOCK_ON), ok(&[("ETag", "\"abc\"")], "")]).await);
+        assert!(e.contains("no version id"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_wrong_mode_fails() {
+        let e = err(put(vec![
+            ok(&[], LOCK_ON),
+            ok(&[("x-amz-version-id", "v1")], ""),
+            ok(&[], &retention("GOVERNANCE", years(8))),
+        ])
+        .await);
+        assert!(e.contains("without the requested lock"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_short_retain_until_fails() {
+        let e = err(put(vec![
+            ok(&[], LOCK_ON),
+            ok(&[("x-amz-version-id", "v1")], ""),
+            ok(&[], &retention("COMPLIANCE", years(1))),
+        ])
+        .await);
+        assert!(e.contains("without the requested lock"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_body_in_place_of_retention_fails() {
+        // A store that ignores `?retention` and returns the object, even one that
+        // contains the elements.
+        let e = err(put(vec![
+            ok(&[], LOCK_ON),
+            ok(&[("x-amz-version-id", "v1")], ""),
+            ok(
+                &[],
+                &format!("{{\"a\":\"{}\"}}", retention("COMPLIANCE", years(8))),
+            ),
+        ])
+        .await);
+        assert!(e.contains("without the requested lock"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_date_fails_closed() {
+        let e = err(put(vec![reply("200 OK", &[], LOCK_ON, None)]).await);
+        assert!(e.contains("Date"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_skewed_date_fails_on_the_put_response_too() {
+        let e = err(put(vec![
+            ok(&[], LOCK_ON),
+            reply(
+                "200 OK",
+                &[("x-amz-version-id", "v1")],
+                "",
+                Some(SystemTime::now() - Duration::from_hours(1)),
+            ),
+        ])
+        .await);
+        assert!(e.contains("clock differs"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_an_error() {
+        let e = err(put(vec![reply(
+            "301 Moved Permanently",
+            &[("Location", "https://elsewhere.example/")],
+            "",
+            Some(SystemTime::now()),
+        )])
+        .await);
+        assert!(e.contains("redirect"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_bucket_check_tells_its_failures_apart() {
+        let no_bucket = "<Error><Code>NoSuchBucket</Code><Message>x\ny</Message></Error>";
+        let e = err(put(vec![reply(
+            "404 Not Found",
+            &[],
+            no_bucket,
+            Some(SystemTime::now()),
+        )])
+        .await);
+        assert!(e.contains("does not exist") && !e.contains('\n'), "{e}");
+        let no_lock = "<Error><Code>ObjectLockConfigurationNotFoundError</Code></Error>";
+        let e = err(put(vec![reply(
+            "404 Not Found",
+            &[],
+            no_lock,
+            Some(SystemTime::now()),
+        )])
+        .await);
+        assert!(e.contains("no Object Lock configuration"), "{e}");
+        let denied = "<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
+        let e = err(put(vec![reply(
+            "403 Forbidden",
+            &[],
+            denied,
+            Some(SystemTime::now()),
+        )])
+        .await);
+        assert!(
+            e.contains("403") && e.contains("AccessDenied") && !e.contains("create it"),
+            "{e}"
+        );
     }
 }

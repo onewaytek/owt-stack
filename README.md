@@ -3240,8 +3240,17 @@ credential or a server error, and names the S3 error code. The receipt is the
 version id.
 
 The retain-until date follows this host's clock, so a clock set back shortens the
-lock: every response's `Date` header is compared with the local clock, and a
-difference over five minutes fails the request. Keep the host on NTP.
+lock: every response's `Date` header is compared with the local clock, a response
+without a valid one is refused, and a difference over five minutes fails the
+request. On a `put` that error can arrive after the object is locked, to a date that
+follows the wrong clock; write a new key once the clock is fixed. Keep the host on
+NTP.
+
+The readback proves the store reports the lock, not that it enforces it: the
+retention document is parsed structurally (a `Retention` root with `Mode` and
+`RetainUntilDate` children), so a store that returns the object or any other body
+fails, but a store that fabricates a well-formed one cannot be detected from the
+client. Use a store you trust to honor Object Lock.
 
 Tested against MinIO only (`bitnamilegacy/minio`, a bucket made with
 `mc mb --with-lock`). Backblaze B2 and AWS S3 follow the same API and the signer is
