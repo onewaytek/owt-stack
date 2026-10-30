@@ -30,7 +30,8 @@ CREATE INDEX owt_audit_events_resource ON owt_audit_events (tenant, resource_typ
 
 -- A text field in the canonical encoding: its UTF-8 length (4 bytes, big-endian)
 -- and bytes, or 0xFFFFFFFF alone for NULL.
-CREATE FUNCTION owt_audit_lp(t text) RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
+CREATE FUNCTION owt_audit_lp(t text) RETURNS bytea LANGUAGE sql IMMUTABLE
+    SET search_path = pg_catalog, pg_temp AS $$
     SELECT CASE WHEN t IS NULL THEN '\xffffffff'::bytea
                 ELSE int4send(octet_length(convert_to(t, 'UTF8'))) || convert_to(t, 'UTF8')
            END
@@ -39,33 +40,45 @@ $$;
 -- Each event joins its tenant's chain here, so no insert, by any role, chooses its
 -- place, time or hash. Appends to one chain are serialized by a transaction-scoped
 -- advisory lock; under REPEATABLE READ or SERIALIZABLE the chain's last event could
--- be read from a snapshot older than the lock, so those are refused.
-CREATE FUNCTION owt_audit_chain() RETURNS trigger LANGUAGE plpgsql AS $$
+-- be read from a snapshot older than the lock, so those are refused (READ
+-- UNCOMMITTED runs as READ COMMITTED). The search path is pinned and the table is
+-- the trigger's own (TG_RELID), so no temporary table or function of the inserting
+-- role's can stand in for the chain or the encoding.
+CREATE FUNCTION owt_audit_chain() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     last_seq bigint;
     last_hash bytea;
     us bigint;
 BEGIN
-    IF current_setting('transaction_isolation') <> 'read committed' THEN
+    IF current_setting('transaction_isolation') NOT IN ('read committed', 'read uncommitted') THEN
         RAISE EXCEPTION 'owt_audit: record events under READ COMMITTED, not %',
             current_setting('transaction_isolation');
     END IF;
     PERFORM pg_advisory_xact_lock(1870099553, hashtext(NEW.tenant));
-    SELECT e.seq, e.hash INTO last_seq, last_hash FROM owt_audit_events e
-    WHERE e.tenant = NEW.tenant ORDER BY e.seq DESC LIMIT 1;
+    EXECUTE format('SELECT e.seq, e.hash FROM %s e WHERE e.tenant = $1 ORDER BY e.seq DESC LIMIT 1',
+                   TG_RELID::regclass)
+        INTO last_seq, last_hash USING NEW.tenant;
     us := floor(extract(epoch FROM clock_timestamp()) * 1000000)::bigint;
     NEW.seq := COALESCE(last_seq, 0) + 1;
     NEW.prev := COALESCE(last_hash, decode(repeat('00', 32), 'hex'));
     NEW.at := timestamptz 'epoch' + us * interval '1 microsecond';
-    NEW.hash := sha256(
-        convert_to('owt-audit/event/v1', 'UTF8') || '\x00'::bytea
-        || owt_audit_lp(NEW.tenant) || int8send(NEW.seq) || int8send(us)
-        || owt_audit_lp(NEW.actor) || owt_audit_lp(NEW.actor_kind)
-        || owt_audit_lp(NEW.subject) || owt_audit_lp(NEW.action)
-        || owt_audit_lp(NEW.resource_type) || owt_audit_lp(NEW.resource_id)
-        || owt_audit_lp(NEW.purpose) || owt_audit_lp(NEW.outcome)
-        || owt_audit_lp(NEW.ip) || owt_audit_lp(NEW.user_agent)
-        || owt_audit_lp(NEW.request_id) || NEW.prev);
+    -- The encoding helper is the one beside the table, named by schema: pg_temp is
+    -- never searched for functions, and nothing else is on the path.
+    EXECUTE format(
+        'SELECT sha256(convert_to(''owt-audit/event/v1'', ''UTF8'') || ''\x00''::bytea
+                || %1$I.owt_audit_lp($1) || int8send($2) || int8send($3)
+                || %1$I.owt_audit_lp($4) || %1$I.owt_audit_lp($5)
+                || %1$I.owt_audit_lp($6) || %1$I.owt_audit_lp($7)
+                || %1$I.owt_audit_lp($8) || %1$I.owt_audit_lp($9)
+                || %1$I.owt_audit_lp($10) || %1$I.owt_audit_lp($11)
+                || %1$I.owt_audit_lp($12) || %1$I.owt_audit_lp($13)
+                || %1$I.owt_audit_lp($14) || $15)',
+        TG_TABLE_SCHEMA)
+        INTO NEW.hash
+        USING NEW.tenant, NEW.seq, us, NEW.actor, NEW.actor_kind, NEW.subject, NEW.action,
+              NEW.resource_type, NEW.resource_id, NEW.purpose, NEW.outcome, NEW.ip,
+              NEW.user_agent, NEW.request_id, NEW.prev;
     RETURN NEW;
 END
 $$;
@@ -85,7 +98,8 @@ CREATE TABLE owt_audit_anchors (
 
 -- Rows are never changed or removed while these triggers stand. Only the tables'
 -- owner can drop or disable them; the anchors show a chain rewritten that way.
-CREATE FUNCTION owt_audit_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE FUNCTION owt_audit_append_only() RETURNS trigger LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     RAISE EXCEPTION 'owt_audit: % on % is refused; audit records are append-only',
         TG_OP, TG_TABLE_NAME;
@@ -100,3 +114,11 @@ CREATE TRIGGER owt_audit_anchors_no_change BEFORE UPDATE OR DELETE ON owt_audit_
     FOR EACH ROW EXECUTE FUNCTION owt_audit_append_only();
 CREATE TRIGGER owt_audit_anchors_no_truncate BEFORE TRUNCATE ON owt_audit_anchors
     FOR EACH STATEMENT EXECUTE FUNCTION owt_audit_append_only();
+
+-- Fire in every session_replication_role, replica included, so a role granted SET on
+-- it cannot skip them.
+ALTER TABLE owt_audit_events ENABLE ALWAYS TRIGGER owt_audit_events_chain;
+ALTER TABLE owt_audit_events ENABLE ALWAYS TRIGGER owt_audit_events_no_change;
+ALTER TABLE owt_audit_events ENABLE ALWAYS TRIGGER owt_audit_events_no_truncate;
+ALTER TABLE owt_audit_anchors ENABLE ALWAYS TRIGGER owt_audit_anchors_no_change;
+ALTER TABLE owt_audit_anchors ENABLE ALWAYS TRIGGER owt_audit_anchors_no_truncate;

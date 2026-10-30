@@ -190,8 +190,8 @@ pub async fn anchor<A: Anchor>(pool: &PgPool, to: &A) -> anyhow::Result<Anchored
     })
 }
 
-/// The latest manifest recorded in the database, checked against its recorded
-/// digest and format. The database's copy is only as trustworthy as the roles that
+/// The latest manifest recorded in the database whose recorded digest and format
+/// match it (a row that does not is skipped, with a warning). The database's copy is only as trustworthy as the roles that
 /// may insert into `owt_audit_anchors`: for a check the database's owner cannot
 /// defeat, verify against the copy in the anchor store.
 pub async fn latest(pool: &PgPool) -> anyhow::Result<Option<Manifest>> {
@@ -200,23 +200,27 @@ pub async fn latest(pool: &PgPool) -> anyhow::Result<Option<Manifest>> {
 }
 
 async fn latest_in(conn: &mut sqlx::PgConnection) -> anyhow::Result<Option<(Manifest, Hash)>> {
-    let row: Option<(Vec<u8>, Vec<u8>)> =
-        sqlx::query_as("SELECT manifest, digest FROM owt_audit_anchors ORDER BY id DESC LIMIT 1")
-            .fetch_optional(&mut *conn)
+    // The newest row whose manifest matches its digest. A row that does not is
+    // skipped with a warning rather than trusted, and, since anchors are never
+    // deleted, rather than blocking every later anchoring.
+    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT id, manifest, digest FROM owt_audit_anchors ORDER BY id DESC")
+            .fetch_all(&mut *conn)
             .await?;
-    let Some((bytes, digest)) = row else {
-        return Ok(None);
-    };
-    let manifest = Manifest::from_bytes(&bytes)?;
-    let stored: Hash = digest
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("an anchor digest is 32 bytes"))?;
-    anyhow::ensure!(
-        manifest.format == FORMAT && manifest.digest() == stored,
-        "the latest audit anchor's manifest does not match its digest"
-    );
-    Ok(Some((manifest, stored)))
+    for (id, bytes, digest) in rows {
+        let valid = Manifest::from_bytes(&bytes).ok().and_then(|m| {
+            let stored: Hash = digest.as_slice().try_into().ok()?;
+            (m.format == FORMAT && m.digest() == stored).then_some((m, stored))
+        });
+        match valid {
+            Some(found) => return Ok(Some(found)),
+            None => tracing::warn!(
+                id,
+                "an audit anchor's manifest does not match its digest; skipped"
+            ),
+        }
+    }
+    Ok(None)
 }
 
 fn unhex(s: &str) -> Option<Hash> {

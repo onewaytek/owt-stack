@@ -276,7 +276,8 @@ pub enum RecordError {
     #[error("recording an audit event: {0}")]
     Db(#[from] sqlx::Error),
     /// The database hashed the event differently from the crate: the migration's
-    /// trigger and this build disagree. Nothing should be recorded with it.
+    /// trigger and this build disagree. The row is inserted in the caller's
+    /// transaction: roll it back. ([`Audit::record`] does.)
     #[error("the database's audit hash differs from the crate's")]
     Mismatch,
 }

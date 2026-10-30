@@ -158,6 +158,27 @@ async fn an_insert_cannot_choose_its_place_or_links() {
     ] {
         assert!(db.pool.execute(bad).await.is_err(), "{bad}");
     }
+    // A temporary table of the same name cannot stand in for the chain.
+    let mut conn = db.pool.acquire().await.unwrap();
+    conn.execute(
+        "CREATE TEMP TABLE owt_audit_events (tenant text, seq bigint, hash bytea);
+         INSERT INTO pg_temp.owt_audit_events VALUES ('t', 1000, decode(repeat('ee', 32), 'hex'))",
+    )
+    .await
+    .unwrap();
+    // The real table, by its schema, while the temporary one shadows the name.
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {}.owt_audit_events (tenant, actor, actor_kind, action, resource_type, outcome)
+         VALUES ('t', 'x', 'system', 'a', 'b', 'success')",
+        db.schema
+    )))
+    .await
+    .unwrap();
+    conn.execute("DROP TABLE pg_temp.owt_audit_events")
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(verify(&db.pool, "t").await.unwrap().events, 4);
     // Under REPEATABLE READ the last event could be stale: refused.
     let mut tx = db.pool.begin().await.unwrap();
     tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -186,8 +207,10 @@ async fn a_forged_anchor_record_is_caught() {
         )
         .await
         .unwrap();
-    assert!(anchor::latest(&db.pool).await.is_err());
-    assert!(anchor::anchor(&db.pool, &NoAnchor).await.is_err());
+    // Skipped, not trusted, and it blocks nothing.
+    let latest = anchor::latest(&db.pool).await.unwrap().unwrap();
+    assert_eq!(latest.heads.len(), 1);
+    anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
     db.drop().await;
 }
 
