@@ -100,8 +100,10 @@ impl Check {
 
 /// Whether `password` matches `stored`, an Argon2 PHC string. Anything unparseable
 /// matches nothing. The normalized form is tried, then (only if it differs) the
-/// password as typed, which is how hashes made before normalization still open; see
-/// [`check`] to learn which matched.
+/// password as typed, which is how hashes made before normalization still open. It answers
+/// only yes or no: a caller that stores hashes and rehashes after a match uses [`check`],
+/// which says when the match was only of the password as typed ([`Check::MatchRaw`]),
+/// so that hash is replaced by one of the normalized form.
 pub async fn verify(password: &str, stored: &str) -> bool {
     check(password, stored).await.matched()
 }
@@ -152,7 +154,8 @@ async fn decoy() -> Option<&'static str> {
 /// if no account matched. `None`, or a hash that is not one [`verify`] reads (a
 /// legacy format, an empty or damaged value), still costs a full Argon2 check
 /// against a hash nothing matches, so the time a sign-in takes says neither whether
-/// the account exists nor what its hash looks like.
+/// the account exists nor what its hash looks like. A yes or no: a caller that rehashes uses
+/// [`check_or_decoy`], to learn of a [`Check::MatchRaw`].
 pub async fn verify_or_decoy(password: &str, stored: Option<&str>) -> bool {
     check_or_decoy(password, stored).await.matched()
 }

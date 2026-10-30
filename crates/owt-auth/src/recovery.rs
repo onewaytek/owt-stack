@@ -109,7 +109,9 @@ pub fn normalize(input: &str) -> Option<String> {
 /// however many codes are unused: at least [`DEFAULT_COUNT`] Argon2 checks, one after
 /// another under a single permit of the password hasher's pool, the missing ones against
 /// a decoy hash. So the time says neither how many codes an account has left nor which
-/// one matched, and one attempt takes one permit, not ten.
+/// one matched, and one attempt takes one permit, not ten. That permit is held for the
+/// whole run (ten Argon2 checks, a few hundred milliseconds), so each attempt costs the
+/// pool that long: the throttle bounds how many a person can make.
 pub async fn find_match<S: AsRef<str>>(input: &str, hashes: &[S]) -> Option<usize> {
     let code = normalize(input)?;
     let hashes: Vec<&str> = hashes.iter().map(AsRef::as_ref).collect();
