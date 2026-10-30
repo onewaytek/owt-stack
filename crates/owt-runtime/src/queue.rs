@@ -693,20 +693,36 @@ impl Queue {
         }
     }
 
-    /// The queue's jobs by state.
+    /// The queue's jobs by state. Each count is its own subquery whose predicate matches a
+    /// partial index (`owt_jobs_due`, `owt_jobs_running`, `owt_jobs_finished`), so none
+    /// reads a row of another state; `done` reads the done rows, which [`Queue::purge_done`]
+    /// bounds. The housekeeping tick uses [`Queue::depth`] instead, which skips them.
     pub async fn counts(&self) -> sqlx::Result<Counts> {
+        self.count_states(true).await
+    }
+
+    /// [`Queue::counts`] with `done` left at zero: the per-tick gauges never read it.
+    #[cfg(feature = "metrics")]
+    async fn depth(&self) -> sqlx::Result<Counts> {
+        self.count_states(false).await
+    }
+
+    async fn count_states(&self, with_done: bool) -> sqlx::Result<Counts> {
         let (queued, due, running, done, dead, lag): (i64, i64, i64, i64, i64, f64) =
             sqlx::query_as(
-                "SELECT count(*) FILTER (WHERE state = 'queued'),
-                        count(*) FILTER (WHERE state = 'queued' AND run_at <= now()),
-                        count(*) FILTER (WHERE state = 'running'),
-                        count(*) FILTER (WHERE state = 'done'),
-                        count(*) FILTER (WHERE state = 'dead'),
-                        COALESCE(extract(epoch FROM now() - min(run_at)
-                                 FILTER (WHERE state = 'queued' AND run_at <= now())), 0)::float8
-                 FROM owt_jobs WHERE queue = $1",
+                "SELECT (SELECT count(*) FROM owt_jobs WHERE queue = $1 AND state = 'queued'),
+                        (SELECT count(*) FROM owt_jobs
+                          WHERE queue = $1 AND state = 'queued' AND run_at <= now()),
+                        (SELECT count(*) FROM owt_jobs WHERE queue = $1 AND state = 'running'),
+                        CASE WHEN $2 THEN (SELECT count(*) FROM owt_jobs
+                                            WHERE queue = $1 AND state = 'done') ELSE 0 END,
+                        (SELECT count(*) FROM owt_jobs WHERE queue = $1 AND state = 'dead'),
+                        COALESCE((SELECT extract(epoch FROM now() - run_at) FROM owt_jobs
+                                   WHERE queue = $1 AND state = 'queued' AND run_at <= now()
+                                   ORDER BY run_at, id LIMIT 1), 0)::float8",
             )
             .bind(&*self.name)
+            .bind(with_done)
             .fetch_one(&self.pool)
             .await?;
         Ok(Counts {
@@ -1079,7 +1095,7 @@ impl Worker {
         }
         #[cfg(feature = "metrics")]
         if let Some(m) = &self.metrics {
-            match self.queue.counts().await {
+            match self.queue.depth().await {
                 Ok(c) => {
                     let name = name.to_string();
                     for (state, n) in [
