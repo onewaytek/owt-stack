@@ -715,18 +715,18 @@ async fn a_sealer_is_stale_past_its_maximum_age() {
     let Some(db) = Db::new().await else { return };
     let f = Field::new("s1", "notes", "body", "1");
     let kek = local("k1");
-    let crypt = Crypt::new(db.pool.clone(), kek.clone()).sealer_max_age(Duration::from_millis(300));
+    let crypt = Crypt::new(db.pool.clone(), kek.clone()).sealer_max_age(Duration::from_secs(3));
     let sealer = crypt.sealer("s1").await.unwrap();
     let ct = sealer.seal(&f, b"x").unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(3200)).await;
     assert!(sealer.is_stale());
     assert!(matches!(sealer.seal(&f, b"x"), Err(CryptError::Stale(_))));
     assert!(matches!(sealer.open(&f, &ct), Err(CryptError::Stale(_))));
     assert!(sealer.refresh(&crypt).await.unwrap().seal(&f, b"x").is_ok());
     // By default the bound is the key cache's.
-    let crypt = Crypt::new(db.pool.clone(), kek).cache_ttl(Duration::from_millis(300));
+    let crypt = Crypt::new(db.pool.clone(), kek).cache_ttl(Duration::from_secs(3));
     let sealer = crypt.sealer("s1").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(3200)).await;
     assert!(sealer.is_stale());
     db.drop().await;
 }
@@ -738,5 +738,29 @@ async fn a_sealer_does_not_print_its_keys() {
     let text = format!("{:?}", crypt.sealer("s1").await.unwrap());
     assert!(text.contains("redacted") && text.contains("s1"), "{text}");
     assert!(!text.contains("Key("), "{text}");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_sealer_computes_blind_index_candidates_for_every_index_version() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    let before = crypt.sealer("s1").await.unwrap();
+    let old = before.blind_index("p", "email", b"a").unwrap();
+    crypt.rotate("s1", Purpose::Index).await.unwrap();
+    assert!(matches!(
+        before.blind_index_candidates("p", "email", b"a"),
+        Err(CryptError::Stale(_))
+    ));
+    let after = crypt.sealer("s1").await.unwrap();
+    let sync = after.blind_index_candidates("p", "email", b"a").unwrap();
+    let asynch = crypt
+        .blind_index_candidates("s1", "p", "email", b"a")
+        .await
+        .unwrap();
+    assert_eq!(sync, asynch);
+    assert_eq!(sync.len(), 2);
+    assert_eq!(sync[1], old);
+    assert_eq!(sync[0], after.blind_index("p", "email", b"a").unwrap());
     db.drop().await;
 }

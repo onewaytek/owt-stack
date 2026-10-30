@@ -2932,8 +2932,9 @@ is harmless.
 **Synchronous sealing.** `encrypt` and `decrypt` are `async`, because they may ask the
 database or the KEK for a key. Code that cannot `.await` (serde and template paths,
 `FromRow` decoding) uses a `Sealer`: `crypt.sealer(scope).await?` loads and unwraps the
-scope's current data key, every older data key version and its index key once, and
-`seal`, `open` and `blind_index` are then plain functions. Load it once per request or
+scope's current data key, every older data key version and every index key version
+once, and `seal`, `open`, `blind_index` and `blind_index_candidates` (for `= ANY($1)`
+during an index rotation) are then plain functions. Load it once per request or
 job and pass it down. Its ciphertexts and blind indexes are exactly `Crypt`'s, so the
 two read each other's values, and a `Sealer` clones cheaply. It refuses a `Field` of
 another scope with `CryptError::Invalid`.
@@ -2961,10 +2962,12 @@ let sealer = match sealer.seal(&field, b"x") {
 
 A `Sealer` is a snapshot, so it has rules. After `rotate` or `shred` on the same
 `Crypt` (or a clone) it is stale: `seal` and `blind_index` return `CryptError::Stale`,
-so a new value never uses an old key, while `open` still reads old ciphertexts. After
+so a new value never uses an old key (`blind_index_candidates` refuses too, as the
+sealer may lack the new index version), while `open` still reads old ciphertexts. After
 a shred it refuses everything with `CryptError::Shredded`. A rotation or shred on
 *another replica* is invisible to this process, so every `Sealer` also has a maximum
-age, `Crypt::sealer_max_age` (by default `cache_ttl`, five minutes): past it, every
+age, `Crypt::sealer_max_age` (by default `cache_ttl`, five minutes, counted from
+before the load starts): past it, every
 method, `open` included, returns `Stale`, which bounds how long a replica misses a
 rotation or keeps opening a shredded scope. `open` of a version made after loading
 returns `CryptError::NotLoaded`. In each case `sealer.refresh(&crypt).await?` (or

@@ -1,9 +1,9 @@
 //! A synchronous sealer for one scope, with its keys loaded ahead of time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -35,6 +35,9 @@ use crate::{Crypt, CryptError, Field, Key, Purpose, ScopeState, check_field, mac
 ///   That bound is the longest another replica's rotation goes unseen here, and the
 ///   longest a shredded scope keeps opening here, as with the key cache.
 ///
+/// The age bound starts before the first `.await` of [`Crypt::sealer`], so it counts
+/// the load too and is conservative.
+///
 /// Load a sealer per request or job, or call [`Sealer::refresh`] on `Stale`. Cloning
 /// is cheap; clones share the keys, which are zeroized when the last one drops.
 #[derive(Clone)]
@@ -48,8 +51,8 @@ struct Inner {
     data: BTreeMap<u32, Arc<Key>>,
     /// The newest data key's version.
     current: u32,
-    /// The newest index key.
-    index: (u32, Arc<Key>),
+    /// Every index key version, newest first.
+    index: Vec<(u32, Arc<Key>)>,
     state: Arc<ScopeState>,
     /// The scope's generation when loading began.
     generation: u64,
@@ -73,6 +76,8 @@ impl Crypt {
     /// and unwrapped. Keys are made if the scope has none. Fails with
     /// [`CryptError::Shredded`] for a shredded scope.
     pub async fn sealer(&self, scope: &str) -> Result<Sealer, CryptError> {
+        // Started before any await, so the age bound counts the whole load.
+        let started = Instant::now();
         crate::check_scope(scope)?;
         let state = self.scope_state(scope);
         // Read before loading: a rotation that lands meanwhile leaves the snapshot
@@ -96,7 +101,18 @@ impl Crypt {
             }
         }
         let current = *data.keys().next_back().unwrap_or(&version);
-        let index = self.current(scope, Purpose::Index).await?;
+        let (newest, key) = self.current(scope, Purpose::Index).await?;
+        let mut index = vec![(newest, key)];
+        for v in self.versions(scope, Purpose::Index).await? {
+            if index.iter().all(|(have, _)| *have != v) {
+                match self.key(scope, Purpose::Index, v).await {
+                    Ok(key) => index.push((v, key)),
+                    Err(CryptError::NoKey { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        index.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
         Ok(Sealer {
             inner: Arc::new(Inner {
                 scope: scope.into(),
@@ -105,7 +121,7 @@ impl Crypt {
                 index,
                 state,
                 generation,
-                loaded: Instant::now(),
+                loaded: started,
                 max_age: self.sealer_max_age.unwrap_or(self.cache_ttl),
             }),
         })
@@ -120,19 +136,34 @@ impl Crypt {
         self
     }
 
-    /// The shared state of `scope`, made on first use.
-    fn scope_state(&self, scope: &str) -> Arc<ScopeState> {
+    fn scopes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Weak<ScopeState>>> {
         self.scopes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(scope.to_owned())
-            .or_default()
-            .clone()
     }
 
-    /// Mark the sealers of `scope` stale; `shredded` also makes them refuse to open.
+    /// The shared state of `scope`: the live one, or a new one. Entries whose
+    /// sealers are all gone are dropped on every insert, so the map holds only
+    /// scopes with a live sealer. A sealer made after its entry went reads the
+    /// database at load: a shredded scope has no keys and a tombstone, and a
+    /// rotation is in the key listing.
+    fn scope_state(&self, scope: &str) -> Arc<ScopeState> {
+        let mut scopes = self.scopes();
+        if let Some(state) = scopes.get(scope).and_then(Weak::upgrade) {
+            return state;
+        }
+        scopes.retain(|_, weak| weak.strong_count() > 0);
+        let state = Arc::new(ScopeState::default());
+        scopes.insert(scope.to_owned(), Arc::downgrade(&state));
+        state
+    }
+
+    /// Mark the live sealers of `scope` stale; `shredded` also makes them refuse to
+    /// open.
     pub(crate) fn invalidate(&self, scope: &str, shredded: bool) {
-        let state = self.scope_state(scope);
+        let Some(state) = self.scopes().get(scope).and_then(Weak::upgrade) else {
+            return;
+        };
         if shredded {
             state.shredded.store(true, Ordering::SeqCst);
         }
@@ -229,7 +260,27 @@ impl Sealer {
         value: &[u8],
     ) -> Result<[u8; 32], CryptError> {
         self.check(true)?;
-        Ok(mac(&self.inner.index.1, table, column, value))
+        Ok(mac(&self.inner.index[0].1, table, column, value))
+    }
+
+    /// The blind index of `value` under every index key version the sealer loaded,
+    /// newest first: search with `= ANY($1)` while an index key rotation is under
+    /// way, as [`Crypt::blind_index_candidates`] does. A sealer made stale by a
+    /// rotation here refuses, as [`Sealer::blind_index`] does, because it may lack
+    /// the newest version.
+    pub fn blind_index_candidates(
+        &self,
+        table: &str,
+        column: &str,
+        value: &[u8],
+    ) -> Result<Vec<[u8; 32]>, CryptError> {
+        self.check(true)?;
+        Ok(self
+            .inner
+            .index
+            .iter()
+            .map(|(_, key)| mac(key, table, column, value))
+            .collect())
     }
 
     fn check_field(&self, field: &Field<'_>) -> Result<(), CryptError> {
@@ -256,5 +307,37 @@ impl Sealer {
             return Err(CryptError::Stale(i.scope.clone()));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::Crypt;
+    use crate::kek::{KekProvider, LocalKek};
+
+    #[tokio::test]
+    async fn the_scope_map_holds_only_scopes_with_a_live_sealer() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/none").unwrap();
+        let kek: Arc<dyn KekProvider> =
+            Arc::new(LocalKek::parse(&LocalKek::generate_entry("k")).unwrap());
+        let crypt = Crypt::new(pool, kek);
+        let held: Vec<_> = (0..50)
+            .map(|i| crypt.scope_state(&format!("s{i}")))
+            .collect();
+        assert_eq!(crypt.scopes().len(), 50);
+        // Invalidating a scope with a live holder reaches it.
+        crypt.invalidate("s7", false);
+        assert_eq!(
+            held[7].generation.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        drop(held);
+        // Dead entries go on the next insert; an unknown scope adds none.
+        crypt.invalidate("gone", true);
+        assert_eq!(crypt.scopes().len(), 50);
+        let _again = crypt.scope_state("new");
+        assert_eq!(crypt.scopes().len(), 1);
     }
 }

@@ -53,7 +53,7 @@ pub mod yubihsm;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -118,8 +118,10 @@ impl Purpose {
     }
 }
 
-/// Why an operation failed. None carries a key or a plaintext.
+/// Why an operation failed. None carries a key or a plaintext. New variants are not a
+/// breaking change: match with a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CryptError {
     /// The KEK provider.
     #[error(transparent)]
@@ -211,8 +213,9 @@ pub struct Crypt {
     cache: Arc<Mutex<Cache>>,
     /// Bumped by every `shred`; a key unwrapped across a bump is not cached.
     shreds: Arc<AtomicU64>,
-    /// What each scope's sealers check.
-    scopes: Arc<Mutex<HashMap<String, Arc<ScopeState>>>>,
+    /// What each scope's live sealers check. An entry lasts as long as a sealer holds
+    /// it; a scope without one is read afresh from the database at load.
+    scopes: Arc<Mutex<HashMap<String, Weak<ScopeState>>>>,
     cache_ttl: Duration,
     sealer_max_age: Option<Duration>,
 }
