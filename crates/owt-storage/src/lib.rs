@@ -140,6 +140,7 @@ pub struct Storage {
 impl Storage {
     /// The bucket `config` names. Path-style requests, so any S3-compatible endpoint
     /// works; plain `http://` only for the loopback IP literals `127.0.0.1` and `[::1]`
+    /// (an in-cluster Service over plain `http` is [`Storage::s3_in_cluster`])
     /// (a local `MinIO`), never for a name such as `localhost`, which resolution could
     /// point elsewhere. An endpoint that does not parse is [`StorageError::Invalid`].
     pub fn s3(config: &S3Config) -> Result<Self, StorageError> {
@@ -168,7 +169,11 @@ impl Storage {
         match endpoint.scheme() {
             "https" => {}
             "http" if loopback || any_http => {}
-            "http" => return Err(invalid("plain http is for 127.0.0.1 and [::1] only")),
+            "http" => {
+                return Err(invalid(
+                    "plain http is for 127.0.0.1 and [::1] only (or Storage::s3_in_cluster)",
+                ));
+            }
             _ => return Err(invalid("the scheme is https")),
         }
         let s3 = Arc::new(
@@ -498,11 +503,13 @@ impl Storage {
     }
 
     /// Encrypt the plaintext object a presigned upload left at `from` into `to` for
-    /// `scope`, then delete `from`, verified. Not for health data, which must never sit
-    /// in the bucket as plaintext: stream it through [`Storage::upload_sealed`]. The plaintext's length. `from` and `to`
-    /// must differ ([`StorageError::BadKey`]). On a versioned bucket the delete only
-    /// hides the upload (see the module docs), and the presigned URL that wrote it can
-    /// write again until its TTL ends: seal after the URL has expired.
+    /// `scope`, then delete `from`, verified. The plaintext's length. `from` and `to`
+    /// must differ ([`StorageError::BadKey`]).
+    ///
+    /// Not for health data, which must never sit in the bucket as plaintext: stream it
+    /// through [`Storage::upload_sealed`]. On a versioned bucket the delete only hides
+    /// the upload (see the module docs), and the presigned URL that wrote it can write
+    /// again until its TTL ends: seal after the URL has expired.
     pub async fn seal_uploaded(
         &self,
         scope: &str,

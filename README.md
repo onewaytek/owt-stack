@@ -2595,7 +2595,8 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
   billed and invisible to listing. Give the bucket the lifecycle rule "abort incomplete
   multipart uploads after 1 day".
 - **Configuration.** The endpoint is `https`; plain `http` is accepted only for the IP
-  literals `127.0.0.1` and `[::1]`, not the name `localhost`. `S3Config`'s `Debug`
+  literals `127.0.0.1` and `[::1]`, not the name `localhost`; an in-cluster Service over
+  plain `http` uses `Storage::s3_in_cluster`. `S3Config`'s `Debug`
   redacts the secret.
 - **Verified deletion** deletes, then requires the store to answer that the object is
   gone, which proves deletion on an unversioned bucket only (above).
