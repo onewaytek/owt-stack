@@ -132,6 +132,66 @@ async fn each_tenant_has_a_chain_that_verifies() {
 }
 
 #[tokio::test]
+async fn an_insert_cannot_choose_its_place_or_links() {
+    let Some(db) = Db::new().await else { return };
+    let audit = Audit::new(db.pool.clone());
+    audit.record(&view("t", "p1")).await.unwrap();
+    // A direct insert naming its own seq, time, prev and hash: all replaced.
+    db.pool
+        .execute(
+            "INSERT INTO owt_audit_events (tenant, seq, at, actor, actor_kind, action, resource_type,
+                                           outcome, prev, hash)
+             VALUES ('t', 9223372036854775807, 'infinity', 'x', 'system', 'forged', 'chart',
+                     'success', decode(repeat('ab', 32), 'hex'), decode(repeat('cd', 32), 'hex'))",
+        )
+        .await
+        .unwrap();
+    let after = audit.record(&view("t", "p2")).await.unwrap();
+    assert_eq!(after.seq, 3);
+    assert_eq!(verify(&db.pool, "t").await.unwrap().events, 3);
+    // A malformed address or a control character is refused by the table itself.
+    for bad in [
+        "INSERT INTO owt_audit_events (tenant, actor, actor_kind, action, resource_type, outcome, ip)
+         VALUES ('t', 'x', 'system', 'a', 'b', 'success', 'not an ip')",
+        "INSERT INTO owt_audit_events (tenant, actor, actor_kind, action, resource_type, outcome)
+         VALUES ('t', E'x\\ny', 'system', 'a', 'b', 'success')",
+    ] {
+        assert!(db.pool.execute(bad).await.is_err(), "{bad}");
+    }
+    // Under REPEATABLE READ the last event could be stale: refused.
+    let mut tx = db.pool.begin().await.unwrap();
+    tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    let e = owt_audit::record_in(&mut tx, &view("t", "p3"))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("READ COMMITTED"), "{e}");
+    tx.rollback().await.unwrap();
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_forged_anchor_record_is_caught() {
+    let Some(db) = Db::new().await else { return };
+    let audit = Audit::new(db.pool.clone());
+    audit.record(&view("t", "p")).await.unwrap();
+    anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
+    // An anchor row whose manifest anchors nothing, with a digest that is not its own.
+    db.pool
+        .execute(
+            "INSERT INTO owt_audit_anchors (manifest, digest, provider, receipt)
+             VALUES (convert_to('{\"format\":\"owt-audit/manifest/v1\",\"at_us\":0,\"prev\":null,\"heads\":[]}', 'UTF8'),
+                     decode(repeat('00', 32), 'hex'), 'none', '')",
+        )
+        .await
+        .unwrap();
+    assert!(anchor::latest(&db.pool).await.is_err());
+    assert!(anchor::anchor(&db.pool, &NoAnchor).await.is_err());
+    db.drop().await;
+}
+
+#[tokio::test]
 async fn concurrent_appends_to_one_chain_stay_contiguous() {
     let Some(db) = Db::new().await else { return };
     let audit = Audit::new(db.pool.clone());

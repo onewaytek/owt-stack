@@ -2306,8 +2306,12 @@ let social = social.on_arrival(move |arrived| {
 append-only table where any later change shows. Each event joins its tenant's chain
 (events with no tenant share the chain `""`): its `seq` follows the chain's last,
 its `prev` is that event's hash, and its `hash` is SHA-256 over a canonical encoding
-of all its fields (`owt_audit::canonical`). Triggers refuse `UPDATE`, `DELETE` and
-`TRUNCATE` on the tables from every role, the owner included.
+of all its fields (`owt_audit::canonical`). The database assigns all four as the row
+is inserted, whoever inserts it, and `record_in` checks the database's hash against
+the crate's. Triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` while they stand; only
+the tables' owner can drop or disable them, which anchoring (below) exposes. A role
+that may insert can still record false events, as it can make false changes; the log
+shows what was recorded, and that nothing recorded was altered since.
 
 ```rust,no_run
 use owt_audit::{ActorKind, Audit, Event, Outcome};
@@ -2352,29 +2356,40 @@ id, a resource's id, and codes (`[a-z0-9_.:-]`, up to 100) for the action, the
 resource type and the purpose of use. Never a name, a diagnosis, a note's text or a
 search term; the log is kept for years and erases nothing. The fields are short (200
 characters, a user agent 512) and `Event::check` refuses control characters and
-malformed codes. `record_in` holds its tenant's chain until the transaction ends:
-call it last in the transaction.
+malformed codes; the table's own constraints refuse control characters and malformed
+addresses too. `record_in` holds its tenant's chain until the transaction ends, so
+call it last in the transaction, and the transaction must be READ COMMITTED (the
+default; the database refuses others, whose snapshot could miss the chain's last
+event).
 
-**Roles.** Run the migrations as the role that owns the schema, and give the app's
-role `INSERT` and `SELECT` only. It then cannot drop the triggers, which takes
-ownership:
+**Roles.** Run the migrations as the role that owns the schema. Give the app's role
+`INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
+or disable the triggers, which takes ownership. Only the role that runs the anchoring
+job inserts anchors, so the app cannot record a manifest of its own:
 
 ```sql
-GRANT USAGE ON SCHEMA public TO myapp_app;
-GRANT SELECT, INSERT ON owt_audit_events, owt_audit_anchors TO myapp_app;
+GRANT USAGE ON SCHEMA public TO myapp_app, myapp_anchor;
+GRANT SELECT, INSERT ON owt_audit_events TO myapp_app;
+GRANT SELECT ON owt_audit_anchors TO myapp_app;
+GRANT SELECT ON owt_audit_events TO myapp_anchor;
+GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
 -- Nothing else: no UPDATE, DELETE, TRUNCATE, TRIGGER or ownership.
 ```
 
 **Anchoring.** The schema's owner can still drop the triggers and rewrite a chain
 from some event on, recomputing every hash after it; the chain still verifies on its
 own. So, on a schedule, write every chain's head to storage the database's owner
-cannot change: `anchor::anchor(&pool, &store)` builds a manifest of the heads (naming
-the previous manifest's digest), stores it through an `anchor::Anchor`, and records
-it in `owt_audit_anchors`. `verify_anchor` then fails for any chain that no longer
+cannot change: `anchor::anchor(&pool, &store)` verifies each chain since the previous
+manifest (so a broken chain is never anchored), builds a manifest of the heads
+(naming the previous manifest's digest), stores it through an `anchor::Anchor`, and
+records it in `owt_audit_anchors`; runs are serialized by an advisory lock. `verify_anchor` then fails for any chain that no longer
 holds an anchored head. `NoAnchor` records manifests in the database only, for
 development and tests; production implements `Anchor` over a bucket under a
 compliance-mode retention lock (an S3-compatible provider for that follows
-`owt-storage`).
+`owt-storage`). The database's copy of a manifest is checked against its recorded
+digest, but it is only as trustworthy as the roles that may insert anchors; an
+independent check verifies against the copy in the store
+(`myapp audit verify --manifest m.json`).
 
 ```rust,no_run
 use std::time::Duration;

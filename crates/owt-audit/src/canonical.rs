@@ -17,6 +17,9 @@
 //! `0xFFFF_FFFF` alone, so `None` and `Some("")` differ and no field can run into
 //! the next. Kinds and outcomes are their stored forms (`account`, `success`). Any
 //! change to this encoding is a new domain string, and the verifier keeps the old.
+//!
+//! The database computes the same hash as each event is inserted (the migration's
+//! `owt_audit_chain` trigger), and [`crate::record_in`] checks the two agree.
 
 use sha2::{Digest, Sha256};
 
@@ -25,36 +28,105 @@ use crate::{Hash, Recorded, micros};
 /// The prefix of every hashed encoding.
 pub const DOMAIN: &[u8] = b"owt-audit/event/v1\0";
 
+/// An event's fields as stored: what the hash covers.
+#[derive(Clone, Copy, Debug)]
+pub struct Raw<'a> {
+    /// The tenant (`""` for none).
+    pub tenant: &'a str,
+    /// Its position.
+    pub seq: i64,
+    /// Microseconds since the UNIX epoch.
+    pub at_us: i64,
+    /// The actor.
+    pub actor: &'a str,
+    /// The actor kind's stored form.
+    pub actor_kind: &'a str,
+    /// The subject.
+    pub subject: Option<&'a str>,
+    /// The action.
+    pub action: &'a str,
+    /// The resource type.
+    pub resource_type: &'a str,
+    /// The resource id.
+    pub resource_id: Option<&'a str>,
+    /// The purpose.
+    pub purpose: Option<&'a str>,
+    /// The outcome's stored form.
+    pub outcome: &'a str,
+    /// The IP address as stored.
+    pub ip: Option<&'a str>,
+    /// The user agent.
+    pub user_agent: Option<&'a str>,
+    /// The request id.
+    pub request_id: Option<&'a str>,
+    /// The previous event's hash.
+    pub prev: &'a [u8],
+}
+
 /// The encoding of `r`, without [`DOMAIN`].
 #[must_use]
-pub fn encode(r: &Recorded) -> Vec<u8> {
-    let e = &r.event;
+pub fn encode_raw(r: &Raw<'_>) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
-    text(&mut out, Some(e.tenant.as_deref().unwrap_or("")));
+    text(&mut out, Some(r.tenant));
     out.extend_from_slice(&r.seq.to_be_bytes());
-    out.extend_from_slice(&micros(r.at).to_be_bytes());
-    text(&mut out, Some(&e.actor));
-    text(&mut out, Some(e.actor_kind.as_str()));
-    text(&mut out, e.subject.as_deref());
-    text(&mut out, Some(&e.action));
-    text(&mut out, Some(&e.resource_type));
-    text(&mut out, e.resource_id.as_deref());
-    text(&mut out, e.purpose.as_deref());
-    text(&mut out, Some(e.outcome.as_str()));
-    text(&mut out, e.ip.map(|ip| ip.to_string()).as_deref());
-    text(&mut out, e.user_agent.as_deref());
-    text(&mut out, e.request_id.as_deref());
-    out.extend_from_slice(&r.prev);
+    out.extend_from_slice(&r.at_us.to_be_bytes());
+    text(&mut out, Some(r.actor));
+    text(&mut out, Some(r.actor_kind));
+    text(&mut out, r.subject);
+    text(&mut out, Some(r.action));
+    text(&mut out, Some(r.resource_type));
+    text(&mut out, r.resource_id);
+    text(&mut out, r.purpose);
+    text(&mut out, Some(r.outcome));
+    text(&mut out, r.ip);
+    text(&mut out, r.user_agent);
+    text(&mut out, r.request_id);
+    out.extend_from_slice(r.prev);
     out
 }
 
 /// The hash of `r`.
 #[must_use]
-pub fn hash(r: &Recorded) -> Hash {
+pub fn hash_raw(r: &Raw<'_>) -> Hash {
     let mut h = Sha256::new();
     h.update(DOMAIN);
-    h.update(encode(r));
+    h.update(encode_raw(r));
     h.finalize().into()
+}
+
+/// The encoding of `r`, without [`DOMAIN`].
+#[must_use]
+pub fn encode(r: &Recorded) -> Vec<u8> {
+    let ip = r.event.ip.map(|ip| ip.to_string());
+    encode_raw(&raw(r, ip.as_deref()))
+}
+
+/// The hash of `r`.
+#[must_use]
+pub fn hash(r: &Recorded) -> Hash {
+    let ip = r.event.ip.map(|ip| ip.to_string());
+    hash_raw(&raw(r, ip.as_deref()))
+}
+
+fn raw<'a>(r: &'a Recorded, ip: Option<&'a str>) -> Raw<'a> {
+    let e = &r.event;
+    Raw {
+        tenant: e.tenant.as_deref().unwrap_or(""),
+        seq: r.seq,
+        at_us: micros(r.at),
+        actor: &e.actor,
+        actor_kind: e.actor_kind.as_str(),
+        subject: e.subject.as_deref(),
+        action: &e.action,
+        resource_type: &e.resource_type,
+        resource_id: e.resource_id.as_deref(),
+        purpose: e.purpose.as_deref(),
+        outcome: e.outcome.as_str(),
+        ip,
+        user_agent: e.user_agent.as_deref(),
+        request_id: e.request_id.as_deref(),
+        prev: &r.prev,
+    }
 }
 
 fn text(out: &mut Vec<u8>, s: Option<&str>) {

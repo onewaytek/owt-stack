@@ -45,6 +45,7 @@ pub async fn run(pool: &PgPool, cmd: AuditCommand) -> anyhow::Result<()> {
             for t in &tenants {
                 events += crate::verify(pool, t).await?.events;
             }
+            let from_store = manifest.is_some();
             let manifest = match manifest {
                 Some(path) => {
                     let bytes = std::fs::read(&path)
@@ -56,7 +57,12 @@ pub async fn run(pool: &PgPool, cmd: AuditCommand) -> anyhow::Result<()> {
             let anchored = match &manifest {
                 Some(m) => {
                     crate::verify_anchor(pool, m).await?;
-                    format!("; {} anchored heads match", m.heads.len())
+                    let from = if from_store {
+                        "the given manifest"
+                    } else {
+                        "the database's latest manifest (pass --manifest with the store's copy for an independent check)"
+                    };
+                    format!("; {} heads anchored by {from} match", m.heads.len())
                 }
                 None => "; nothing anchored yet".into(),
             };

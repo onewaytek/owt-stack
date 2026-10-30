@@ -9,13 +9,17 @@
 //! * **Chains.** Every tenant has its own chain (events with no tenant share the
 //!   chain `""`). An event's `seq` is one more than the previous event's, its `prev`
 //!   is the previous event's hash (32 zero bytes for the first), and its `hash` is
-//!   SHA-256 over a canonical encoding of every other field ([`canonical`]). Appends
-//!   to one chain are serialized by a transaction-scoped advisory lock; chains of
-//!   different tenants never wait on each other.
+//!   SHA-256 over a canonical encoding of every other field ([`canonical`]). The
+//!   database assigns all of these as the row is inserted, whoever inserts it, so a
+//!   role that may only insert cannot choose an event's place or fake its links.
+//!   Appends to one chain are serialized by a transaction-scoped advisory lock;
+//!   chains of different tenants never wait on each other.
 //! * **Append-only.** Triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on the
-//!   tables, from any role. The app's role is granted `INSERT` and `SELECT` only (see
-//!   the README), so it cannot drop them; the table's owner could, which is what
-//!   anchoring is for.
+//!   tables while they stand. The app's role is granted `INSERT` and `SELECT` only
+//!   (see the README), so it cannot drop or disable them; the tables' owner could,
+//!   which is what anchoring is for. A role that may insert can still record false
+//!   events, as it can make false changes: the log shows what was recorded and that
+//!   nothing recorded was altered since.
 //! * **Verification.** [`verify`] walks a chain, recomputing every hash and link;
 //!   any edited, removed or reordered event breaks it at that event.
 //! * **Anchoring.** [`anchor::anchor`] writes a manifest of every chain's head to an
@@ -43,7 +47,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sqlx::{PgConnection, PgPool};
 
 pub use migrations::{LEDGER, LOCK_ID, migrate, migrator};
-pub use verify::{Broken, Head, Verified, VerifyError, heads, verify, verify_anchor};
+pub use verify::{Broken, Head, Verified, VerifyError, heads, verify, verify_anchor, verify_since};
 
 /// The hash of an event, or of the nothing before a chain's first event (all zeros).
 pub type Hash = [u8; 32];
@@ -76,16 +80,6 @@ impl ActorKind {
             Self::Anonymous => "anonymous",
         }
     }
-
-    fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "account" => Self::Account,
-            "service" => Self::Service,
-            "system" => Self::System,
-            "anonymous" => Self::Anonymous,
-            _ => return None,
-        })
-    }
 }
 
 /// How it went.
@@ -109,15 +103,6 @@ impl Outcome {
             Self::Failure => "failure",
             Self::Denied => "denied",
         }
-    }
-
-    fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "success" => Self::Success,
-            "failure" => Self::Failure,
-            "denied" => Self::Denied,
-            _ => return None,
-        })
     }
 }
 
@@ -290,6 +275,10 @@ pub enum RecordError {
     /// The database.
     #[error("recording an audit event: {0}")]
     Db(#[from] sqlx::Error),
+    /// The database hashed the event differently from the crate: the migration's
+    /// trigger and this build disagree. Nothing should be recorded with it.
+    #[error("the database's audit hash differs from the crate's")]
+    Mismatch,
 }
 
 /// An event as recorded: its place in its chain.
@@ -343,52 +332,27 @@ impl Audit {
     }
 }
 
-/// Append `event` to its tenant's chain on `conn`, which must be in a transaction:
-/// the event then commits, or not, with the change it records. The tenant's chain is
-/// locked from here until that transaction ends, so record late in it.
+/// Append `event` to its tenant's chain on `conn`. Inside a transaction (`&mut *tx`)
+/// the event commits, or not, with the change it records, and the tenant's chain is
+/// locked from here until that transaction ends, so record late in it. The
+/// transaction must be READ COMMITTED (Postgres's default); the database refuses
+/// others.
+///
+/// The database assigns the event's place, time and hash; this checks that its hash
+/// is the one the crate's encoding gives, and fails ([`RecordError::Mismatch`])
+/// otherwise.
 pub async fn record_in(conn: &mut PgConnection, event: &Event) -> Result<Recorded, RecordError> {
     event.check()?;
     let tenant = event.tenant.as_deref().unwrap_or("");
-    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
-        .bind(CHAIN_LOCK_CLASS)
-        .bind(tenant)
-        .execute(&mut *conn)
-        .await?;
-    let (last_seq, last_hash, now_us): (Option<i64>, Option<Vec<u8>>, i64) = sqlx::query_as(
-        "SELECT e.seq, e.hash,
-                floor(extract(epoch FROM clock_timestamp()) * 1000000)::int8
-         FROM (SELECT 1) one
-         LEFT JOIN LATERAL (SELECT seq, hash FROM owt_audit_events
-                            WHERE tenant = $1 ORDER BY seq DESC LIMIT 1) e ON true",
-    )
-    .bind(tenant)
-    .fetch_one(&mut *conn)
-    .await?;
-    let prev = match last_hash {
-        Some(h) => to_hash(&h).ok_or_else(|| sqlx::Error::Decode("a hash is 32 bytes".into()))?,
-        None => GENESIS,
-    };
-    let seq = last_seq.unwrap_or(0) + 1;
-    let at = from_micros(now_us);
-    let mut recorded = Recorded {
-        event: event.clone(),
-        seq,
-        at,
-        prev,
-        hash: GENESIS,
-    };
-    recorded.hash = canonical::hash(&recorded);
-    let e = &recorded.event;
-    sqlx::query(
+    let e = event;
+    let (seq, at_us, prev, hash): (i64, i64, Vec<u8>, Vec<u8>) = sqlx::query_as(
         "INSERT INTO owt_audit_events
-             (tenant, seq, at, actor, actor_kind, subject, action, resource_type, resource_id,
-              purpose, outcome, ip, user_agent, request_id, prev, hash)
-         VALUES ($1, $2, timestamptz 'epoch' + $3 * interval '1 microsecond', $4, $5, $6, $7,
-                 $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+             (tenant, actor, actor_kind, subject, action, resource_type, resource_id,
+              purpose, outcome, ip, user_agent, request_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING seq, (extract(epoch FROM at) * 1000000)::int8, prev, hash",
     )
     .bind(tenant)
-    .bind(seq)
-    .bind(now_us)
     .bind(&e.actor)
     .bind(e.actor_kind.as_str())
     .bind(&e.subject)
@@ -400,16 +364,25 @@ pub async fn record_in(conn: &mut PgConnection, event: &Event) -> Result<Recorde
     .bind(e.ip.map(|ip| ip.to_string()))
     .bind(&e.user_agent)
     .bind(&e.request_id)
-    .bind(&recorded.prev[..])
-    .bind(&recorded.hash[..])
-    .execute(&mut *conn)
+    .fetch_one(&mut *conn)
     .await?;
+    let decode = || sqlx::Error::Decode("an audit hash is 32 bytes".into());
+    let recorded = Recorded {
+        event: event.clone(),
+        seq,
+        at: from_micros(at_us),
+        prev: to_hash(&prev).ok_or_else(decode)?,
+        hash: to_hash(&hash).ok_or_else(decode)?,
+    };
+    if recorded.computed_hash() != recorded.hash {
+        return Err(RecordError::Mismatch);
+    }
     Ok(recorded)
 }
 
-/// The first key of the advisory locks that serialize each chain's appends (the
-/// second is the tenant's `hashtext`); two tenants whose hashes collide merely
-/// share a lock.
+/// The first key of the advisory locks that serialize each chain's appends, taken by
+/// the database as it inserts (the second is the tenant's `hashtext`); two tenants
+/// whose hashes collide merely share a lock.
 pub const CHAIN_LOCK_CLASS: i32 = 0x6f77_7461;
 
 fn to_hash(bytes: &[u8]) -> Option<Hash> {

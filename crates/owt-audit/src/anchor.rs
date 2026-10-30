@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use crate::{Hash, Head, heads, micros};
+use crate::{Hash, Head, micros};
 
 /// The manifest's format.
 pub const FORMAT: &str = "owt-audit/manifest/v1";
@@ -38,9 +38,13 @@ pub struct Manifest {
 
 impl Manifest {
     /// The bytes stored and hashed: JSON, fields in declaration order.
+    ///
+    /// # Panics
+    ///
+    /// Never: a manifest is strings and integers, which always serialize.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
+        serde_json::to_vec(self).expect("a manifest of strings and integers serializes")
     }
 
     /// Read a manifest from its bytes.
@@ -106,19 +110,58 @@ pub struct Anchored {
     pub receipt: String,
 }
 
-/// Anchor every chain's head now: build the manifest, store it with `to`, then record
-/// it. A failed store records nothing; the next run anchors the heads as they are
-/// then.
+/// The advisory lock [`anchor`] holds, so concurrent runs do not fork the anchors.
+pub const ANCHOR_LOCK: i64 = 0x6f77_745f_616e_6368;
+
+/// Anchor every chain's head now. Each chain is verified first, from the head the
+/// previous manifest anchored (from its first event when there is none), so a
+/// broken chain is never anchored; then the manifest is stored with `to`, and
+/// recorded. Runs are serialized by [`ANCHOR_LOCK`]. A failed verification or store
+/// records nothing.
+///
+/// Run it as a role that may insert into `owt_audit_anchors` (see the README); the
+/// app's role needs only `SELECT` on it.
 pub async fn anchor<A: Anchor>(pool: &PgPool, to: &A) -> anyhow::Result<Anchored> {
-    let prev: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT digest FROM owt_audit_anchors ORDER BY id DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ANCHOR_LOCK)
+        .execute(&mut *tx)
+        .await?;
+    let previous = latest_in(&mut tx).await?;
+    let prev_heads: std::collections::HashMap<String, (i64, Hash)> = previous
+        .as_ref()
+        .map(|(m, _)| {
+            m.heads
+                .iter()
+                .filter_map(|h| Some((h.tenant.clone(), (h.seq, unhex(&h.hash)?))))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut heads = Vec::new();
+    for head in crate::heads(pool).await? {
+        let (seq, hash) = prev_heads
+            .get(&head.tenant)
+            .copied()
+            .unwrap_or((0, crate::GENESIS));
+        let verified = crate::verify::verify_since(pool, &head.tenant, seq, &hash).await?;
+        // Events recorded since `heads` read; the walk's own end is the head.
+        heads.push(verified.head.unwrap_or(crate::Head {
+            tenant: head.tenant.clone(),
+            seq,
+            hash: crate::hex(&hash),
+        }));
+    }
+    // A chain the previous manifest anchored must still be there.
+    for (tenant, (seq, _)) in &prev_heads {
+        if !heads.iter().any(|h| &h.tenant == tenant) && *seq > 0 {
+            anyhow::bail!("the audit chain {tenant:?} anchored at event {seq} is gone");
+        }
+    }
     let manifest = Manifest {
         format: FORMAT.into(),
         at_us: micros(SystemTime::now()),
-        prev: prev.map(|d| crate::hex(&d)),
-        heads: heads(pool).await?,
+        prev: previous.map(|(_, digest)| crate::hex(&digest)),
+        heads,
     };
     let bytes = manifest.to_bytes();
     let digest = manifest.digest();
@@ -131,8 +174,9 @@ pub async fn anchor<A: Anchor>(pool: &PgPool, to: &A) -> anyhow::Result<Anchored
     .bind(&digest[..])
     .bind(to.name())
     .bind(&receipt)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     tracing::info!(
         id,
         chains = manifest.heads.len(),
@@ -146,12 +190,42 @@ pub async fn anchor<A: Anchor>(pool: &PgPool, to: &A) -> anyhow::Result<Anchored
     })
 }
 
-/// The latest manifest recorded in the database. Verify against the copy in the
-/// store for a check the database's owner cannot defeat.
+/// The latest manifest recorded in the database, checked against its recorded
+/// digest and format. The database's copy is only as trustworthy as the roles that
+/// may insert into `owt_audit_anchors`: for a check the database's owner cannot
+/// defeat, verify against the copy in the anchor store.
 pub async fn latest(pool: &PgPool) -> anyhow::Result<Option<Manifest>> {
-    let bytes: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT manifest FROM owt_audit_anchors ORDER BY id DESC LIMIT 1")
-            .fetch_optional(pool)
+    let mut conn = pool.acquire().await?;
+    Ok(latest_in(&mut conn).await?.map(|(m, _)| m))
+}
+
+async fn latest_in(conn: &mut sqlx::PgConnection) -> anyhow::Result<Option<(Manifest, Hash)>> {
+    let row: Option<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT manifest, digest FROM owt_audit_anchors ORDER BY id DESC LIMIT 1")
+            .fetch_optional(&mut *conn)
             .await?;
-    Ok(bytes.map(|b| Manifest::from_bytes(&b)).transpose()?)
+    let Some((bytes, digest)) = row else {
+        return Ok(None);
+    };
+    let manifest = Manifest::from_bytes(&bytes)?;
+    let stored: Hash = digest
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("an anchor digest is 32 bytes"))?;
+    anyhow::ensure!(
+        manifest.format == FORMAT && manifest.digest() == stored,
+        "the latest audit anchor's manifest does not match its digest"
+    );
+    Ok(Some((manifest, stored)))
+}
+
+fn unhex(s: &str) -> Option<Hash> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
 }

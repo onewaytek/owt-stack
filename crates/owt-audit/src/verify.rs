@@ -4,7 +4,7 @@ use futures::TryStreamExt;
 use sqlx::PgPool;
 
 use crate::anchor::Manifest;
-use crate::{ActorKind, Event, GENESIS, Outcome, Recorded, from_micros, to_hash};
+use crate::{GENESIS, Hash};
 
 /// The last event of a chain.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,16 +55,6 @@ pub enum Broken {
         /// The event.
         seq: i64,
     },
-    /// An event holds a value no recorded event can.
-    #[error("chain {tenant:?}: event {seq} has an unreadable `{field}`")]
-    Unreadable {
-        /// The chain.
-        tenant: String,
-        /// The event.
-        seq: i64,
-        /// The field.
-        field: &'static str,
-    },
     /// An anchored head is not in the chain, or the chain's event there differs.
     #[error("chain {tenant:?}: event {seq} is not the event anchored")]
     Anchor {
@@ -84,6 +74,9 @@ pub enum VerifyError {
     /// The database.
     #[error("reading the audit chain: {0}")]
     Db(#[from] sqlx::Error),
+    /// A manifest that is not one, or whose recorded digest does not match it.
+    #[error("audit manifest: {0}")]
+    Manifest(String),
 }
 
 type Row = (
@@ -108,20 +101,57 @@ type Row = (
 /// Walk `tenant`'s chain (`""` for events with no tenant) from its first event,
 /// recomputing each hash and link.
 pub async fn verify(pool: &PgPool, tenant: &str) -> Result<Verified, VerifyError> {
+    walk(pool, tenant, 0, GENESIS).await
+}
+
+/// Walk `tenant`'s chain from the event after `seq`, whose hash must be `hash` (an
+/// anchored head): the events since an anchor, without re-reading those before it.
+pub async fn verify_since(
+    pool: &PgPool,
+    tenant: &str,
+    seq: i64,
+    hash: &Hash,
+) -> Result<Verified, VerifyError> {
+    if seq > 0 {
+        let at: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT hash FROM owt_audit_events WHERE tenant = $1 AND seq = $2")
+                .bind(tenant)
+                .bind(seq)
+                .fetch_optional(pool)
+                .await?;
+        if at.as_deref() != Some(&hash[..]) {
+            return Err(Broken::Anchor {
+                tenant: tenant.into(),
+                seq,
+            }
+            .into());
+        }
+    }
+    walk(pool, tenant, seq, *hash).await
+}
+
+async fn walk(
+    pool: &PgPool,
+    tenant: &str,
+    after: i64,
+    start: Hash,
+) -> Result<Verified, VerifyError> {
     let mut rows = sqlx::query_as::<_, Row>(
         "SELECT tenant, seq, (extract(epoch FROM at) * 1000000)::int8, actor, actor_kind,
                 subject, action, resource_type, resource_id, purpose, outcome, ip, user_agent,
                 request_id, prev, hash
-         FROM owt_audit_events WHERE tenant = $1 ORDER BY seq",
+         FROM owt_audit_events WHERE tenant = $1 AND seq > $2 ORDER BY seq",
     )
     .bind(tenant)
+    .bind(after)
     .fetch(pool);
-    let mut expected = 1_i64;
-    let mut prev = GENESIS;
+    let mut expected = after + 1;
+    let mut prev = start;
     let mut head = None;
     while let Some(row) = rows.try_next().await? {
-        let r = decode(row)?;
-        let seq = r.seq;
+        let seq = row.1;
+        let broken =
+            |kind: fn(String, i64) -> Broken| -> VerifyError { kind(tenant.into(), seq).into() };
         if seq != expected {
             return Err(Broken::Gap {
                 tenant: tenant.into(),
@@ -130,30 +160,39 @@ pub async fn verify(pool: &PgPool, tenant: &str) -> Result<Verified, VerifyError
             }
             .into());
         }
-        if r.prev != prev {
-            return Err(Broken::Link {
-                tenant: tenant.into(),
-                seq,
-            }
-            .into());
+        if row.14 != prev {
+            return Err(broken(|tenant, seq| Broken::Link { tenant, seq }));
         }
-        if r.computed_hash() != r.hash {
-            return Err(Broken::Hash {
-                tenant: tenant.into(),
-                seq,
-            }
-            .into());
+        let computed = crate::canonical::hash_raw(&crate::canonical::Raw {
+            tenant: &row.0,
+            seq,
+            at_us: row.2,
+            actor: &row.3,
+            actor_kind: &row.4,
+            subject: row.5.as_deref(),
+            action: &row.6,
+            resource_type: &row.7,
+            resource_id: row.8.as_deref(),
+            purpose: row.9.as_deref(),
+            outcome: &row.10,
+            ip: row.11.as_deref(),
+            user_agent: row.12.as_deref(),
+            request_id: row.13.as_deref(),
+            prev: &row.14,
+        });
+        if row.15 != computed {
+            return Err(broken(|tenant, seq| Broken::Hash { tenant, seq }));
         }
-        prev = r.hash;
+        prev = computed;
         expected += 1;
         head = Some(Head {
             tenant: tenant.into(),
             seq,
-            hash: crate::hex(&r.hash),
+            hash: crate::hex(&computed),
         });
     }
     Ok(Verified {
-        events: u64::try_from(expected - 1).unwrap_or(0),
+        events: u64::try_from(expected - 1 - after).unwrap_or(0),
         head,
     })
 }
@@ -188,8 +227,12 @@ pub async fn heads(pool: &PgPool) -> sqlx::Result<Vec<Head>> {
 }
 
 /// Check that every head `manifest` anchored is still in its chain, unchanged. With
-/// [`verify`] of each chain, this shows the chains were only appended to since.
+/// [`verify`] of each chain, this shows the chains were only appended to since. A
+/// manifest of another format is refused.
 pub async fn verify_anchor(pool: &PgPool, manifest: &Manifest) -> Result<(), VerifyError> {
+    if manifest.format != crate::anchor::FORMAT {
+        return Err(VerifyError::Manifest("not an owt-audit manifest".into()));
+    }
     for head in &manifest.heads {
         let hash: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT hash FROM owt_audit_events WHERE tenant = $1 AND seq = $2")
@@ -206,52 +249,4 @@ pub async fn verify_anchor(pool: &PgPool, manifest: &Manifest) -> Result<(), Ver
         }
     }
     Ok(())
-}
-
-fn decode(row: Row) -> Result<Recorded, Broken> {
-    let (tenant, seq, at, actor, kind, subject, action, resource_type, resource_id, purpose) = (
-        row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
-    );
-    let (outcome, ip, user_agent, request_id, prev, hash) =
-        (row.10, row.11, row.12, row.13, row.14, row.15);
-    let bad = |field| Broken::Unreadable {
-        tenant: tenant.clone(),
-        seq,
-        field,
-    };
-    let actor_kind = ActorKind::parse(&kind).ok_or_else(|| bad("actor_kind"))?;
-    let outcome = Outcome::parse(&outcome).ok_or_else(|| bad("outcome"))?;
-    let ip = match ip {
-        Some(ip) => {
-            let parsed: std::net::IpAddr = ip.parse().map_err(|_| bad("ip"))?;
-            // Stored as Rust displays it, or the hash would not cover what is shown.
-            if parsed.to_string() != ip {
-                return Err(bad("ip"));
-            }
-            Some(parsed)
-        }
-        None => None,
-    };
-    let prev = to_hash(&prev).ok_or_else(|| bad("prev"))?;
-    let hash = to_hash(&hash).ok_or_else(|| bad("hash"))?;
-    Ok(Recorded {
-        event: Event {
-            actor,
-            actor_kind,
-            tenant: (!tenant.is_empty()).then(|| tenant.clone()),
-            subject,
-            action,
-            resource_type,
-            resource_id,
-            purpose,
-            outcome,
-            ip,
-            user_agent,
-            request_id,
-        },
-        seq,
-        at: from_micros(at),
-        prev,
-        hash,
-    })
 }
