@@ -312,24 +312,51 @@ fn line_hash(line: &str) -> anyhow::Result<[u8; 20]> {
     })
 }
 
-/// The hashes in `reader`, one per line, a line at a time (a corpus can be gigabytes: no
-/// line is kept once parsed). `reserve` is a guess at how many, from the file's size.
-fn read_hashes(reader: impl BufRead, reserve: usize) -> anyhow::Result<Vec<[u8; 20]>> {
-    let mut hashes = Vec::with_capacity(reserve);
-    let mut line = String::new();
+/// The longest line read: a hash is 40 digits and `:count` a dozen more. A longer one
+/// is not a corpus, and is refused before it is held (a file with no newlines would
+/// otherwise be read whole into one line).
+const MAX_LINE: usize = 128;
+
+/// Call `f(number, line)` for each non-blank line of `reader`, trimmed, holding one line
+/// at a time.
+fn each_line(
+    reader: impl BufRead,
+    mut f: impl FnMut(usize, &str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let mut reader = reader;
+    let mut line = String::new();
     let mut number = 0usize;
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
+        // One byte more than the longest line and its newline: no newline in them means
+        // the line is too long.
+        let read = (&mut reader)
+            .take(MAX_LINE as u64 + 2)
+            .read_line(&mut line)?;
+        if read == 0 {
+            return Ok(());
         }
         number += 1;
+        anyhow::ensure!(
+            line.ends_with('\n') || read <= MAX_LINE,
+            "line {number} is longer than {MAX_LINE} bytes: this is not a file of SHA-1 hashes, \
+             one per line"
+        );
         let text = line.trim();
         if !text.is_empty() {
-            hashes.push(line_hash(text).with_context(|| format!("line {number}"))?);
+            f(number, text)?;
         }
     }
+}
+
+/// The hashes in `reader`, one per line. `reserve` is a guess at how many, from the
+/// file's size.
+fn read_hashes(reader: impl BufRead, reserve: usize) -> anyhow::Result<Vec<[u8; 20]>> {
+    let mut hashes = Vec::with_capacity(reserve);
+    each_line(reader, |number, text| {
+        hashes.push(line_hash(text).with_context(|| format!("line {number}"))?);
+        Ok(())
+    })?;
     Ok(hashes)
 }
 
@@ -375,10 +402,10 @@ impl SortedHashes {
         let path = path.as_ref();
         let file =
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // A line is 40 hex digits and a newline at least; with `:count` it is longer.
+        // A line is 40 hex digits and a newline at least: 41 bytes (more with `:count`).
         let reserve = file
             .metadata()
-            .map_or(0, |m| usize::try_from(m.len() / 46).unwrap_or(0));
+            .map_or(0, |m| usize::try_from(m.len() / 41).unwrap_or(0));
         let mut hashes = read_hashes(std::io::BufReader::new(file), reserve)
             .with_context(|| format!("reading {}", path.display()))?;
         hashes.sort_unstable();
@@ -539,21 +566,17 @@ impl Bloom {
                 .with_context(|| format!("opening {}", path.display()))
         };
         let mut entries = 0usize;
-        for line in open()?.lines() {
-            if !line?.trim().is_empty() {
-                entries += 1;
-            }
-        }
+        each_line(open()?, |_, _| {
+            entries += 1;
+            Ok(())
+        })?;
         let mut seed = [0u8; 8];
         getrandom::fill(&mut seed).map_err(|e| anyhow::anyhow!("reading random bytes: {e}"))?;
         let mut bloom = Self::empty(entries, fp_rate, u64::from_le_bytes(seed))?;
-        for line in open()?.lines() {
-            let line = line?;
-            let line = line.trim();
-            if !line.is_empty() {
-                bloom.insert(&line_hash(line)?);
-            }
-        }
+        each_line(open()?, |number, text| {
+            bloom.insert(&line_hash(text).with_context(|| format!("line {number}"))?);
+            Ok(())
+        })?;
         Ok(bloom)
     }
 
@@ -716,6 +739,11 @@ mod tests {
             e.contains("line 2") && e.contains("40 hexadecimal digits"),
             "{e}"
         );
+        // A file with no newlines is refused at 128 bytes, not read whole.
+        std::fs::write(&path, "a".repeat(10_000)).unwrap();
+        let e = format!("{:#}", SortedHashes::open(&path).unwrap_err());
+        assert!(e.contains("longer than 128 bytes"), "{e}");
+        assert!(Bloom::build_from_file(&path, 1e-6).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

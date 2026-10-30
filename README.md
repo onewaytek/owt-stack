@@ -791,9 +791,11 @@ if !throttle.sign_in(ip, account) {
 }
 // Argon2id on the blocking pool, a bounded number at once. An unknown account
 // (`None`) costs a real check too, so timing does not tell which accounts exist.
-if password::verify_or_decoy(given, stored_hash).await {
-    // A hash made with weaker parameters than today's: store a fresh one.
-    if stored_hash.is_some_and(password::needs_rehash) {
+let checked = password::check_or_decoy(given, stored_hash).await;
+if checked.matched() {
+    // A hash made with weaker parameters than today's, or of the password as typed
+    // before passwords were normalized (`Check::MatchRaw`): store a fresh one.
+    if checked == password::Check::MatchRaw || stored_hash.is_some_and(password::needs_rehash) {
         let _new_hash = password::hash(given).await?;
     }
     // Then `session.cycle_id()` before storing who signed in: a session id fixed
