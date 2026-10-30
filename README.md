@@ -3888,6 +3888,30 @@ App-specific recipes go below the template's `---- app recipes ----` line. The
 compose ports and database name come from the app's `.env` (`POSTGRES_PORT`,
 `POSTGRES_DB`, ...), so two apps' stacks can run side by side.
 
+**Fast tests:** a debug build runs password hashing and the ciphers 20 to 50 times
+slower than a release one, and a suite that signs users in or seals a cookie spends
+most of its time there. This repository's root `Cargo.toml` builds the cryptography
+dependencies at `opt-level = 3` in the dev profile (which `cargo test` inherits), and
+the workspace's own crates stay unoptimised, so recompiling after an edit stays quick.
+An app adds the same to its root `Cargo.toml`, for the crates its `Cargo.lock` has
+(cargo warns about an override for a package that is absent; `cargo tree -i <crate>`
+shows whether one is):
+
+```toml
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+# likewise: blake2, password-hash, aes, aes-gcm, aead, ghash, polyval, universal-hash,
+# sha1, md-5, hmac, hkdf, chacha20, ctr, cipher, inout, digest, block-buffer,
+# crypto-common, cpufeatures, subtle, base64ct, curve25519-dalek, ed25519-dalek, rsa,
+# num-bigint-dig, crypto-bigint, pbkdf2, p256, p384, elliptic-curve, primeorder, ecdsa,
+# ff, group, fiat-crypto
+```
+
+It changes nothing about the lockfile, `cargo audit` or sccache (the optimised
+artifacts are cached under their own key).
+
 **CI:** call the reusable check workflow with the app's gate. It runs on ARC, with
 Postgres and Redis as services, installs `just` and `cargo-audit` (and `sqlx-cli`
 for an app with a `.sqlx/` or `migrations/`), migrates, then runs `check-command`.
