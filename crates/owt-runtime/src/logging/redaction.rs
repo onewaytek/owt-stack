@@ -180,13 +180,16 @@ impl Redactor {
         if !name.contains('.') {
             return self.judge(&whole);
         }
-        // A dotted name is judged segment by segment, skipping the segments the app
-        // allows (`user.customer_name` with `customer_name` allowed); any other
-        // sensitive segment (`otel.secret`, `user.passwordHash`) denies it.
-        name.split('.').any(|s| {
-            let s = normalize(s);
-            !self.allow.contains(&*s) && self.judge(&s)
-        })
+        // A dotted name is judged whole (`private.key`, `date.of.birth`) unless the app
+        // allows one of its segments, and segment by segment, skipping allowed ones
+        // (`user.customer_name` with `customer_name` allowed); any other sensitive
+        // segment (`otel.secret`, `user.passwordHash`) denies it.
+        let segments: Vec<Cow<'_, str>> = name.split('.').map(normalize).collect();
+        let any_allowed = segments.iter().any(|s| self.allow.contains(&**s));
+        (!any_allowed && self.judge(&whole))
+            || segments
+                .iter()
+                .any(|s| !self.allow.contains(&**s) && self.judge(s))
     }
 
     /// Judges a normalized name against the rules.

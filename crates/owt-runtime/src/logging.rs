@@ -383,6 +383,10 @@ mod tests {
             "otel.email",
             "code.password",
             "code.email",
+            "private.key",
+            "x.api.key",
+            "x.access.key",
+            "date.of.birth",
         ] {
             assert!(r.denies(name), "{name} should be denied");
         }
@@ -412,6 +416,7 @@ mod tests {
             "host.name",
             "db.name",
             "content_type",
+            "x.cache.key",
         ] {
             assert!(!r.denies(name), "{name} should pass");
         }
