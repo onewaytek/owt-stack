@@ -119,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         default_filter: "myapp=info,tower_http=info".into(),
         json: !env::flag("DEBUG", false)?,
         otel_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        ..logging::Options::default()
     });
     let pool = PoolConfig { max: env::parse_or("DB_POOL_MAX", 10)?, ..PoolConfig::default() }
         .connect(&env::required("DATABASE_URL")?)
@@ -558,6 +559,88 @@ the handler and write `<script nonce="{{ nonce }}">`.
   `127.0.0.1:9464` on a workstation, and in a pod, where the scraper reaches the pod's
   address, `metrics::spawn_listener_on_all_interfaces(9464, sample)`, which says what it
   does. `metrics::serve` stays for an app that owns its listener.
+
+### Keeping sensitive values out of logs
+
+`logging::init` redacts by field name: a `tracing` event or span field whose name
+matches the denylist is logged as `[redacted]`, in the JSON and the text output and, with
+feature `otel`, in the span, event and link attributes exported over OTLP. The value is
+replaced before it is formatted, so the original never reaches the writer or the
+exporter. This includes fields added later with `span.record(..)`.
+
+A name is normalized before it is compared, so `passwordHash`, `Set-Cookie` and
+`access.token` are judged as `password_hash`, `set_cookie` and `access_token`, and each
+segment of a dotted name is judged on its own (`password.value`). Redacted by default:
+
+* the names `password`, `passwd`, `pwd`, `secret`, `token`, `access_token`,
+  `refresh_token`, `id_token`, `authorization`, `cookie`, `set_cookie`, `api_key`,
+  `apikey`, `private_key`, `ssn`, `dob`, `date_of_birth`, `email`, `phone`, `address`,
+  `name`, `first_name`, `last_name`, `diagnosis`, `note`, `notes`, `content`,
+  `transcript`, `mrn` and `patient_name`;
+* a name ending `_secret`, `_token` or `_password`, and one that is or ends in `_` and
+  `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key` or
+  `encryption_key` (`cache_key` and `idempotency_key` are not);
+* a name starting `ssn` or `authorization`, and a name with a `_`-separated word
+  (trailing digits ignored) `password`, `passwd`, `pwd`, `secret`, `token`,
+  `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`, `phone`, `address`,
+  `name`, `diagnosis`, `note`, `notes`, `transcript` or `mrn`, so `user_email`,
+  `phone_number` and `password1` are caught.
+
+The word rule catches operational names too (`bind_address`, `file_name`), so a name can be
+allowed. The defaults never redact the attributes the tracing layers write, by exact
+name (`code.filepath`, `code.lineno`, `code.module.name`, `otel.name`, `otel.kind`,
+`otel.status_code`, `thread.id`, `thread.name`, ...), nor `target`, `level`, `message`,
+`server.address`, `host.name`, `db.name`, `service.name`, `token_count` and
+`max_tokens`; any other name under `code.` or `otel.` is judged like the rest, so
+`otel.secret` is redacted. `Options::redact_allow` lists names that are never
+redacted and wins over every other rule; a dotted name is judged segment by segment,
+skipping allowed segments. `Options::redact_fields` adds names to redact,
+and wins over the defaults' allowlist. `redact_defaults: false` drops the defaults (and
+every rule above) so that exactly `redact_fields` applies.
+
+`logging::Sensitive<T>` wraps a value whose `Debug` and `Display` print `[redacted]`,
+also inside a derived `Debug`. It has no `Deref`: `expose()` and `into_inner()` are the
+only reads, so each is visible in review. `Deserialize` is transparent, so a form or
+configuration struct can hold one. There is no `Serialize`: storing `"[redacted]"` in a
+cache or a queue would corrupt the value silently, so persisting one is a compile
+error and the code that stores it calls `expose()`.
+
+```rust,no_run
+use owt_runtime::logging::{self, Sensitive};
+
+# #[derive(serde::Deserialize)]
+struct Login {
+    email: String,
+    password: Sensitive<String>,
+}
+
+# fn run(login: Login) {
+let _logging = logging::init(&logging::Options {
+    service: "myapp",
+    // Redacted in addition to the defaults.
+    redact_fields: vec!["nickname".into()],
+    ..logging::Options::default()
+});
+// `email` is denied by name; `credential` is not, so `Sensitive` keeps the password out.
+tracing::info!(email = %login.email, credential = ?login.password, "login attempt");
+let password: &str = login.password.expose();
+# let _ = password;
+# }
+```
+
+Redaction is a safety net, not a policy. An app must still not log PHI or credentials
+on purpose, and the list is a floor: a field named for something it does not know is
+logged. Only names are judged:
+
+* A value inside a message, as in `info!("saw {}", name)`, is not a field and is
+  logged as it is. A bridged `log` record is only a message, so it is logged as it is
+  too.
+* With feature `otel`, span names, event names (a tracing event's message) and status
+  descriptions are exported as written, like a message, so they must never carry data.
+* A `Debug` or `Display` value is not inspected. `info!(req = ?login)` prints every
+  member of `login`, because the field is named `req`; wrap the members in `Sensitive`.
+  An error's message prints whatever it contains (a unique violation names the
+  duplicate value), so log an error's code or kind where data may appear.
 
 ### Handlers, errors and pages
 
