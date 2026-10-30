@@ -2006,6 +2006,26 @@ async fn a_local_identity_is_a_way_in_until_it_is_forgotten() {
     db.drop().await;
 }
 
+/// Wait until a statement is blocked on a lock the transaction with backend `holder`
+/// holds, so that what that transaction then does lands while `task` is in flight.
+async fn wait_blocked_on<T>(pool: &PgPool, holder: i32, task: &tokio::task::JoinHandle<T>) {
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                            WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        )
+        .bind(holder)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting {
+            return;
+        }
+        assert!(!task.is_finished(), "the task never reached the lock");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// A password sign-in under way when password sign-in is turned off does not stand.
 #[tokio::test]
 async fn a_sign_in_in_flight_does_not_outlive_password_sign_in() {
@@ -2029,24 +2049,7 @@ async fn a_sign_in_in_flight_does_not_outlive_password_sign_in() {
         tokio::spawn(
             async move { store::authenticate(&pool, "ada", "correct horse battery").await },
         );
-    loop {
-        let waiting: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-                            WHERE $1 = ANY(pg_blocking_pids(pid)))",
-        )
-        .bind(off_pid)
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
-        if waiting {
-            break;
-        }
-        assert!(
-            !signing_in.is_finished(),
-            "the sign-in never reached the lock"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_blocked_on(&db.pool, off_pid, &signing_in).await;
     off.commit().await.unwrap();
     assert_eq!(signing_in.await.unwrap().unwrap(), None);
     db.drop().await;
@@ -4883,22 +4886,30 @@ async fn a_sign_in_in_flight_does_not_outlive_a_password_change() {
     let replacement = owt_auth::password::hash("a different passphrase")
         .await
         .unwrap();
-    let pool = db.pool.clone();
-    let signing_in =
-        tokio::spawn(
-            async move { store::authenticate(&pool, "ada", "correct horse battery").await },
-        );
-    // The check is under way (Argon2 takes far longer than this); change the
-    // password and sign out everywhere in one statement, as set_password does.
-    tokio::time::sleep(Duration::from_millis(15)).await;
+    // The change is made in a transaction not yet committed: the sign-in reads the
+    // row as it was, checks the old password, and its last statement waits on the
+    // row's lock. Only then does the change commit, as set_password does: the
+    // password and the session epoch in one statement.
+    let mut change = db.pool.begin().await.unwrap();
+    let change_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *change)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE accounts SET password_hash = $1, session_epoch = session_epoch + 1 WHERE id = $2",
     )
     .bind(&replacement)
     .bind(ada.id)
-    .execute(&db.pool)
+    .execute(&mut *change)
     .await
     .unwrap();
+    let pool = db.pool.clone();
+    let signing_in =
+        tokio::spawn(
+            async move { store::authenticate(&pool, "ada", "correct horse battery").await },
+        );
+    wait_blocked_on(&db.pool, change_pid, &signing_in).await;
+    change.commit().await.unwrap();
     assert_eq!(signing_in.await.unwrap().unwrap(), None);
     let now = store::by_id(&db.pool, ada.id).await.unwrap().unwrap();
     assert!(
@@ -4976,13 +4987,22 @@ async fn a_reset_by_staff_beats_a_change_in_flight() {
     let changing = async move {
         store::change_password(&pool, &a, "correct horse battery", "the attackers choice").await
     };
-    let changing = tokio::spawn(changing);
-    tokio::time::sleep(Duration::from_millis(15)).await;
+    // The reset is made in a transaction not yet committed: the change reads the row
+    // as it was, checks the current password, and its last statement waits on the
+    // row's lock. Only then does the reset commit.
+    let mut reset = db.pool.begin().await.unwrap();
+    let reset_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *reset)
+        .await
+        .unwrap();
     assert!(
-        store::set_password(&db.pool, &ada, "staff reset passphrase")
+        store::set_password(&mut *reset, &ada, "staff reset passphrase")
             .await
             .unwrap()
     );
+    let changing = tokio::spawn(changing);
+    wait_blocked_on(&db.pool, reset_pid, &changing).await;
+    reset.commit().await.unwrap();
     let err = changing.await.unwrap().unwrap_err();
     assert_eq!(err.refused(), Some(&owt_accounts::Refused::CurrentPassword));
     for (password, opens) in [
