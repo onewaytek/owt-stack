@@ -2458,9 +2458,8 @@ manifest (so a broken chain is never anchored), builds a manifest of the heads
 (naming the previous manifest's digest), stores it through an `anchor::Anchor`, and
 records it in `owt_audit_anchors`; runs are serialized by an advisory lock. `verify_anchor` then fails for any chain that no longer
 holds an anchored head. `NoAnchor` records manifests in the database only, for
-development and tests; production implements `Anchor` over a bucket under a
-compliance-mode retention lock (an S3-compatible provider for that follows
-`owt-storage`). The database's copy of a manifest is checked against its recorded
+development and tests; production uses `S3ObjectLock` (feature `s3`, below),
+or implements `Anchor` over another write-once store. The database's copy of a manifest is checked against its recorded
 digest, but it is only as trustworthy as the roles that may insert anchors; an
 independent check verifies against the copy in the store
 (`myapp audit verify --manifest m.json`).
@@ -2481,6 +2480,50 @@ jobs.singleton("audit_anchor", Every::new(Duration::from_hours(1)), pool.clone()
     }
 });
 # }
+```
+
+**Anchoring to S3 Object Lock.** With feature `s3`, `anchor::S3ObjectLock` PUTs each
+manifest to a bucket with `x-amz-object-lock-mode: COMPLIANCE` and a
+`retain-until-date` of now plus the retention you configure (seven years covers
+HIPAA's six, with a margin), a `Content-MD5` and `If-None-Match: *`, and returns the
+version id (or `ETag`) as the receipt. Until the date passes, nothing can overwrite
+or delete the object, the bucket owner included. The requests are signed in the
+crate (AWS Signature V4, path-style), so B2 and MinIO work as S3 does. Set the
+bucket up once:
+
+1. Create it with Object Lock enabled (it cannot be turned on later in some stores,
+   and enables versioning). B2: "Object Lock" at creation; MinIO:
+   `mc mb --with-lock <alias>/<bucket>`.
+2. Give the anchoring job a credential of its own, restricted to this bucket and to
+   `s3:PutObject`, `s3:GetObject` and `s3:GetBucketObjectLockConfiguration`. Grant no
+   `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:PutObjectRetention` or
+   `s3:BypassGovernanceRetention`, and no `s3:PutBucketObjectLockConfiguration`.
+   Keep it out of the app's environment and the database host's reach.
+3. Call `verify_bucket()` at start-up; it fails unless Object Lock is enabled.
+
+`fetch(key)` reads a manifest back, to save as the file `audit verify --manifest`
+takes.
+
+```rust,no_run
+use std::time::Duration;
+use owt_audit::anchor::{self, S3Config, S3ObjectLock};
+
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+let store = S3ObjectLock::new(S3Config {
+    endpoint: "https://s3.us-west-004.backblazeb2.com".into(),
+    bucket: "myapp-audit-anchors".into(),
+    region: "us-west-004".into(),
+    access_key: owt_runtime::env::required("MYAPP_ANCHOR_KEY_ID")?,
+    secret_key: owt_runtime::env::required("MYAPP_ANCHOR_KEY")?,
+    retention: Duration::from_hours(7 * 365 * 24),
+})?;
+store.verify_bucket().await?;
+
+let anchored = anchor::anchor(&pool, &store).await?;
+// Later, for `myapp audit verify --manifest m.json`:
+let key = anchored.manifest.key();
+std::fs::write("m.json", store.fetch(&key).await?)?;
+# Ok(()) }
 ```
 
 **Verifying.** `owt_audit::verify(&pool, tenant)` walks a chain and names the first
