@@ -2914,11 +2914,14 @@ assert!(crypt.software_wrapped_keys().await?.is_empty());
 # Ok(()) }
 ```
 
-`reencrypt_column` returns `Reencrypted { moved, failed, complete }`. A row that does
+`reencrypt_column` returns a `Reencrypted` (non-exhaustive) with `moved`, `failed`,
+`no_key` and `complete`. A row that does
 not decrypt (malformed, an older key version shredded, refused) is listed in `failed`
 by id and skipped, and the job stops after 10,000 failures or a pass that moves
 nothing (a trigger or policy swallowing the update, or live writers winning every
-race), so a bad row cannot wedge it. Those two stops return `complete: false`:
+race), so a bad row cannot wedge it. Rows whose scope has no data key cannot be
+visited at all: they are counted in `no_key`, not listed. Those two stops, and any
+`no_key`, return `complete: false`:
 retire an old key version only after a run that is `complete` with nothing in
 `failed`, never on `moved: 0` alone. A KEK id no provider knows aborts the job with an
 error. A data key seals with random 96-bit nonces, which is safe for

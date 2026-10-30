@@ -58,6 +58,45 @@ use zeroize::Zeroizing;
 
 use crate::sealed::{CHUNK, Chunks, Header, MAX_HEADER, PREFIX, TAG};
 
+/// The most [`Storage::get_sealed`] reserves up front from a store's reported size.
+const PREALLOC_MAX: u64 = 64 << 20;
+
+/// A growable plaintext buffer that wipes the allocation it outgrows.
+struct WipingBuffer(Zeroizing<Vec<u8>>);
+
+impl AsyncWrite for WipingBuffer {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.0.capacity() - this.0.len() < data.len() {
+            let want = (this.0.len() + data.len()).max(this.0.capacity().saturating_mul(2));
+            let mut grown = Zeroizing::new(Vec::with_capacity(want));
+            grown.extend_from_slice(&this.0);
+            // The old buffer is zeroized as it drops.
+            this.0 = grown;
+        }
+        this.0.extend_from_slice(data);
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 /// The longest a presigned URL lives.
 pub const MAX_PRESIGN: Duration = Duration::from_hours(1);
 
@@ -412,20 +451,33 @@ impl Storage {
     }
 
     /// The decrypted object at `key`, sealed for `scope`.
+    ///
+    /// The buffer reserves at most 64 MiB from the store's reported size and grows
+    /// beyond that only as authenticated chunks arrive, doubling each time. A growth
+    /// step holds the old buffer, the new one and the chunk in flight at once (about
+    /// three times the plaintext at the step above 64 MiB), and the finished buffer
+    /// can carry up to twice the plaintext in unused capacity. Do not call
+    /// `shrink_to_fit` on the result: that reallocates and frees the plaintext
+    /// unwiped. For an object too large to hold, stream it with
+    /// [`Storage::download_sealed`].
     pub async fn get_sealed(
         &self,
         scope: &str,
         key: &str,
     ) -> Result<Zeroizing<Vec<u8>>, StorageError> {
-        // Sized from the object (the plaintext is smaller than the ciphertext), so the
-        // buffer never grows: a reallocation would free plaintext without zeroizing it.
+        // Sized from the object (the plaintext is smaller than the ciphertext), but the
+        // store's reported size is not trusted: the reservation stops at
+        // `PREALLOC_MAX`, and the buffer grows beyond it only as authenticated chunks
+        // arrive. Each growth moves the plaintext into a new `Zeroizing` buffer and
+        // wipes the old one, so no freed allocation keeps plaintext.
         let size = self
             .head(key)
             .await?
             .ok_or_else(|| StorageError::NotFound(key.into()))?;
-        let mut out = Zeroizing::new(Vec::with_capacity(usize::try_from(size).unwrap_or(0)));
-        self.download_sealed(scope, key, &mut *out).await?;
-        Ok(out)
+        let reserve = usize::try_from(size.min(PREALLOC_MAX)).unwrap_or(0);
+        let mut out = WipingBuffer(Zeroizing::new(Vec::with_capacity(reserve)));
+        self.download_sealed(scope, key, &mut out).await?;
+        Ok(out.0)
     }
 
     /// Decrypt the object at `key`, sealed for `scope`, into `writer` a chunk at a
@@ -674,6 +726,31 @@ fn path(key: &str) -> Result<ObjectPath, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wiping_buffer_grows_geometrically_and_keeps_its_contents() {
+        let mut buf = WipingBuffer(Zeroizing::new(Vec::new()));
+        assert_eq!(buf.0.capacity(), 0);
+        let mut expected = Vec::new();
+        let mut capacity = 0;
+        for n in [1_usize, 7, 100, 0] {
+            let chunk: Vec<u8> = (0..n).map(|i| u8::try_from(i).unwrap() + 1).collect();
+            buf.write_all(&chunk).await.unwrap();
+            expected.extend_from_slice(&chunk);
+            assert_eq!(&buf.0[..], &expected[..]);
+            assert!(buf.0.capacity() >= expected.len());
+            assert!(
+                buf.0.capacity() >= capacity,
+                "capacity never shrinks: {} after {capacity}",
+                buf.0.capacity()
+            );
+            if capacity > 0 && buf.0.capacity() > capacity {
+                assert!(buf.0.capacity() >= 2 * capacity, "growth at least doubles");
+            }
+            capacity = buf.0.capacity();
+        }
+        assert_eq!(expected.len(), 108);
+    }
 
     #[test]
     fn keys_are_checked() {

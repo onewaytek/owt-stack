@@ -6,7 +6,7 @@ use std::sync::Arc;
 use owt_crypt::kek::{KekChain, KekProvider, LocalKek};
 use std::time::Duration;
 
-use owt_crypt::{Column, Crypt, CryptError, Field, Purpose, Reencrypted, Scope};
+use owt_crypt::{Column, Crypt, CryptError, Field, Purpose, Scope};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Executor, PgPool};
 
@@ -168,13 +168,10 @@ async fn rotation_keeps_old_values_readable_and_the_job_moves_them() {
         12,
         "tenant a's rows"
     );
+    let left = crypt.reencrypt_column(&column, 5).await.unwrap();
     assert_eq!(
-        crypt.reencrypt_column(&column, 5).await.unwrap(),
-        Reencrypted {
-            moved: 0,
-            failed: Vec::new(),
-            complete: true
-        },
+        (left.moved, left.failed, left.no_key, left.complete),
+        (0, Vec::new(), 0, true),
         "nothing left"
     );
     let rows: Vec<(i64, String, Vec<u8>)> =
@@ -436,6 +433,42 @@ async fn reencrypt_column_reports_a_bad_row_and_terminates() {
     // A second run finds the same two and still ends.
     let again = crypt.reencrypt_column(&column, 2).await.unwrap();
     assert_eq!((again.moved, again.failed.len()), (0, 2));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn reencrypt_column_counts_rows_whose_scope_has_no_key() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    db.pool
+        .execute("CREATE TABLE notes (id bigint PRIMARY KEY, tenant text, body bytea)")
+        .await
+        .unwrap();
+    let ct = crypt
+        .encrypt(&Field::new("a", "notes", "body", "1"), b"v")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO notes VALUES (1, 'a', $1), (2, 'ghost', '\\x0100000001'::bytea)")
+        .bind(ct)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    crypt.rotate("a", Purpose::Data).await.unwrap();
+    let column = Column {
+        table: "notes",
+        id: "id",
+        column: "body",
+        scope: Scope::Column("tenant"),
+    };
+    let done = crypt.reencrypt_column(&column, 10).await.unwrap();
+    assert_eq!((done.moved, done.no_key, done.complete), (1, 1, false));
+    assert_eq!(done.failed, [] as [String; 0]);
+    let fixed = Column {
+        scope: Scope::Fixed("ghost"),
+        ..column
+    };
+    let done = crypt.reencrypt_column(&fixed, 10).await.unwrap();
+    assert_eq!((done.moved, done.no_key, done.complete), (0, 2, false));
     db.drop().await;
 }
 
