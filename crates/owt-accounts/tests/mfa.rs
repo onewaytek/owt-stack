@@ -374,6 +374,76 @@ async fn a_recovery_code_works_once() {
 }
 
 #[tokio::test]
+async fn two_simultaneous_uses_of_one_recovery_code_give_one_success() {
+    let db = db!();
+    let ada = account(&db, "ada", false).await;
+    let mfa = mfa();
+    let Enrolled { codes, .. } = enroll(&db, &mfa, &ada).await;
+    let throttle = throttle();
+    let (a, b) = (Session::<Data>::default(), Session::<Data>::default());
+    for s in [&a, &b] {
+        mfa.password_sign_in(&db.pool, &throttle, s, IP, "ada", PASSWORD)
+            .await
+            .unwrap();
+    }
+    let code = &codes[0].code;
+    let (ra, rb) = tokio::join!(
+        mfa.challenge(&db.pool, &throttle, &a, IP, Answer::Recovery(code)),
+        mfa.challenge(&db.pool, &throttle, &b, IP, Answer::Recovery(code)),
+    );
+    assert_eq!(
+        usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+        1,
+        "{ra:?} {rb:?}"
+    );
+    assert_eq!(
+        usize::from(a.read(Data::signature).is_some())
+            + usize::from(b.read(Data::signature).is_some()),
+        1
+    );
+    assert_eq!(
+        mfa.factors(&db.pool, ada.id)
+            .await
+            .unwrap()
+            .recovery_codes_left,
+        2
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn two_simultaneous_challenges_with_one_totp_code_give_one_success() {
+    let db = db!();
+    let ada = account(&db, "ada", false).await;
+    let mfa = mfa();
+    let Enrolled { secret, .. } = enroll(&db, &mfa, &ada).await;
+    let throttle = throttle();
+    let (a, b) = (Session::<Data>::default(), Session::<Data>::default());
+    for s in [&a, &b] {
+        mfa.password_sign_in(&db.pool, &throttle, s, IP, "ada", PASSWORD)
+            .await
+            .unwrap();
+    }
+    // A step the confirmation did not use, inside the window.
+    let code = totp::code(&secret, step_now() + 1);
+    let (ra, rb) = tokio::join!(
+        mfa.challenge(&db.pool, &throttle, &a, IP, Answer::Totp(&code)),
+        mfa.challenge(&db.pool, &throttle, &b, IP, Answer::Totp(&code)),
+    );
+    assert_eq!(
+        usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+        1,
+        "{ra:?} {rb:?}"
+    );
+    assert_eq!(
+        usize::from(a.read(Data::signature).is_some())
+            + usize::from(b.read(Data::signature).is_some()),
+        1
+    );
+    db.drop().await;
+}
+
+#[tokio::test]
 async fn attempts_are_throttled_and_the_right_code_is_not_checked_once_spent() {
     let db = db!();
     let ada = account(&db, "ada", false).await;
