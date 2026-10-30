@@ -1,0 +1,61 @@
+name: Image selftest
+
+# Exercises image-check.yml and image.yml against tests/image-sample, which is never
+# shipped. The check runs on every push to this branch; the image jobs run on dispatch
+# and push to ghcr.io/onewaytek/owt-stack under the test tags `selftest` and
+# `selftest-docker`. image.yml builds a tag, so the dispatch input names a throwaway
+# prerelease tag (`v0.0.0-rc.N`) that exists on the commit to test.
+
+on:
+  push:
+    branches: [ci/image-selftest]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: A prerelease tag that exists on the commit to test.
+        type: string
+        default: 0.0.0-rc.1
+
+permissions: {}
+
+jobs:
+  check-crane:
+    permissions: {contents: read}
+    uses: ./.github/workflows/image-check.yml
+    with:
+      bin: image-sample
+      cargo-args: --manifest-path tests/image-sample/Cargo.toml --target-dir target
+      assets-script: ""
+      sccache-redis: ""
+      files: tests/image-sample/files
+  check-docker:
+    permissions: {contents: read}
+    uses: ./.github/workflows/image-check.yml
+    with:
+      builder: docker
+      context: tests/image-sample
+      dockerfile: tests/image-sample/Dockerfile
+  image-crane:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [check-crane, check-docker]
+    permissions: {contents: read, packages: write, id-token: write}
+    uses: ./.github/workflows/image.yml
+    with:
+      version: ${{ inputs.version }}
+      tag: selftest
+      bin: image-sample
+      cargo-args: --manifest-path tests/image-sample/Cargo.toml --target-dir target
+      assets-script: ""
+      sccache-redis: ""
+      files: tests/image-sample/files
+  image-docker:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [check-crane, check-docker]
+    permissions: {contents: read, packages: write, id-token: write}
+    uses: ./.github/workflows/image.yml
+    with:
+      builder: docker
+      version: ${{ inputs.version }}
+      tag: selftest-docker
+      context: tests/image-sample
+      dockerfile: tests/image-sample/Dockerfile
