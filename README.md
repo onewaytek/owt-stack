@@ -2320,8 +2320,12 @@ owt_crypt::migrate(&pool).await?;
 
 // Production: the YubiHSM (below). Everywhere else: a software keyring.
 let kek: Arc<dyn KekProvider> = Arc::new(LocalKek::from_env("MYAPP_KEK")?);
-let crypt = Crypt::new(pool.clone(), kek)
-    .require_hardware_kek(owt_runtime::env::flag("MYAPP_REQUIRE_HARDWARE_KEK", false)?)?;
+let hardware = owt_runtime::env::flag("MYAPP_REQUIRE_HARDWARE_KEK", false)?;
+let crypt = Crypt::new(pool.clone(), kek).require_hardware_kek(hardware)?;
+if hardware {
+    // No key may still be wrapped by a software KEK (a chain's old provider, say).
+    crypt.check_keys_hardware().await?;
+}
 
 // The row id is the app's, made before the insert (a UUID), and never changes.
 let field = Field::new("practice-3", "notes", "body", note_id);
@@ -2392,17 +2396,22 @@ assert!(crypt.software_wrapped_keys().await?.is_empty());
 # Ok(()) }
 ```
 
-`reencrypt_column` returns `Reencrypted { moved, failed }`. A row that does not
-decrypt (malformed, its key shredded, refused) is listed in `failed` by id and
-skipped, and the job stops after 10,000 failures or a pass that moves nothing, so a
-bad row cannot wedge it. A data key seals with random 96-bit nonces, which is safe for
+`reencrypt_column` returns `Reencrypted { moved, failed, complete }`. A row that does
+not decrypt (malformed, an older key version shredded, refused) is listed in `failed`
+by id and skipped, and the job stops after 10,000 failures or a pass that moves
+nothing (a trigger or policy swallowing the update, or live writers winning every
+race), so a bad row cannot wedge it. Those two stops return `complete: false`:
+retire an old key version only after a run that is `complete` with nothing in
+`failed`, never on `moved: 0` alone. A KEK id no provider knows aborts the job with an
+error. A data key seals with random 96-bit nonces, which is safe for
 about 2^32 messages per key (NIST SP 800-38D): rotate data keys well before that,
 yearly or every N writes. Two concurrent `rotate` calls may each add a version; that
 is harmless.
 
 **Shredding.** `crypt.shred(scope)` deletes a tenant's keys and records a tombstone
 in `owt_crypt_shredded`, in one transaction, so everything encrypted for the tenant is
-unreadable and the scope can never get keys again (`encrypt` and `rotate` fail with
+unreadable and the scope can never get keys again (the tombstone is permanent, so a
+shredded scope id is never reusable: do not shred ids the app recycles) (`encrypt` and `rotate` fail with
 `CryptError::Shredded`). Each `Crypt` caches unwrapped keys for `cache_ttl` (default
 five minutes, `Crypt::new(..).cache_ttl(Duration::from_secs(60))`), so another
 replica can still decrypt for up to that long after a shred, or notice a `rewrap`:
@@ -2418,9 +2427,10 @@ the wrapped keys until they expire, so set their retention with that in mind.
 key it wraps, so production sets `require_hardware_kek(true)` and starts only with a
 hardware KEK. `require_hardware_kek` checks the current KEK only: a `KekChain` from a
 software KEK to an HSM passes it while rows are still software-wrapped. So production
-runs `require_hardware_kek(true)` and treats a non-empty
-`crypt.software_wrapped_keys()` (the stored KEK ids that are not hardware) after
-`rewrap` as an alarm.
+runs `require_hardware_kek(true)` and then `crypt.check_keys_hardware().await?` at
+start-up, which fails while any stored key is wrapped by a KEK that is not hardware
+(`software_wrapped_keys()` lists those ids). Treat a non-empty list after `rewrap` as
+an alarm.
 
 **The YubiHSM KEK** (feature `yubihsm`). The KEK is an AES-256-CCM wrap key inside
 a YubiHSM 2 on the node (the YubiHSM 2 FIPS model where FIPS 140-2 validation is required, which adds restrictions on algorithms and authentication keys); it never leaves the device. Data keys are sent to it
@@ -2431,9 +2441,13 @@ authentication key that has only the `wrap-data` and `unwrap-data` capabilities 
 the wrap key's domain, never the factory default key. `YubiHsmKek` refuses, at start,
 a wrap key that is not AES-256-CCM, lacks `wrap-data` or `unwrap-data`, or has
 `export-wrapped` or `import-wrapped`, and wraps and unwraps 32 random bytes as a
-self-test, so a wrongly provisioned authentication key fails at startup. A device
-failure while unwrapping is `Unavailable` when the device stops answering, and
-`Refused` only when it answers and rejects the message:
+self-test, so a wrongly provisioned authentication key fails at startup. It also
+refuses an authentication key that holds `export-wrapped`, `import-wrapped`,
+`put-wrap-key`, `generate-wrap-key` or `delete-wrap-key`. An unwrap is `Refused` only
+when the device reports the message as invalid or unauthentic; connection, session
+and every other device error are `Unavailable`. These checks are unit-tested against
+`MockHsm` and a fake device; `tests/yubihsm.rs` runs them against real hardware when
+`OWT_YUBIHSM_CONNECTOR` is set:
 
 ```rust,no_run
 use std::sync::Arc;

@@ -170,7 +170,11 @@ async fn rotation_keeps_old_values_readable_and_the_job_moves_them() {
     );
     assert_eq!(
         crypt.reencrypt_column(&column, 5).await.unwrap(),
-        Reencrypted::default(),
+        Reencrypted {
+            moved: 0,
+            failed: Vec::new(),
+            complete: true
+        },
         "nothing left"
     );
     let rows: Vec<(i64, String, Vec<u8>)> =
@@ -462,5 +466,66 @@ async fn empty_field_parts_are_refused() {
             Err(CryptError::Invalid(_))
         ));
     }
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_swallowed_update_is_not_reported_as_complete() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    db.pool
+        .execute("CREATE TABLE notes (id bigint PRIMARY KEY, body bytea)")
+        .await
+        .unwrap();
+    for id in 1..=3_i64 {
+        let ct = crypt
+            .encrypt(&Field::new("a", "notes", "body", &id.to_string()), b"v")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO notes VALUES ($1, $2)")
+            .bind(id)
+            .bind(ct)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    crypt.rotate("a", Purpose::Data).await.unwrap();
+    db.pool
+        .execute(
+            "CREATE FUNCTION swallow() RETURNS trigger AS $$ BEGIN RETURN NULL; END $$ LANGUAGE plpgsql",
+        )
+        .await
+        .unwrap();
+    db.pool
+        .execute(
+            "CREATE TRIGGER swallow BEFORE UPDATE ON notes FOR EACH ROW EXECUTE FUNCTION swallow()",
+        )
+        .await
+        .unwrap();
+    let column = Column {
+        table: "notes",
+        id: "id",
+        column: "body",
+        scope: Scope::Fixed("a"),
+    };
+    let done = crypt.reencrypt_column(&column, 10).await.unwrap();
+    assert_eq!((done.moved, done.complete), (0, false));
+    assert_eq!(done.failed.len(), 0);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_chain_with_software_rows_fails_the_hardware_check() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    crypt.check_keys_hardware().await.unwrap();
+    crypt
+        .encrypt(&Field::new("t", "n", "b", "1"), b"v")
+        .await
+        .unwrap();
+    assert!(matches!(
+        crypt.check_keys_hardware().await,
+        Err(CryptError::SoftwareKek(ids)) if ids == "local:k1"
+    ));
     db.drop().await;
 }
