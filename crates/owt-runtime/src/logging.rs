@@ -74,8 +74,10 @@ pub struct Options {
     /// Whether the defaults apply. `false` redacts exactly `redact_fields`.
     pub redact_defaults: bool,
     /// Names that are never redacted, normalized like `redact_fields`; it wins over
-    /// every other rule. The defaults already pass the attributes the tracing layers
-    /// write (`code.*`, `otel.*`, `thread.id`, `thread.name`, `target`, `level`,
+    /// every other rule, and an allowed segment of a dotted name is not judged on its
+    /// own. The defaults already pass the attributes the tracing layers write, by
+    /// exact name (`code.filepath`, `code.lineno`, `code.module.name`, `otel.name`,
+    /// `otel.kind`, `otel.status_code`, `thread.id`, `thread.name`, `target`, `level`,
     /// `message`) and a few operational names (`server.address`, `host.name`,
     /// `db.name`, `service.name`, `token_count`, `max_tokens`).
     pub redact_allow: Vec<String>,
@@ -376,6 +378,11 @@ mod tests {
             "thread.password",
             "thread.token",
             "user.name",
+            "otel.secret",
+            "otel.token",
+            "otel.email",
+            "code.password",
+            "code.email",
         ] {
             assert!(r.denies(name), "{name} should be denied");
         }
@@ -416,6 +423,10 @@ mod tests {
         assert!(!allow.denies("customerName"));
         assert!(!allow.denies("email"));
         assert!(allow.denies("user_email"));
+        assert!(
+            !allow.denies("user.customer_name"),
+            "an allowed segment is not judged alone"
+        );
 
         let extra = redaction::Redactor::new(true, &["host_name".into()], &[]);
         assert!(extra.denies("host.name"));

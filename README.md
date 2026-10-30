@@ -511,10 +511,14 @@ segment of a dotted name is judged on its own (`password.value`). Redacted by de
   `phone_number` and `password1` are caught.
 
 The word rule catches operational names too (`bind_address`, `file_name`), so a name can be
-allowed. The defaults never redact `code.*`, `otel.*`, `thread.id`, `thread.name`,
-`target`, `level`, `message`, `server.address`, `host.name`, `db.name`, `service.name`,
-`token_count` and `max_tokens`. `Options::redact_allow` lists names that are never
-redacted and wins over every other rule. `Options::redact_fields` adds names to redact,
+allowed. The defaults never redact the attributes the tracing layers write, by exact
+name (`code.filepath`, `code.lineno`, `code.module.name`, `otel.name`, `otel.kind`,
+`otel.status_code`, `thread.id`, `thread.name`, ...), nor `target`, `level`, `message`,
+`server.address`, `host.name`, `db.name`, `service.name`, `token_count` and
+`max_tokens`; any other name under `code.` or `otel.` is judged like the rest, so
+`otel.secret` is redacted. `Options::redact_allow` lists names that are never
+redacted and wins over every other rule; a dotted name is judged segment by segment,
+skipping allowed segments. `Options::redact_fields` adds names to redact,
 and wins over the defaults' allowlist. `redact_defaults: false` drops the defaults (and
 every rule above) so that exactly `redact_fields` applies.
 

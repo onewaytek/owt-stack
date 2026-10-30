@@ -122,10 +122,23 @@ const DEFAULT_ALLOW: &[&str] = &[
     "host_name",
     "db_name",
     "service_name",
+    // What tracing and tracing-opentelemetry write themselves, by exact name: a
+    // whole `code.` or `otel.` prefix would let `otel.secret` through.
+    "code_filepath",
+    "code_file_path",
+    "code_lineno",
+    "code_line_number",
+    "code_column_number",
+    "code_namespace",
+    "code_module_name",
+    "code_function_name",
+    "otel_name",
+    "otel_kind",
+    "otel_status_code",
+    "otel_status_description",
+    "otel_scope_name",
+    "otel_scope_version",
 ];
-
-/// Dotted prefixes the defaults never redact (`code.module.name`, `otel.status_code`).
-const DEFAULT_ALLOW_PREFIXES: &[&str] = &["code.", "otel."];
 
 /// Decides which field names are redacted. The order of precedence is `allow`, then
 /// `extra`, then the defaults' own allowlist, then the default rules.
@@ -161,14 +174,19 @@ impl Redactor {
         if self.extra.contains(&*whole) {
             return true;
         }
-        if self.defaults
-            && (DEFAULT_ALLOW.contains(&&*whole)
-                || DEFAULT_ALLOW_PREFIXES.iter().any(|p| name.starts_with(p)))
-        {
+        if self.defaults && DEFAULT_ALLOW.contains(&&*whole) {
             return false;
         }
-        self.judge(&whole)
-            || (name.contains('.') && name.split('.').any(|s| self.judge(&normalize(s))))
+        if !name.contains('.') {
+            return self.judge(&whole);
+        }
+        // A dotted name is judged segment by segment, skipping the segments the app
+        // allows (`user.customer_name` with `customer_name` allowed); any other
+        // sensitive segment (`otel.secret`, `user.passwordHash`) denies it.
+        name.split('.').any(|s| {
+            let s = normalize(s);
+            !self.allow.contains(&*s) && self.judge(&s)
+        })
     }
 
     /// Judges a normalized name against the rules.
