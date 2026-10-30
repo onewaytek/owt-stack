@@ -20,7 +20,9 @@
 //! the price of bounding guesses at it, and it lasts only while they keep at it.
 //!
 //! The counts live in this process: with N replicas an attacker gets N times each
-//! budget, which is still a bound. The address must be the client's, not the
+//! budget, which is still a bound. Where it must be exactly the budget, the
+//! `redis` feature adds [`shared::SharedThrottle`]: the same three budgets counted in
+//! Redis, so every replica spends from one. The address must be the client's, not the
 //! proxy's: see `owt_web::client_ip`. An IPv6 address is counted by its /64, the
 //! block one client is usually given.
 //!
@@ -28,6 +30,9 @@
 //! refused unchecked, so it was no guess, and charging for it would let one address
 //! hold every account's sign-ins off (and fill the table with names) at any rate it
 //! cared to send.
+
+#[cfg(feature = "redis")]
+pub mod shared;
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
@@ -103,7 +108,7 @@ fn per_window(n: u32, window: Duration) -> Quota {
 
 /// The key `address` is counted under: an IPv4 address as itself (also when written
 /// IPv4-mapped), an IPv6 address by its /64.
-fn client_key(address: IpAddr) -> IpAddr {
+pub(crate) fn client_key(address: IpAddr) -> IpAddr {
     match address {
         IpAddr::V4(_) => address,
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -119,7 +124,7 @@ const MAX_ACCOUNT_KEY_BYTES: usize = 256;
 
 /// The key `account` is counted under: trimmed and lower case, so that variants of
 /// one name share its budget, and cut to [`MAX_ACCOUNT_KEY_BYTES`].
-fn account_key(account: &str) -> String {
+pub(crate) fn account_key(account: &str) -> String {
     let account = account.trim();
     // Cut before lower-casing, so a megabyte of text is not copied to be discarded.
     let mut end = account.len().min(MAX_ACCOUNT_KEY_BYTES);

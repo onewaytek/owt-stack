@@ -1,0 +1,30 @@
+[package]
+name = "owt-storage"
+description = "Objects in an S3-compatible bucket for apps on owt-stack: client-side encryption through owt-crypt in bounded memory, streaming multipart uploads, presigned URLs, and verified deletion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+bytes = "1"
+futures.workspace = true
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+owt-crypt.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tokio-util = { workspace = true, features = ["io"] }
+url.workspace = true
+zeroize = { version = "1", features = ["std"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+owt-runtime.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
