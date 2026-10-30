@@ -21,17 +21,37 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use yubihsm::{Capability, Client, Connector, Credentials, object, wrap};
+use yubihsm::{Capability, Client, Connector, Credentials, client, device, object, wrap};
 use zeroize::Zeroizing;
 
 use crate::kek::{KekError, KekProvider};
 
 /// Why the device did not unwrap a message.
+#[derive(Debug, PartialEq, Eq)]
 enum Unwrapped {
-    /// The message is not even a wrap message.
-    Malformed,
-    /// The device answered with an error, or did not answer.
-    Device,
+    /// The message is not a wrap message, or the device rejected it as invalid or
+    /// not authentic: tampered, moved, or wrapped under another key.
+    Refused,
+    /// The device or the path to it failed: an outage, a busy device, a lost session.
+    Unavailable(String),
+}
+
+/// Sort a failed unwrap by the error the client reported. Only a device-reported
+/// invalid-data, wrong-length or authentication failure for the message is a refusal;
+/// connection, session and protocol errors, and every other device error, are not
+/// evidence about the message.
+fn classify(kind: client::ErrorKind, device: Option<device::ErrorKind>) -> bool {
+    matches!(
+        (kind, device),
+        (
+            client::ErrorKind::DeviceError,
+            Some(
+                device::ErrorKind::InvalidData
+                    | device::ErrorKind::WrongLength
+                    | device::ErrorKind::AuthenticationFailed
+            )
+        )
+    )
 }
 
 /// The HSM commands the provider uses, so tests can stand in for a device.
@@ -42,8 +62,6 @@ trait Device: Send + Sync {
         wrap_key: object::Id,
         message: Vec<u8>,
     ) -> Result<Zeroizing<Vec<u8>>, Unwrapped>;
-    /// Whether the device answers and the wrap key is there.
-    fn probe(&self, wrap_key: object::Id) -> Result<(), String>;
 }
 
 impl Device for Client {
@@ -61,16 +79,16 @@ impl Device for Client {
         wrap_key: object::Id,
         message: Vec<u8>,
     ) -> Result<Zeroizing<Vec<u8>>, Unwrapped> {
-        let message = wrap::Message::from_vec(message).map_err(|_| Unwrapped::Malformed)?;
+        let message = wrap::Message::from_vec(message).map_err(|_| Unwrapped::Refused)?;
         Client::unwrap_data(self, wrap_key, message)
             .map(Zeroizing::new)
-            .map_err(|_| Unwrapped::Device)
-    }
-
-    fn probe(&self, wrap_key: object::Id) -> Result<(), String> {
-        self.get_object_info(wrap_key, object::Type::WrapKey)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|e| {
+                if classify(*e.kind(), e.device_error()) {
+                    Unwrapped::Refused
+                } else {
+                    Unwrapped::Unavailable(e.to_string())
+                }
+            })
     }
 }
 
@@ -121,6 +139,7 @@ impl YubiHsmKek {
         wrap_key: object::Id,
         self_test: bool,
     ) -> Result<Self, KekError> {
+        let credentials_id = credentials.authentication_key_id;
         let client = Client::open(connector, credentials, true)
             .map_err(|e| KekError::Unavailable(e.to_string()))?;
         let info = client
@@ -144,6 +163,21 @@ impl YubiHsmKek {
             return Err(KekError::Config(format!(
                 "wrap key {wrap_key:#06x} has export-wrapped or import-wrapped: \
                  a KEK is not a transport key"
+            )));
+        }
+        let auth_id = credentials_id;
+        let auth = client
+            .get_object_info(auth_id, object::Type::AuthenticationKey)
+            .map_err(|e| KekError::Config(format!("authentication key {auth_id:#06x}: {e}")))?;
+        let forbidden = Capability::EXPORT_WRAPPED
+            | Capability::IMPORT_WRAPPED
+            | Capability::PUT_WRAP_KEY
+            | Capability::GENERATE_WRAP_KEY
+            | Capability::DELETE_WRAP_KEY;
+        if auth.capabilities.intersects(forbidden) {
+            return Err(KekError::Config(format!(
+                "authentication key {auth_id:#06x} may export, import, create or delete \
+                 wrap keys: the app's key holds wrap-data and unwrap-data only"
             )));
         }
         let kek = Self::with_device(Arc::new(client), wrap_key);
@@ -249,18 +283,13 @@ impl KekProvider for YubiHsmKek {
             }
             // A device error is a refusal when the device still answers (a message that
             // does not authenticate), and an outage when a probe of the wrap key fails.
-            let id = kek_id.to_owned();
-            let plain = tokio::task::spawn_blocking(move || {
-                device.unwrap_data(wrap_key, message).map_err(|e| match e {
-                    Unwrapped::Malformed => KekError::Refused(id),
-                    Unwrapped::Device => match device.probe(wrap_key) {
-                        Ok(()) => KekError::Refused(id),
-                        Err(e) => KekError::Unavailable(e),
-                    },
-                })
-            })
-            .await
-            .map_err(|e| KekError::Unavailable(e.to_string()))??;
+            let plain = tokio::task::spawn_blocking(move || device.unwrap_data(wrap_key, message))
+                .await
+                .map_err(|e| KekError::Unavailable(e.to_string()))?
+                .map_err(|e| match e {
+                    Unwrapped::Refused => KekError::Refused(kek_id.into()),
+                    Unwrapped::Unavailable(why) => KekError::Unavailable(why),
+                })?;
             let digest = Sha256::digest(context);
             if plain.len() < digest.len() || !bool::from(plain[..digest.len()].ct_eq(&digest)) {
                 return Err(KekError::Refused(kek_id.into()));
@@ -296,22 +325,14 @@ mod tests {
             message: Vec<u8>,
         ) -> Result<Zeroizing<Vec<u8>>, Unwrapped> {
             if !self.1.load(Ordering::SeqCst) {
-                return Err(Unwrapped::Device);
+                return Err(Unwrapped::Unavailable("usb gone".into()));
             }
             let (nonce, sealed) = message.split_at(12);
-            let nonce: [u8; 12] = nonce.try_into().map_err(|_| Unwrapped::Malformed)?;
+            let nonce: [u8; 12] = nonce.try_into().map_err(|_| Unwrapped::Refused)?;
             self.0
                 .decrypt(&Nonce::from(nonce), sealed)
                 .map(Zeroizing::new)
-                .map_err(|_| Unwrapped::Device)
-        }
-
-        fn probe(&self, _: object::Id) -> Result<(), String> {
-            if self.1.load(Ordering::SeqCst) {
-                Ok(())
-            } else {
-                Err("usb gone".into())
-            }
+                .map_err(|_| Unwrapped::Refused)
         }
     }
 
@@ -319,10 +340,36 @@ mod tests {
         fake_with(Arc::default())
     }
 
-    /// `up` false takes the fake device away: every command and probe fails.
+    /// `up` false takes the fake device away: every command fails.
     fn fake_with(up: Arc<AtomicBool>) -> YubiHsmKek {
         up.store(true, Ordering::SeqCst);
         YubiHsmKek::with_device(Arc::new(Fake(Aes256Gcm::new(&[3; 32].into()), up)), 0x64)
+    }
+
+    #[test]
+    fn errors_are_sorted_by_what_the_device_reported() {
+        use device::ErrorKind as D;
+        for refused in [D::InvalidData, D::WrongLength, D::AuthenticationFailed] {
+            assert!(classify(client::ErrorKind::DeviceError, Some(refused)));
+        }
+        for other in [
+            D::SessionsFull,
+            D::ObjectNotFound,
+            D::InsufficientPermissions,
+        ] {
+            assert!(!classify(client::ErrorKind::DeviceError, Some(other)));
+        }
+        assert!(!classify(client::ErrorKind::DeviceError, None));
+        for kind in [
+            client::ErrorKind::ConnectorError,
+            client::ErrorKind::ClosedSessionError,
+            client::ErrorKind::CreateFailed,
+            client::ErrorKind::ProtocolError,
+            client::ErrorKind::ResponseError,
+            client::ErrorKind::AuthenticationError,
+        ] {
+            assert!(!classify(kind, Some(D::InvalidData)), "{kind:?}");
+        }
     }
 
     #[tokio::test]
@@ -385,7 +432,31 @@ mod tests {
                 vec![9_u8; len],
             )
             .unwrap();
+        for (id, capabilities) in [
+            (2, Capability::WRAP_DATA | Capability::UNWRAP_DATA),
+            (
+                3,
+                Capability::WRAP_DATA | Capability::UNWRAP_DATA | Capability::EXPORT_WRAPPED,
+            ),
+        ] {
+            client
+                .put_authentication_key(
+                    id,
+                    object::Label::from("app"),
+                    Domain::all(),
+                    capabilities,
+                    Capability::empty(),
+                    yubihsm::authentication::Algorithm::YubicoAes,
+                    yubihsm::authentication::Key::derive_from_password(b"app"),
+                )
+                .unwrap();
+        }
         connector
+    }
+
+    /// The app's authentication key: wrap-data and unwrap-data only.
+    fn app() -> Credentials {
+        Credentials::from_password(2, b"app")
     }
 
     /// Opens with the self-test skipped: `MockHsm` panics on wrap-data, which the
@@ -404,7 +475,7 @@ mod tests {
         for extra in [Capability::EXPORT_WRAPPED, Capability::IMPORT_WRAPPED] {
             let r = open(
                 mock_with_wrap_key(both | extra, wrap::Algorithm::Aes256Ccm),
-                Credentials::default(),
+                app(),
                 0x64,
             );
             assert!(matches!(r, Err(KekError::Config(_))), "{extra:?}");
@@ -415,10 +486,27 @@ mod tests {
                 both | Capability::EXPORTABLE_UNDER_WRAP,
                 wrap::Algorithm::Aes256Ccm,
             ),
-            Credentials::default(),
+            app(),
             0x64,
         );
         assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn open_refuses_an_authentication_key_that_can_export() {
+        let both = Capability::WRAP_DATA | Capability::UNWRAP_DATA;
+        // The mock's default key holds every capability; id 3 holds export-wrapped.
+        for credentials in [
+            Credentials::default(),
+            Credentials::from_password(3, b"app"),
+        ] {
+            let r = open(
+                mock_with_wrap_key(both, wrap::Algorithm::Aes256Ccm),
+                credentials,
+                0x64,
+            );
+            assert!(matches!(r, Err(KekError::Config(_))));
+        }
     }
 
     #[test]
@@ -426,26 +514,26 @@ mod tests {
         let both = Capability::WRAP_DATA | Capability::UNWRAP_DATA;
         let ok = open(
             mock_with_wrap_key(both, wrap::Algorithm::Aes256Ccm),
-            Credentials::default(),
+            app(),
             0x64,
         )
         .unwrap();
         assert_eq!(ok.kek_id(), "yubihsm:0x0064");
         let missing = open(
             mock_with_wrap_key(both, wrap::Algorithm::Aes256Ccm),
-            Credentials::default(),
+            app(),
             0x65,
         );
         assert!(matches!(missing, Err(KekError::Config(_))));
         let wrap_only = open(
             mock_with_wrap_key(Capability::WRAP_DATA, wrap::Algorithm::Aes256Ccm),
-            Credentials::default(),
+            app(),
             0x64,
         );
         assert!(matches!(wrap_only, Err(KekError::Config(_))));
         let short = open(
             mock_with_wrap_key(both, wrap::Algorithm::Aes128Ccm),
-            Credentials::default(),
+            app(),
             0x64,
         );
         assert!(matches!(short, Err(KekError::Config(_))));

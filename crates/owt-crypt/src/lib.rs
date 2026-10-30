@@ -48,6 +48,7 @@ pub mod yubihsm;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -181,6 +182,8 @@ pub struct Crypt {
     pool: PgPool,
     kek: Arc<dyn KekProvider>,
     cache: Arc<Mutex<Cache>>,
+    /// Bumped by every `shred`; a key unwrapped across a bump is not cached.
+    shreds: Arc<AtomicU64>,
     cache_ttl: Duration,
 }
 
@@ -200,6 +203,7 @@ impl Crypt {
             pool,
             kek,
             cache: Arc::default(),
+            shreds: Arc::default(),
             cache_ttl: DEFAULT_CACHE_TTL,
         }
     }
@@ -220,12 +224,26 @@ impl Crypt {
     /// software KEK does not start. It checks the current KEK only: a [`kek::KekChain`]
     /// whose previous provider is software passes while rows are still software-wrapped.
     /// Production also treats a non-empty [`Crypt::software_wrapped_keys`] after
-    /// [`Crypt::rewrap`] as an alarm.
+    /// [`Crypt::rewrap`] as an alarm; [`Crypt::check_keys_hardware`] makes that a
+    /// start-up failure.
     pub fn require_hardware_kek(self, required: bool) -> Result<Self, CryptError> {
         if required && !self.kek.is_hardware() {
             return Err(CryptError::SoftwareKek(self.kek.kek_id().into()));
         }
         Ok(self)
+    }
+
+    /// Fail with [`CryptError::SoftwareKek`] when any stored key is wrapped by a KEK
+    /// that is not hardware (or that no provider knows). Call it at start-up after
+    /// [`Crypt::require_hardware_kek`], so a chain that still holds software-wrapped
+    /// rows does not pass for hardware.
+    pub async fn check_keys_hardware(&self) -> Result<(), CryptError> {
+        let ids = self.software_wrapped_keys().await?;
+        if ids.is_empty() {
+            Ok(())
+        } else {
+            Err(CryptError::SoftwareKek(ids.join(", ")))
+        }
     }
 
     /// The distinct KEK ids in `owt_crypt_keys` that are not hardware ones. After a
@@ -380,8 +398,13 @@ impl Crypt {
     /// A row that cannot be decrypted (malformed, its key shredded, or refused) is
     /// recorded in [`Reencrypted::failed`] and left out of later passes; the job goes on
     /// and stops after 10,000 failures. It also stops when a pass moves no row and
-    /// finds no new failure (a trigger, a policy or a view that swallows the update),
-    /// so it cannot loop forever. A database or KEK outage is an error.
+    /// finds no new failure (a trigger, a policy or a view that swallows the update,
+    /// or live writers winning every race), so it cannot loop forever; that stop and
+    /// the failure cap return [`Reencrypted::complete`] false. A database or KEK
+    /// outage, and a KEK id no provider knows, are errors.
+    ///
+    /// Retire an old key version only after a run that is `complete` with no `failed`
+    /// rows (and has been checked against the column): `moved: 0` alone is not "done".
     pub async fn reencrypt_column(
         &self,
         column: &Column<'_>,
@@ -412,7 +435,7 @@ impl Crypt {
         let mut moved = 0;
         let mut failed = Vec::new();
         let mut skip: Vec<String> = Vec::new();
-        loop {
+        let complete = loop {
             let mut query = sqlx::query_as::<_, (String, String, String, Vec<u8>)>(
                 sqlx::AssertSqlSafe(select.clone()),
             )
@@ -422,7 +445,7 @@ impl Crypt {
             }
             let rows = query.bind(&skip).fetch_all(&self.pool).await?;
             if rows.is_empty() {
-                break;
+                break true;
             }
             // The current version of each scope, asked once per pass.
             let mut currents: HashMap<String, (u32, Arc<Key>)> = HashMap::new();
@@ -437,7 +460,7 @@ impl Crypt {
                         | CryptError::NoKey { .. }
                         | CryptError::Refused { .. }
                         | CryptError::Shredded(_)
-                        | CryptError::Kek(KekError::Refused(_) | KekError::UnknownKek(_)),
+                        | CryptError::Kek(KekError::Refused(_)),
                     ) => {
                         failed.push(row);
                         skip.push(ctid);
@@ -458,10 +481,14 @@ impl Crypt {
             if failed.len() >= FAILED_MAX
                 || (moved == moved_before && failed.len() == failed_before)
             {
-                break;
+                break false;
             }
-        }
-        Ok(Reencrypted { moved, failed })
+        };
+        Ok(Reencrypted {
+            moved,
+            failed,
+            complete,
+        })
     }
 
     /// [`Crypt::reencrypt`] with the scope's current key remembered in `currents`.
@@ -532,7 +559,8 @@ impl Crypt {
     /// Delete every key of `scope` and record it as shredded: everything encrypted for
     /// it becomes unreadable for good, and the scope can never get keys again
     /// (crypto-shredding, for a tenant that leaves). The tombstone and the deletion are
-    /// one transaction.
+    /// one transaction. The tombstone is permanent: a shredded scope id can never be
+    /// reused, so an app that recycles tenant ids must not shred them.
     ///
     /// Other replicas may decrypt from their key caches for up to [`Crypt::cache_ttl`].
     /// Backups, WAL archives, replicas and logical-decoding slots hold the wrapped keys
@@ -551,6 +579,9 @@ impl Crypt {
             .await?
             .rows_affected();
         tx.commit().await?;
+        // Bump first: a key unwrapped before the bump is refused by `remember`, and one
+        // cached before it is dropped by the retain.
+        self.shreds.fetch_add(1, Ordering::SeqCst);
         self.cache().retain(|(s, _, _), _| s != scope);
         Ok(gone)
     }
@@ -601,6 +632,7 @@ impl Crypt {
         purpose: Purpose,
         version: u32,
     ) -> Result<Option<u32>, CryptError> {
+        let epoch = self.shreds.load(Ordering::SeqCst);
         let mut key = Zeroizing::new([0_u8; 32]);
         getrandom::fill(&mut key[..]).map_err(|e| {
             CryptError::Invalid(format!("the operating system's random generator: {e}"))
@@ -632,7 +664,7 @@ impl Crypt {
             return Err(CryptError::Shredded(scope.into()));
         }
         if made {
-            self.remember(scope, purpose, version, Arc::new(Key(key)));
+            self.remember(scope, purpose, version, Arc::new(Key(key)), epoch);
             return Ok(Some(version));
         }
         Ok(None)
@@ -658,6 +690,7 @@ impl Crypt {
         purpose: Purpose,
         version: u32,
     ) -> Result<Arc<Key>, CryptError> {
+        let epoch = self.shreds.load(Ordering::SeqCst);
         if let Some((k, at)) = self.cache().get(&(scope.to_owned(), purpose, version))
             && at.elapsed() < self.cache_ttl
         {
@@ -697,16 +730,19 @@ impl Crypt {
         if shredded {
             return Err(CryptError::Shredded(scope.into()));
         }
-        self.remember(scope, purpose, version, key.clone());
+        self.remember(scope, purpose, version, key.clone(), epoch);
         Ok(key)
     }
 
-    fn remember(&self, scope: &str, purpose: Purpose, version: u32, key: Arc<Key>) {
+    /// Cache `key`, unless a shred ran since `epoch` was read. Expired entries go on
+    /// every insert, so a shredded scope's keys do not linger past the TTL.
+    fn remember(&self, scope: &str, purpose: Purpose, version: u32, key: Arc<Key>, epoch: u64) {
         let mut cache = self.cache();
-        if cache.len() >= CACHE_MAX {
-            let ttl = self.cache_ttl;
-            cache.retain(|_, (_, at)| at.elapsed() < ttl);
+        if self.shreds.load(Ordering::SeqCst) != epoch {
+            return;
         }
+        let ttl = self.cache_ttl;
+        cache.retain(|_, (_, at)| at.elapsed() < ttl);
         if cache.len() >= CACHE_MAX {
             let mut ages: Vec<Instant> = cache.values().map(|(_, at)| *at).collect();
             ages.sort_unstable();
@@ -722,9 +758,13 @@ impl Crypt {
 pub struct Reencrypted {
     /// How many rows it re-encrypted.
     pub moved: u64,
-    /// The ids of rows that could not be decrypted (malformed, shredded or refused),
-    /// left as they were. It stops collecting at 10,000.
+    /// The ids of rows that could not be decrypted (malformed, an older key version
+    /// shredded, or refused), left as they were. It stops collecting at 10,000.
     pub failed: Vec<String>,
+    /// Whether the column was walked until no row outside `failed` was left under an
+    /// old key. False when the job gave up: no progress in a pass, or the failure cap.
+    /// Retire an old key version only after a complete run with nothing in `failed`.
+    pub complete: bool,
 }
 
 /// Serialize key creation against `shred` for `scope` until the transaction ends.
