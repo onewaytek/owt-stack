@@ -1405,6 +1405,7 @@ test awaits that sequence on its pool before anything else.
 | `owt_accounts_local` | `account_local_identities` | `account_local_identities_pkey`, `account_local_identities_account` | | `accounts.password_sign_in`; constraint `accounts_password_sign_in_hash` on `accounts` |
 | `owt_accounts_link_next` | | | | `sign_in_links.next` |
 | `owt_accounts_mfa` | `account_totp`, `account_recovery_codes` | `account_totp_pkey`, `account_recovery_codes_pkey`, `account_recovery_codes_id_seq`, `account_recovery_codes_account` | | |
+| `owt_accounts_recovery_codes_index` | | `account_recovery_codes_account_all` | | |
 
 Each table is also a type of its name, and its triggers and constraints are its own.
 An app that already has any of these names (a table, view, index, sequence, type or
