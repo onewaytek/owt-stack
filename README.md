@@ -10,6 +10,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-crypt` | envelope field encryption: AES-256-GCM data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
+| `owt-audit` | an append-only, hash-chained audit log: one chain per tenant, SHA-256 over a canonical encoding, triggers that refuse changes, a verifier (and its clap subcommand, feature `cli`), and anchoring of the chain heads to external write-once storage |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
 | `owt-test` | an in-process client with a cookie jar, signed in as an account without Argon2; account fixtures; the router on an ephemeral port; golden-page snapshots; page/fragment agreement; the browser fetches nothing from another origin, and vendored files match their pins |
@@ -58,6 +59,7 @@ owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
+owt-audit = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.10.0" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
@@ -255,6 +257,80 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
         .layer(from_fn(headers::private_by_default))
         .layer(from_fn(headers::security))
 }
+```
+
+**Idle timeout and lifetimes.** Three limits end a session, and an app handling
+health data sets all three: `max_age` (how long a cookie lives without being
+resealed), `absolute_lifetime` (from sign-in, however active: 30 days unless set),
+and `idle_timeout` (since the person's last activity). Revocation is the epoch above:
+`sign_out_everywhere`, a password change or a deactivation moves the account's
+`session_epoch`, and the validator refuses every session sealed under the old one on
+its next request, on every replica.
+
+With `idle_timeout`, the cookie also carries the last-active time. Activity (a
+request that carries the session, is not passive and does not fail) refreshes it at
+most once per `idle_refresh` (a tenth of the timeout, at least 15 s, by default;
+never more than half the timeout), so a busy page does not rewrite a cookie on every
+request, and a session ends between the timeout less one refresh and the timeout
+after the last activity, give or take the replicas' clock skew. An activity-only
+refresh sets a second cookie (`<name>-seen`), sealed and bound to the session's id,
+and leaves the session cookie alone: a slow request in one tab cannot put back a
+session another tab has since signed out of. Activity alone does not extend `max_age`: the
+session cookie's own expiry moves only when a handler changes the session, so set
+`max_age` to the longest working day the app allows, and let the idle timeout end
+sessions sooner.
+
+A session past the timeout is no session: its cookies are removed, and
+`Session::idle_expired()` is true for that request, so a guard on the app's pages
+can redirect to `/login?reason=idle` (the next request carries no cookie to tell).
+A request with `owt-passive: 1` (`session::PASSIVE_HEADER`), or whose handler calls
+`Session::passive()`, is not activity, so a poll cannot keep an unattended screen
+signed in. Every response to a request whose session stands carries
+`owt-idle-remaining: <seconds>` (`session::IDLE_REMAINING_HEADER`), with
+`Cache-Control: no-store` and `Vary: cookie`, since the value is one person's.
+
+Turning the timeout on ends every session older than it (a cookie sealed without the
+last-active time counts from its sign-in), and replicas without it drop the time
+when they reseal: enable it once every replica runs a build that knows it.
+
+```rust,no_run
+use std::time::Duration;
+use axum::{Router, routing::get};
+use owt_web::session::{Session, Sessions};
+
+# #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+# struct SessionData {}
+# fn demo(key: cookie::Key) -> (Sessions<SessionData>, Router) {
+let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_hours(12), true)
+    .absolute_lifetime(Duration::from_hours(12))
+    .idle_timeout(Duration::from_mins(15));
+
+// The page polls this (passively) and shows a warning in the last two minutes.
+let routes = Router::new().route("/session/idle", get(|session: Session<SessionData>| async move {
+    session.passive();
+    match session.idle_remaining() {
+        Some(left) if left <= Duration::from_mins(2) => format!(
+            r#"<div role="alert">Signing you out in {} s for inactivity.
+               <button hx-post="/session/stay" hx-swap="none">Stay signed in</button></div>"#,
+            left.as_secs()
+        ),
+        _ => String::new(),
+    }
+}))
+// Any request that is not passive extends the session; this one does nothing else.
+.route("/session/stay", axum::routing::post(|| async { "" }));
+# (sessions, routes) }
+```
+
+The poller is a sibling of the warning it fills, so the "Stay signed in" button
+does not inherit its passive header (htmx inherits `hx-headers` from ancestors), and
+its click counts as activity. Cross-origin protection needs no token here (see
+"Decisions").
+
+```html
+<span hx-get="/session/idle" hx-trigger="every 30s" hx-target="#idle-warning"
+      hx-headers='{"owt-passive": "1"}'></span>
+<div id="idle-warning" aria-live="polite"></div>
 ```
 
 **The same stack as a builder.** `owt_web::stack::Stack` applies these layers, and the
@@ -2494,6 +2570,143 @@ from the node, holding the same wrap key under the same object id (so the KEK id
 To recover, move the backup HSM to the replacement node, start its connector, and
 start the app; nothing in the database changes.
 
+### Audit log
+
+`owt-audit` records who did what to which record, why, and how it went, in an
+append-only table where any later change shows. Each event joins its tenant's chain
+(events with no tenant share the chain `""`): its `seq` follows the chain's last,
+its `prev` is that event's hash, and its `hash` is SHA-256 over a canonical encoding
+of all its fields (`owt_audit::canonical`). The database assigns all four as the row
+is inserted, whoever inserts it, and `record_in` checks the database's hash against
+the crate's. Triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` while they stand; only
+the tables' owner can drop or disable them, which anchoring (below) exposes. A role
+that may insert can still record false events, as it can make false changes; the log
+shows what was recorded, and that nothing recorded was altered since.
+
+```rust,no_run
+use owt_audit::{ActorKind, Audit, Event, Outcome};
+
+# async fn demo(pool: sqlx::PgPool, ip: std::net::IpAddr) -> anyhow::Result<()> {
+owt_audit::migrate(&pool).await?; // as the migration role, at start
+let audit = Audit::new(pool.clone());
+
+// A clinician opens a chart: references and codes only.
+audit
+    .record(
+        &Event::new(ActorKind::Account, "17", "record.view", "chart")
+            .tenant("practice-3")
+            .subject("patient:4821")
+            .resource_id("4821")
+            .purpose("treatment")
+            .client(Some(ip), Some("Mozilla/5.0 …"), Some("req-7f3a")),
+    )
+    .await?;
+
+// With the change it records: both commit, or neither.
+let mut tx = pool.begin().await?;
+// ... sign the note in `tx` ...
+let signed = Event::new(ActorKind::Account, "17", "note.sign", "note")
+    .tenant("practice-3")
+    .subject("patient:4821")
+    .resource_id("note:991");
+owt_audit::record_in(&mut tx, &signed).await?;
+tx.commit().await?;
+
+// Refusals are events too.
+let denied = Event::new(ActorKind::Account, "23", "record.view", "chart")
+    .tenant("practice-3")
+    .subject("patient:4821")
+    .outcome(Outcome::Denied);
+audit.record(&denied).await?;
+# Ok(()) }
+```
+
+**What goes in an event.** Ids, never content: an account id, the patient's record
+id, a resource's id, and codes (`[a-z0-9_.:-]`, up to 100) for the action, the
+resource type and the purpose of use. Never a name, a diagnosis, a note's text or a
+search term; the log is kept for years and erases nothing. The fields are short (200
+characters, a user agent 512) and `Event::check` refuses control characters and
+malformed codes; the table's own constraints refuse control characters and malformed
+addresses too. `record_in` holds its tenant's chain until the transaction ends, so
+call it last in the transaction, and the transaction must be READ COMMITTED (the
+default; the database refuses others, whose snapshot could miss the chain's last
+event).
+
+**Roles.** Run the migrations as the role that owns the schema. Give the app's role
+`INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
+or disable the triggers, which takes ownership. Only the role that runs the anchoring
+job inserts anchors, so the app cannot record a manifest of its own:
+
+```sql
+GRANT USAGE ON SCHEMA public TO myapp_app, myapp_anchor;
+GRANT SELECT, INSERT ON owt_audit_events TO myapp_app;
+GRANT SELECT ON owt_audit_anchors TO myapp_app;
+GRANT SELECT ON owt_audit_events TO myapp_anchor;
+GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
+-- Nothing else: no UPDATE, DELETE, TRUNCATE, TRIGGER or ownership.
+```
+
+**Anchoring.** The schema's owner can still drop the triggers and rewrite a chain
+from some event on, recomputing every hash after it; the chain still verifies on its
+own. So, on a schedule, write every chain's head to storage the database's owner
+cannot change: `anchor::anchor(&pool, &store)` verifies each chain since the previous
+manifest (so a broken chain is never anchored), builds a manifest of the heads
+(naming the previous manifest's digest), stores it through an `anchor::Anchor`, and
+records it in `owt_audit_anchors`; runs are serialized by an advisory lock. `verify_anchor` then fails for any chain that no longer
+holds an anchored head. `NoAnchor` records manifests in the database only, for
+development and tests; production implements `Anchor` over a bucket under a
+compliance-mode retention lock (an S3-compatible provider for that follows
+`owt-storage`). The database's copy of a manifest is checked against its recorded
+digest, but it is only as trustworthy as the roles that may insert anchors; an
+independent check verifies against the copy in the store
+(`myapp audit verify --manifest m.json`).
+
+```rust,no_run
+use std::time::Duration;
+use owt_audit::anchor::{self, NoAnchor};
+use owt_runtime::jobs::{CancellationToken, Every, Jobs};
+
+# async fn demo(pool: sqlx::PgPool) {
+let jobs = Jobs::new(CancellationToken::new());
+let p = pool.clone();
+jobs.singleton("audit_anchor", Every::new(Duration::from_hours(1)), pool.clone(), 7_210_010, move || {
+    let p = p.clone();
+    async move {
+        anchor::anchor(&p, &NoAnchor).await?; // the app's WORM store in production
+        Ok(())
+    }
+});
+# }
+```
+
+**Verifying.** `owt_audit::verify(&pool, tenant)` walks a chain and names the first
+event that was edited (`Broken::Hash`), removed (`Broken::Gap`) or swapped
+(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads. With
+the `cli` feature the app gets both as operator commands (`myapp audit verify`,
+`myapp audit verify --manifest m.json` for a manifest fetched from the store, and
+`myapp audit heads`):
+
+```rust,no_run
+use clap::{Parser, Subcommand};
+use owt_audit::cli::AuditCommand;
+
+#[derive(Parser)]
+struct Cli { #[command(subcommand)] command: Command }
+
+#[derive(Subcommand)]
+enum Command {
+    /// The audit log.
+    #[command(subcommand)]
+    Audit(AuditCommand),
+}
+
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+match Cli::parse().command {
+    Command::Audit(cmd) => owt_audit::cli::run(&pool, cmd).await?,
+}
+# Ok(()) }
+```
+
 ### Change requests
 
 `owt-change` lets a site's signed-in admins ask for a change from the page itself. A
@@ -3169,7 +3382,7 @@ jobs:
   image:
     needs: release
     if: needs.release.outputs.version != ''
-    permissions: {contents: read, packages: write}
+    permissions: {contents: read, packages: write, id-token: write}
     uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.10.0
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
@@ -3209,7 +3422,7 @@ jobs:
         floating-tags: {description: "Also move the channel's floating tags", type: boolean, default: false}
   jobs:
     image:
-      permissions: {contents: read, packages: write}
+      permissions: {contents: read, packages: write, id-token: write}
       uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.10.0
       with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
@@ -3356,8 +3569,10 @@ the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
 (0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The
 read-only `verify` job checks the layer's paths and modes and that the base has
-`base-requires` and a glibc at least as new as the binary needs. The `push` job confirms the layer is the one verified and runs
-none of the app's code and alone holds `packages: write`: with
+`base-requires` and a glibc at least as new as the binary needs. The `push` job
+confirms the layer is the one verified and runs none of the app's code; of the
+`crane` builder's jobs it alone holds `packages: write` (the `docker` builder's job
+and `attest` hold it too): with
 [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) (pinned
 by version and SHA-256) appends the layer to the base pinned by its linux/amd64
 digest, sets the configuration, pushes by digest, reads the version label back and
@@ -3383,6 +3598,53 @@ the template's:
 | `port` | `8000` (empty: neither) | `ENV BIND_ADDR=0.0.0.0:<port>`, `EXPOSE <port>` |
 | `entrypoint` / `cmd` | `["/usr/local/bin/server"]` / `[]` | `ENTRYPOINT` / `CMD` (JSON arrays) |
 | `env` / `labels` | none | more `ENV` / `LABEL` lines, `KEY=VALUE` each |
+| `vuln-fail-on` | `critical` | none (the scan below); `negligible`, `low`, `medium`, `high`, `critical`, or `none` to report only |
+| `vuln-ignore-file` | none | none; a grype configuration file in the repository whose `ignore:` rules waive findings |
+| `attest` | `true` | none; `false` skips the signature and the SBOM (`image.yml` only) |
+
+**Supply chain:** each image is scanned, signed and given an SBOM.
+
+- **Scan:** grype runs before anything is pushed, so a finding of `vuln-fail-on`
+  severity or worse (`critical` by default) pushes and tags nothing. With `crane`, a
+  `scan` job assembles the image as `push` would make it (the base pinned by digest,
+  the layer on top) and `push` waits for it. With `docker`, the image is pushed
+  once under a temporary tag (`scan-<run id>-<attempt>`), scanned there by digest, and only then given its
+  version and floating tags (the same digest, retagged); a failing scan leaves
+  the temporary tag and no other. `vuln-fail-on: none` still prints the
+  findings and never fails; any other value than `negligible`, `low`, `medium`,
+  `high`, `critical` or `none` fails the job. grype reads exactly the configuration
+  `vuln-ignore-file` names, and none when it is empty: a `.grype.yaml` in the
+  repository is not picked up unasked. A finding with no fix, or a false positive,
+  is waived in that file:
+
+  ```yaml
+  # .grype.yaml, named by vuln-ignore-file
+  ignore:
+    - vulnerability: CVE-2026-0001   # a finding id
+    - fix-state: not-fixed           # or every finding that has no fix yet
+  ```
+- **Signature:** the `attest` job signs the pushed digest, never a tag, with
+  [cosign](https://github.com/sigstore/cosign) keyless: the run's OIDC token, which
+  Sigstore exchanges for a short-lived certificate, and a record in the public
+  transparency log. The certificate's identity is the reusable workflow, not the
+  app's workflow, and the app's repository is its source repository:
+
+  ```sh
+  cosign verify ghcr.io/<owner>/<app>@<digest> \
+    --certificate-identity-regexp '^https://github.com/onewaytek/owt-stack/\.github/workflows/image\.yml@' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-github-workflow-repository <owner>/<app>
+  ```
+- **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
+  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact and attaches
+  it to the image as a signed attestation (`cosign verify-attestation --type
+  spdxjson ...`, with the same identity flags).
+
+The caller's job therefore grants `id-token: write` besides `packages: write`
+(`permissions: {contents: read, packages: write, id-token: write}`): a reusable
+workflow cannot take a permission its caller withholds, and a caller that grants
+less fails to start, `attest: false` or not. `attest: false` skips the signature and
+the SBOM, not the scan.
 
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
@@ -3473,7 +3735,10 @@ commit the way a release does and verifies all but the push: with `builder: cran
 (the default) the compile, the npm assets, the packed layer, and the base's tools and
 glibc, by the same `build` and `verify` jobs as `image.yml`'s (`just image-check`
 keeps them identical); with `builder: docker` the Dockerfile is built with BuildKit
-and pushed nowhere. It takes `image.yml`'s inputs that shape the build (`bin`,
+and pushed nowhere. It also scans the image with grype, as `image.yml` does, with the
+same `vuln-fail-on` and `vuln-ignore-file` inputs: this is where a vulnerable base image
+is most useful to learn of, before the release. Nothing is signed and no SBOM is made
+here, and the caller still grants `contents: read` only. It takes `image.yml`'s inputs that shape the build (`bin`,
 `cargo-args`, `files`, `base-image`, ...) and none that shape the push.
 `cargo-profile` makes the check cheaper: a pull request can build with `dev`, or with a
 profile of the app's own that turns off fat LTO and sets many codegen units
@@ -4092,6 +4357,13 @@ this command, run when the app adopts a release, is the only thing that moves it
   dashboards and load-test reports keep their names.
 - **Bus channel names** (`<prefix>:<topic>`, `~changed`, `~beat`) are a wire format
   between replicas. Changing one is a rollout hazard: old and new replicas must agree.
+- **One audit chain per tenant**, not one global chain. Appends to a chain are
+  serialized, so a global chain would make every tenant's writes wait on one lock;
+  per tenant, they never wait on each other. A tenant's chain verifies and exports
+  on its own, without revealing other tenants' events, and a tenant's log can be
+  handed over or retired at the end of its contract without breaking anyone else's.
+  What a global chain adds, evidence across tenants, comes from anchoring: each
+  manifest holds every chain's head and names the previous manifest.
 - **OpenShift Template, not Kustomize**, for the deployment: the app's name must reach
   the image trigger annotation and the CNPG Secret's name, which Kustomize's name
   transformers do not rewrite.
@@ -4387,6 +4659,7 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 its own is checked by the same rules (`commitlint.config.mjs`). Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
 `accounts`, `change`, `crypt`, `tailwind`, `deps`, `release` (release-please and its configuration).
+`accounts`, `audit`, `change`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
 **Releasing is automatic.** release-please keeps a release pull request open against
 `main`, with the next version and the changelog since the last release. Merging it

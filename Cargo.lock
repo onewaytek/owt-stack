@@ -2374,6 +2374,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "owt-audit"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "owt-runtime",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "owt-auth"
 version = "0.10.0"
 dependencies = [
@@ -3148,6 +3166,7 @@ dependencies = [
  "clap",
  "cookie",
  "owt-accounts",
+ "owt-audit",
  "owt-auth",
  "owt-bus",
  "owt-change",

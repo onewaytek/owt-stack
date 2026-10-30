@@ -11,7 +11,7 @@ name: App release (reusable)
 #     image:
 #       needs: release
 #       if: needs.release.outputs.version != ''
-#       permissions: {contents: read, packages: write}
+#       permissions: {contents: read, packages: write, id-token: write}
 #       uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # vX.Y.Z, the release the app uses
 #       with: {version: "${{ needs.release.outputs.version }}"}
 #

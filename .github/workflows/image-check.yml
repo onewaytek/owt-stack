@@ -12,6 +12,12 @@ name: Image check
 # - `docker` builds the app's Dockerfile with BuildKit on a GitHub-hosted runner,
 #   pushing nothing.
 #
+# Both builders' images are also scanned with grype, failing the run on a vulnerability
+# of `vuln-fail-on` severity or worse (critical by default): the crane image as image.yml
+# would push it (the base and the layer), the Dockerfile's image once loaded into the
+# runner's daemon. Nothing is signed and no SBOM is made here: that needs a pushed image
+# and `id-token: write`.
+#
 # It is a workflow of its own because no job in it can write: a caller's token needs
 # only `contents: read`. A reusable workflow whose jobs ask for `packages: write` (as
 # image.yml's push does) fails to start for a caller that grants less, even when the
@@ -138,6 +144,20 @@ on:
         description: The Dockerfile, relative to the repository root (builder docker).
         type: string
         default: Dockerfile
+      # vulnerability scan
+      vuln-fail-on:
+        description: >-
+          Fail on a vulnerability of at least this severity (grype's severity cutoff):
+          `negligible`, `low`, `medium`, `high` or `critical`; `none` reports and never
+          fails. Applies to the base image and the layer alike.
+        type: string
+        default: critical
+      vuln-ignore-file:
+        description: >-
+          A grype configuration file in the repository (`.grype.yaml`, say), whose
+          `ignore:` rules waive a finding by id, package or fix state; empty for none.
+        type: string
+        default: ""
     secrets:
       SCCACHE_REDIS_PASSWORD:
         description: "As in rust-ci.yml; passed by name, never with `secrets: inherit`."
@@ -513,6 +533,77 @@ jobs:
             echo "ref=${ref}"
           } >> "$GITHUB_OUTPUT"
 
+  # The image as it would be pushed (the base and the layer), scanned for vulnerabilities
+  # before anything is pushed. Holds no write permission and runs none of the app's code.
+  scan:
+    needs: [build, verify]
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    permissions:
+      contents: read
+    env:
+      BASE_REF: ${{ needs.verify.outputs.ref }}
+      IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
+    steps:
+      # Only for the ignore file; the pull request's merge commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.vuln-ignore-file != '' }}
+        with:
+          persist-credentials: false
+      - name: Scan configuration
+        env:
+          IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
+          FAIL_ON: ${{ inputs.vuln-fail-on }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$FAIL_ON" in
+            negligible|low|medium|high|critical|none) ;;
+            *) echo "::error::vuln-fail-on must be negligible, low, medium, high, critical or none ('$FAIL_ON')"; exit 1 ;;
+          esac
+          # An explicit configuration in every job, so a .grype.yaml in the checkout
+          # (or the runner's home) is never picked up unasked.
+          config="$RUNNER_TEMP/grype.yaml"
+          if [ -n "$IGNORE_FILE" ]; then
+            if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
+              echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+            fi
+            config="$GITHUB_WORKSPACE/$IGNORE_FILE"
+          else
+            echo '{}' > "$config"
+          fi
+          echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-layer
+          path: ${{ runner.temp }}/image-layer
+      - name: Install crane
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/crane"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/crane.tar.gz" \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  $dir/crane.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/crane.tar.gz" -C "$dir" crane
+          rm "$dir/crane.tar.gz"
+          echo "$dir" >> "$GITHUB_PATH"
+      # What push makes, less its configuration: the base pinned by digest and the layer
+      # on top, written to a tarball instead of a registry.
+      - name: Assemble the image
+        shell: bash
+        run: |
+          set -euo pipefail
+          crane append --base "$BASE_REF" --new_layer "$RUNNER_TEMP/image-layer/layer.tar" \
+            --new_tag scan.invalid/image:scan --output "$RUNNER_TEMP/image.tar"
+      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: docker-archive:${{ runner.temp }}/image.tar
+          severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
+          fail-build: ${{ inputs.vuln-fail-on != 'none' }}
+          output-format: table
+          config: ${{ env.GRYPE_CONFIG }}
+
   docker:
     if: >-
       ${{ inputs.builder == 'docker' && github.repository_owner == 'onewaytek'
@@ -532,8 +623,41 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           push: false
+          # Loaded into the runner's Docker daemon, to be scanned.
+          load: true
+          tags: image-check:scan
           platforms: linux/amd64
           build-args: VERSION=check
+      - name: Scan configuration
+        env:
+          IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
+          FAIL_ON: ${{ inputs.vuln-fail-on }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$FAIL_ON" in
+            negligible|low|medium|high|critical|none) ;;
+            *) echo "::error::vuln-fail-on must be negligible, low, medium, high, critical or none ('$FAIL_ON')"; exit 1 ;;
+          esac
+          # An explicit configuration in every job, so a .grype.yaml in the checkout
+          # (or the runner's home) is never picked up unasked.
+          config="$RUNNER_TEMP/grype.yaml"
+          if [ -n "$IGNORE_FILE" ]; then
+            if [[ "$IGNORE_FILE" == /* ]] || [[ "$IGNORE_FILE" =~ (^|/)\.\.(/|$) ]] || [ ! -f "$IGNORE_FILE" ]; then
+              echo "::error::vuln-ignore-file must be a file in the repository ('$IGNORE_FILE')"; exit 1
+            fi
+            config="$GITHUB_WORKSPACE/$IGNORE_FILE"
+          else
+            echo '{}' > "$config"
+          fi
+          echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
+      - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: image-check:scan
+          severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
+          fail-build: ${{ inputs.vuln-fail-on != 'none' }}
+          output-format: table
+          config: ${{ env.GRYPE_CONFIG }}
 
   # Says why when nothing would run, rather than succeed with no check.
   refused:
