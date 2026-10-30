@@ -3150,6 +3150,7 @@ dependencies = [
  "owt-auth",
  "owt-bus",
  "owt-change",
+ "owt-crypt",
  "owt-runtime",
  "owt-test",
  "owt-web",
