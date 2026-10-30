@@ -362,3 +362,91 @@ async fn reencrypt_backs_out_when_the_object_changes_underneath() {
     assert_eq!(f.raw("rec/c1").await, b"someone else");
     f.drop().await;
 }
+
+/// A store whose `HEAD` reports an absurd size.
+#[derive(Debug)]
+struct Liar(Arc<InMemory>);
+
+impl std::fmt::Display for Liar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Liar")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for Liar {
+    async fn put_opts(
+        &self,
+        l: &Path,
+        p: PutPayload,
+        o: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.0.put_opts(l, p, o).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        l: &Path,
+        o: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(l, o).await
+    }
+
+    async fn get_opts(
+        &self,
+        l: &Path,
+        o: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let head = o.head;
+        let mut got = self.0.get_opts(l, o).await?;
+        if head {
+            got.meta.size = u64::MAX;
+        }
+        Ok(got)
+    }
+
+    fn delete_stream(
+        &self,
+        l: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.0.delete_stream(l)
+    }
+
+    fn list(
+        &self,
+        p: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.0.list(p)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        p: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(p).await
+    }
+
+    async fn copy_opts(
+        &self,
+        f: &Path,
+        t: &Path,
+        o: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(f, t, o).await
+    }
+}
+
+#[tokio::test]
+async fn get_sealed_does_not_trust_the_reported_size() {
+    let Some(f) = fixture().await else { return };
+    let plain = pattern(2 * CHUNK + 3);
+    f.storage
+        .upload_sealed("t1", "rec/big", &plain[..])
+        .await
+        .unwrap();
+    let lying = Storage::from_store(Arc::new(Liar(f.store.clone()))).encrypted(f.crypt.clone());
+    let got = lying.get_sealed("t1", "rec/big").await.unwrap();
+    assert_eq!(&got[..], &plain[..]);
+    assert!(got.capacity() < 1 << 30);
+    f.drop().await;
+}

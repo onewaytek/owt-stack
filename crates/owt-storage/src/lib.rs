@@ -56,6 +56,45 @@ use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
+/// The most [`Storage::get_sealed`] reserves up front from a store's reported size.
+const PREALLOC_MAX: u64 = 64 << 20;
+
+/// A growable plaintext buffer that wipes the allocation it outgrows.
+struct WipingBuffer(Zeroizing<Vec<u8>>);
+
+impl AsyncWrite for WipingBuffer {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.0.capacity() - this.0.len() < data.len() {
+            let want = (this.0.len() + data.len()).max(this.0.capacity().saturating_mul(2));
+            let mut grown = Zeroizing::new(Vec::with_capacity(want));
+            grown.extend_from_slice(&this.0);
+            // The old buffer is zeroized as it drops.
+            this.0 = grown;
+        }
+        this.0.extend_from_slice(data);
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 use crate::sealed::{CHUNK, Chunks, Header, MAX_HEADER, PREFIX, TAG};
 
 /// The longest a presigned URL lives.
@@ -417,15 +456,19 @@ impl Storage {
         scope: &str,
         key: &str,
     ) -> Result<Zeroizing<Vec<u8>>, StorageError> {
-        // Sized from the object (the plaintext is smaller than the ciphertext), so the
-        // buffer never grows: a reallocation would free plaintext without zeroizing it.
+        // Sized from the object (the plaintext is smaller than the ciphertext), but the
+        // store's reported size is not trusted: the reservation stops at
+        // `PREALLOC_MAX`, and the buffer grows beyond it only as authenticated chunks
+        // arrive. Each growth moves the plaintext into a new `Zeroizing` buffer and
+        // wipes the old one, so no freed allocation keeps plaintext.
         let size = self
             .head(key)
             .await?
             .ok_or_else(|| StorageError::NotFound(key.into()))?;
-        let mut out = Zeroizing::new(Vec::with_capacity(usize::try_from(size).unwrap_or(0)));
-        self.download_sealed(scope, key, &mut *out).await?;
-        Ok(out)
+        let reserve = usize::try_from(size.min(PREALLOC_MAX)).unwrap_or(0);
+        let mut out = WipingBuffer(Zeroizing::new(Vec::with_capacity(reserve)));
+        self.download_sealed(scope, key, &mut out).await?;
+        Ok(out.0)
     }
 
     /// Decrypt the object at `key`, sealed for `scope`, into `writer` a chunk at a

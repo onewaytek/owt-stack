@@ -400,7 +400,9 @@ impl Crypt {
     /// and stops after 10,000 failures. It also stops when a pass moves no row and
     /// finds no new failure (a trigger, a policy or a view that swallows the update,
     /// or live writers winning every race), so it cannot loop forever; that stop and
-    /// the failure cap return [`Reencrypted::complete`] false. A database or KEK
+    /// the failure cap return [`Reencrypted::complete`] false. Rows whose scope has no
+    /// data key are not visited; they are counted in [`Reencrypted::no_key`], which
+    /// also makes `complete` false. A database or KEK
     /// outage, and a KEK id no provider knows, are errors.
     ///
     /// Retire an old key version only after a run that is `complete` with no `failed`
@@ -484,10 +486,27 @@ impl Crypt {
                 break false;
             }
         };
+        // Rows the JOIN above cannot see: their scope has no data key at all.
+        let no_key_scope = match column.scope {
+            Scope::Fixed(_) => "$1::text".to_owned(),
+            Scope::Column(c) => format!("t.{}::text", ident(c)?),
+        };
+        let count = format!(
+            "SELECT count(*) FROM {table} t
+             WHERE t.{value} IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM owt_crypt_keys k
+                               WHERE k.purpose = 'data' AND k.scope = {no_key_scope})"
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count));
+        if let Some(scope) = scope_arg {
+            query = query.bind(scope);
+        }
+        let no_key = u64::try_from(query.fetch_one(&self.pool).await?).unwrap_or(0);
         Ok(Reencrypted {
             moved,
             failed,
-            complete,
+            no_key,
+            complete: complete && no_key == 0,
         })
     }
 
@@ -761,8 +780,12 @@ pub struct Reencrypted {
     /// The ids of rows that could not be decrypted (malformed, an older key version
     /// shredded, or refused), left as they were. It stops collecting at 10,000.
     pub failed: Vec<String>,
+    /// How many rows with a value sit under a scope that has no data key, so the job
+    /// cannot read or move them. They are not in `failed`; any makes `complete` false.
+    pub no_key: u64,
     /// Whether the column was walked until no row outside `failed` was left under an
-    /// old key. False when the job gave up: no progress in a pass, or the failure cap.
+    /// old key, and no row was left without a key (`no_key` is 0). False when the job
+    /// gave up (no progress in a pass, or the failure cap) or `no_key` is not 0.
     /// Retire an old key version only after a complete run with nothing in `failed`.
     pub complete: bool,
 }
