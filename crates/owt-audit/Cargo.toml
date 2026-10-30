@@ -11,7 +11,7 @@ publish.workspace = true
 # `cli::AuditCommand`, the verifier as a clap `Subcommand` an app nests in its own CLI.
 cli = ["dep:clap"]
 # `anchor::S3ObjectLock`, an anchor in an S3 bucket under an Object Lock retention.
-s3 = ["dep:reqwest", "dep:hmac", "dep:md-5", "dep:base64"]
+s3 = ["dep:reqwest", "dep:hmac", "dep:md-5", "dep:base64", "dep:tokio", "dep:zeroize"]
 
 [dependencies]
 anyhow.workspace = true
@@ -27,7 +27,9 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 tracing.workspace = true
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true

@@ -64,6 +64,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 unicode-security = "0.1.2"
 url = "2.5"
+zeroize = "1.8"
 
 owt-web = { path = "crates/owt-web" }
 owt-runtime = { path = "crates/owt-runtime" }
