@@ -567,3 +567,20 @@ async fn a_keyed_enqueue_refuses_a_snapshot_isolation_level() {
     tx.commit().await.unwrap();
     db.drop().await;
 }
+
+#[tokio::test]
+async fn a_job_released_on_its_last_attempt_is_dead() {
+    let Some(db) = Db::new().await else { return };
+    let q = Queue::new(db.pool.clone(), "mail").unwrap();
+    let e = q.enqueue(Job::bytes(vec![]).max_attempts(1)).await.unwrap();
+    let c = q.claim(1).await.unwrap().pop().unwrap();
+    assert!(q.release(&c).await.unwrap());
+    assert!(
+        q.claim(1).await.unwrap().is_empty(),
+        "it does not run a second time"
+    );
+    let (state, attempts, _, error) = db.state(e.id).await;
+    assert_eq!((state.as_str(), attempts), ("dead", 1));
+    assert!(error.unwrap().contains("last attempt"));
+    db.drop().await;
+}

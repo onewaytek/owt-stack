@@ -566,9 +566,10 @@ impl Queue {
         })
     }
 
-    /// Put a claimed job back in the queue, due now (a worker shutting down). The
-    /// attempt stays counted, so a handler that never returns still runs out of
-    /// attempts. False when the claim was no longer current.
+    /// Put a claimed job back in the queue, due now (a worker shutting down), or make
+    /// it dead when this was its last attempt. The attempt stays counted, so a
+    /// handler that never returns still runs out of attempts, and a job never runs
+    /// more than its attempts. False when the claim was no longer current.
     pub async fn release(&self, job: &Claimed) -> sqlx::Result<bool> {
         release(&self.pool, job.id, job.claim).await
     }
@@ -741,8 +742,13 @@ impl Queue {
 
 async fn release(pool: &PgPool, id: i64, claim: i64) -> sqlx::Result<bool> {
     let done = sqlx::query(
-        "UPDATE owt_jobs SET state = 'queued', run_at = now(),
-                claimed_at = NULL, heartbeat_at = NULL
+        "UPDATE owt_jobs SET
+                state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+                finished_at = CASE WHEN attempts >= max_attempts THEN now() END,
+                last_error = CASE WHEN attempts >= max_attempts
+                                  THEN 'stopped at shutdown on its last attempt'
+                                  ELSE last_error END,
+                run_at = now(), claimed_at = NULL, heartbeat_at = NULL
          WHERE id = $1 AND state = 'running' AND claim = $2",
     )
     .bind(id)
