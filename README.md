@@ -2499,7 +2499,8 @@ start the app; nothing in the database changes.
 ### Object storage
 
 `owt-storage` keeps files (recordings, documents, images) in an S3-compatible bucket:
-Backblaze B2, Cloudflare R2, or MinIO in development. Objects that hold health data
+one inside the cluster (MinIO, or OpenShift Data Foundation's object gateway, through
+`Storage::s3_in_cluster`), Cloudflare R2, Backblaze B2, or MinIO in development. Objects that hold health data
 are **encrypted in the app** before they leave it, under a fresh content key per
 object that `owt-crypt` seals for the tenant and the object's key. The bucket, its
 replicas and anyone holding its credentials see only ciphertext.
@@ -2562,23 +2563,27 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
   `incoming/` prefix and then `seal_uploaded(scope, "incoming/…", "recordings/…")`,
   which encrypts it into its final key and deletes the plaintext, verified. Give
   `incoming/` a lifecycle rule that expires objects after a day, so an upload never
-  sealed does not linger. A presigned URL limits neither size nor content type, and
+  sealed does not linger. A presigned URL is only as reachable as the endpoint it
+  signs: for an in-cluster bucket, sign against the endpoint browsers reach (a Route
+  to the gateway), not the Service name. A presigned URL limits neither size nor content type, and
   stays valid until its TTL ends even after the object is sealed and deleted, so
   whoever holds it can upload plaintext again: keep upload TTLs to minutes, use an
   unguessable key per upload, and seal after the URL has expired. A zero TTL is
   refused.
-- **Versioned buckets keep deleted plaintext.** Backblaze B2 is versioned by default
-  (Cloudflare R2 is not). There a delete only *hides* the object: the bytes stay
-  recoverable with the bucket's credentials, and `delete_verified`'s `HEAD` of 404 does
-  not mean they are gone. No S3-API call `owt-storage` makes can delete a specific
-  version. A B2 lifecycle rule "keep only the last version" (`daysFromHidingToDeleting:
-  1`) bounds the exposure but does not remove it: B2 applies lifecycle rules about once
-  a day, so a sealed upload's plaintext stays recoverable for **at least a day and up
-  to about two** after `delete_verified` reports success, and a "delete unsealed
-  uploads after a day" rule on `incoming/` adds another day before the hide even
-  starts. For health data, put presigned uploads in a **separate unversioned bucket**
-  (R2, or B2 with no versions kept) or encrypt in the browser; treat the lifecycle
-  rule as a fallback.
+- **Use an unversioned bucket for anything `delete_verified` must remove.** Verified
+  deletion deletes, then requires a `HEAD` of 404. On an unversioned bucket (the
+  default for MinIO, ODF and R2) that 404 means the bytes are gone. On a versioned
+  bucket a delete only *hides* the object: its bytes stay recoverable with the
+  bucket's credentials, the 404 proves nothing, and no S3-API call `owt-storage`
+  makes can delete a specific version. So keep media and presigned uploads in a bucket
+  with versioning and Object Lock off, and check that setting when the bucket is
+  made.
+- **Backups on Backblaze B2.** B2 buckets are versioned by default. When a backup
+  of the bucket (or of anything holding ciphertext) goes to B2, give that bucket the
+  lifecycle rule "keep only the last version" (`daysFromHidingToDeleting: 1`), and
+  count deletions as complete only after the backup's own retention ends: B2 applies
+  lifecycle rules about once a day, so a hidden object stays recoverable for at least
+  a day and up to about two.
 - **Interrupted uploads.** A failed `upload_sealed` aborts its multipart upload, but a
   dropped future (a client disconnect, a timeout) leaves an incomplete one that is
   billed and invisible to listing. Give the bucket the lifecycle rule "abort incomplete
@@ -2587,9 +2592,7 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
   literals `127.0.0.1` and `[::1]`, not the name `localhost`. `S3Config`'s `Debug`
   redacts the secret.
 - **Verified deletion** deletes, then requires the store to answer that the object is
-  gone. In a bucket with versioning (B2's default) or Object Lock, the delete hides the
-  object and its bytes stay until the bucket's lifecycle rules remove them (above);
-  set those rules to match the retention the app promises.
+  gone, which proves deletion on an unversioned bucket only (above).
 - `Storage::from_store` takes any `object_store` store: `InMemory` in tests, a
   directory in development (neither presigns).
 

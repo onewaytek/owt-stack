@@ -1,4 +1,5 @@
-//! Objects in an S3-compatible bucket (Backblaze B2, Cloudflare R2, `MinIO`), with
+//! Objects in an S3-compatible bucket (in-cluster `MinIO` or ODF, Cloudflare R2,
+//! Backblaze B2), with
 //! client-side encryption through `owt-crypt`.
 //!
 //! * **Plain objects**: [`Storage::put`], [`Storage::get`], [`Storage::head`], and
@@ -13,16 +14,15 @@
 //! * **Verified deletion**: [`Storage::delete_verified`] deletes, then asks for the
 //!   object again and fails unless the store answers that it is gone.
 //!
-//! **Versioned buckets.** Backblaze B2 keeps every version of an object by default
-//! (Cloudflare R2 does not). On a versioned bucket a delete only hides the object: the
-//! bytes stay recoverable by anyone holding the credentials, and a `HEAD` answering 404
-//! does not mean they are gone, so [`Storage::delete_verified`] cannot tell. Add a
-//! lifecycle rule that removes hidden versions (B2: "keep only the last version",
-//! `daysFromHidingToDeleting: 1`) on any prefix that holds plaintext, such as
-//! `incoming/`. That rule leaves the plaintext recoverable for at least a day and up
-//! to about two after a delete (B2 applies lifecycle rules about daily), and no call
-//! this crate makes can delete a specific version. For health data use a separate
-//! unversioned bucket for presigned uploads, or encrypt in the browser.
+//! **Unversioned buckets.** [`Storage::delete_verified`] proves deletion only on a
+//! bucket without versioning or an object lock (the default for `MinIO`, ODF's object
+//! gateway and Cloudflare R2): there a `HEAD` answering 404 means the bytes are gone.
+//! On a versioned bucket (Backblaze B2's default) a delete only hides the object, the
+//! bytes stay recoverable with the bucket's credentials, and no call this crate makes
+//! can delete a specific version. Keep media and presigned uploads in an unversioned
+//! bucket; a versioned bucket holding backups needs a lifecycle rule that removes
+//! hidden versions (B2: "keep only the last version", `daysFromHidingToDeleting: 1`),
+//! which leaves them recoverable for a day or two.
 //!
 //! **Interrupted uploads.** [`Storage::upload_sealed`] aborts its multipart upload when
 //! it fails, but a dropped future (a client disconnect, a timeout, a cancelled task)
@@ -141,6 +141,21 @@ impl Storage {
     /// (a local `MinIO`), never for a name such as `localhost`, which resolution could
     /// point elsewhere. An endpoint that does not parse is [`StorageError::Invalid`].
     pub fn s3(config: &S3Config) -> Result<Self, StorageError> {
+        Self::open_s3(config, false)
+    }
+
+    /// [`Storage::s3`] for a bucket inside the cluster (`MinIO`, or ODF's object
+    /// gateway), which also accepts plain `http://` to any host: a Service such as
+    /// `http://minio.media.svc:9000`. Objects are encrypted before they leave the app
+    /// and requests are signed without sending the secret, but presigned URLs, object
+    /// keys and metadata cross the pod network in the clear: prefer `https` through the
+    /// cluster's service CA, and keep plain `http` to a namespace that a
+    /// `NetworkPolicy` closes to everything but the app.
+    pub fn s3_in_cluster(config: &S3Config) -> Result<Self, StorageError> {
+        Self::open_s3(config, true)
+    }
+
+    fn open_s3(config: &S3Config, any_http: bool) -> Result<Self, StorageError> {
         let invalid = |why: &str| StorageError::Invalid(format!("S3 endpoint: {why}"));
         let endpoint = url::Url::parse(&config.endpoint).map_err(|_| invalid("not a URL"))?;
         let loopback = match endpoint.host() {
@@ -150,7 +165,7 @@ impl Storage {
         };
         match endpoint.scheme() {
             "https" => {}
-            "http" if loopback => {}
+            "http" if loopback || any_http => {}
             "http" => return Err(invalid("plain http is for 127.0.0.1 and [::1] only")),
             _ => return Err(invalid("the scheme is https")),
         }
@@ -217,13 +232,11 @@ impl Storage {
     /// Delete `key`, then ask for it again: fails unless the store answers that it is
     /// gone. A key already gone is deleted.
     ///
-    /// **On a versioned bucket this does not erase the bytes.** Backblaze B2 is
-    /// versioned by default (R2 is not): a delete only hides the object, a `HEAD` of 404
-    /// is the hidden object's answer, and the bytes stay recoverable with the bucket's
-    /// credentials until a lifecycle rule removes the hidden version (B2: "keep only the
-    /// last version", `daysFromHidingToDeleting: 1`), which takes at least a day and up
-    /// to about two. With an object lock they stay until the lock expires. Set those
-    /// rules to match what the app promises.
+    /// This proves deletion on an unversioned bucket only. **On a versioned bucket it
+    /// does not erase the bytes**: a delete only hides the object, a `HEAD` of 404 is the
+    /// hidden object's answer, and the bytes stay recoverable with the bucket's
+    /// credentials until a lifecycle rule removes the hidden version, or, with an object
+    /// lock, until the lock expires. See the module docs.
     pub async fn delete_verified(&self, key: &str) -> Result<(), StorageError> {
         let p = path(key)?;
         match self.store.delete(&p).await {
@@ -715,6 +728,13 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("wJalrXUtnFEMI"));
+    }
+
+    #[test]
+    fn an_in_cluster_bucket_may_be_plain_http() {
+        assert!(Storage::s3_in_cluster(&config("http://minio.media.svc:9000")).is_ok());
+        assert!(Storage::s3(&config("http://minio.media.svc:9000")).is_err());
+        assert!(Storage::s3_in_cluster(&config("ftp://minio")).is_err());
     }
 
     #[test]
