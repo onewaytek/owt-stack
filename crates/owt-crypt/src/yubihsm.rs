@@ -388,7 +388,8 @@ mod tests {
         connector
     }
 
-    /// Opens with the self-test skipped, which `MockHsm` cannot run.
+    /// Opens with the self-test skipped: `MockHsm` panics on wrap-data, which the
+    /// self-test needs. The self-test itself runs against `Fake`.
     fn open(
         connector: Connector,
         credentials: Credentials,
@@ -398,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_a_transport_key_and_runs_the_self_test() {
+    fn open_refuses_a_transport_key() {
         let both = Capability::WRAP_DATA | Capability::UNWRAP_DATA;
         for extra in [Capability::EXPORT_WRAPPED, Capability::IMPORT_WRAPPED] {
             let r = open(
@@ -418,13 +419,6 @@ mod tests {
             0x64,
         );
         assert!(ok.is_ok());
-        // MockHsm has no wrap-data, so the real `open` fails its self-test.
-        let tested = YubiHsmKek::open(
-            mock_with_wrap_key(both, wrap::Algorithm::Aes256Ccm),
-            Credentials::default(),
-            0x64,
-        );
-        assert!(matches!(tested, Err(KekError::Config(_))));
     }
 
     #[test]
