@@ -314,7 +314,9 @@ mod tests {
     }
 
     fn admin() -> Option<PgConnectOptions> {
-        let url = std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty())?;
+        let url = std::env::var("DATABASE_URL")
+            .ok()
+            .filter(|u| !u.is_empty())?;
         Some(PgConnectOptions::from_str(&url).unwrap())
     }
 
