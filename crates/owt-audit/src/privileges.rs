@@ -34,6 +34,7 @@ pub struct Privileges {
 
 impl Privileges {
     /// The role can append and read but cannot alter, remove or unprotect events.
+    #[must_use]
     pub fn least(&self) -> bool {
         !self.superuser && self.owns.is_empty() && self.excess.is_empty() && self.missing.is_empty()
     }
