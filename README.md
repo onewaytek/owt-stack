@@ -143,6 +143,11 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+A credential is read with `env::secret`, which returns a
+`logging::Sensitive<String>` that prints as `[redacted]` (`expose()` reads it), so
+a derived `Debug` of the config that keeps it does not print it. `env::Vars`, a map
+of variables for tests, prints its names and never its values.
+
 `serve::serve` is the same with `ServeOptions::default()`: a request head must arrive
 within 30 s (an idle kept-alive connection closes then too), at most 4096 connections
 are open at once, and a stop drains for up to 20 s. `ServeOptions` is built from its
@@ -468,10 +473,11 @@ the handler and write `<script nonce="{{ nonce }}">`.
   # fn main() -> anyhow::Result<()> {
   use owt_web::session::{Sessions, key_for, key_from_base64};
   # #[derive(Clone, Default, serde::Serialize, serde::Deserialize)] struct SessionData;
-  let secret = owt_runtime::env::required("SESSION_SECRET")?;
+  // `secret`, not `required`: a `Sensitive<String>`, which prints as `[redacted]`.
+  let secret = owt_runtime::env::secret("SESSION_SECRET")?;
   let purpose = format!("myapp/{}", owt_runtime::env::required("POD_NAMESPACE")?);
   let sessions = Sessions::<SessionData>::new(
-      key_for(&secret, &purpose)?,
+      key_for(secret.expose(), &purpose)?,
       "__Host-session",
       std::time::Duration::from_secs(14 * 86_400),
       true,
@@ -1957,8 +1963,9 @@ supply a `SecretSealer` that encrypts it with a key the database does not hold
 (`owt-crypt`'s, say). The stored value carries a format byte and the sealer's key id, so
 keys rotate (a secret sealed under an older id is opened with it and resealed at its next
 use). The default, `Unsealed`, stores it in the clear, marked plain, and logs a warning; it is
-for development, and a plain row is accepted and sealed at its next use once a real sealer is
-set, so adopting one later locks nobody out. Then turn `Mfa::accept_plaintext(false)` on once
+for development, and a release build (no `debug_assertions`) refuses it: enrolling, and
+signing in with a factor it stored, fail as a fault until a real sealer is set. A plain row is
+accepted and sealed at its next use once one is, so adopting one later locks nobody out. Then turn `Mfa::accept_plaintext(false)` on once
 none remain (`SELECT count(*) FROM account_totp WHERE get_byte(secret, 0) = 0` is 0): until
 then anyone who can write to the table can plant a known secret in a plain row, which the
 sealer's authentication would have stopped. A sealer must treat the key id it is handed as
