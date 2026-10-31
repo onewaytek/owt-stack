@@ -548,7 +548,7 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
             .contains("\"roles\", which the row already has"),
         "{err}"
     );
-    let err = store::by_id_in_epoch_with::<Everything>(&db.pool, ada.id, epoch)
+    let err = store::by_id_in_epoch_with::<Everything>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap_err();
     assert!(
@@ -556,12 +556,12 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
             .contains("\"id\", which the row already has"),
         "{err}"
     );
-    store::by_id_in_epoch_with::<Mistyped>(&db.pool, ada.id, epoch)
+    store::by_id_in_epoch_with::<Mistyped>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap_err();
     // With a second account, the whole table is two rows: refused, not the first.
     store::create(&db.pool, new("bob", "", None)).await.unwrap();
-    let err = store::by_id_in_epoch_with::<WholeTable>(&db.pool, ada.id, epoch)
+    let err = store::by_id_in_epoch_with::<WholeTable>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("several rows"), "{err}");
