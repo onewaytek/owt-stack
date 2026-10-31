@@ -3230,6 +3230,22 @@ call it last in the transaction, and the transaction must be READ COMMITTED (the
 default; the database refuses others, whose snapshot could miss the chain's last
 event).
 
+**Locks and refusals.** The chain lock is per tenant and lasts until commit, so:
+
+- Record for one tenant per transaction. Two transactions that record for tenants
+  `a` and `b` in opposite orders deadlock; Postgres aborts one of them
+  (`40P01`). If one transaction must record for several tenants, record them in a
+  fixed order (sorted by tenant).
+- Never call `audit.record` for a tenant while your own open transaction has already
+  run `record_in` for that tenant. `record` takes another pool connection, which
+  waits for your transaction's lock while your task waits for `record`. Postgres
+  cannot see that wait, so it lasts until a statement timeout ends it, or forever
+  without one.
+- Record refusals and failures (`Outcome::Denied`, a failed attempt) with
+  `audit.record`, in a transaction of their own, as in the example above. An event
+  recorded with `record_in` rolls back with its transaction, and the transaction of
+  a refused or failed request is usually the one that rolls back.
+
 **Roles.** Run the migrations as the role that owns the schema. Give the app's role
 `INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
 or disable the triggers, which takes ownership. Only the role that runs the anchoring
