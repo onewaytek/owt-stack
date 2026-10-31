@@ -3949,25 +3949,51 @@ run from two worktrees, or from two apps with tests at one path, asks the shared
 for the same name twice: one run drops the other's database, or fails with "database
 `_sqlx_test_…` already exists". A per-worktree `DATABASE_URL` does not help, because
 database names are server-wide, and sqlx offers no way to rename them. Tests that
-share a server use `owt_test::schema::TestSchema` instead: it creates
-`owt_test_<checkout>_<process>_<sequence>` (eight hex digits of a hash of the
-`CARGO_MANIFEST_DIR` you pass, the process id, and a counter; under 63 bytes) in the
-database `DATABASE_URL` names, puts it first on its pool's `search_path`, and drops it
-with its contents when the value drops. It needs `CREATE` on the database, not
-`CREATEDB`, and avoids the checkpoint each `DROP DATABASE` forces. It returns `None`
-when `DATABASE_URL` is unset, so the test skips. Queries that name `public.` bypass the
-`search_path`; leave the schema out of the app's SQL.
+share a server use `owt_test::schema::TestSchema` instead, in a plain `#[tokio::test]`
+(it replaces `#[sqlx::test(migrations = false)]`): it creates
+`owt_test_<checkout>_<process>_<sequence>` (eight hex digits of a hash of the host name
+and the `CARGO_MANIFEST_DIR` you pass, the process id, and a counter; under 63 bytes)
+in the database `DATABASE_URL` names, and gives its pool `search_path = <schema>,
+public`. It needs `CREATE` on the database, not `CREATEDB`, and avoids the checkpoint
+each `DROP DATABASE` forces. It returns `None` when `DATABASE_URL` is unset, so the
+test skips. Queries that name `public.` bypass the `search_path`; leave the schema out
+of the app's SQL.
+
+The test ends with `db.close().await`, which closes the pool and drops the schema with
+its contents. Dropping the value does the same as a fallback, from a thread of its own.
+Both first end the pool's server sessions (they carry the schema's name as
+`application_name`), so a transaction dropped open or a pool clone still held in app
+state cannot keep `DROP SCHEMA` waiting, and both give up after 30 seconds. A run that
+is killed or aborted leaves its schema behind; the next `create` in the same checkout
+drops it, along with any schema of that checkout whose process is no longer running
+on this host (Linux only, as the check reads `/proc`).
+
+`CREATE EXTENSION` installs into the first schema on the `search_path`, which is the
+test's. A migration that creates an extension names the schema
+(`CREATE EXTENSION IF NOT EXISTS citext SCHEMA public`), or the extension is installed
+in `public` beforehand; otherwise the first test's schema holds it, concurrent schemas
+fail with `type "citext" does not exist`, and dropping that schema removes it. Each
+schema runs its migrations in full, and the advisory locks behind them
+(`owt_accounts::migrations::LOCK_ID`, the app's `migrate_locked` id) are database-wide,
+so the migrations of every test, worktree and app sharing the database queue behind
+one another: correct, and slower under parallel load.
 
 ```rust,no_run
 use owt_test::schema::TestSchema;
 
+# static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate::Migrator::DEFAULT;
+// static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!(); // the app's migrations/
 # async fn run() {
 let Some(db) = TestSchema::create(env!("CARGO_MANIFEST_DIR")).await else {
     return; // no DATABASE_URL: skip
 };
-let one: i32 = sqlx::query_scalar("SELECT 1").fetch_one(db.pool()).await.unwrap();
-assert_eq!(one, 1);
-// Apply the app's migrations to `db.pool()` as a production start does, then test.
+owt_accounts::migrations::start(db.pool(), || {
+    owt_runtime::db::migrate_locked(db.pool(), &MIGRATOR, 8_531_207)
+})
+.await
+.unwrap();
+// ... test against `db.pool()`, then:
+db.close().await;
 # }
 ```
 
