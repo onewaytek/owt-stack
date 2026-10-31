@@ -106,8 +106,11 @@ fn app_with(db: &Db, sessions: &Sessions<Data>, policies: Policies) -> Router {
     async fn whoami(Maybe(account): Maybe) -> String {
         account.map_or_else(|| "anonymous".to_owned(), |a| a.username)
     }
-    async fn sign_out(session: Session<Data>) -> &'static str {
-        session::sign_out(&session);
+    async fn sign_out(
+        axum::extract::State(pool): axum::extract::State<sqlx::PgPool>,
+        session: Session<Data>,
+    ) -> &'static str {
+        session::sign_out(&pool, &session).await.unwrap();
         "out"
     }
     let accounts = Accounts::new(db.pool.clone(), "/login");
@@ -115,7 +118,7 @@ fn app_with(db: &Db, sessions: &Sessions<Data>, policies: Policies) -> Router {
         .merge(policies.routes())
         .route("/whoami", get(whoami))
         .route("/static/app.css", get(|| async { "css" }))
-        .route("/out", post(sign_out))
+        .route("/out", post(sign_out).with_state(db.pool.clone()))
         .layer(from_fn_with_state(policies, Policies::gate))
         .layer(from_fn_with_state(accounts, Accounts::load::<Data>))
         .layer(from_fn_with_state(sessions.clone(), Sessions::layer))

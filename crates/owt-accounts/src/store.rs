@@ -398,20 +398,50 @@ pub async fn by_id(db: impl PgExecutor<'_>, id: i64) -> sqlx::Result<Option<Acco
     .await
 }
 
-/// The active account with this id, if `epoch` is still its current one: the
+/// The active account with this id, if `epoch` is still its current one and the
+/// session with id `session` (when given) was not signed out ([`revoke_session`]): the
 /// session's question.
 pub async fn by_id_in_epoch(
     db: impl PgExecutor<'_>,
     id: i64,
     epoch: i32,
+    session: Option<&str>,
 ) -> sqlx::Result<Option<Account>> {
     sqlx::query_as::<_, Account>(sqlx::AssertSqlSafe(format!(
-        "SELECT {COLUMNS} FROM accounts WHERE id = $1 AND is_active AND session_epoch = $2"
+        "SELECT {COLUMNS} FROM accounts WHERE id = $1 AND is_active AND session_epoch = $2
+         AND NOT EXISTS (SELECT 1 FROM revoked_sessions r WHERE r.id = $3)"
     )))
     .bind(id)
     .bind(epoch)
+    .bind(session)
     .fetch_optional(db)
     .await
+}
+
+/// Record the session with id `session` as signed out, so its cookie opens it no more
+/// even if someone kept a copy; `expires` (Unix seconds) is when the cookie could no
+/// longer open it anyway, after which the row is pointless. Rows past their expiry
+/// are deleted on the way, a bounded batch per call.
+pub async fn revoke_session(
+    db: impl PgExecutor<'_>,
+    session: &str,
+    expires: u64,
+) -> sqlx::Result<()> {
+    let expires = i64::try_from(expires).unwrap_or(i64::MAX);
+    sqlx::query(
+        "WITH pruned AS (
+             DELETE FROM revoked_sessions WHERE id IN (
+                 SELECT id FROM revoked_sessions WHERE expires_at < now() LIMIT 1000
+             )
+         )
+         INSERT INTO revoked_sessions (id, expires_at) VALUES ($1, to_timestamp($2))
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(session)
+    .bind(expires)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// What an app reads about the signed-in account beside the [`Account`], in the
@@ -427,6 +457,7 @@ pub async fn by_id_in_epoch(
 /// CROSS JOIN LATERAL (SELECT COLUMNS) account
 /// LEFT JOIN LATERAL (QUERY) extra ON true
 /// WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2
+/// AND NOT EXISTS (SELECT 1 FROM revoked_sessions r WHERE r.id = $3)
 /// ```
 ///
 /// The type is decoded from the same row as the [`Account`], by column name, so the
@@ -441,7 +472,7 @@ pub async fn by_id_in_epoch(
 ///
 /// `QUERY` is SQL pasted into the statement as it is, so it is a constant of the app's
 /// code: never built from anything a visitor sends. It binds no parameters of its own
-/// (`$1` and `$2` are the library's); it reads the account through `accounts`.
+/// (`$1` to `$3` are the library's); it reads the account through `accounts`.
 pub trait Extra: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Sync + 'static {
     /// The `SELECT`, as above: `"SELECT p.display_name FROM profiles p WHERE
     /// p.account_id = accounts.id"`, or `"SELECT accounts.beta"` for a column of the
@@ -454,6 +485,7 @@ pub async fn by_id_in_epoch_with<X: Extra>(
     db: impl PgExecutor<'_>,
     id: i64,
     epoch: i32,
+    session: Option<&str>,
 ) -> sqlx::Result<Option<(Account, X)>> {
     use sqlx::{Column, FromRow, Row};
     // The account's columns are computed in a lateral of their own, which sees only
@@ -465,11 +497,13 @@ pub async fn by_id_in_epoch_with<X: Extra>(
          CROSS JOIN LATERAL (SELECT {COLUMNS}\n) account
          LEFT JOIN LATERAL ({}\n) extra ON true
          WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2
+         AND NOT EXISTS (SELECT 1 FROM revoked_sessions r WHERE r.id = $3)
          LIMIT 2",
         X::QUERY
     )))
     .bind(id)
     .bind(epoch)
+    .bind(session)
     .fetch_all(db)
     .await?;
     if rows.len() > 1 {

@@ -81,6 +81,10 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_recovery_codes_index",
         sql: include_str!("../migrations/0008_recovery_codes_index.sql"),
     },
+    Migration {
+        name: "owt_accounts_revoked_sessions",
+        sql: include_str!("../migrations/0009_revoked_sessions.sql"),
+    },
 ];
 
 /// The table [`run`] records the library's migrations in, in the schema they run in
@@ -820,6 +824,14 @@ const RELATIONS: &[(&str, &[&str])] = &[
     (
         "owt_accounts_recovery_codes_index",
         &["account_recovery_codes_account_all"],
+    ),
+    (
+        "owt_accounts_revoked_sessions",
+        &[
+            "revoked_sessions",
+            "revoked_sessions_pkey",
+            "revoked_sessions_expires_at",
+        ],
     ),
 ];
 

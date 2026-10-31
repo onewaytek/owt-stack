@@ -1531,10 +1531,13 @@ every name made after.
 
 **Revocation, and what it does not reach:**
 
-- `session::sign_out` replaces this browser's cookie; a copy of it taken earlier
-  still opens until it expires: the idle timeout (30 minutes by default) or the
-  absolute lifetime (24 hours by default), whichever comes first. Only
-  `sign_out_everywhere` (the epoch) revokes.
+- `session::sign_out` revokes this session alone: its id goes into
+  `revoked_sessions` (migration 0009) until its cookie would have expired anyway,
+  and the per-request account load checks it by primary key in the same query, so a
+  copy of the cookie taken earlier opens nothing. Expired rows are deleted by later
+  sign-outs. `sign_out_everywhere` bumps the epoch and ends every session of the
+  account. A database error from `sign_out` still replaces the cookie, but the
+  copy stays good until it expires.
 - A password change, deactivation or a demotion ends every session at its next
   request, but a stream opened before (SSE, a WebSocket) was checked at its start:
   an app that streams to signed-in people re-checks `store::by_id_in_epoch` on
@@ -1634,7 +1637,7 @@ match session::password_gate(&pool, &gate_throttle, &session, ip, given, gate).a
     Ok(account) => { let _ = account; /* redirect */ }
     Err(refused) => { let _ = (refused.status(), refused.to_string()); /* the form again */ }
 }
-session::sign_out(&session); // this session
+session::sign_out(&pool, &session).await?; // this session, copies of its cookie too
 session::sign_out_everywhere(&pool, &session).await?; // every session: the epoch moves
 
 // Accounts: normalized, password rules checked (`owt_accounts::password`), a taken

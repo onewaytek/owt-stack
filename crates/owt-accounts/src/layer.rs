@@ -136,8 +136,8 @@ impl Accounts {
         req: Request,
         next: Next,
     ) -> Response {
-        this.load_by::<T, _, _, _>(req, next, |pool, id, epoch| async move {
-            let account = store::by_id_in_epoch(&pool, id, epoch).await?;
+        this.load_by::<T, _, _, _>(req, next, |pool, id, epoch, session| async move {
+            let account = store::by_id_in_epoch(&pool, id, epoch, session.as_deref()).await?;
             Ok(account.map(|account| (account, ())))
         })
         .await
@@ -152,8 +152,8 @@ impl Accounts {
         req: Request,
         next: Next,
     ) -> Response {
-        this.load_by::<T, _, _, _>(req, next, |pool, id, epoch| async move {
-            store::by_id_in_epoch_with::<X>(&pool, id, epoch).await
+        this.load_by::<T, _, _, _>(req, next, |pool, id, epoch, session| async move {
+            store::by_id_in_epoch_with::<X>(&pool, id, epoch, session.as_deref()).await
         })
         .await
     }
@@ -190,13 +190,14 @@ impl Accounts {
         T: SignedData,
         X: Clone + Send + Sync + 'static,
         F: Future<Output = sqlx::Result<Option<(Account, X)>>>,
-        R: FnOnce(PgPool, i64, i32) -> F,
+        R: FnOnce(PgPool, i64, i32, Option<String>) -> F,
     {
         let session = req.extensions().get::<Session<T>>().cloned();
         let loaded = match session.as_ref().and_then(|s| s.read(SignedData::signature)) {
             None => Loaded::Anonymous,
             Some(signature) => {
-                match read(self.pool.clone(), signature.account, signature.epoch).await {
+                let id = session.as_ref().and_then(Session::id);
+                match read(self.pool.clone(), signature.account, signature.epoch, id).await {
                     Ok(Some((account, extra))) => {
                         let held = self.hold::<T>(session.as_ref(), &account).await;
                         match held {

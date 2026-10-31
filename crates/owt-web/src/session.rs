@@ -660,7 +660,11 @@ impl<T: SessionData> Sessions<T> {
     /// seals an empty session, dropping anything the handler did after it.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
         let session = Session::<T>::default();
-        session.inner().idle = this.inner.idle;
+        {
+            let mut inner = session.inner();
+            inner.idle = this.inner.idle;
+            inner.absolute = Some(this.inner.absolute);
+        }
         let (mut refused, mut unchecked) = (false, false);
         let passive = req
             .headers()
@@ -829,6 +833,8 @@ struct Inner<T> {
     seen: Option<u64>,
     /// The idle timeout in force.
     idle: Option<Duration>,
+    /// The absolute lifetime in force.
+    absolute: Option<Duration>,
     /// The request presented a session that had passed its idle timeout.
     idle_expired: bool,
     /// The handler marked this request as not the person's activity.
@@ -850,6 +856,7 @@ impl<T: Default> Default for Inner<T> {
             issued: None,
             seen: None,
             idle: None,
+            absolute: None,
             idle_expired: false,
             passive: false,
             data: T::default(),
@@ -924,6 +931,15 @@ impl<T: Default + Clone> Session<T> {
     #[must_use]
     pub fn issued(&self) -> Option<u64> {
         self.inner().issued
+    }
+
+    /// The last moment its cookie can open, in Unix seconds: when it began plus the
+    /// absolute lifetime. `None` until it has been sealed, or outside the layer. A
+    /// record kept against this session (a revocation) can be forgotten after it.
+    #[must_use]
+    pub fn expires(&self) -> Option<u64> {
+        let inner = self.inner();
+        Some(inner.issued?.saturating_add(inner.absolute?.as_secs()))
     }
 
     /// Whether the request presented a session that had passed its idle timeout, and

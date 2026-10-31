@@ -224,7 +224,7 @@ async fn changing_the_password_deactivating_or_demoting_moves_the_epoch() {
     let after = store::by_id(&db.pool, a.id).await.unwrap().unwrap();
     assert_eq!(after.session_epoch, a.session_epoch + 1);
     assert!(
-        store::by_id_in_epoch(&db.pool, a.id, a.session_epoch)
+        store::by_id_in_epoch(&db.pool, a.id, a.session_epoch, None)
             .await
             .unwrap()
             .is_none()
@@ -290,8 +290,11 @@ fn app(db: &Db, sessions: &Sessions<Data>, extra: Router) -> Router {
     async fn staff(Staff(account): Staff) -> String {
         format!("staff room for {}", account.username)
     }
-    async fn sign_out(session: Session<Data>) -> &'static str {
-        session::sign_out(&session);
+    async fn sign_out(
+        axum::extract::State(pool): axum::extract::State<PgPool>,
+        session: Session<Data>,
+    ) -> &'static str {
+        session::sign_out(&pool, &session).await.unwrap();
         "out"
     }
     let accounts = Accounts::new(db.pool.clone(), "/login");
@@ -300,7 +303,7 @@ fn app(db: &Db, sessions: &Sessions<Data>, extra: Router) -> Router {
         .route("/whoami", get(whoami))
         .route("/private", get(private))
         .route("/staff", get(staff))
-        .route("/out", post(sign_out))
+        .route("/out", post(sign_out).with_state(db.pool.clone()))
         .layer(from_fn_with_state(accounts, Accounts::load::<Data>))
         .layer(axum::middleware::from_fn_with_state(
             sessions.clone(),
@@ -412,8 +415,9 @@ async fn an_extra_is_read_with_the_account_in_its_epoch() {
         .await
         .unwrap();
 
-    let read =
-        |a: &store::Account, epoch| store::by_id_in_epoch_with::<Viewer>(&db.pool, a.id, epoch);
+    let read = |a: &store::Account, epoch| {
+        store::by_id_in_epoch_with::<Viewer>(&db.pool, a.id, epoch, None)
+    };
     let (account, viewer) = read(&ada, ada.session_epoch).await.unwrap().unwrap();
     assert_eq!(account, ada);
     let ada_viewer = Viewer {
@@ -528,7 +532,7 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
         .unwrap();
     let epoch = ada.session_epoch;
 
-    let (account, joined) = store::by_id_in_epoch_with::<Joined>(&db.pool, ada.id, epoch)
+    let (account, joined) = store::by_id_in_epoch_with::<Joined>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap()
         .unwrap();
@@ -536,7 +540,7 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
     assert_eq!(joined.display_name.as_deref(), Some("Ada L."));
     assert!(joined.profile_id.is_some());
 
-    let err = store::by_id_in_epoch_with::<Sneaky>(&db.pool, ada.id, epoch)
+    let err = store::by_id_in_epoch_with::<Sneaky>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap_err();
     assert!(
@@ -719,11 +723,18 @@ async fn signing_in_cycles_the_id_and_signing_out_empties_the_session() {
     assert_eq!(id, new_id);
     assert_eq!(data.account, Some(ada.id));
 
+    let copied = client.cookie("s").unwrap();
     client.post_form("/out", &[]).await;
     assert_eq!(client.get("/whoami").await.text(), "anonymous");
     let (id, data) = sessions.unseal(&client.cookie("s").unwrap()).unwrap();
     assert_ne!(id, new_id);
     assert_eq!(data, Data::default());
+    // A copy of the signed-out cookie opens nothing, while the account's other
+    // sessions stand.
+    client.set_cookie("s", &copied);
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    assert_eq!(client.get("/whoami").await.text(), "ada");
     db.drop().await;
 }
 
