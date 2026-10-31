@@ -2907,9 +2907,9 @@ async fn an_admin_page_keeps_the_apps_csp() {
 /// answers: the nest's layers put both headers on it, and a route moved out of the
 /// nest would lose them silently.
 fn assert_admin_headers(r: &owt_test::Response) {
-    assert!(
-        r.header("cache-control")
-            .is_some_and(|c| c.contains("no-store")),
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE),
         "{}",
         r.status
     );
@@ -2951,9 +2951,9 @@ async fn the_admin_is_for_staff_and_finds_accounts_by_name_email_and_role() {
     client.set_cookie("s", &cookie_for(&sessions, &boss));
     let r = client.get("/staff/accounts").await;
     assert_eq!(r.status, 200);
-    assert!(
-        r.header("cache-control")
-            .is_some_and(|c| c.contains("no-store"))
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE)
     );
     assert_eq!(r.header("x-frame-options"), Some("DENY"), "never framed");
     let html = r.text();
@@ -3231,9 +3231,9 @@ async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
     // A generated password, shown in the answer to the POST and nowhere after.
     let r = client.post_form(&format!("{at}/password"), &[]).await;
     assert_eq!(r.status, 200);
-    assert!(
-        r.header("cache-control")
-            .is_some_and(|c| c.contains("no-store"))
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE)
     );
     let password = secret(&r.text());
     assert_eq!(password.len(), 20);
@@ -3789,9 +3789,9 @@ async fn a_secret_survives_the_apps_page_failing() {
     for action in ["password", "link"] {
         let r = client.post_form(&format!("{at}/{action}"), &[]).await;
         assert_eq!(r.status, 200, "{action}");
-        assert!(
-            r.header("cache-control")
-                .is_some_and(|c| c.contains("no-store"))
+        assert_eq!(
+            r.header("cache-control"),
+            Some(owt_web::headers::NEVER_CACHE)
         );
         assert_eq!(r.header("x-frame-options"), Some("DENY"));
         let value = secret(&r.text());
@@ -3841,9 +3841,9 @@ async fn an_app_draws_the_admin_with_its_own_templates() {
 
     let r = client.get("/staff/accounts?role=editor").await;
     assert_eq!(r.status, 200);
-    assert!(
-        r.header("cache-control")
-            .is_some_and(|c| c.contains("no-store"))
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE)
     );
     assert_eq!(r.header("x-frame-options"), Some("DENY"));
     let html = r.text();
@@ -3893,9 +3893,9 @@ async fn an_app_draws_the_admin_with_its_own_templates() {
 
     let r = client.post_form(&format!("{at}/password"), &[]).await;
     assert_eq!(r.status, 200);
-    assert!(
-        r.header("cache-control")
-            .is_some_and(|c| c.contains("no-store"))
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE)
     );
     assert_eq!(r.header("x-frame-options"), Some("DENY"));
     let html = r.text();
