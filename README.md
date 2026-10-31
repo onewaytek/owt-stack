@@ -1455,8 +1455,9 @@ subcommand that runs this sequence and exits, and both run it instead of `sqlx m
 run`: the template justfile's `migrate` recipe runs `SQLX_OFFLINE=true cargo run
 --locked -- migrate` (the offline build needs the committed `.sqlx/`), and
 `rust-ci.yml` takes `migrate-command: SQLX_OFFLINE=true cargo run --locked -- migrate`.
-A test's database is made the same way: `#[sqlx::test(migrations = false)]`, then the
-test awaits that sequence on its pool before anything else.
+A test's database is made the same way: a schema of its own (`TestSchema`, under
+"A schema per test" below), then the test awaits that sequence on its pool before
+anything else.
 
 **Names the migrations take**, in the schema they run in (the first on the
 `search_path`, usually `public`):

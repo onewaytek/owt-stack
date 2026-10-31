@@ -925,7 +925,7 @@ async fn applied_checksums(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Vec<u8>>> {
 /// `search_path`). Empty when there is nothing in the way.
 ///
 /// A migration [`LEDGER`] records as applied, or the app's `_sqlx_migrations` records
-/// as a copy (by its checksum; both found on the `search_path` as sqlx finds them), is
+/// as a copy (by checksum; both read from `current_schema()`, where they are made), is
 /// installed, and what it created is the library's own; the names of every other
 /// migration are checked against the tables, indexes, sequences, views, types and
 /// functions there, and the columns and constraints it adds to an existing table (an
