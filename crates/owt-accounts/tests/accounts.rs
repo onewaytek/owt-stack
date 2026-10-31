@@ -345,7 +345,7 @@ fn cookie_proved(
         account: account.id,
         epoch: account.session_epoch,
         at: now.as_secs(),
-        mfa_at: mfa_ago.map(|ago| (now - ago).as_secs()),
+        mfa_at: mfa_ago.map(|ago| now.saturating_sub(ago).as_secs()),
     });
     sessions.seal(&owt_web::session::new_id(), &data)
 }
@@ -3364,6 +3364,9 @@ async fn the_admin_asks_for_a_recent_second_factor_and_records_each_change() {
             })
         }
     }
+    async fn epoch_of(pool: &PgPool, id: i64) -> i32 {
+        store::by_id(pool, id).await.unwrap().unwrap().session_epoch
+    }
     let db = db!();
     let sessions = sessions();
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -3380,9 +3383,6 @@ async fn the_admin_asks_for_a_recent_second_factor_and_records_each_change() {
     let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
     let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
     let at = format!("/staff/accounts/{}", ada.id);
-    async fn epoch_of(pool: &PgPool, id: i64) -> i32 {
-        store::by_id(pool, id).await.unwrap().unwrap().session_epoch
-    }
     let before = epoch_of(&db.pool, ada.id).await;
 
     // No second factor, or one 16 minutes ago: pages show, changes wait.
