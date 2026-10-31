@@ -7,12 +7,16 @@
 //! fails with "database already exists". Pointing `DATABASE_URL` at another database
 //! of the same server changes nothing, because database names are server-wide.
 //!
-//! [`TestSchema`] takes a schema named `owt_test_<checkout>_<process>_<sequence>`,
-//! where `<checkout>` is eight hex digits of a hash of the host name and the app's
-//! `CARGO_MANIFEST_DIR`, so two worktrees (two paths) or two hosts never share a name
-//! and neither do two processes of one worktree or two tests of one process. A
-//! schema costs a catalog entry where `DROP DATABASE` forces a checkpoint, which on
-//! a server shared by many test runs is the slower and the more contended of the two.
+//! [`TestSchema`] takes a schema named
+//! `owt_test_<checkout>_<pid>_<nonce>_<sequence>`, where `<checkout>` is eight hex
+//! digits of a hash of the host name and the app's `CARGO_MANIFEST_DIR` and `<nonce>`
+//! is eight random hex digits drawn once per process, so two worktrees (two paths) or
+//! two hosts never share a name and neither do two processes of one worktree or two
+//! tests of one process. The nonce separates processes the rest cannot: containers
+//! that share a host name and a path, whose pids are namespace-local, and hosts with
+//! no readable host name. A schema costs a catalog entry where `DROP DATABASE`
+//! forces a checkpoint, which on a server shared by many test runs is the slower and
+//! the more contended of the two.
 //!
 //! Its pool's connections carry the schema's name as their `application_name` and
 //! have `search_path` set to `<schema>, public`: the app's tables land in the schema,
@@ -43,11 +47,12 @@ use sqlx::{Connection, PgConnection, PgPool};
 /// Postgres truncates identifiers longer than this many bytes.
 pub const MAX_NAME_LEN: usize = 63;
 
-/// The longest any one cleanup (close or drop) takes before it gives up.
+/// The longest a cleanup takes before it gives up: a drop's whole cleanup, and a
+/// close's, including its wait for the pool.
 const CLEANUP_LIMIT: Duration = Duration::from_secs(30);
 
 /// How long [`TestSchema::close`] waits for the pool's connections to come back
-/// before ending their sessions.
+/// before ending their sessions, out of its [`CLEANUP_LIMIT`].
 const POOL_CLOSE_LIMIT: Duration = Duration::from_secs(5);
 
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -67,15 +72,30 @@ pub fn checkout_tag(host: &str, manifest_dir: &str) -> String {
     })
 }
 
-/// The name of the schema for the `sequence`-th test of process `pid` in the
-/// checkout at `manifest_dir` on `host`: lower-case letters, digits and underscores,
-/// at most [`MAX_NAME_LEN`] bytes, so it needs no quoting.
+/// The name of the schema for the `sequence`-th test of process `pid` with random
+/// `nonce`, in the checkout at `manifest_dir` on `host`: lower-case letters, digits
+/// and underscores, at most [`MAX_NAME_LEN`] bytes, so it needs no quoting.
 #[must_use]
-pub fn schema_name(host: &str, manifest_dir: &str, pid: u32, sequence: u32) -> String {
+pub fn schema_name(host: &str, manifest_dir: &str, pid: u32, nonce: u32, sequence: u32) -> String {
     format!(
-        "owt_test_{}_{pid}_{sequence}",
+        "owt_test_{}_{pid}_{nonce:08x}_{sequence}",
         checkout_tag(host, manifest_dir)
     )
+}
+
+/// This process's nonce: 32 random bits, drawn on first use. Should the OS refuse
+/// random bytes, the clock's sub-second nanoseconds mixed with the pid stand in.
+fn process_nonce() -> u32 {
+    static NONCE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(|| {
+        getrandom::u32().unwrap_or_else(|_| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos();
+            nanos ^ std::process::id().rotate_left(16)
+        })
+    })
 }
 
 /// This machine's host name, or empty when none can be read.
@@ -91,7 +111,15 @@ fn host_name() -> String {
 /// The process of a schema of checkout `tag`, or `None` when `name` is not one.
 fn schema_pid(name: &str, tag: &str) -> Option<u32> {
     let rest = name.strip_prefix("owt_test_")?.strip_prefix(tag)?;
-    let (pid, sequence) = rest.strip_prefix('_')?.split_once('_')?;
+    let (pid, rest) = rest.strip_prefix('_')?.split_once('_')?;
+    let (nonce, sequence) = rest.split_once('_')?;
+    if nonce.len() != 8
+        || !nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
     sequence.parse::<u32>().ok()?;
     pid.parse().ok()
 }
@@ -133,17 +161,17 @@ async fn drop_schema(conn: &mut PgConnection, name: &str) -> Result<(), sqlx::Er
     Ok(())
 }
 
-/// Drop the schema `name`, within [`CLEANUP_LIMIT`].
-async fn clean_up(admin: &PgConnectOptions, name: &str) {
+/// Drop the schema `name`, within `limit`.
+async fn clean_up(admin: &PgConnectOptions, name: &str, limit: Duration) {
     let run = async {
         let mut conn = control(admin).await?;
         drop_schema(&mut conn, name).await?;
         conn.close().await
     };
-    match tokio::time::timeout(CLEANUP_LIMIT, run).await {
+    match tokio::time::timeout(limit, run).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("owt-test: schema {name} not dropped: {e}"),
-        Err(_) => eprintln!("owt-test: schema {name} not dropped within {CLEANUP_LIMIT:?}"),
+        Err(_) => eprintln!("owt-test: schema {name} not dropped within {limit:?}"),
     }
 }
 
@@ -196,7 +224,13 @@ impl TestSchema {
         let host = host_name();
         let tag = checkout_tag(&host, manifest_dir);
         let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let name = schema_name(&host, manifest_dir, std::process::id(), sequence);
+        let name = schema_name(
+            &host,
+            manifest_dir,
+            std::process::id(),
+            process_nonce(),
+            sequence,
+        );
         // The pool connects before the schema exists, so a failure here leaks nothing.
         let pool = PgPoolOptions::new()
             .max_connections(5)
@@ -238,11 +272,14 @@ impl TestSchema {
     /// Close the pool and drop the schema; a test ends with this. It waits on the
     /// test's own runtime, where sqlx returns connections (rolling back transactions
     /// dropped open), and after a few seconds ends the sessions of any connection
-    /// still out. Errors are printed, not returned, as a drop's are.
+    /// still out. It gives up after 30 seconds in all. Errors are printed, not
+    /// returned, as a drop's are.
     pub async fn close(mut self) {
         self.closed = true;
+        let started = std::time::Instant::now();
         let _ = tokio::time::timeout(POOL_CLOSE_LIMIT, self.pool.close()).await;
-        clean_up(&self.admin, &self.name).await;
+        let left = CLEANUP_LIMIT.saturating_sub(started.elapsed());
+        clean_up(&self.admin, &self.name, left).await;
     }
 }
 
@@ -264,7 +301,7 @@ impl Drop for TestSchema {
             else {
                 return;
             };
-            rt.block_on(clean_up(&admin, &name));
+            rt.block_on(clean_up(&admin, &name, CLEANUP_LIMIT));
         })
         .join();
     }
@@ -278,9 +315,9 @@ mod tests {
 
     #[test]
     fn checkouts_and_hosts_get_different_names() {
-        let a = schema_name(HOST, "/home/u/wt-a/app", 10, 0);
-        let b = schema_name(HOST, "/home/u/wt-b/app", 10, 0);
-        let c = schema_name("host-b", "/home/u/wt-a/app", 10, 0);
+        let a = schema_name(HOST, "/home/u/wt-a/app", 10, 1, 0);
+        let b = schema_name(HOST, "/home/u/wt-b/app", 10, 1, 0);
+        let c = schema_name("host-b", "/home/u/wt-a/app", 10, 1, 0);
         assert_ne!(a, b);
         assert_ne!(a, c);
     }
@@ -288,15 +325,31 @@ mod tests {
     #[test]
     fn processes_and_tests_get_different_names() {
         let dir = "/home/u/wt-a/app";
-        assert_ne!(schema_name(HOST, dir, 10, 0), schema_name(HOST, dir, 11, 0));
-        assert_ne!(schema_name(HOST, dir, 10, 0), schema_name(HOST, dir, 10, 1));
+        assert_ne!(
+            schema_name(HOST, dir, 10, 1, 0),
+            schema_name(HOST, dir, 11, 1, 0)
+        );
+        assert_ne!(
+            schema_name(HOST, dir, 10, 1, 0),
+            schema_name(HOST, dir, 10, 1, 1)
+        );
+    }
+
+    #[test]
+    fn one_pid_in_two_containers_gets_different_names() {
+        // Same host name (or none) and path, pid 1 in each: only the nonce differs.
+        let dir = "/app";
+        assert_ne!(
+            schema_name("", dir, 1, 0xdead_beef, 0),
+            schema_name("", dir, 1, 0x1234_5678, 0)
+        );
     }
 
     #[test]
     fn a_name_is_stable_and_fits_an_identifier() {
         let dir = "/a/very/long/path/".repeat(50);
-        let name = schema_name(HOST, &dir, u32::MAX, u32::MAX);
-        assert_eq!(name, schema_name(HOST, &dir, u32::MAX, u32::MAX));
+        let name = schema_name(HOST, &dir, u32::MAX, u32::MAX, u32::MAX);
+        assert_eq!(name, schema_name(HOST, &dir, u32::MAX, u32::MAX, u32::MAX));
         assert!(name.len() <= MAX_NAME_LEN, "{name}");
         assert!(
             name.bytes()
@@ -307,10 +360,32 @@ mod tests {
     #[test]
     fn a_swept_name_yields_its_process() {
         let tag = checkout_tag(HOST, "/d");
-        assert_eq!(schema_pid(&schema_name(HOST, "/d", 42, 7), &tag), Some(42));
-        assert_eq!(schema_pid(&schema_name(HOST, "/e", 42, 7), &tag), None);
+        assert_eq!(
+            schema_pid(&schema_name(HOST, "/d", 42, 0xab, 7), &tag),
+            Some(42)
+        );
+        assert_eq!(
+            schema_pid(&schema_name(HOST, "/d", 42, u32::MAX, 7), &tag),
+            Some(42)
+        );
+        assert_eq!(
+            schema_pid(&schema_name(HOST, "/e", 42, 0xab, 7), &tag),
+            None
+        );
         assert_eq!(schema_pid(&format!("owt_test_{tag}_42"), &tag), None);
-        assert_eq!(schema_pid(&format!("owt_test_{tag}_x_1"), &tag), None);
+        assert_eq!(schema_pid(&format!("owt_test_{tag}_42_7"), &tag), None);
+        assert_eq!(
+            schema_pid(&format!("owt_test_{tag}_42_000000ab"), &tag),
+            None
+        );
+        assert_eq!(
+            schema_pid(&format!("owt_test_{tag}_42_xyz000ab_7"), &tag),
+            None
+        );
+        assert_eq!(
+            schema_pid(&format!("owt_test_{tag}_x_000000ab_1"), &tag),
+            None
+        );
     }
 
     fn admin() -> Option<PgConnectOptions> {
@@ -445,6 +520,49 @@ mod tests {
         db.close().await;
     }
 
+    #[tokio::test]
+    async fn a_ledger_later_on_the_search_path_is_not_the_schemas() {
+        // A second schema stands in for `public`, so no other test sees the decoy.
+        let Some(db) = TestSchema::create(env!("CARGO_MANIFEST_DIR")).await else {
+            return;
+        };
+        let decoy = TestSchema::create(env!("CARGO_MANIFEST_DIR"))
+            .await
+            .expect("set");
+        let ledger = owt_accounts::migrations::LEDGER;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {ledger} (version bigint, success bool, checksum bytea); \
+             INSERT INTO {ledger} SELECT v, true, '' FROM generate_series(1, 1000) v"
+        )))
+        .execute(decoy.pool())
+        .await
+        .unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(db.admin.clone().application_name(db.name()).options([(
+                "search_path",
+                format!("{},{},public", db.name(), decoy.name()),
+            )]))
+            .await
+            .unwrap();
+        owt_accounts::migrations::start(&pool, || async { Ok::<(), std::io::Error>(()) })
+            .await
+            .unwrap();
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_tables WHERE schemaname = $1 \
+             AND tablename IN ('accounts', $2)",
+        )
+        .bind(db.name())
+        .bind(ledger)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, 2);
+        pool.close().await;
+        decoy.close().await;
+        db.close().await;
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn creating_sweeps_a_dead_process_schema() {
@@ -452,7 +570,13 @@ mod tests {
             return;
         };
         // Above any pid_max, so no process of this host has it.
-        let leaked = schema_name(&host_name(), env!("CARGO_MANIFEST_DIR"), u32::MAX - 1, 0);
+        let leaked = schema_name(
+            &host_name(),
+            env!("CARGO_MANIFEST_DIR"),
+            u32::MAX - 1,
+            process_nonce(),
+            0,
+        );
         let mut conn = PgConnection::connect_with(&admin).await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE SCHEMA IF NOT EXISTS {leaked}"

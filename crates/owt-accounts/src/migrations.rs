@@ -230,13 +230,25 @@ pub async fn run(pool: &PgPool) -> Result<Migrated, MigrationError> {
     Ok(done)
 }
 
+/// Whether `table` exists in `current_schema()`, the schema an unqualified `CREATE TABLE`
+/// writes to. A table of that name in a schema later on the `search_path` (`public`, say)
+/// does not count: the migrations create their own rather than share it.
+async fn in_current_schema<'e>(
+    conn: impl sqlx::PgExecutor<'e>,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_class
+          WHERE relname = $1 AND relnamespace = current_schema()::regnamespace)",
+    )
+    .bind(table)
+    .fetch_one(conn)
+    .await
+}
+
 /// The versions [`LEDGER`] records, or none when it does not exist yet.
 async fn recorded(conn: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error> {
-    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-        .bind(LEDGER)
-        .fetch_one(&mut *conn)
-        .await?;
-    if !exists {
+    if !in_current_schema(&mut *conn, LEDGER).await? {
         return Ok(Vec::new());
     }
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
@@ -246,15 +258,12 @@ async fn recorded(conn: &mut PgConnection) -> Result<Vec<i64>, sqlx::Error> {
     .await
 }
 
-/// The rows of the app's `_sqlx_migrations` (found on the `search_path`, as sqlx finds
-/// it): version, description, success, checksum.
+/// The rows of the app's `_sqlx_migrations` (in `current_schema()`, where sqlx creates it):
+/// version, description, success, checksum.
 async fn app_ledger(
     conn: &mut PgConnection,
 ) -> Result<Vec<(i64, String, bool, Vec<u8>)>, sqlx::Error> {
-    let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-        .fetch_one(&mut *conn)
-        .await?;
-    if !exists {
+    if !in_current_schema(&mut *conn, "_sqlx_migrations").await? {
         return Ok(Vec::new());
     }
     sqlx::query_as(
@@ -885,11 +894,7 @@ impl std::fmt::Display for Conflict {
 async fn applied_checksums(pool: &sqlx::PgPool) -> sqlx::Result<Vec<Vec<u8>>> {
     let mut applied = Vec::new();
     for table in [LEDGER, "_sqlx_migrations"] {
-        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(table)
-            .fetch_one(pool)
-            .await?;
-        if exists {
+        if in_current_schema(pool, table).await? {
             applied.extend(
                 sqlx::query_scalar::<_, Vec<u8>>(sqlx::AssertSqlSafe(format!(
                     "SELECT checksum FROM {table} WHERE success"

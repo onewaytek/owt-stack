@@ -3951,8 +3951,10 @@ for the same name twice: one run drops the other's database, or fails with "data
 database names are server-wide, and sqlx offers no way to rename them. Tests that
 share a server use `owt_test::schema::TestSchema` instead, in a plain `#[tokio::test]`
 (it replaces `#[sqlx::test(migrations = false)]`): it creates
-`owt_test_<checkout>_<process>_<sequence>` (eight hex digits of a hash of the host name
-and the `CARGO_MANIFEST_DIR` you pass, the process id, and a counter; under 63 bytes)
+`owt_test_<checkout>_<pid>_<nonce>_<sequence>` (eight hex digits of a hash of the host
+name and the `CARGO_MANIFEST_DIR` you pass, the process id, eight random hex digits
+drawn once per process, and a counter; under 63 bytes; the nonce keeps apart processes
+with one pid in containers that share a host name and path)
 in the database `DATABASE_URL` names, and gives its pool `search_path = <schema>,
 public`. It needs `CREATE` on the database, not `CREATEDB`, and avoids the checkpoint
 each `DROP DATABASE` forces. It returns `None` when `DATABASE_URL` is unset, so the
@@ -3963,7 +3965,7 @@ The test ends with `db.close().await`, which closes the pool and drops the schem
 its contents. Dropping the value does the same as a fallback, from a thread of its own.
 Both first end the pool's server sessions (they carry the schema's name as
 `application_name`), so a transaction dropped open or a pool clone still held in app
-state cannot keep `DROP SCHEMA` waiting, and both give up after 30 seconds. A run that
+state cannot keep `DROP SCHEMA` waiting, and both give up after 30 seconds in all. A run that
 is killed or aborted leaves its schema behind; the next `create` in the same checkout
 drops it, along with any schema of that checkout whose process is no longer running
 on this host (Linux only, as the check reads `/proc`).
