@@ -123,6 +123,7 @@ const LIBRARY_TABLES: &[&str] = &[
     "policy_acceptance_events",
     "policy_acceptances",
     "policy_versions",
+    "revoked_sessions",
     "sign_in_links",
 ];
 
@@ -218,7 +219,7 @@ async fn an_apps_applied_copies_are_adopted_never_run_again() {
     // Once no binary carries the copies, their rows can go, and the app's migrator
     // no longer needs to ignore them.
     let forgotten = migrations::forget_copies(&db.pool).await.unwrap();
-    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11, 12, 13]);
     let left: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
         .fetch_all(&db.pool)
         .await
@@ -256,7 +257,8 @@ async fn a_partly_applied_set_of_copies_is_adopted_and_the_rest_applied() {
             ALL[4].name,
             ALL[5].name,
             ALL[6].name,
-            ALL[7].name
+            ALL[7].name,
+            ALL[8].name
         ]
     );
     assert_eq!(tables(&db.pool).await.len(), LIBRARY_TABLES.len() + 1);
@@ -569,7 +571,8 @@ async fn an_adoption_cut_short_resumes() {
             ALL[4].name,
             ALL[5].name,
             ALL[6].name,
-            ALL[7].name
+            ALL[7].name,
+            ALL[8].name
         ]
     );
     assert_eq!(done.applied, Vec::<&str>::new());
