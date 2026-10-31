@@ -46,7 +46,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::{PgConnection, PgPool};
 
-pub use migrations::{LEDGER, LOCK_ID, migrate, migrator};
+pub use migrations::{LEDGER, LOCK_ID, grant_runtime, migrate, migrator};
 pub use verify::{Broken, Head, Verified, VerifyError, heads, verify, verify_anchor, verify_since};
 
 /// The hash of an event, or of the nothing before a chain's first event (all zeros).

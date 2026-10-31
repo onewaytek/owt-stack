@@ -206,8 +206,81 @@ async fn locked(
     Ok(())
 }
 
+/// `role` as a quoted SQL identifier, for a statement that cannot bind one (`GRANT`):
+/// a Postgres role name of lowercase letters, digits and underscores, not starting
+/// with a digit, at most 63 bytes.
+///
+/// # Errors
+///
+/// When `role` is anything else.
+pub fn quoted_role(role: &str) -> anyhow::Result<String> {
+    let ok = !role.is_empty()
+        && role.len() <= 63
+        && !role.starts_with(|c: char| c.is_ascii_digit())
+        && role
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    anyhow::ensure!(ok, "not a role name of [a-z0-9_]: {role:?}");
+    Ok(format!("\"{role}\""))
+}
+
+/// Grant the app's runtime `role` what serving needs in the current schema, as the
+/// schema's owner, after the migrations: `USAGE` on the schema, `SELECT`, `INSERT`,
+/// `UPDATE` and `DELETE` on every table, `USAGE` and `SELECT` on every sequence, and
+/// only `SELECT` on the migration ledgers (`_sqlx_migrations`, `_owt_*_migrations`).
+/// Never `TRUNCATE`, `TRIGGER`, `REFERENCES` or ownership, so the role cannot change
+/// the schema or drop a trigger. Run it after every migration (it covers the tables
+/// that exist when it runs); a crate with tables that need less (`owt_audit`) narrows
+/// its own afterwards. Calling it again changes nothing.
+///
+/// # Errors
+///
+/// When `role` is not a role name ([`quoted_role`]) or a statement fails.
+pub async fn grant_runtime(pool: &PgPool, role: &str) -> anyhow::Result<()> {
+    let role = quoted_role(role)?;
+    let mut tx = pool.begin().await?;
+    let schema: String = sqlx::query_scalar("SELECT quote_ident(current_schema())")
+        .fetch_one(&mut *tx)
+        .await?;
+    for sql in [
+        format!("GRANT USAGE ON SCHEMA {schema} TO {role}"),
+        format!("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO {role}"),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
+    }
+    let ledgers: Vec<String> = sqlx::query_scalar(
+        r"SELECT quote_ident(tablename) FROM pg_tables
+          WHERE schemaname = current_schema()
+            AND (tablename = '_sqlx_migrations' OR tablename LIKE '\_owt\_%\_migrations')",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for ledger in ledgers {
+        let sql = format!("REVOKE INSERT, UPDATE, DELETE ON {schema}.{ledger} FROM {role}");
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_role_name_is_quoted_and_anything_else_refused() {
+        assert_eq!(
+            super::quoted_role("myapp_runtime").unwrap(),
+            "\"myapp_runtime\""
+        );
+        for bad in ["", "1app", "My", "a\"b", "a;b", "a b", &"a".repeat(64)] {
+            assert!(super::quoted_role(bad).is_err(), "{bad:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
