@@ -3378,10 +3378,16 @@ std::fs::write("m.json", store.fetch(&key, Some(&anchored.receipt)).await?)?;
 
 **Verifying.** `owt_audit::verify(&pool, tenant)` walks a chain and names the first
 event that was edited (`Broken::Hash`), removed (`Broken::Gap`) or swapped
-(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads. With
-the `cli` feature the app gets both as operator commands (`myapp audit verify`,
-`myapp audit verify --manifest m.json` for a manifest fetched from the store, and
-`myapp audit heads`):
+(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads.
+`anchor::history(&pool)` reads every manifest the database records and fails, rather
+than skipping, on one that does not match its digest or does not name the one before
+it; `anchor::age(&pool)` is how old the latest is, for an alert when anchoring stops
+(a store credential rotated, a job not running). With the `cli` feature the app gets
+these as operator commands: `myapp audit verify` checks every chain, that the
+database's anchors chain, and the latest one's heads; `myapp audit verify --manifest
+m.json`, for a manifest fetched from the store, also fails unless the database
+records it; `--max-age 2h` fails when the latest anchor is older (schedule it a
+margin above the anchoring interval); and `myapp audit heads`:
 
 ```rust,no_run
 use clap::{Parser, Subcommand};

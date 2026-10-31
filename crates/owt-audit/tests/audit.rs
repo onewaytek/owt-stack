@@ -211,6 +211,48 @@ async fn a_forged_anchor_record_is_caught() {
     let latest = anchor::latest(&db.pool).await.unwrap().unwrap();
     assert_eq!(latest.heads.len(), 1);
     anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
+    // Verification, though, reports it rather than falling back past it.
+    let e = anchor::history(&db.pool).await.unwrap_err();
+    assert!(matches!(e, VerifyError::Manifest(_)), "{e}");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn the_anchors_form_a_chain_and_have_an_age() {
+    let Some(db) = Db::new().await else { return };
+    assert!(anchor::history(&db.pool).await.unwrap().is_empty());
+    assert_eq!(anchor::age(&db.pool).await.unwrap(), None);
+    let audit = Audit::new(db.pool.clone());
+    audit.record(&view("t", "p")).await.unwrap();
+    let first = anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
+    audit.record(&view("t", "p")).await.unwrap();
+    anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
+    let history = anchor::history(&db.pool).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0], first.manifest);
+    assert!(anchor::age(&db.pool).await.unwrap().unwrap() < std::time::Duration::from_secs(60));
+
+    // A self-consistent manifest inserted out of the chain: its digest is its own,
+    // but it names no previous manifest.
+    let orphan = anchor::Manifest {
+        prev: None,
+        ..first.manifest.clone()
+    };
+    let orphan = anchor::Manifest {
+        at_us: orphan.at_us + 1,
+        ..orphan
+    };
+    sqlx::query(
+        "INSERT INTO owt_audit_anchors (manifest, digest, provider, receipt)
+         VALUES ($1, $2, 'none', '')",
+    )
+    .bind(orphan.to_bytes())
+    .bind(&orphan.digest()[..])
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let e = anchor::history(&db.pool).await.unwrap_err();
+    assert!(e.to_string().contains("previous manifest"), "{e}");
     db.drop().await;
 }
 
