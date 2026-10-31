@@ -9,6 +9,8 @@
 //! * [`fragment`]: a page and its htmx fragment render one element the same way.
 //! * [`accounts`]: account fixtures, a fixed session key, and a [`Client`] signed in
 //!   without an Argon2 round.
+//! * [`schema`]: a schema per test named for its checkout and process, so worktrees
+//!   and apps sharing a server never collide.
 //! * [`assets`]: the browser fetches nothing from another origin; vendored files match
 //!   their pins.
 //!
@@ -32,6 +34,7 @@ pub mod accounts;
 pub mod assets;
 pub mod fragment;
 pub mod golden;
+pub mod schema;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
