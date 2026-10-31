@@ -4781,9 +4781,12 @@ if let Ok(role) = std::env::var("DB_RUNTIME_ROLE") {
 # Ok(()) }
 ```
 
-Tasks from `cronjob.yaml` still connect as the owner (an anchoring job inserts
-anchors, which the runtime role may not); a task that needs less copies the
-Deployment's runtime `DATABASE_URL`.
+Tasks from `cronjob.yaml` connect as the runtime role too. A task that needs more
+gets a role of its own, never the owner's: the anchoring job inserts anchors, which
+the runtime role may only read, so it runs as `myapp_anchor`, a second managed role
+in the Cluster, its Secret `myapp-db-anchor` made like `myapp-db-runtime`, given the
+grants under "Roles" (Audit log) once by the owner, and the task processed
+with `-p DB_ROLE=anchor`.
 
 **Upgrading an app to the two roles:** add the `migrate` subcommand above (or the
 grants to the one it has) and stop migrating in the serve path; create the
@@ -4882,7 +4885,8 @@ oc process -f templates/openshift/cronjob.yaml -p NAME=myapp -p NAMESPACE=myapp 
 ```
 
 It follows the app's channel through the same image trigger, and has the Deployment's
-database access: `DATABASE_URL` from `myapp-db-app`, `PGSSLMODE=verify-full` with
+database access: `DATABASE_URL` as the runtime role from `myapp-db-runtime` (or the
+role `DB_ROLE` names, from `myapp-db-<DB_ROLE>`), `PGSSLMODE=verify-full` with
 `PGSSLROOTCERT` at the mounted `myapp-db-ca`, `POD_NAMESPACE`, `REDIS_URL` and
 `myapp-env`. A credential only the task needs goes in a Secret of its own,
 `myapp-<JOB>-env` (`myapp-digest-env`), which the task reads after `myapp-env` (its
@@ -5017,8 +5021,8 @@ oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
   -p IMAGE=ghcr.io/onewaytek/myapp -p POSTGRES_MAJOR=16 | oc diff -f -
 ```
 
-**`DATABASE_URL` is the `uri` key of `myapp-db-app`** (`myapp-<DB_SUFFIX>-app`), in
-the Deployment and in every `cronjob.yaml` task. CloudNativePG creates that Secret,
+**The `migrate` init container's `DATABASE_URL` is the `uri` key of `myapp-db-app`**
+(`myapp-<DB_SUFFIX>-app`). CloudNativePG creates that Secret,
 `uri` included, only when the Cluster's bootstrap (`initdb`, `recovery` or
 `pg_basebackup`) names no `secret:` of its own, as the template's `initdb` and the
 restore under "Restoring" below do. A Cluster made elsewhere with `secret:` gets no

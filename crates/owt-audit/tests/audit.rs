@@ -305,6 +305,111 @@ async fn the_app_role_may_insert_and_select_only() {
     db.drop().await;
 }
 
+/// The privileges `owt_runtime::db::grant_runtime` and then `owt_audit::grant_runtime`
+/// leave the runtime role: full DML on an app's table, read-only ledgers, append-only
+/// audit events, read-only anchors, and nothing that changes a table or its triggers.
+#[tokio::test]
+async fn grant_runtime_gives_the_runtime_role_exactly_what_serving_needs() {
+    let Some(db) = Db::new().await else { return };
+    let role = format!("{}_rt", db.schema);
+    for sql in [
+        format!("CREATE ROLE {role} NOLOGIN"),
+        "CREATE TABLE app_things (id bigserial PRIMARY KEY, v text)".to_owned(),
+    ] {
+        db.pool.execute(sqlx::AssertSqlSafe(sql)).await.unwrap();
+    }
+    for _ in 0..2 {
+        owt_runtime::db::grant_runtime(&db.pool, &role)
+            .await
+            .unwrap();
+        owt_audit::grant_runtime(&db.pool, &role).await.unwrap();
+    }
+    let all = [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "TRUNCATE",
+        "REFERENCES",
+        "TRIGGER",
+    ];
+    for (table, want) in [
+        ("app_things", &["SELECT", "INSERT", "UPDATE", "DELETE"][..]),
+        (owt_audit::LEDGER, &["SELECT"][..]),
+        ("owt_audit_events", &["SELECT", "INSERT"][..]),
+        ("owt_audit_anchors", &["SELECT"][..]),
+    ] {
+        let mut have = Vec::new();
+        for privilege in all {
+            let granted: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege($1, format('%I.%I', $2::text, $3::text), $4)",
+            )
+            .bind(&role)
+            .bind(&db.schema)
+            .bind(table)
+            .bind(privilege)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            if granted {
+                have.push(privilege);
+            }
+        }
+        assert_eq!(have, want, "{table}");
+    }
+    let (create, sequence): (bool, bool) = sqlx::query_as(
+        "SELECT has_schema_privilege($1, $2, 'CREATE'),
+                has_sequence_privilege($1, format('%I.app_things_id_seq', $2::text), 'USAGE')",
+    )
+    .bind(&role)
+    .bind(&db.schema)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(!create, "the runtime role creates no table");
+    assert!(sequence, "the runtime role draws ids");
+
+    let app = pool_in(&db.url, &db.schema, Some(&role)).await;
+    app.execute("INSERT INTO app_things (v) VALUES ('a'); UPDATE app_things SET v = 'b'; DELETE FROM app_things")
+        .await
+        .unwrap();
+    let audit = Audit::new(app.clone());
+    audit.record(&view("t", "p")).await.unwrap();
+    assert_eq!(verify(&app, "t").await.unwrap().events, 1);
+    for sql in [
+        "ALTER TABLE owt_audit_events DISABLE TRIGGER USER",
+        "ALTER TABLE owt_audit_events OWNER TO CURRENT_USER",
+        "ALTER TABLE owt_audit_anchors DISABLE TRIGGER USER",
+        "DROP TRIGGER owt_audit_events_no_change ON owt_audit_events",
+        "DROP TABLE owt_audit_events",
+        "DROP TABLE owt_audit_anchors",
+        "TRUNCATE owt_audit_events",
+        "UPDATE owt_audit_events SET action = 'x'",
+        "DELETE FROM owt_audit_events",
+        "INSERT INTO owt_audit_anchors DEFAULT VALUES",
+        "DELETE FROM _owt_audit_migrations",
+        "ALTER TABLE app_things ADD COLUMN w text",
+        "CREATE TABLE app_more (id int)",
+    ] {
+        let e = app.execute(sql).await.expect_err(sql);
+        assert!(
+            e.to_string().contains("must be owner") || e.to_string().contains("permission denied"),
+            "{sql}: {e}"
+        );
+    }
+    app.close().await;
+    db.pool
+        .execute(sqlx::AssertSqlSafe(format!(
+            "REVOKE ALL ON ALL TABLES IN SCHEMA {0} FROM {role}; \
+             REVOKE ALL ON ALL SEQUENCES IN SCHEMA {0} FROM {role}; \
+             REVOKE ALL ON SCHEMA {0} FROM {role}; DROP ROLE {role}",
+            db.schema
+        )))
+        .await
+        .unwrap();
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn tampering_breaks_the_chain_or_the_anchor() {
     let Some(db) = Db::new().await else { return };
