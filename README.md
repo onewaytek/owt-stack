@@ -2929,6 +2929,52 @@ about 2^32 messages per key (NIST SP 800-38D): rotate data keys well before that
 yearly or every N writes. Two concurrent `rotate` calls may each add a version; that
 is harmless.
 
+**Synchronous sealing.** `encrypt` and `decrypt` are `async`, because they may ask the
+database or the KEK for a key. Code that cannot `.await` (serde and template paths,
+`FromRow` decoding) uses a `Sealer`: `crypt.sealer(scope).await?` loads and unwraps the
+scope's current data key, every older data key version and every index key version
+once, and `seal`, `open`, `blind_index` and `blind_index_candidates` (for `= ANY($1)`
+during an index rotation) are then plain functions. Load it once per request or
+job and pass it down. Its ciphertexts and blind indexes are exactly `Crypt`'s, so the
+two read each other's values, and a `Sealer` clones cheaply. It refuses a `Field` of
+another scope with `CryptError::Invalid`.
+
+```rust,no_run
+use owt_crypt::{Crypt, CryptError, Field};
+
+# async fn demo(crypt: Crypt, note_id: &str) -> anyhow::Result<()> {
+let sealer = crypt.sealer("practice-3").await?;
+
+// Synchronous from here on.
+let field = Field::new("practice-3", "notes", "body", note_id);
+let sealed: Vec<u8> = sealer.seal_str(&field, "Reports sleeping better.")?;
+let body = sealer.open_string(&field, &sealed)?;
+let idx = sealer.blind_index("patients", "email", b"ann@example.com")?;
+# let _ = (body, idx);
+
+// A long-lived sealer reloads when told it is stale.
+let sealer = match sealer.seal(&field, b"x") {
+    Err(CryptError::Stale(_)) => sealer.refresh(&crypt).await?,
+    _ => sealer,
+};
+# let _ = sealer; Ok(()) }
+```
+
+A `Sealer` is a snapshot, so it has rules. After `rotate` or `shred` on the same
+`Crypt` (or a clone) it is stale: `seal` and `blind_index` return `CryptError::Stale`,
+so a new value never uses an old key (`blind_index_candidates` refuses too, as the
+sealer may lack the new index version), while `open` still reads old ciphertexts. After
+a shred it refuses everything with `CryptError::Shredded`. A rotation or shred on
+*another replica* is invisible to this process, so every `Sealer` also has a maximum
+age, `Crypt::sealer_max_age` (by default `cache_ttl`, five minutes, counted from
+before the load starts): past it, every
+method, `open` included, returns `Stale`, which bounds how long a replica misses a
+rotation or keeps opening a shredded scope. `open` of a version made after loading
+returns `CryptError::NotLoaded`. In each case `sealer.refresh(&crypt).await?` (or
+`crypt.sealer(scope)`) loads a new one; `sealer.is_stale()` asks without trying.
+Keys in a `Sealer` are zeroized when its last clone drops, and its `Debug` shows no
+key.
+
 **Shredding.** `crypt.shred(scope)` deletes a tenant's keys and records a tombstone
 in `owt_crypt_shredded`, in one transaction, so everything encrypted for the tenant is
 unreadable and the scope can never get keys again (the tombstone is permanent, so a
