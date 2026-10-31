@@ -3128,8 +3128,9 @@ method, `open` included, returns `Stale`, which bounds how long a replica misses
 rotation or keeps opening a shredded scope. `open` of a version made after loading
 returns `CryptError::NotLoaded`. In each case `sealer.refresh(&crypt).await?` (or
 `crypt.sealer(scope)`) loads a new one; `sealer.is_stale()` asks without trying.
-Keys in a `Sealer` are zeroized when its last clone drops, and its `Debug` shows no
-key.
+A `Sealer` shares its keys with the key cache: a key is zeroized when its last holder
+drops, the last clone of every sealer holding it and its cache entry (expired, or
+`forget_keys`). Its `Debug` shows no key.
 
 **Shredding.** `crypt.shred(scope)` deletes a tenant's keys and records a tombstone
 in `owt_crypt_shredded`, in one transaction, so everything encrypted for the tenant is
