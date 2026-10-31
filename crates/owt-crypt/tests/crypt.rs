@@ -66,6 +66,11 @@ async fn fields_round_trip_per_tenant_and_bind_to_their_place() {
         .await
         .unwrap();
     assert!(!ct.windows(7).any(|w| w == b"Patient"));
+    // Sealed in the current format: XChaCha20-Poly1305, 24-byte nonce.
+    assert_eq!(
+        owt_crypt::format::Sealed::parse(&ct).unwrap().format,
+        owt_crypt::format::Format::XChaCha20Poly1305
+    );
     assert_eq!(
         &*crypt.decrypt_string(&f, &ct).await.unwrap(),
         "Patient reports better sleep."
