@@ -483,7 +483,7 @@ the handler and write `<script nonce="{{ nonce }}">`.
       true,
   )
   // For one `max_age` after the move, then drop it (never after a leak).
-  .also_open_with(key_from_base64(&secret)?);
+  .also_open_with(key_from_base64(secret.expose())?);
   # Ok(()) }
   ```
 - **Failed requests change no session:** a 5xx response (the `Limits` timeout's
