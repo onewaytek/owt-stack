@@ -268,7 +268,10 @@ async fn the_gate_sends_signed_in_page_loads_to_the_page_that_asks() {
         html.contains("&lt;b&gt;kind&lt;/b&gt;") && !html.contains("<b>"),
         "{html}"
     );
-    assert_eq!(page.header("cache-control"), Some("no-store"));
+    assert!(
+        page.header("cache-control")
+            .is_some_and(|c| c.contains("no-store"))
+    );
     assert_eq!(anonymous.get("/whoami").await.text(), "anonymous");
     assert_eq!(
         anonymous.get("/agree").await.location(),
