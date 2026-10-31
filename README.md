@@ -3688,7 +3688,8 @@ enqueue.
   `Queue::discard_dead`.
 - **The worker** claims while it has free slots (`concurrency`), runs each job in its
   own task (a panic is a failed attempt), renews running jobs' heartbeats every third
-  of `stale_after`, and puts back jobs whose heartbeat went stale on any replica (a
+  of `stale_after` (aborting a handler whose claim the heartbeat finds taken over, so
+  a lost claim does not run on beside its replacement), and puts back jobs whose heartbeat went stale on any replica (a
   replica that died). Heartbeats and housekeeping run in tasks of their own, so a slow
   claim or purge never delays a heartbeat. Done jobs are purged after `retain_done`
   (7 days) in batches, which frees their keys. On shutdown it claims nothing more,

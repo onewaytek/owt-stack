@@ -444,6 +444,69 @@ async fn heartbeats_keep_a_long_job_from_being_recovered() {
 }
 
 #[tokio::test]
+async fn a_heartbeat_that_finds_the_claim_lost_aborts_the_handler() {
+    struct Dropped(Arc<AtomicU32>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let Some(db) = Db::new().await else { return };
+    let q = Queue::new(db.pool.clone(), "work").unwrap();
+    let job = q.enqueue(Job::bytes(b"long".to_vec())).await.unwrap();
+    let (started, dropped) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+    let (s, d) = (started.clone(), dropped.clone());
+    let shutdown = CancellationToken::new();
+    let jobs = Jobs::new(shutdown.clone());
+    q.worker(move |_| {
+        let (s, guard) = (s.clone(), Dropped(d.clone()));
+        async move {
+            let _guard = guard;
+            s.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+    })
+    .poll(Duration::from_millis(20))
+    .stale_after(Duration::from_secs(3))
+    .spawn(&jobs);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the job never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Another worker took the job over: its claim moved on.
+    sqlx::query("UPDATE owt_jobs SET claim = claim + 1 WHERE id = $1")
+        .bind(job.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // The next heartbeat (every second) finds the claim lost and aborts the handler.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while dropped.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the handler ran on after its claim was lost"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (state, attempts, _, _) = db.state(job.id).await;
+    assert_eq!(
+        (state.as_str(), attempts),
+        ("running", 1),
+        "the new claim's row is untouched"
+    );
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), jobs.stopped())
+        .await
+        .expect("the worker stops");
+    db.drop().await;
+}
+
+#[tokio::test]
 async fn a_worker_never_runs_more_jobs_than_its_concurrency() {
     let Some(db) = Db::new().await else { return };
     let q = Queue::new(db.pool.clone(), "work").unwrap();
