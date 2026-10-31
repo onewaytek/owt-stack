@@ -233,7 +233,7 @@ async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<Option
 
 pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool: sqlx::PgPool) -> Router {
     // `__Host-`: browsers refuse a copy set over plain HTTP or by a sibling subdomain.
-    let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_secs(14 * 86_400), true)
+    let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_hours(12), true)
         .validate_with(move |s: Presented<SessionData>| {
             let pool = pool.clone();
             async move {
@@ -264,15 +264,19 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
 }
 ```
 
-**Idle timeout and lifetimes.** Three limits end a session, and an app handling
-health data sets all three: `max_age` (how long a cookie lives without being
-resealed), `absolute_lifetime` (from sign-in, however active: 30 days unless set),
-and `idle_timeout` (since the person's last activity). Revocation is the epoch above:
+**Idle timeout and lifetimes.** Three limits end a session: `max_age` (how long a
+cookie lives without being resealed), `absolute_lifetime` (from sign-in, however
+active: `session::ABSOLUTE_LIFETIME`, 24 hours, unless set, or `max_age` if longer),
+and `idle_timeout` (since the person's last activity: `session::IDLE_TIMEOUT`, 30
+minutes, unless set). These are NIST SP 800-63B-4's AAL2 bounds; an app handling
+health data sets AAL3's (12 hours, 15 minutes). An app whose sessions guard nothing
+a copied cookie could misuse (a game's guest identity) may call
+`without_idle_timeout()`. Revocation is the epoch above:
 `sign_out_everywhere`, a password change or a deactivation moves the account's
 `session_epoch`, and the validator refuses every session sealed under the old one on
 its next request, on every replica.
 
-With `idle_timeout`, the cookie also carries the last-active time. Activity (a
+With an idle timeout, the cookie also carries the last-active time. Activity (a
 request that carries the session, is not passive and does not fail) refreshes it at
 most once per `idle_refresh` (a tenth of the timeout, at least 15 s, by default;
 never more than half the timeout), so a busy page does not rewrite a cookie on every
@@ -299,9 +303,11 @@ request whose session stands carries
 `owt-idle-remaining: <seconds>` (`session::IDLE_REMAINING_HEADER`), with
 `Cache-Control: no-store` and `Vary: cookie`, since the value is one person's.
 
-Turning the timeout on ends every session older than it (a cookie sealed without the
-last-active time counts from its sign-in), and replicas without it drop the time
-when they reseal: enable it once every replica runs a build that knows it.
+Turning the timeout on (an upgrade to a build where it is the default included) ends
+every session older than it (a cookie sealed without the last-active time counts from
+its sign-in), and replicas without it drop the time when they reseal: enable it once
+every replica runs a build that knows it, or call `without_idle_timeout()` until
+then.
 
 ```rust,no_run
 use std::time::Duration;
@@ -1526,7 +1532,9 @@ every name made after.
 **Revocation, and what it does not reach:**
 
 - `session::sign_out` replaces this browser's cookie; a copy of it taken earlier
-  still opens until it expires. Only `sign_out_everywhere` (the epoch) revokes.
+  still opens until it expires: the idle timeout (30 minutes by default) or the
+  absolute lifetime (24 hours by default), whichever comes first. Only
+  `sign_out_everywhere` (the epoch) revokes.
 - A password change, deactivation or a demotion ends every session at its next
   request, but a stream opened before (SSE, a WebSocket) was checked at its start:
   an app that streams to signed-in people re-checks `store::by_id_in_epoch` on
@@ -5238,8 +5246,8 @@ this command, run when the app adopts a release, is the only thing that moves it
   header. Session cookies stay `SameSite=Lax` as a second line.
 - **Sessions are cookies.** Sealed with AES-GCM; no store. Revoke by epoch (a counter
   in the account, copied into the session at sign-in, bumped at sign-out) checked in
-  `Sessions::validate_with`. A session ends at its absolute lifetime however often it
-  is re-sealed, and a response that sets the cookie is never cacheable.
+  `Sessions::validate_with`. A session ends after 30 minutes idle and at its absolute
+  lifetime (24 hours) however often it is re-sealed, both unless the app sets others, and a response that sets the cookie is never cacheable.
 - **Fragments have their own URLs.** Nothing varies by request header, so every
   response stays cacheable behind a CDN that ignores `Vary`.
 - **Password policy: NIST SP 800-63B-4, not folklore.** 15 characters at least for a password

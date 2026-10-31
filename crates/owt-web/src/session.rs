@@ -8,16 +8,18 @@
 //! * **Size.** `T` travels on every request; keep it to identifiers and small flags.
 //!   A sealed cookie over 4 KB is dropped by browsers (sign-out included); the layer
 //!   logs a warning when it seals one.
-//! * **Revocation.** A sealed cookie is valid until it lapses, and [`Session::flush`]
-//!   only replaces the browser's copy: a copy taken earlier still opens. Revoke by
+//! * **Revocation.** A sealed cookie is valid until it lapses (the idle timeout or
+//!   the absolute lifetime, whichever comes first), and [`Session::flush`] only
+//!   replaces the browser's copy: a copy taken earlier still opens. Revoke by
 //!   epoch: store a per-account counter in `T` at sign-in, bump it at sign-out and at
 //!   a password change, and compare the two in [`Sessions::validate_with`], which
 //!   the layer asks about every session it opens.
 //! * **Lifetime.** A change re-seals the cookie for another `max_age`, but never past
-//!   [`Sessions::absolute_lifetime`] from when the session began (sign-in, or a
-//!   guest's first id).
-//! * **Idle timeout.** With [`Sessions::idle_timeout`], the cookie also carries when
-//!   its holder was last active, and a session idle longer than the timeout is no
+//!   [`Sessions::absolute_lifetime`] ([`ABSOLUTE_LIFETIME`], 24 hours, unless set)
+//!   from when the session began (sign-in, or a guest's first id).
+//! * **Idle timeout.** [`Sessions::idle_timeout`] ([`IDLE_TIMEOUT`], 30 minutes,
+//!   unless set or turned off with [`Sessions::without_idle_timeout`]): the cookie
+//!   also carries when its holder was last active, and a session idle longer than the timeout is no
 //!   session (its cookie is removed, and [`Session::idle_expired`] says why).
 //!   Activity reseals that time, at most once per [`Sessions::idle_refresh`], so a
 //!   busy page does not rewrite the cookie on every request. A request marked
@@ -242,8 +244,16 @@ fn oversized(encoded_len: usize) -> bool {
 }
 
 /// The longest a session lasts, however often it is re-sealed, unless
-/// [`Sessions::absolute_lifetime`] says otherwise (or `max_age` is longer).
-pub const ABSOLUTE_LIFETIME: Duration = Duration::from_hours(30 * 24);
+/// [`Sessions::absolute_lifetime`] says otherwise (or `max_age` is longer): 24 hours,
+/// NIST SP 800-63B-4's reauthentication bound at AAL2, so a copied cookie is good for
+/// a day at most.
+pub const ABSOLUTE_LIFETIME: Duration = Duration::from_hours(24);
+
+/// How long a session lasts without activity, unless [`Sessions::idle_timeout`] says
+/// otherwise or [`Sessions::without_idle_timeout`] turns it off: 30 minutes, NIST SP
+/// 800-63B-4's inactivity bound at AAL2. A workforce app handling health data sets
+/// less (15 minutes, AAL3's).
+pub const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// What the cookie holds, before sealing. Field names are short: they ride on every
 /// request.
@@ -273,7 +283,9 @@ fn now() -> u64 {
 
 impl<T: SessionData> Sessions<T> {
     /// Sessions sealed with `key` in the cookie `cookie`, good for `max_age`, `Secure`
-    /// when `secure` (always, outside plain-HTTP development). Name the cookie
+    /// when `secure` (always, outside plain-HTTP development), ending after
+    /// [`IDLE_TIMEOUT`] without activity and [`ABSOLUTE_LIFETIME`] (or `max_age`, if
+    /// longer) after they began. Name the cookie
     /// `__Host-<name>` in production: browsers then refuse a copy set over plain HTTP
     /// or by a sibling subdomain. A `__Host-` or `__Secure-` name is always `Secure`.
     pub fn new(key: Key, cookie: impl Into<String>, max_age: Duration, secure: bool) -> Self {
@@ -286,7 +298,7 @@ impl<T: SessionData> Sessions<T> {
                 cookie,
                 max_age,
                 absolute: ABSOLUTE_LIFETIME.max(max_age),
-                idle: None,
+                idle: Some(IDLE_TIMEOUT),
                 idle_refresh: None,
                 secure,
             }),
@@ -362,8 +374,8 @@ impl<T: SessionData> Sessions<T> {
         self
     }
 
-    /// End a session after `timeout` without activity (a workforce app handling
-    /// health data: 15 minutes, say). Activity is any request carrying the session
+    /// End a session after `timeout` without activity ([`IDLE_TIMEOUT`] unless set; a
+    /// workforce app handling health data: 15 minutes, say). Activity is any request carrying the session
     /// that is not passive ([`PASSIVE_HEADER`], [`Session::passive`]) and does not end
     /// in a server error. The last-active time is resealed at most every
     /// [`idle_refresh`](Self::idle_refresh) (a tenth of the timeout, at least 15 s, by
@@ -375,6 +387,15 @@ impl<T: SessionData> Sessions<T> {
         self
     }
 
+    /// Never end a session for inactivity, only at its absolute lifetime: for an app
+    /// whose sessions guard nothing a copied cookie could misuse (a game's guest
+    /// identity, say). A page then gets no [`IDLE_REMAINING_HEADER`].
+    #[must_use]
+    pub fn without_idle_timeout(mut self) -> Self {
+        Arc::make_mut(&mut self.inner).idle = None;
+        self
+    }
+
     /// Reseal the last-active time at most this often (see
     /// [`idle_timeout`](Self::idle_timeout)).
     #[must_use]
@@ -383,7 +404,8 @@ impl<T: SessionData> Sessions<T> {
         self
     }
 
-    /// The idle timeout, if set.
+    /// The idle timeout, unless [`without_idle_timeout`](Self::without_idle_timeout)
+    /// turned it off.
     #[must_use]
     pub fn idle(&self) -> Option<Duration> {
         self.inner.idle
@@ -1177,6 +1199,16 @@ mod tests {
 
     fn sessions() -> Sessions<Data> {
         Sessions::new(Key::generate(), "sid", Duration::from_secs(3600), true)
+            .without_idle_timeout()
+    }
+
+    #[test]
+    fn sessions_end_when_idle_and_after_a_day_by_default() {
+        let s = Sessions::<Data>::new(Key::generate(), "sid", Duration::from_secs(3600), true);
+        assert_eq!(s.idle(), Some(IDLE_TIMEOUT));
+        assert_eq!(IDLE_TIMEOUT, Duration::from_mins(30));
+        assert_eq!(s.inner.absolute, ABSOLUTE_LIFETIME);
+        assert_eq!(s.without_idle_timeout().idle(), None);
     }
 
     #[test]
@@ -1838,7 +1870,7 @@ mod tests {
 
     #[test]
     fn the_absolute_lifetime_ends_on_the_second() {
-        assert_eq!(ABSOLUTE_LIFETIME, Duration::from_hours(720), "30 days");
+        assert_eq!(ABSOLUTE_LIFETIME, Duration::from_hours(24), "a day");
         let s = sessions().absolute_lifetime(Duration::from_secs(7200));
         let lenient = s.clone().absolute_lifetime(ABSOLUTE_LIFETIME);
         let data = Data::default();
