@@ -4537,6 +4537,13 @@ workflow cannot take a permission its caller withholds, and a caller that grants
 less fails to start, `attest: false` or not. `attest: false` skips the signature and
 the SBOM, not the scan.
 
+**Base images float on purpose.** The template's `FROM` lines name tags (`rust:1`,
+`core-runtime:2`), not digests, so every build picks up the base's latest patches
+without a bot bumping pins. Two builds of one commit can therefore differ. What a
+given image was built from is still on record: the signature binds its digest, and
+the SBOM attestation lists the base's packages and versions. An app that needs a
+rebuild to be byte-reproducible passes `base-image` as a digest (used as given).
+
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
 image and the Dockerfile in Hummingbird's. The template Dockerfile owns `/app/static`
