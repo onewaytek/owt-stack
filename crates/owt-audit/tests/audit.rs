@@ -233,7 +233,7 @@ async fn the_anchors_form_a_chain_and_have_an_age() {
     let history = anchor::history(&db.pool).await.unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[0], first.manifest);
-    assert!(anchor::age(&db.pool).await.unwrap().unwrap() < std::time::Duration::from_secs(60));
+    assert!(anchor::age(&db.pool).await.unwrap().unwrap() < std::time::Duration::from_mins(1));
 
     // A self-consistent manifest inserted out of the chain: its digest is its own,
     // but it names no previous manifest.
