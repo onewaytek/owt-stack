@@ -220,7 +220,10 @@ async fn a_forged_anchor_record_is_caught() {
 #[tokio::test]
 async fn the_anchors_form_a_chain_and_have_an_age() {
     let Some(db) = Db::new().await else { return };
-    assert!(anchor::history(&db.pool).await.unwrap().is_empty());
+    assert_eq!(
+        anchor::history(&db.pool).await.unwrap(),
+        Vec::<anchor::Manifest>::new()
+    );
     assert_eq!(anchor::age(&db.pool).await.unwrap(), None);
     let audit = Audit::new(db.pool.clone());
     audit.record(&view("t", "p")).await.unwrap();
