@@ -140,9 +140,9 @@ mod tests {
     #[test]
     fn ages_parse_with_a_unit() {
         assert_eq!(parse_age("90"), Ok(Duration::from_secs(90)));
-        assert_eq!(parse_age("90m"), Ok(Duration::from_secs(5400)));
-        assert_eq!(parse_age("2h"), Ok(Duration::from_secs(7200)));
-        assert_eq!(parse_age("1d"), Ok(Duration::from_secs(86_400)));
+        assert_eq!(parse_age("90m"), Ok(Duration::from_mins(90)));
+        assert_eq!(parse_age("2h"), Ok(Duration::from_hours(2)));
+        assert_eq!(parse_age("1d"), Ok(Duration::from_hours(24)));
         assert!(parse_age("").is_err());
         assert!(parse_age("2w").is_err());
         assert!(parse_age("h").is_err());
