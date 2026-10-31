@@ -1711,16 +1711,25 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_checks_the_lock_before_the_body_and_wants_a_200() {
-        // A lock that fails is reported although the body follows.
+        // The manifest announces more than the cap: read first, it would fail as too
+        // large. The lock's failure is reported instead, so it was checked first.
+        let too_large = ok(&[("x-amz-version-id", "v1")], "m").replace(
+            "Content-Length: 1\r\n",
+            &format!("Content-Length: {}\r\n", MAX_MANIFEST + 1),
+        );
         let e = fetch(
             Some("v1"),
             vec![
-                ok(&[("x-amz-version-id", "v1")], "m"),
+                too_large,
                 ok(&[], "<Retention><Mode>COMPLIANCE</Mode></Retention>"),
             ],
         )
         .await;
-        assert!(e.is_err());
+        let e = format!("{:#}", e.unwrap_err());
+        assert!(
+            e.contains("not held in COMPLIANCE mode") && !e.contains("larger than"),
+            "{e}"
+        );
         for status in ["204 No Content", "206 Partial Content"] {
             let r = fetch(None, vec![reply(status, &[], "", Some(SystemTime::now()))]).await;
             let e = format!("{:#}", r.unwrap_err());
