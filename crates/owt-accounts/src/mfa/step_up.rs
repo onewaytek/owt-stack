@@ -156,6 +156,18 @@ pub struct Recent<const SECS: u64, T = Data>(PhantomData<fn() -> T>);
 pub struct RecentMfa<const SECS: u64, T = Data>(PhantomData<fn() -> T>);
 
 fn guard<T: MfaSession>(parts: &Parts, secs: u64, second_factor: bool) -> Result<(), Error> {
+    let next = layer::asked_for(&parts.extensions, &parts.uri);
+    guard_to::<T>(parts, secs, second_factor, next)
+}
+
+/// [`guard`], sending the visitor back to `next` once the proof is renewed: a `POST`
+/// names the page its form is on, which a redirect can `GET`.
+pub(crate) fn guard_to<T: MfaSession>(
+    parts: &Parts,
+    secs: u64,
+    second_factor: bool,
+    next: &str,
+) -> Result<(), Error> {
     if Maybe::of(&parts.extensions).0.is_none() {
         return Err(layer::wall(parts));
     }
@@ -175,7 +187,6 @@ fn guard<T: MfaSession>(parts: &Parts, secs: u64, second_factor: bool) -> Result
     ) else {
         return Ok(());
     };
-    let next = layer::asked_for(&parts.extensions, &parts.uri);
     let at = if why == StepUp::NoSecondFactor {
         parts
             .extensions

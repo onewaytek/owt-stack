@@ -317,8 +317,19 @@ fn sessions() -> Sessions<Data> {
     )
 }
 
-/// A cookie signed in as `account`, sealed as the app would seal it.
+/// A cookie signed in as `account` with a second factor used just now, sealed as the
+/// app would seal it: enough for the admin's changes ([`owt_accounts::admin::STEP_UP`]).
 fn cookie_for(sessions: &Sessions<Data>, account: &store::Account) -> String {
+    cookie_proved(sessions, account, Some(Duration::ZERO))
+}
+
+/// A cookie signed in as `account` whose second factor was used `mfa_ago`, or never.
+fn cookie_proved(
+    sessions: &Sessions<Data>,
+    account: &store::Account,
+    mfa_ago: Option<Duration>,
+) -> String {
+    use owt_accounts::mfa::{Auth, MfaSession};
     let mut data = Data::default();
     session::Signed::set_signature(
         &mut data,
@@ -327,6 +338,15 @@ fn cookie_for(sessions: &Sessions<Data>, account: &store::Account) -> String {
             epoch: account.session_epoch,
         }),
     );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    data.mfa_mut().auth = Some(Auth {
+        account: account.id,
+        epoch: account.session_epoch,
+        at: now.as_secs(),
+        mfa_at: mfa_ago.map(|ago| (now - ago).as_secs()),
+    });
     sessions.seal(&owt_web::session::new_id(), &data)
 }
 
@@ -3317,6 +3337,108 @@ async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
     );
 
     assert_eq!(client.get("/staff/accounts/999999").await.status, 404);
+    db.drop().await;
+}
+
+/// Each admin change asks for a second factor used within 15 minutes, sending staff
+/// to re-authenticate and back to the form's page, and hands the app's recorder an
+/// event in the change's transaction: a recorder that fails rolls the change back.
+#[tokio::test]
+async fn the_admin_asks_for_a_recent_second_factor_and_records_each_change() {
+    use owt_accounts::admin::{Event, EventKind, Recorder};
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    struct Log(Arc<Mutex<Vec<Event>>>, bool);
+    impl Recorder for Log {
+        fn record<'a>(
+            &'a self,
+            conn: &'a mut sqlx::PgConnection,
+            event: &'a Event,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                // On the change's own connection.
+                sqlx::query("SELECT 1").execute(conn).await?;
+                anyhow::ensure!(!self.1, "the audit log is down");
+                self.0.lock().unwrap().push(event.clone());
+                Ok(())
+            })
+        }
+    }
+    let db = db!();
+    let sessions = sessions();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let link = |token: &str| format!("https://app.example/login/link/{token}");
+    let routes = admin(&db)
+        .sign_in_links(Duration::from_hours(30 * 24), link)
+        .audit(Log(Arc::clone(&log), false))
+        .routes();
+    let client = owt_test::Client::new(app(&db, &sessions, routes));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let at = format!("/staff/accounts/{}", ada.id);
+    async fn epoch_of(pool: &PgPool, id: i64) -> i32 {
+        store::by_id(pool, id).await.unwrap().unwrap().session_epoch
+    }
+    let before = epoch_of(&db.pool, ada.id).await;
+
+    // No second factor, or one 16 minutes ago: pages show, changes wait.
+    for proof in [None, Some(Duration::from_mins(16))] {
+        client.set_cookie("s", &cookie_proved(&sessions, &boss, proof));
+        assert_eq!(client.get(&at).await.status, 200);
+        let r = client.post_form(&format!("{at}/sign-out"), &[]).await;
+        assert_eq!(r.status, 303);
+        let back = format!("/reauth?next=%2Fstaff%2Faccounts%2F{}", ada.id);
+        assert_eq!(r.location(), Some(back.as_str()));
+        let r = client
+            .post_form("/staff/accounts", &[("username", "eve"), ("email", "")])
+            .await;
+        assert_eq!(r.location(), Some("/reauth?next=%2Fstaff%2Faccounts%2Fnew"));
+    }
+    assert_eq!(epoch_of(&db.pool, ada.id).await, before);
+    assert!(store::by_username(&db.pool, "eve").await.unwrap().is_none());
+    assert!(log.lock().unwrap().is_empty());
+
+    // Within the window: done, and recorded.
+    client.set_cookie(
+        "s",
+        &cookie_proved(&sessions, &boss, Some(Duration::from_mins(14))),
+    );
+    let r = client.post_form(&format!("{at}/sign-out"), &[]).await;
+    assert_eq!(
+        r.location(),
+        Some(format!("{at}?notice=signed-out").as_str())
+    );
+    assert!(epoch_of(&db.pool, ada.id).await > before);
+    // A link asked for 30 days lives one.
+    let r = client.post_form(&format!("{at}/link"), &[]).await;
+    assert!(r.text().contains("within 1 day"), "{}", r.text());
+    {
+        let events = log.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].actor, events[0].account), (boss.id, ada.id));
+        assert_eq!(events[0].kind, EventKind::SignedOut);
+        assert_eq!(events[0].name(), "admin.account.signed_out");
+        assert_eq!(
+            events[1].kind,
+            EventKind::LinkIssued {
+                ttl: Duration::from_hours(24)
+            }
+        );
+    }
+
+    // A recorder that fails takes the change with it.
+    let failing = admin(&db).audit(Log(Arc::clone(&log), true)).routes();
+    let client = owt_test::Client::new(app(&db, &sessions, failing));
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let now = epoch_of(&db.pool, ada.id).await;
+    let r = client.post_form(&format!("{at}/sign-out"), &[]).await;
+    assert_eq!(r.status, 500);
+    assert_eq!(epoch_of(&db.pool, ada.id).await, now);
+    assert_eq!(log.lock().unwrap().len(), 2);
     db.drop().await;
 }
 

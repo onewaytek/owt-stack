@@ -2111,7 +2111,12 @@ there removes the password and signs the account out everywhere, as
 (key, subject, when added and last used), each with a button that retires it through
 `identities::forget_as`, which signs the account out everywhere too.
 
-- **Who:** only `Staff`, and each change re-checks inside its transaction that its
+- **Who:** only `Staff` who used a second factor within `admin::STEP_UP` (15
+  minutes) for every change (any `POST`): a member of staff without one is sent to
+  the re-authentication page (`Accounts::reauth_at`), or to enrollment when the
+  account has no factor under `require_mfa`, with `?next=` the account's page. Pages
+  that only show still open on `Staff` alone. Each change re-checks inside its
+  transaction that its
   author is still active staff (locking both rows, so two staff removing each other at
   once cannot leave none). It refuses your own staff access, deactivating yourself,
   turning your own password sign-in off, retiring your own local identity, unlinking
@@ -2124,10 +2129,45 @@ there removes the password and signs the account out everywhere, as
   everywhere" end every session and void the account's unused sign-in links (in the
   same statement); removing a sign-in connection, retiring a local identity and
   turning password sign-in off sign the account out everywhere too.
-  A link is not issued to a deactivated account.
+  A link is not issued to a deactivated account, and lives at most
+  `admin::MAX_LINK_TTL` (24 hours), whatever `Admin::sign_in_links` asks.
 - **What is kept:** every response is `no-store` and never framed, a refusal (a 403,
   a 404, a 422) included; a password or link is shown once; each change is logged at
   `info` with who made it and what changed.
+- **What is recorded:** each change is an `admin::Event` (actor, account, an
+  `EventKind`, a dotted `name()` such as `admin.password.reset`) handed to the app's
+  `admin::Recorder` (`Admin::audit`) on the change's own transaction, so the change
+  and its audit record commit together; a recorder that fails rolls the change back
+  and answers 500. Without a recorder `Admin::routes` warns at startup. An app with
+  its own session type names it with `Admin::session::<T>()`, where the step-up
+  proof is read.
+
+```rust,no_run
+use std::pin::Pin;
+use owt_accounts::admin::{Admin, Event, Recorder};
+use owt_audit::{ActorKind, Event as AuditEvent};
+
+/// The admin's changes, into the audit chain, in the change's transaction.
+struct Audited;
+
+impl Recorder for Audited {
+    fn record<'a>(
+        &'a self,
+        conn: &'a mut sqlx::PgConnection,
+        event: &'a Event,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let audit = AuditEvent::new(ActorKind::Account, event.actor.to_string(), event.name(), "account")
+                .resource_id(event.account.to_string());
+            owt_audit::record_in(conn, &audit).await?;
+            Ok(())
+        })
+    }
+}
+# fn demo(pool: sqlx::PgPool, chrome: fn(owt_accounts::admin::Page<'_>) -> owt_web::Result<axum::response::Response>) {
+let _admin = Admin::new(pool, "/staff/accounts", chrome).audit(Audited);
+# }
+```
 
 The app gives it a layout and, optionally, its roles, a sign-in-link route, a link
 to its own page about each account (what the admin does not show: a nickname, what

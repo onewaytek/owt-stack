@@ -23,9 +23,16 @@
 //! their session's epoch: two staff removing each other's access at once queue, and
 //! the second is refused, so staff never reach zero this way.
 //!
+//! Every change asks for a second factor used within [`STEP_UP`] (15 minutes), as
+//! [`RecentMfa`](crate::mfa::RecentMfa) does: a member of staff without one is sent to
+//! re-authenticate (or to enrol a factor) and back to the account's page. A sign-in
+//! link staff issue lives at most [`MAX_LINK_TTL`] (24 hours).
+//!
 //! A password or link is shown once, in the answer to the `POST` that made it; every
 //! response here is `no-store` and never framed, a refusal included. Each change is
-//! logged at `info` with who made it and what it changed.
+//! logged at `info` with who made it and what it changed, and handed to the app's
+//! [`Recorder`] ([`Admin::audit`]) as an [`Event`] inside the change's transaction:
+//! a recorder that fails rolls the change back.
 //!
 //! The app supplies its layout through a [`Chrome`] function: the admin renders the
 //! page's body and the app wraps it, as it would any page. The body comes from
@@ -46,9 +53,10 @@ use std::time::Duration;
 use askama::Template;
 use askama::filters::HtmlSafe;
 use axum::Router;
-use axum::extract::{Form, FromRequestParts, OriginalUri, Path, Query, State};
+use axum::extract::{Form, FromRequestParts, OriginalUri, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use owt_web::cache::CachePolicy;
@@ -69,6 +77,156 @@ pub use words::Words;
 
 /// Accounts on one list page.
 pub const PER_PAGE: usize = 50;
+
+/// How recently the member of staff must have used a second factor to change
+/// anything: 15 minutes.
+pub const STEP_UP: Duration = Duration::from_mins(15);
+
+/// The longest a sign-in link issued here lives: 24 hours. A longer
+/// [`Admin::sign_in_links`] `ttl` is capped here.
+pub const MAX_LINK_TTL: Duration = Duration::from_hours(24);
+
+/// A change made in the admin, for the app's audit log: handed to the [`Recorder`]
+/// inside the change's transaction. The library writes no audit log of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Event {
+    /// The member of staff who made it.
+    pub actor: i64,
+    /// The account changed.
+    pub account: i64,
+    /// What changed.
+    pub kind: EventKind,
+}
+
+/// What an [`Event`] records. A variant may be added without a breaking release, so a
+/// `match` on it ends with a `_` arm.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EventKind {
+    /// The account was created.
+    Created {
+        /// Whether it is staff.
+        staff: bool,
+        /// The roles granted.
+        roles: Vec<String>,
+    },
+    /// The account's page was saved: its email, active flag, staff flag and roles.
+    Saved {
+        /// Whether the email changed.
+        email_changed: bool,
+        /// Active before.
+        active_was: bool,
+        /// Active now.
+        active: bool,
+        /// Staff before.
+        staff_was: bool,
+        /// Staff now.
+        staff: bool,
+        /// The roles granted.
+        granted: Vec<String>,
+        /// The roles revoked.
+        revoked: Vec<String>,
+    },
+    /// The password was replaced by a generated one, shown to the member of staff.
+    PasswordReset,
+    /// A sign-in link was issued, shown to the member of staff: whoever holds it signs
+    /// in as the account.
+    LinkIssued {
+        /// How long it lives.
+        ttl: Duration,
+    },
+    /// The account was signed out everywhere.
+    SignedOut,
+    /// A provider identity was unlinked (and the account signed out everywhere).
+    IdentityUnlinked {
+        /// The identity's id.
+        identity: i64,
+    },
+    /// Password sign-in was turned on or off.
+    PasswordSignIn {
+        /// Before.
+        was: bool,
+        /// Now.
+        allowed: bool,
+    },
+    /// A local identity was retired (and the account signed out everywhere).
+    LocalIdentityForgotten {
+        /// Its key.
+        key: String,
+        /// Its subject.
+        subject: String,
+    },
+}
+
+impl Event {
+    /// A stable, dotted name for the audit log: `admin.account.created`,
+    /// `admin.account.saved`, `admin.password.reset`, `admin.link.issued`,
+    /// `admin.account.signed_out`, `admin.identity.unlinked`,
+    /// `admin.password_sign_in.set`, `admin.local_identity.forgotten`.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self.kind {
+            EventKind::Created { .. } => "admin.account.created",
+            EventKind::Saved { .. } => "admin.account.saved",
+            EventKind::PasswordReset => "admin.password.reset",
+            EventKind::LinkIssued { .. } => "admin.link.issued",
+            EventKind::SignedOut => "admin.account.signed_out",
+            EventKind::IdentityUnlinked { .. } => "admin.identity.unlinked",
+            EventKind::PasswordSignIn { .. } => "admin.password_sign_in.set",
+            EventKind::LocalIdentityForgotten { .. } => "admin.local_identity.forgotten",
+        }
+    }
+}
+
+/// Where the admin's [`Event`]s go: the app's audit log, written on `conn`, the
+/// change's own transaction, so the change and its record commit together. An error
+/// rolls the change back and answers 500. The future borrows the connection, so it is
+/// boxed:
+///
+/// ```
+/// use std::pin::Pin;
+/// use owt_accounts::admin::{Event, Recorder};
+///
+/// struct Log;
+///
+/// impl Recorder for Log {
+///     fn record<'a>(
+///         &'a self,
+///         conn: &'a mut sqlx::PgConnection,
+///         event: &'a Event,
+///     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+///         Box::pin(async move {
+///             sqlx::query("INSERT INTO admin_log (actor, account, what) VALUES ($1, $2, $3)")
+///                 .bind(event.actor)
+///                 .bind(event.account)
+///                 .bind(event.name())
+///                 .execute(conn)
+///                 .await?;
+///             Ok(())
+///         })
+///     }
+/// }
+/// ```
+pub trait Recorder: Send + Sync + 'static {
+    /// Record `event` on `conn`.
+    ///
+    /// # Errors
+    ///
+    /// When it cannot be recorded; the change is rolled back.
+    fn record<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        event: &'a Event,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+}
+
+type StepUpCheck = fn(&Parts, &str) -> owt_web::Result<()>;
+
+/// The step-up check for session data `T`, sending the visitor back to `next`.
+fn step_up_for<T: crate::mfa::MfaSession>(parts: &Parts, next: &str) -> owt_web::Result<()> {
+    crate::mfa::guard_to::<T>(parts, STEP_UP.as_secs(), true, next)
+}
 
 /// The rendered body of an admin page, for the app's layout to embed as
 /// `{{ page.body }}`: HTML the admin escaped already, so an Askama layout does not
@@ -742,6 +900,8 @@ pub struct Admin {
     more: Option<(&'static str, MoreHref)>,
     search: Option<(&'static str, Search)>,
     words: Words,
+    recorder: Option<Box<dyn Recorder>>,
+    step_up: StepUpCheck,
 }
 
 impl fmt::Debug for Admin {
@@ -776,7 +936,26 @@ impl Admin {
             more: None,
             search: None,
             words: Words::ENGLISH,
+            recorder: None,
+            step_up: step_up_for::<crate::session::Data>,
         }
+    }
+
+    /// Hand each change to `recorder` as an [`Event`], inside the change's
+    /// transaction: the app's audit log. Without one, changes are logged at `info`
+    /// only, and [`Admin::routes`] warns.
+    #[must_use]
+    pub fn audit(mut self, recorder: impl Recorder) -> Self {
+        self.recorder = Some(Box::new(recorder));
+        self
+    }
+
+    /// Read the step-up proof from session data `T`, the type the app's session layer
+    /// carries, rather than [`Data`](crate::session::Data).
+    #[must_use]
+    pub fn session<T: crate::mfa::MfaSession>(mut self) -> Self {
+        self.step_up = step_up_for::<T>;
+        self
     }
 
     /// The words the pages and notices write, in place of [`Words::ENGLISH`]: what
@@ -803,7 +982,7 @@ impl Admin {
         self
     }
 
-    /// Offer one-time sign-in links good for `ttl` (capped at [`links::MAX_TTL`]),
+    /// Offer one-time sign-in links good for `ttl` (capped at [`MAX_LINK_TTL`]),
     /// at the URL `url` makes from a token: the app's route that calls
     /// [`links::redeem`].
     #[must_use]
@@ -812,7 +991,7 @@ impl Admin {
         ttl: Duration,
         url: impl Fn(&str) -> String + Send + Sync + 'static,
     ) -> Self {
-        self.links = Some((ttl, Box::new(url)));
+        self.links = Some((ttl.min(MAX_LINK_TTL), Box::new(url)));
         self
     }
 
@@ -849,9 +1028,17 @@ impl Admin {
 
     /// The routes, at the `base` given to [`Admin::new`]: merge them into the app's
     /// router, inside the accounts layer ([`crate::Accounts::load`]). They refuse a
-    /// cross-origin `POST` on their own.
+    /// cross-origin `POST` on their own, and a change without a second factor used
+    /// within [`STEP_UP`].
     pub fn routes<S: Clone + Send + Sync + 'static>(self) -> Router<S> {
+        if self.recorder.is_none() {
+            tracing::warn!(
+                base = %self.base,
+                "the accounts admin records no audit events: give it a Recorder with Admin::audit"
+            );
+        }
         let base = self.base.clone();
+        let admin = Arc::new(self);
         let pages = Router::new()
             .route("/", get(list).post(create))
             .route("/new", get(new_form))
@@ -862,7 +1049,11 @@ impl Admin {
             .route("/{id}/identities/{identity}/unlink", post(unlink))
             .route("/{id}/password-sign-in", post(set_password_sign_in))
             .route("/{id}/local-identities/forget", post(forget_local))
-            .with_state(Arc::new(self))
+            .route_layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&admin),
+                step_up,
+            ))
+            .with_state(admin)
             .layer(axum::middleware::from_fn_with_state(
                 CrossOrigin::new(),
                 CrossOrigin::layer,
@@ -897,6 +1088,39 @@ impl Admin {
         }
     }
 
+    /// Hand `event` to the recorder, on the change's transaction.
+    async fn record(
+        &self,
+        conn: &mut PgConnection,
+        me: &Account,
+        account: i64,
+        kind: EventKind,
+    ) -> owt_web::Result<()> {
+        let Some(recorder) = &self.recorder else {
+            return Ok(());
+        };
+        let event = Event {
+            actor: me.id,
+            account,
+            kind,
+        };
+        recorder
+            .record(conn, &event)
+            .await
+            .map_err(owt_web::Error::Internal)
+    }
+
+    /// The page a change's form is on, at `path` below the base (`/` for the list's
+    /// "create", `/42/password` for account 42's): where re-authentication returns.
+    fn form_page(&self, path: &str) -> String {
+        match path.trim_start_matches('/').split('/').next() {
+            Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+                format!("{}/{id}", self.base)
+            }
+            _ => format!("{}/new", self.base),
+        }
+    }
+
     fn redirect(&self, id: i64, notice: &str) -> Response {
         (
             CachePolicy::no_store(),
@@ -907,6 +1131,25 @@ impl Admin {
 }
 
 type Shared = State<Arc<Admin>>;
+
+/// Every change (any method but `GET` and `HEAD`) is for staff who used a second
+/// factor within [`STEP_UP`]; the rest are sent to re-authenticate and back to the
+/// form's page.
+async fn step_up(State(admin): Shared, request: Request, next: Next) -> Response {
+    if request.method().is_safe() {
+        return next.run(request).await;
+    }
+    let (mut parts, body) = request.into_parts();
+    // Staff first: anyone else meets the sign-in wall or a 403, not re-authentication.
+    if let Err(e) = Staff::from_request_parts(&mut parts, &()).await {
+        return e.into_response();
+    }
+    let back = admin.form_page(parts.uri.path());
+    if let Err(e) = (admin.step_up)(&parts, &back) {
+        return e.into_response();
+    }
+    next.run(Request::from_parts(parts, body)).await
+}
 
 /// The request's parts, for the app's chrome, with the URI the client sent: the
 /// routes are nested, so the parts' own URI has the base stripped (`/` for the
@@ -1299,6 +1542,11 @@ async fn create(
         roles::grant(&mut *tx, account.id, role, Some(me.id)).await?;
         granted.push(role.name);
     }
+    let kind = EventKind::Created {
+        staff: account.is_staff,
+        roles: granted.iter().map(|&r| r.to_owned()).collect(),
+    };
+    admin.record(&mut tx, &me, account.id, kind).await?;
     tx.commit().await?;
     tracing::info!(by = me.id, account = account.id, staff = account.is_staff, roles = ?granted, "admin created an account");
     Ok(admin.redirect(account.id, "created"))
@@ -1568,6 +1816,16 @@ async fn save(
             revoked.push(name.as_str());
         }
     }
+    let kind = EventKind::Saved {
+        email_changed,
+        active_was: account.is_active,
+        active,
+        staff_was: account.is_staff,
+        staff,
+        granted: granted.iter().map(|&r| r.to_owned()).collect(),
+        revoked: revoked.iter().map(|&r| r.to_owned()).collect(),
+    };
+    admin.record(&mut tx, &me, id, kind).await?;
     tx.commit().await?;
     tracing::info!(
         by = me.id,
@@ -1613,6 +1871,9 @@ async fn reset_password(
     }
     let password = generated_password(&account);
     store::set_password(&mut *tx, &account, &password).await?;
+    admin
+        .record(&mut tx, &me, id, EventKind::PasswordReset)
+        .await?;
     tx.commit().await?;
     tracing::info!(by = me.id, account = id, "admin set a generated password");
     let secret = Secret {
@@ -1646,6 +1907,9 @@ async fn issue_link(
     }
     let reason = format!("issued in the admin by {} (id {})", me.username, me.id);
     let minted = links::mint(&mut *tx, account.id, *ttl, &reason).await?;
+    admin
+        .record(&mut tx, &me, id, EventKind::LinkIssued { ttl: *ttl })
+        .await?;
     tx.commit().await?;
     tracing::info!(by = me.id, account = id, "admin issued a sign-in link");
     let secret = Secret {
@@ -1653,10 +1917,7 @@ async fn issue_link(
             .words
             .sign_in_link
             .replace("{username}", &account.username)
-            .replace(
-                "{lifetime}",
-                &admin.words.duration((*ttl).min(links::MAX_TTL)),
-            ),
+            .replace("{lifetime}", &admin.words.duration(*ttl)),
         value: url(&minted.token),
     };
     show(&admin, &parts, &me, id, None, Some(secret), None).await
@@ -1670,6 +1931,7 @@ async fn sign_out(
     let mut tx = admin.pool.begin().await?;
     lock(&mut tx, &me, id).await?;
     store::sign_out_everywhere(&mut *tx, id).await?;
+    admin.record(&mut tx, &me, id, EventKind::SignedOut).await?;
     tx.commit().await?;
     tracing::info!(
         by = me.id,
@@ -1690,6 +1952,9 @@ async fn unlink(
         // Removed: whoever signed in through it is signed out with everyone else.
         Ok(true) => {
             store::sign_out_everywhere(&mut *tx, id).await?;
+            admin
+                .record(&mut tx, &me, id, EventKind::IdentityUnlinked { identity })
+                .await?;
             tx.commit().await?;
             tracing::info!(
                 by = me.id,
@@ -1745,6 +2010,8 @@ async fn set_password_sign_in(
         ..
     } = load(&mut *tx, id).await?;
     store::set_password_sign_in(&mut *tx, id, allowed).await?;
+    let kind = EventKind::PasswordSignIn { was, allowed };
+    admin.record(&mut tx, &me, id, kind).await?;
     tx.commit().await?;
     tracing::info!(
         by = me.id,
@@ -1797,6 +2064,11 @@ async fn forget_local(
             "retiring a local identity of account {id} reached {forgotten:?}"
         )));
     }
+    let kind = EventKind::LocalIdentityForgotten {
+        key: key.to_owned(),
+        subject: subject.to_owned(),
+    };
+    admin.record(&mut tx, &me, id, kind).await?;
     tx.commit().await?;
     tracing::info!(
         by = me.id,
