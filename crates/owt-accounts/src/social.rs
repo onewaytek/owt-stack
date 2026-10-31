@@ -333,10 +333,11 @@ pub struct Started {
     pub session: String,
 }
 
-/// Session data that can hold a [`Started`] sign-in as well as the signature. An
-/// app with its own session type adds a field and these two methods; one without
-/// uses [`Data`].
-pub trait Social: SignedData {
+/// Session data that can hold a [`Started`] sign-in as well as the signature and the
+/// second-factor state ([`MfaSession`](crate::mfa::MfaSession): a provider's sign-in
+/// is recorded there as a recent sign-in, never as a second factor). An app with its
+/// own session type adds a field and these two methods; one without uses [`Data`].
+pub trait Social: crate::mfa::MfaSession {
     /// The sign-in in progress, if any.
     fn started(&self) -> Option<&Started>;
     /// Keep `started`, or clear it with `None`.
@@ -1310,6 +1311,10 @@ async fn callback<T: Social + SessionData>(
         return Ok(landing(&inner.sign_in_page, "failed"));
     }
     session::sign_in(&session, account);
+    // A recent sign-in for `Recent`, never a second factor: the provider's own session
+    // may be weeks old and its second factor is not the app's, so only the app's TOTP
+    // or a recovery code satisfies `RecentMfa`.
+    crate::mfa::mark_authenticated(&session, account);
     tracing::info!(
         account = account.id,
         provider = %provider,

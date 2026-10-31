@@ -2642,6 +2642,7 @@ let app: Router = Router::new()
 An app with its own session type adds one field and the trait:
 
 ```rust
+use owt_accounts::mfa::{MfaSession, State};
 use owt_accounts::session::{Signature, Signed};
 use owt_accounts::social::{Social, Started};
 
@@ -2656,6 +2657,13 @@ struct MySession {
 impl Signed for MySession {
     fn signature(&self) -> Option<Signature> { self.signed.signature() }
     fn set_signature(&mut self, s: Option<Signature>) { self.signed.set_signature(s) }
+    fn on_sign_in(&mut self) { self.signed.on_sign_in() }
+}
+// A provider's sign-in is recorded here as a recent sign-in (`Recent`), never as a
+// second factor (`RecentMfa` takes the app's own TOTP or a recovery code).
+impl MfaSession for MySession {
+    fn mfa(&self) -> &State { &self.signed.mfa }
+    fn mfa_mut(&mut self) -> &mut State { &mut self.signed.mfa }
 }
 impl Social for MySession {
     fn started(&self) -> Option<&Started> { self.started.as_ref() }

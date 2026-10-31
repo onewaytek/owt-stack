@@ -152,6 +152,8 @@ impl From<StepUp> for Error {
 pub struct Recent<const SECS: u64, T = Data>(PhantomData<fn() -> T>);
 
 /// [`Recent`], for a second factor used within `SECS` seconds ([`require_recent_mfa`]).
+/// Only the app's own second factor (a TOTP code or a recovery code) counts: a password,
+/// a link or a provider's sign-in never does, whatever the provider checked.
 #[derive(Clone, Copy, Debug)]
 pub struct RecentMfa<const SECS: u64, T = Data>(PhantomData<fn() -> T>);
 
