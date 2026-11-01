@@ -372,11 +372,17 @@ async fn a_public_page_stays_public_until_it_sets_a_cookie() {
         "a shared cache would hand this cookie to the next visitor"
     );
 
-    // With the cookie already held, nothing is set and the page is public again.
+    // With the cookie already held, nothing is set, but the response carries the
+    // session's idle time left, which is one person's: it stays uncacheable.
     let cookie = touched.cookie().unwrap();
     let again = get_(&app, "/public?touch=1", Some(&cookie)).await;
     assert!(again.cookie().is_none());
-    assert_eq!(again.header("cache-control"), Some("public, s-maxage=600"));
+    assert!(
+        again
+            .header(owt_web::session::IDLE_REMAINING_HEADER)
+            .is_some()
+    );
+    assert_eq!(again.header("cache-control"), Some(headers::NEVER_CACHE));
 }
 
 #[tokio::test]

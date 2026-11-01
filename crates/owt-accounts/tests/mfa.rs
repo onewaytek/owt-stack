@@ -602,7 +602,7 @@ async fn the_last_factor_cannot_be_removed_when_the_policy_requires_one() {
     let epoch = fresh(&db, ada.id).await.session_epoch;
     assert_eq!(epoch, ada_e.account.session_epoch + 1);
     assert!(
-        store::by_id_in_epoch(&db.pool, ada.id, ada_e.account.session_epoch)
+        store::by_id_in_epoch(&db.pool, ada.id, ada_e.account.session_epoch, None)
             .await
             .unwrap()
             .is_none(),

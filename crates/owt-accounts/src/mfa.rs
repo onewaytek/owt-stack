@@ -806,7 +806,13 @@ impl Mfa {
         if !state::within(pending.at, self.pending_ttl, state::unix(SystemTime::now())) {
             return Ok(None);
         }
-        let account = store::by_id_in_epoch(pool, pending.account, pending.epoch).await?;
+        let account = store::by_id_in_epoch(
+            pool,
+            pending.account,
+            pending.epoch,
+            session.id().as_deref(),
+        )
+        .await?;
         Ok(account.map(|a| (a, pending.kind)))
     }
 
