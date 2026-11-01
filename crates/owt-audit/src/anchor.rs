@@ -257,10 +257,13 @@ struct Recorded {
     receipt: String,
 }
 
+/// A row of `owt_audit_anchors`: id, manifest, digest, provider, receipt.
+type AnchorRow = (i64, Vec<u8>, Vec<u8>, String, String);
+
 /// [`history`], with each row's provider and receipt.
 async fn recorded(pool: &PgPool) -> Result<Vec<Recorded>, crate::VerifyError> {
     use crate::VerifyError;
-    let rows: Vec<(i64, Vec<u8>, Vec<u8>, String, String)> = sqlx::query_as(
+    let rows: Vec<AnchorRow> = sqlx::query_as(
         "SELECT id, manifest, digest, provider, receipt FROM owt_audit_anchors ORDER BY id",
     )
     .fetch_all(pool)
