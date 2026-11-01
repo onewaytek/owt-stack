@@ -758,28 +758,39 @@ async fn an_app_draws_the_pages_at_its_paths_in_its_words() {
     db.drop().await;
 }
 
-/// Counts the statements sqlx runs on this thread: each one logs an event with target
-/// `sqlx::query` when it finishes.
-struct Statements(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+std::thread_local! {
+    /// The statements counted on this thread, while `statements_for` is counting.
+    static STATEMENTS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Counts the statements sqlx runs on the counting thread: each one logs an event with
+/// target `sqlx::query` when it finishes. It is the process's global subscriber, so the
+/// callsites' interest and the maximum level stay fixed while other tests in this binary
+/// run on other threads; a thread-scoped subscriber lets their teardown race the count.
+struct Statements;
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statements {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         if event.metadata().target() == "sqlx::query" {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            STATEMENTS.with(|n| n.set(n.get().map(|n| n + 1)));
         }
     }
 }
 
 /// The statements `client` runs for `GET uri` as a page, and the response.
 async fn statements_for(client: &owt_test::Client, uri: &str) -> (usize, owt_test::Response) {
-    use tracing_subscriber::layer::SubscriberExt;
-    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry().with(Statements(count.clone()));
-    let response = {
-        let _on = tracing::subscriber::set_default(subscriber);
-        client.get_page(uri).await
-    };
-    (count.load(std::sync::atomic::Ordering::SeqCst), response)
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Statements))
+            .expect("no other global subscriber in this test binary");
+    });
+    STATEMENTS.with(|n| n.set(Some(0)));
+    let response = client.get_page(uri).await;
+    (
+        STATEMENTS.with(std::cell::Cell::take).unwrap_or_default(),
+        response,
+    )
 }
 
 #[tokio::test]
