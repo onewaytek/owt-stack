@@ -339,6 +339,12 @@ impl Audit {
 /// transaction must be READ COMMITTED (Postgres's default); the database refuses
 /// others.
 ///
+/// An event recorded here rolls back with its transaction, so record a refusal or
+/// failure with [`Audit::record`] (a transaction of its own) instead. Record for one
+/// tenant per transaction, or for several in a fixed order: two transactions that
+/// lock two tenants' chains in opposite orders deadlock. While this transaction holds
+/// a tenant's chain, an [`Audit::record`] for that tenant waits on it.
+///
 /// The database assigns the event's place, time and hash; this checks that its hash
 /// is the one the crate's encoding gives, and fails ([`RecordError::Mismatch`])
 /// otherwise.
