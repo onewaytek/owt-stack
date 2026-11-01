@@ -143,6 +143,11 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+A credential is read with `env::secret`, which returns a
+`logging::Sensitive<String>` that prints as `[redacted]` (`expose()` reads it), so
+a derived `Debug` of the config that keeps it does not print it. `env::Vars`, a map
+of variables for tests, prints its names and never its values.
+
 `serve::serve` is the same with `ServeOptions::default()`: a request head must arrive
 within 30 s (an idle kept-alive connection closes then too), at most 4096 connections
 are open at once, and a stop drains for up to 20 s. `ServeOptions` is built from its
@@ -468,16 +473,17 @@ the handler and write `<script nonce="{{ nonce }}">`.
   # fn main() -> anyhow::Result<()> {
   use owt_web::session::{Sessions, key_for, key_from_base64};
   # #[derive(Clone, Default, serde::Serialize, serde::Deserialize)] struct SessionData;
-  let secret = owt_runtime::env::required("SESSION_SECRET")?;
+  // `secret`, not `required`: a `Sensitive<String>`, which prints as `[redacted]`.
+  let secret = owt_runtime::env::secret("SESSION_SECRET")?;
   let purpose = format!("myapp/{}", owt_runtime::env::required("POD_NAMESPACE")?);
   let sessions = Sessions::<SessionData>::new(
-      key_for(&secret, &purpose)?,
+      key_for(secret.expose(), &purpose)?,
       "__Host-session",
       std::time::Duration::from_secs(14 * 86_400),
       true,
   )
   // For one `max_age` after the move, then drop it (never after a leak).
-  .also_open_with(key_from_base64(&secret)?);
+  .also_open_with(key_from_base64(secret.expose())?);
   # Ok(()) }
   ```
 - **Failed requests change no session:** a 5xx response (the `Limits` timeout's
@@ -1973,8 +1979,9 @@ supply a `SecretSealer` that encrypts it with a key the database does not hold
 (`owt-crypt`'s, say). The stored value carries a format byte and the sealer's key id, so
 keys rotate (a secret sealed under an older id is opened with it and resealed at its next
 use). The default, `Unsealed`, stores it in the clear, marked plain, and logs a warning; it is
-for development, and a plain row is accepted and sealed at its next use once a real sealer is
-set, so adopting one later locks nobody out. Then turn `Mfa::accept_plaintext(false)` on once
+for development, and a release build (no `debug_assertions`) refuses it: enrolling, and
+signing in with a factor it stored, fail as a fault until a real sealer is set. A plain row is
+accepted and sealed at its next use once one is, so adopting one later locks nobody out. Then turn `Mfa::accept_plaintext(false)` on once
 none remain (`SELECT count(*) FROM account_totp WHERE get_byte(secret, 0) = 0` is 0): until
 then anyone who can write to the table can plant a known secret in a plain row, which the
 sealer's authentication would have stopped. A sealer must treat the key id it is handed as
@@ -2651,6 +2658,7 @@ let app: Router = Router::new()
 An app with its own session type adds one field and the trait:
 
 ```rust
+use owt_accounts::mfa::{MfaSession, State};
 use owt_accounts::session::{Signature, Signed};
 use owt_accounts::social::{Social, Started};
 
@@ -2665,6 +2673,13 @@ struct MySession {
 impl Signed for MySession {
     fn signature(&self) -> Option<Signature> { self.signed.signature() }
     fn set_signature(&mut self, s: Option<Signature>) { self.signed.set_signature(s) }
+    fn on_sign_in(&mut self) { self.signed.on_sign_in() }
+}
+// A provider's sign-in is recorded here as a recent sign-in (`Recent`), never as a
+// second factor (`RecentMfa` takes the app's own TOTP or a recovery code).
+impl MfaSession for MySession {
+    fn mfa(&self) -> &State { &self.signed.mfa }
+    fn mfa_mut(&mut self) -> &mut State { &mut self.signed.mfa }
 }
 impl Social for MySession {
     fn started(&self) -> Option<&Started> { self.started.as_ref() }
