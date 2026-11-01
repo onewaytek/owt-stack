@@ -1171,9 +1171,11 @@ impl Policies {
         self.with(|i| i.agreement = text)
     }
 
-    /// Paths starting with any of `prefixes` are never sent to the page that asks
-    /// (`/static/`, a live socket's). The documents, the page that asks and the staff
-    /// pages are already; so is anything but a full page load.
+    /// Paths under any of `prefixes` are never sent to the page that asks (`/static/`,
+    /// a live socket's). A prefix matches at a path-segment boundary: `/api` exempts
+    /// `/api` and `/api/...`, not `/apiary`; one ending in `/` exempts what starts
+    /// with it. The documents, the page that asks and the staff pages are already
+    /// exempt; so is anything but a full page load.
     #[must_use]
     pub fn exempt(self, prefixes: &[&str]) -> Self {
         self.with(|i| i.exempt.extend(prefixes.iter().map(|p| (*p).to_owned())))
@@ -1377,7 +1379,13 @@ impl Policies {
                 .documents
                 .iter()
                 .any(|d| under(&self.href(d.slug, None)))
-            || self.0.exempt.iter().any(|p| path.starts_with(p.as_str()))
+            || self.0.exempt.iter().any(|p| {
+                if p.ends_with('/') {
+                    path.starts_with(p.as_str())
+                } else {
+                    under(p)
+                }
+            })
     }
 
     fn document(&self, slug: &str) -> Option<&Document> {
@@ -2237,7 +2245,7 @@ mod tests {
         let chrome = |_: Page<'_>| -> owt_web::Result<Response> { Ok(().into_response()) };
         let p = Policies::new(pool, chrome, &[TERMS, PRIVACY])
             .admin("/staff/policies/")
-            .exempt(&["/static/", "/ws/"]);
+            .exempt(&["/static/", "/ws/", "/api"]);
         for path in [
             "/agree",
             "/terms",
@@ -2247,6 +2255,8 @@ mod tests {
             "/staff/policies/4",
             "/static/app.css",
             "/ws/x",
+            "/api",
+            "/api/v1/x",
         ] {
             assert!(p.exempted(path), "{path}");
         }
@@ -2256,6 +2266,9 @@ mod tests {
             "/agreeable",
             "/staff",
             "/staff/accounts",
+            // A prefix without a trailing slash stops at a segment boundary.
+            "/apiary",
+            "/static",
         ] {
             assert!(!p.exempted(path), "{path}");
         }
