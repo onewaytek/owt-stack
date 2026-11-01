@@ -30,7 +30,8 @@
 //!   is queued again, or dead when it has had its attempts
 //!   ([`Queue::recover_stale`]).
 //! * **The worker** ([`Queue::worker`]) does all of it: claims while it has free
-//!   slots, runs the handler for each job in a task of its own, heartbeats, recovers
+//!   slots, runs the handler for each job in a task of its own, heartbeats (aborting a
+//!   handler whose claim the heartbeat finds lost to another worker), recovers
 //!   stale claims, purges old done jobs, and stops gracefully: on shutdown it claims
 //!   nothing more, lets running jobs finish for a grace period, then aborts the rest
 //!   and puts them back in the queue. The aborted attempt stays counted, so a handler
@@ -62,7 +63,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::RngExt;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::{PgConnection, PgPool, SqlStr};
-use tokio::task::{Id, JoinSet};
+use tokio::task::{AbortHandle, Id, JoinSet};
 
 use crate::jobs::{CancellationToken, Jobs};
 
@@ -577,20 +578,26 @@ impl Queue {
     /// Renew the heartbeat of each claimed job, as `(id, claim)`, that is still running
     /// under that claim. How many were.
     pub async fn heartbeat(&self, held: &[(i64, i64)]) -> sqlx::Result<u64> {
+        Ok(u64::try_from(self.renew(held).await?.len()).unwrap_or(u64::MAX))
+    }
+
+    /// Renew the heartbeat of each claimed job, as `(id, claim)`, that is still running
+    /// under that claim; the ids of those that were.
+    async fn renew(&self, held: &[(i64, i64)]) -> sqlx::Result<Vec<i64>> {
         if held.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let (ids, claims): (Vec<i64>, Vec<i64>) = held.iter().copied().unzip();
-        let done = sqlx::query(
+        sqlx::query_scalar(
             "UPDATE owt_jobs j SET heartbeat_at = now()
              FROM unnest($1::int8[], $2::int8[]) AS h(id, claim)
-             WHERE j.id = h.id AND j.claim = h.claim AND j.state = 'running'",
+             WHERE j.id = h.id AND j.claim = h.claim AND j.state = 'running'
+             RETURNING j.id",
         )
         .bind(ids)
         .bind(claims)
-        .execute(&self.pool)
-        .await?;
-        Ok(done.rows_affected())
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// Recover running jobs whose heartbeat is older than `stale_after`: queued again,
@@ -975,7 +982,7 @@ impl Worker {
         for job in claimed {
             let queue = self.queue.clone();
             let handler = self.handler.clone();
-            let held = (job.id, job.claim, job.attempt);
+            let (id, claim, attempt) = (job.id, job.claim, job.attempt);
             #[cfg(feature = "metrics")]
             let metrics = self.metrics.clone();
             let handle = running.set.spawn(async move {
@@ -989,7 +996,15 @@ impl Worker {
                 #[cfg(not(feature = "metrics"))]
                 let _ = (outcome, started);
             });
-            running.held.lock().insert(handle.id(), held);
+            running.held.lock().insert(
+                handle.id(),
+                Hold {
+                    id,
+                    claim,
+                    attempt,
+                    abort: handle,
+                },
+            );
         }
         n
     }
@@ -1004,7 +1019,13 @@ impl Worker {
             Ok((id, ())) => (id, None),
             Err(e) => (e.id(), e.is_panic().then_some(e)),
         };
-        let Some((job_id, claim, attempt)) = running.held.lock().remove(&id) else {
+        let Some(Hold {
+            id: job_id,
+            claim,
+            attempt,
+            ..
+        }) = running.held.lock().remove(&id)
+        else {
             return;
         };
         if panic.is_some() {
@@ -1029,7 +1050,10 @@ impl Worker {
         }
     }
 
-    /// Renew the held jobs' heartbeats every third of `stale_after` until `stop`.
+    /// Renew the held jobs' heartbeats every third of `stale_after` until `stop`. A job
+    /// whose claim is no longer current (it went stale and another worker took it, or
+    /// it finished) is dropped from the held jobs and its handler aborted, so a lost
+    /// claim never runs beside the copy that replaced it.
     async fn heartbeat_loop(self: Arc<Self>, held: Held, stop: CancellationToken) {
         let mut tick = tokio::time::interval(self.stale_after / 3);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1038,13 +1062,40 @@ impl Worker {
                 () = stop.cancelled() => return,
                 _ = tick.tick() => {}
             }
-            let beats: Vec<(i64, i64)> = held
+            let beats: Vec<(Id, i64, i64)> = held
                 .lock()
-                .values()
-                .map(|&(id, claim, _)| (id, claim))
+                .iter()
+                .map(|(&task, h)| (task, h.id, h.claim))
                 .collect();
-            if let Err(error) = self.queue.heartbeat(&beats).await {
-                tracing::warn!(queue = %self.queue.name, %error, "renewing job heartbeats failed");
+            let pairs: Vec<(i64, i64)> = beats.iter().map(|&(_, id, claim)| (id, claim)).collect();
+            match self.queue.renew(&pairs).await {
+                Ok(current) => self.drop_lost(&held, &beats, &current),
+                Err(error) => {
+                    tracing::warn!(queue = %self.queue.name, %error, "renewing job heartbeats failed");
+                }
+            }
+        }
+    }
+
+    /// Abort the handlers of the `beats` (task, id, claim) whose job is not among the
+    /// `current` ids, and stop holding them.
+    fn drop_lost(&self, held: &Held, beats: &[(Id, i64, i64)], current: &[i64]) {
+        let current: std::collections::HashSet<i64> = current.iter().copied().collect();
+        let mut held = held.lock();
+        for &(task, id, claim) in beats {
+            if current.contains(&id) {
+                continue;
+            }
+            // A task that has ended recorded its own result and is joined as usual. One
+            // still running whose job finished under this claim has recorded its
+            // result, so aborting it loses nothing.
+            if held.get(&task).is_some_and(|h| h.abort.is_finished()) {
+                continue;
+            }
+            if let Some(hold) = held.remove(&task) {
+                hold.abort.abort();
+                tracing::warn!(queue = %self.queue.name, job = id, claim, "a job's claim was lost while it ran; its handler is aborted");
+                self.record("lost", None);
             }
         }
     }
@@ -1137,8 +1188,13 @@ impl Worker {
             }
             self.joined(&mut running, joined).await;
         }
-        let cancelled: Vec<(i64, i64, u32)> = running.held.lock().drain().map(|(_, h)| h).collect();
-        for (id, claim, _) in cancelled {
+        let cancelled: Vec<(i64, i64)> = running
+            .held
+            .lock()
+            .drain()
+            .map(|(_, h)| (h.id, h.claim))
+            .collect();
+        for (id, claim) in cancelled {
             match release(&self.queue.pool, id, claim).await {
                 Ok(Some(state)) => {
                     self.record(if state == "dead" { "dead" } else { "released" }, None);
@@ -1165,13 +1221,17 @@ impl Worker {
     }
 }
 
-/// The jobs a worker's tasks hold, as `(id, claim, attempt)` by task, shared with the
-/// heartbeat task.
+/// The jobs a worker's tasks hold, by task, shared with the heartbeat task.
 #[derive(Clone, Default)]
 struct Held(Arc<Mutex<HashMap<Id, Hold>>>);
 
-/// One held job: `(id, claim, attempt)`.
-type Hold = (i64, i64, u32);
+/// One held job, and the handle that aborts the task running it.
+struct Hold {
+    id: i64,
+    claim: i64,
+    attempt: u32,
+    abort: AbortHandle,
+}
 
 impl Held {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Id, Hold>> {
