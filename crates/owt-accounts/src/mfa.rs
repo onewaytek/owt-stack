@@ -99,6 +99,7 @@ mod step_up;
 
 pub use challenge::Answer;
 pub use state::{Auth, Kind, MfaSession, Pending, State};
+pub(crate) use step_up::guard_to;
 pub use step_up::{
     Recent, RecentMfa, StepUp, require_recent, require_recent_at, require_recent_mfa,
     require_recent_mfa_for,
