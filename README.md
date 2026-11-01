@@ -3552,7 +3552,13 @@ run, and graceful shutdown:
   idle timeout) is aborted at its next `.await`, as a crash would stop it, before
   another replica's run can overlap it. It needs a direct connection, not a
   transaction-mode pooler, behind which every run longer than a check is aborted;
-  a check that itself takes longer than `LOCK_CHECK` aborts the run too.
+  a check that itself takes longer than `LOCK_CHECK` aborts the run too. By default
+  the lock's connection comes from the app's pool and is held for the whole run, so a
+  task that also uses the pool needs a pool of two. `singleton_with` takes
+  `PgConnectOptions` instead and holds the lock on a dedicated connection outside the
+  pool, kept between ticks (one idle server connection per replica): an hour-long
+  singleton then holds no pool slot. If that connection drops, the run is stopped as
+  above and the next tick reconnects and contends for the lock again.
 - `leased` (feature `redis`): one replica, the same one while it lives, by a Redis
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
@@ -3574,6 +3580,10 @@ jobs.every_replica("weekly_pass", Every::new(Duration::from_secs(60)), move || {
 
 // One replica at a time drives the bots; the others skip that tick.
 jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_001, || async { Ok(()) });
+
+// A long singleton on a connection of its own, outside the app's pool.
+let opts = pool.connect_options().as_ref().clone();
+jobs.singleton_with("rebuild", Every::new(Duration::from_hours(1)), opts, 7_210_003, || async { Ok(()) });
 
 // One replica owns the clock; the TTL outlasts the period so ownership sticks.
 let leases = Leases::new(redis, Leases::new_holder_id(), "myapp")?;
