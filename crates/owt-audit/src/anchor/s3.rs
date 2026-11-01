@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
 use zeroize::Zeroizing;
 
-use super::Anchor;
+use super::{Anchor, Manifest, Stored};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -36,6 +36,10 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_MANIFEST: usize = 16 * 1024 * 1024;
 /// The largest bucket or retention document read.
 const MAX_DOCUMENT: usize = 64 * 1024;
+/// The largest bucket listing page read (a page holds at most 1000 keys).
+const MAX_LISTING: usize = 4 * 1024 * 1024;
+/// The prefix every manifest key starts with.
+const PREFIX: &str = "owt-audit/";
 /// The most of an error body that is read.
 const MAX_ERROR: usize = 4 * 1024;
 /// The clock drift between this host and the store that is tolerated.
@@ -254,6 +258,52 @@ impl S3ObjectLock {
         read_capped(resp, MAX_MANIFEST).await
     }
 
+    /// The newest manifest key in the bucket: the greatest key of the form
+    /// [`Manifest::key`] makes (`owt-audit/<at_us>-<digest>.json`, which sort by
+    /// time), listed with `ListObjectsV2` page by page. Needs `s3:ListBucket`.
+    async fn latest_key(&self) -> anyhow::Result<Option<String>> {
+        let mut latest: Option<String> = None;
+        let mut token: Option<String> = None;
+        loop {
+            let mut query = vec![("list-type", "2"), ("prefix", PREFIX)];
+            if let Some(t) = &token {
+                query.push(("continuation-token", t.as_str()));
+            }
+            let req = self.prepare("GET", "", &query, &[], b"", SystemTime::now())?;
+            let resp = self.send(&req, "GET", Vec::new()).await?;
+            if !resp.status().is_success() {
+                bail!(
+                    "listing the anchor bucket {:?} failed: {}",
+                    self.config.bucket,
+                    error_detail(resp).await
+                );
+            }
+            let body = String::from_utf8_lossy(&read_capped(resp, MAX_LISTING).await?).into_owned();
+            let contents = xml_children(&body, "ListBucketResult", "Contents")
+                .context("the bucket listing is not a ListBucketResult document")?;
+            for (inner, _) in contents {
+                let key = xml_child(&format!("<Contents>{inner}</Contents>"), "Contents", "Key")
+                    .context("a bucket listing entry has no single Key")?;
+                if is_manifest_key(&key) && latest.as_ref().is_none_or(|l| key > *l) {
+                    latest = Some(key);
+                }
+            }
+            match xml_child(&body, "ListBucketResult", "IsTruncated").as_deref() {
+                Some("true") => {
+                    let next = xml_child(&body, "ListBucketResult", "NextContinuationToken")
+                        .filter(|t| !t.is_empty())
+                        .context("a truncated bucket listing has no continuation token")?;
+                    if token.as_deref() == Some(next.as_str()) {
+                        bail!("the bucket listing repeats its continuation token");
+                    }
+                    token = Some(next);
+                }
+                Some("false") | None => return Ok(latest),
+                Some(other) => bail!("the bucket listing's IsTruncated is {other:?}"),
+            }
+        }
+    }
+
     /// The signed PUT of `bytes` under `key`, as of `now`.
     fn prepare_put(&self, key: &str, bytes: &[u8], now: SystemTime) -> anyhow::Result<Prepared> {
         validate_key(key)?;
@@ -469,6 +519,47 @@ impl Anchor for S3ObjectLock {
         self.check_lock(key, &version, Some(until)).await?;
         Ok(version)
     }
+
+    /// [`Stored::Version`] is [`S3ObjectLock::fetch`] pinned to the receipt, so the
+    /// version must be the one anchored and held in COMPLIANCE mode. [`Stored::Latest`]
+    /// lists the bucket for the greatest manifest key and reads its latest version,
+    /// which must be the manifest the key names (its digest is in the key), so a
+    /// version written over it later is refused.
+    async fn get(&self, which: Stored<'_>) -> anyhow::Result<Option<Vec<u8>>> {
+        match which {
+            Stored::Version { key, receipt } => self.fetch(key, Some(receipt)).await.map(Some),
+            Stored::Latest => {
+                let Some(key) = self.latest_key().await? else {
+                    return Ok(None);
+                };
+                let bytes = self.fetch(&key, None).await?;
+                let named = Manifest::from_bytes(&bytes).is_ok_and(|m| m.key() == key);
+                if !named {
+                    bail!("the object {key:?} is not the manifest its key names");
+                }
+                Ok(Some(bytes))
+            }
+        }
+    }
+}
+
+/// Whether `key` has the form [`Manifest::key`] makes.
+fn is_manifest_key(key: &str) -> bool {
+    let Some(rest) = key
+        .strip_prefix(PREFIX)
+        .and_then(|k| k.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    let Some((at, digest)) = rest.split_once('-') else {
+        return false;
+    };
+    at.len() == 20
+        && at.bytes().all(|b| b.is_ascii_digit())
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Reject keys whose path would be rewritten by URL normalization.
@@ -557,12 +648,24 @@ async fn error_detail(mut resp: reqwest::Response) -> S3Error {
 }
 
 /// The trimmed text of the leaf element `child` directly under the document root
-/// `root`, or `None` when the document is not a `root` element, has no such child,
-/// the child has any element inside it (mixed content included), or the document is
+/// `root`, or `None` when the document is not a `root` element, has no such child or
+/// more than one, the child has any element inside it (mixed content included), or the document is
 /// not plain XML: comments, CDATA and DTDs are refused, every element must close in
 /// order, and the root's close tag must end the document.
 fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
+    match xml_children(xml, root, child)?.as_slice() {
+        [(text, false)] => Some((*text).to_owned()),
+        _ => None,
+    }
+}
+
+/// Every direct child of the document's `root` element named `child`: its content,
+/// trimmed and raw (any markup inside kept), and whether it holds an element. `None`
+/// when the document is not a `root` element or not plain XML, as [`xml_child`]
+/// describes.
+fn xml_children<'a>(xml: &'a str, root: &str, child: &str) -> Option<Vec<(&'a str, bool)>> {
     let ws = |c: char| c.is_ascii_whitespace();
+    let offset = |rest: &str| xml.len() - rest.len();
     let mut s = xml.trim_start_matches(ws);
     if let Some(after) = s.strip_prefix("<?xml") {
         // The declaration is `<?xml` and whitespace or `?>`, not `<?xmlfoo`.
@@ -584,12 +687,13 @@ fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
     let mut rest = &open[end + 1..];
     // The names of the open elements below the root.
     let mut stack: Vec<&str> = Vec::new();
-    // Whether the direct child being read holds an element.
+    // Whether the direct child being read holds an element, and where its content
+    // starts.
     let mut nested = false;
-    let mut found: Option<String> = None;
+    let mut start = 0;
+    let mut found: Vec<(&'a str, bool)> = Vec::new();
     loop {
         let lt = rest.find('<')?;
-        let before = &rest[..lt];
         let tag_len = tag_end(&rest[lt..])?;
         let tag = &rest[lt + 1..lt + tag_len];
         let after = &rest[lt + tag_len + 1..];
@@ -600,21 +704,14 @@ fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
             let name = name.trim_matches(ws);
             let Some(open_name) = stack.pop() else {
                 // The root's close tag ends the document.
-                return (name == root && after.trim_matches(ws).is_empty())
-                    .then_some(found)
-                    .flatten();
+                return (name == root && after.trim_matches(ws).is_empty()).then_some(found);
             };
             if open_name != name {
                 return None;
             }
             if stack.is_empty() && name == child {
-                if nested {
-                    return None;
-                }
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(before.trim_matches(ws).to_owned());
+                let content = &xml[start..offset(rest) + lt];
+                found.push((content.trim_matches(ws), nested));
             }
         } else {
             let self_closing = tag.ends_with('/');
@@ -626,12 +723,10 @@ fn xml_child(xml: &str, root: &str, child: &str) -> Option<String> {
                 nested = false;
                 if self_closing {
                     if name == child {
-                        if found.is_some() {
-                            return None;
-                        }
-                        found = Some(String::new());
+                        found.push(("", false));
                     }
                 } else {
+                    start = offset(after);
                     stack.push(name);
                 }
             } else {
@@ -1677,5 +1772,116 @@ mod tests {
     async fn fetch_of_the_latest_version_reads_one_object() {
         let got = fetch(None, vec![ok(&[], "manifest")]).await;
         assert_eq!(got.unwrap(), b"manifest");
+    }
+
+    fn listing(keys: &[&str], next: Option<&str>) -> String {
+        let mut contents = String::new();
+        for k in keys {
+            let _ = write!(
+                contents,
+                "<Contents><Key>{k}</Key><Size>1</Size></Contents>"
+            );
+        }
+        let tail = match next {
+            Some(t) => format!(
+                "<IsTruncated>true</IsTruncated><NextContinuationToken>{t}</NextContinuationToken>"
+            ),
+            None => "<IsTruncated>false</IsTruncated>".into(),
+        };
+        format!(
+            "<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>b</Name><KeyCount>{}</KeyCount>{contents}{tail}</ListBucketResult>",
+            keys.len()
+        )
+    }
+
+    fn manifest(at_us: i64) -> Manifest {
+        Manifest {
+            format: super::super::FORMAT.into(),
+            at_us,
+            prev: None,
+            heads: Vec::new(),
+        }
+    }
+
+    async fn latest(responses: Vec<String>) -> anyhow::Result<Option<Vec<u8>>> {
+        let endpoint = fake::serve(responses).await;
+        S3ObjectLock::new(config(&endpoint))
+            .unwrap()
+            .get(Stored::Latest)
+            .await
+    }
+
+    #[tokio::test]
+    async fn latest_lists_every_page_and_reads_the_greatest_manifest_key() {
+        let (old, new, newest) = (manifest(1), manifest(2), manifest(3));
+        let got = latest(vec![
+            ok(
+                &[],
+                &listing(&[&old.key(), "owt-audit/notes.txt"], Some("t1")),
+            ),
+            ok(&[], &listing(&[&newest.key(), &new.key()], None)),
+            ok(&[], &String::from_utf8(newest.to_bytes()).unwrap()),
+        ])
+        .await;
+        assert_eq!(got.unwrap(), Some(newest.to_bytes()));
+    }
+
+    #[tokio::test]
+    async fn latest_of_an_empty_bucket_is_none() {
+        assert_eq!(
+            latest(vec![ok(&[], &listing(&[], None))]).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_refuses_an_object_its_key_does_not_name() {
+        let (named, other) = (manifest(1), manifest(2));
+        let e = latest(vec![
+            ok(&[], &listing(&[&named.key()], None)),
+            ok(&[], &String::from_utf8(other.to_bytes()).unwrap()),
+        ])
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("not the manifest its key names"),
+            "{e:#}"
+        );
+        // A listing that is not one, or a truncated one without a token.
+        assert!(latest(vec![ok(&[], "<Error/>")]).await.is_err());
+        let truncated =
+            listing(&[], Some("")).replace("<NextContinuationToken></NextContinuationToken>", "");
+        assert!(latest(vec![ok(&[], &truncated)]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_by_version_is_a_pinned_fetch() {
+        let endpoint = fake::serve(vec![
+            ok(&[("x-amz-version-id", "v1")], "manifest"),
+            ok(&[], &retention("COMPLIANCE", years(1))),
+        ])
+        .await;
+        let got = S3ObjectLock::new(config(&endpoint))
+            .unwrap()
+            .get(Stored::Version {
+                key: "owt-audit/1.json",
+                receipt: "v1",
+            })
+            .await;
+        assert_eq!(got.unwrap(), Some(b"manifest".to_vec()));
+    }
+
+    #[test]
+    fn children_keep_their_markup() {
+        let doc = "<L><C><K>a</K></C><X/><C> <K>b</K> </C><C/></L>";
+        assert_eq!(
+            xml_children(doc, "L", "C"),
+            Some(vec![("<K>a</K>", true), ("<K>b</K>", true), ("", false)])
+        );
+        assert_eq!(xml_children(doc, "L", "Y"), Some(Vec::new()));
+        assert_eq!(xml_children("<L><C></L>", "L", "C"), None);
+        assert!(is_manifest_key(&manifest(7).key()));
+        assert!(!is_manifest_key("owt-audit/7-abc.json"));
+        assert!(!is_manifest_key("other/00000000000000000007-x.json"));
     }
 }

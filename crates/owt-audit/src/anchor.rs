@@ -9,8 +9,8 @@
 //! names the previous one's digest, so the anchors form a chain of their own.
 //!
 //! Run it on a schedule (a `singleton` job, hourly or daily): an edit to an event
-//! older than the latest anchor is then always detectable with [`crate::verify_anchor`]
-//! against a manifest fetched from the store, not from the database.
+//! older than the latest anchor is then always detectable with [`verify_store`],
+//! which checks the database's anchors against the store's copies.
 
 use std::future::Future;
 use std::time::SystemTime;
@@ -76,17 +76,43 @@ impl Manifest {
 
 /// Where manifests are kept, out of the database owner's reach. An implementation
 /// stores `bytes` under `key` so it cannot be overwritten or deleted before its
-/// retention ends, and returns a receipt (a version id, an `ETag`) to record.
+/// retention ends, returns a receipt (a version id, an `ETag`) to record, and reads
+/// stored manifests back for [`verify_store`].
 pub trait Anchor: Send + Sync {
     /// The provider's name, recorded with each anchor.
     fn name(&self) -> &str;
 
     /// Store a manifest.
     fn put(&self, key: &str, bytes: &[u8]) -> impl Future<Output = anyhow::Result<String>> + Send;
+
+    /// Read a stored manifest back. [`Stored::Version`] is the one stored under a key
+    /// with a receipt `put` returned, and is an error when the store does not hold it.
+    /// [`Stored::Latest`] is the newest manifest stored (keys order by time), or
+    /// `None` when the store holds none.
+    fn get(
+        &self,
+        which: Stored<'_>,
+    ) -> impl Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send;
+}
+
+/// Which stored manifest [`Anchor::get`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stored<'a> {
+    /// The manifest under `key`, as stored with `receipt`.
+    Version {
+        /// [`Manifest::key`].
+        key: &'a str,
+        /// The receipt `put` returned for it.
+        receipt: &'a str,
+    },
+    /// The newest manifest stored.
+    Latest,
 }
 
 /// Anchors nowhere: manifests are recorded in the database only. For development and
 /// tests; in production it leaves rewrites by the database's owner undetectable.
+/// It holds nothing to read back: [`Stored::Latest`] is `None` and a
+/// [`Stored::Version`] is an error.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoAnchor;
 
@@ -101,6 +127,18 @@ impl Anchor for NoAnchor {
         _bytes: &[u8],
     ) -> impl Future<Output = anyhow::Result<String>> + Send {
         std::future::ready(Ok(String::new()))
+    }
+
+    fn get(
+        &self,
+        which: Stored<'_>,
+    ) -> impl Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send {
+        std::future::ready(match which {
+            Stored::Latest => Ok(None),
+            Stored::Version { key, .. } => Err(anyhow::anyhow!(
+                "NoAnchor stores nothing, so it does not hold {key:?}"
+            )),
+        })
     }
 }
 
@@ -203,16 +241,36 @@ pub async fn anchor<A: Anchor>(pool: &PgPool, to: &A) -> anyhow::Result<Anchored
 ///
 /// This checks the database's copies against each other only; a role that may
 /// rewrite `owt_audit_anchors` can rewrite them consistently. The independent check
-/// is a manifest fetched from the store (`verify_anchor`, `audit verify --manifest`).
+/// is the store's copy: [`verify_store`], or `audit verify`.
 pub async fn history(pool: &PgPool) -> Result<Vec<Manifest>, crate::VerifyError> {
+    Ok(recorded(pool)
+        .await?
+        .into_iter()
+        .map(|r| r.manifest)
+        .collect())
+}
+
+/// A manifest the database records, with the provider and receipt recorded with it.
+struct Recorded {
+    manifest: Manifest,
+    provider: String,
+    receipt: String,
+}
+
+/// A row of `owt_audit_anchors`: id, manifest, digest, provider, receipt.
+type AnchorRow = (i64, Vec<u8>, Vec<u8>, String, String);
+
+/// [`history`], with each row's provider and receipt.
+async fn recorded(pool: &PgPool) -> Result<Vec<Recorded>, crate::VerifyError> {
     use crate::VerifyError;
-    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> =
-        sqlx::query_as("SELECT id, manifest, digest FROM owt_audit_anchors ORDER BY id")
-            .fetch_all(pool)
-            .await?;
-    let mut out: Vec<Manifest> = Vec::with_capacity(rows.len());
+    let rows: Vec<AnchorRow> = sqlx::query_as(
+        "SELECT id, manifest, digest, provider, receipt FROM owt_audit_anchors ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out: Vec<Recorded> = Vec::with_capacity(rows.len());
     let mut prev: Option<String> = None;
-    for (id, bytes, digest) in rows {
+    for (id, bytes, digest, provider, receipt) in rows {
         let m = Manifest::from_bytes(&bytes)
             .map_err(|e| VerifyError::Manifest(format!("anchor {id} does not parse: {e}")))?;
         let stored: Option<Hash> = digest.as_slice().try_into().ok();
@@ -228,9 +286,95 @@ pub async fn history(pool: &PgPool) -> Result<Vec<Manifest>, crate::VerifyError>
             )));
         }
         prev = Some(crate::hex(&m.digest()));
-        out.push(m);
+        out.push(Recorded {
+            manifest: m,
+            provider,
+            receipt,
+        });
     }
     Ok(out)
+}
+
+/// Check the database's anchors against the store's copies, so a rewrite of both the
+/// chains and `owt_audit_anchors` by the database's owner is caught: the database's
+/// anchors must form an unbroken chain ([`history`]); the latest must have been
+/// stored by `store` (its recorded provider is `store`'s name), the store's copy of
+/// it, read by its receipt, must be the database's, and it must be the newest
+/// manifest the store holds; and its heads must still be in their chains
+/// ([`crate::verify_anchor`]). Since each manifest names the digest of the one before
+/// it, the store's copy of the latest vouches for every earlier row as well. Walk
+/// each chain with [`crate::verify`] as well, to show the events before the heads
+/// are intact.
+///
+/// Returns the latest manifest, or `None` when neither the database nor the store
+/// holds one. A store that cannot be read, or that holds a manifest the database
+/// does not record as its latest, is a failure, not a warning. A run of [`anchor`]
+/// whose store write succeeded but whose database insert failed leaves the store a
+/// manifest ahead, which fails this check until the next run anchors again.
+pub async fn verify_store<A: Anchor>(
+    pool: &PgPool,
+    store: &A,
+) -> Result<Option<Manifest>, crate::VerifyError> {
+    use crate::VerifyError;
+    let unreadable = |e: anyhow::Error| VerifyError::Store(format!("{e:#}"));
+    let recorded = recorded(pool).await?;
+    let newest = store
+        .get(Stored::Latest)
+        .await
+        .map_err(unreadable)?
+        .map(|b| Manifest::from_bytes(&b))
+        .transpose()
+        .map_err(|e| {
+            VerifyError::Store(format!("the store's latest manifest does not parse: {e}"))
+        })?;
+    let Some(latest) = recorded.last() else {
+        return match newest {
+            Some(n) => Err(VerifyError::Store(format!(
+                "the store holds {} but the database records no anchor: the anchors were removed",
+                n.key()
+            ))),
+            None => Ok(None),
+        };
+    };
+    let m = &latest.manifest;
+    let key = m.key();
+    if latest.provider != store.name() {
+        return Err(VerifyError::Store(format!(
+            "the latest anchor ({key}) was recorded by {:?}, not by the configured store {:?}",
+            latest.provider,
+            store.name()
+        )));
+    }
+    let copy = store
+        .get(Stored::Version {
+            key: &key,
+            receipt: &latest.receipt,
+        })
+        .await
+        .map_err(unreadable)?
+        .ok_or_else(|| VerifyError::Store(format!("the store does not hold {key}")))?;
+    let same = Manifest::from_bytes(&copy).is_ok_and(|c| c.digest() == m.digest());
+    if !same {
+        return Err(VerifyError::Store(format!(
+            "the store's copy of {key} is not the manifest the database records"
+        )));
+    }
+    match newest {
+        Some(n) if n.digest() == m.digest() => {}
+        Some(n) => {
+            return Err(VerifyError::Store(format!(
+                "the store's newest manifest is {}, not the database's latest {key}: anchors were removed or rewritten",
+                n.key()
+            )));
+        }
+        None => {
+            return Err(VerifyError::Store(format!(
+                "the store lists no manifest, but the database's latest is {key}"
+            )));
+        }
+    }
+    crate::verify_anchor(pool, m).await?;
+    Ok(Some(m.clone()))
 }
 
 /// How long ago the latest valid manifest in the database was made; `None` when
@@ -247,7 +391,7 @@ pub async fn age(pool: &PgPool) -> anyhow::Result<Option<std::time::Duration>> {
 /// The latest manifest recorded in the database whose recorded digest and format
 /// match it (a row that does not is skipped, with a warning). The database's copy is only as trustworthy as the roles that
 /// may insert into `owt_audit_anchors`: for a check the database's owner cannot
-/// defeat, verify against the copy in the anchor store.
+/// defeat, use [`verify_store`].
 pub async fn latest(pool: &PgPool) -> anyhow::Result<Option<Manifest>> {
     let mut conn = pool.acquire().await?;
     Ok(latest_in(&mut conn).await?.map(|(m, _)| m))
