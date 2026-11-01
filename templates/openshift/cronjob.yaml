@@ -13,12 +13,29 @@
 # - The label `app: <NAME>-<JOB>`, never `app: <NAME>`: the app's Service sends
 #   traffic to every pod with that label. The NetworkPolicies below admit this label
 #   to the database and to Redis (redis.yaml); app.yaml's admit the app's pods only.
-# - The env: DATABASE_URL from <NAME>-<DB_SUFFIX>-app, PGSSLMODE=verify-full and
-#   PGSSLROOTCERT at the mounted <NAME>-<DB_SUFFIX>-ca, POD_NAMESPACE, REDIS_URL from
+# - The env: DATABASE_URL as the role in <NAME>-<DB_SUFFIX>-<DB_ROLE> (below),
+#   PGSSLMODE=verify-full and PGSSLROOTCERT at the mounted <NAME>-<DB_SUFFIX>-ca,
+#   POD_NAMESPACE, REDIS_URL from
 #   <NAME>-redis, and the rest from <NAME>-env, as the Deployment has them; then
 #   <NAME>-<JOB>-env, the task's own, which the web pods never read (a credential
 #   only this task needs). Both Secrets are optional, and a key in the task's wins.
 # - The same image, kept current by the trigger annotation on the CronJob.
+#
+# The database role. A task connects as the app's runtime role (<NAME>_runtime, from
+# app.yaml's <NAME>-<DB_SUFFIX>-runtime Secret), with the grants the Deployment's
+# `migrate` init container gives it. No task needs the owner: the init container
+# migrates. A task that needs a privilege the runtime role lacks gets a role of its
+# own, never the owner's: the audit anchoring job inserts into owt_audit_anchors,
+# which the runtime role may only read, so it runs as <NAME>_anchor, a managed role
+# added to app.yaml's Cluster beside <NAME>_runtime, its Secret made the same way
+# (username, and a hex password, which the URL needs unescaped), and granted once by
+# the owner:
+#
+#   GRANT USAGE ON SCHEMA public TO myapp_anchor;
+#   GRANT SELECT ON owt_audit_events TO myapp_anchor;
+#   GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
+#
+# then processed with -p DB_ROLE=anchor (its Secret myapp-db-anchor).
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
@@ -46,6 +63,11 @@ parameters:
   - name: DB_SUFFIX
     description: The database cluster is <NAME>-<DB_SUFFIX>, as given to app.yaml.
     value: db
+  - name: DB_ROLE
+    description: >-
+      The role the task connects as, by its Secret <NAME>-<DB_SUFFIX>-<DB_ROLE>
+      (basic-auth: username, a hex password): app.yaml's runtime role by default.
+    value: runtime
   - name: MEMORY_LIMIT
     value: 256Mi
   # The log filter, as given to app.yaml unless the task's jobs/<JOB>.env says otherwise.
@@ -97,9 +119,16 @@ objects:
                     - name: POD_NAMESPACE
                       valueFrom:
                         fieldRef: {fieldPath: metadata.namespace}
-                    - name: DATABASE_URL
+                    # The role at <name>-db-rw, as the Deployment connects: the
+                    # runtime role unless DB_ROLE names another (top), never the owner.
+                    - name: DB_USER
                       valueFrom:
-                        secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-app", key: uri}
+                        secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-${DB_ROLE}", key: username}
+                    - name: DB_PASSWORD
+                      valueFrom:
+                        secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-${DB_ROLE}", key: password}
+                    - name: DATABASE_URL
+                      value: "postgres://$(DB_USER):$(DB_PASSWORD)@${NAME}-${DB_SUFFIX}-rw:5432/${NAME}"
                     - {name: PGSSLMODE, value: verify-full}
                     - {name: PGSSLROOTCERT, value: /etc/db-ca/ca.crt}
                     - name: REDIS_URL

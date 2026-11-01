@@ -44,6 +44,33 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     owt_runtime::db::migrate_locked(pool, &migrator(), LOCK_ID).await
 }
 
+/// Narrow the app's runtime `role` on the audit tables to what the README's least
+/// privilege names: `SELECT` and `INSERT` on `owt_audit_events`, `SELECT` on
+/// `owt_audit_anchors`, nothing else (no `UPDATE`, `DELETE`, `TRUNCATE`, `TRIGGER`).
+/// Run it as the schema's owner after [`migrate`] and after
+/// [`owt_runtime::db::grant_runtime`], which grants every table more. The role that
+/// anchors is another, given `INSERT` on the anchors by hand. Calling it again
+/// changes nothing.
+///
+/// # Errors
+///
+/// When `role` is not a role name or a statement fails (the tables not migrated yet).
+pub async fn grant_runtime(pool: &PgPool, role: &str) -> anyhow::Result<()> {
+    let role = owt_runtime::db::quoted_role(role)?;
+    let mut tx = pool.begin().await?;
+    for sql in [
+        format!("REVOKE ALL ON owt_audit_events, owt_audit_anchors FROM {role}"),
+        format!("GRANT SELECT, INSERT ON owt_audit_events TO {role}"),
+        format!("GRANT SELECT ON owt_audit_anchors TO {role}"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use sha2::{Digest, Sha256};

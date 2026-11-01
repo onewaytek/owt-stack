@@ -14,8 +14,17 @@
 # OpenShift's schedule (~15 min), and the Deployment's image trigger rolls out each
 # new digest. ghcr credentials live in the cluster-wide pull secret.
 #
-# Migrations need no Job: the binary applies its embedded SQLx migrations at startup
-# under an advisory lock (owt_runtime::db::migrate_locked), so replicas serialize.
+# Two database roles. The owner (<NAME>, CNPG's <NAME>-<DB_SUFFIX>-app Secret) runs
+# the migrations in each pod's `migrate` init container (`<binary> migrate`, under an
+# advisory lock, so replicas serialize) and grants the runtime role what serving
+# needs; the app serves as the runtime role (<NAME>_runtime), which owns nothing, so
+# it cannot drop the audit tables' triggers or rewrite their chain. CNPG manages the
+# runtime role from a Secret made once, by hand, before the first apply:
+#
+#   pw=$(openssl rand -hex 32)
+#   oc create secret generic myapp-db-runtime -n myapp --type=kubernetes.io/basic-auth \
+#     --from-literal=username=myapp_runtime --from-literal=password="$pw"
+#   oc label secret myapp-db-runtime -n myapp cnpg.io/reload=true
 #
 # The app's own environment (SESSION_SECRET, provider credentials, its tuning) lives
 # in a Secret named <NAME>-env, which the Deployment reads whole when it exists:
@@ -168,7 +177,9 @@ objects:
         # to a new digest, and that spec change rolls.
         image.openshift.io/triggers: >-
           [{"from": {"kind": "ImageStreamTag", "name": "${NAME}:${CHANNEL}"},
-          "fieldPath": "spec.template.spec.containers[?(@.name==\"app\")].image"}]
+          "fieldPath": "spec.template.spec.containers[?(@.name==\"app\")].image"},
+          {"from": {"kind": "ImageStreamTag", "name": "${NAME}:${CHANNEL}"},
+          "fieldPath": "spec.template.spec.initContainers[?(@.name==\"migrate\")].image"}]
     spec:
       replicas: ${{REPLICAS}}
       # Surge before terminate: with one replica, this is what keeps a rollout (or a
@@ -184,6 +195,43 @@ objects:
         spec:
           # The app never calls the cluster API, so it holds no token for it.
           automountServiceAccountToken: false
+          # The migrations, as the schema's owner, before the app starts: the binary's
+          # `migrate` subcommand migrates, then grants DB_RUNTIME_ROLE what serving
+          # needs (owt_runtime::db::grant_runtime, owt_audit::grant_runtime), and
+          # exits. A failure keeps the old pods serving and this one from starting.
+          initContainers:
+            - name: migrate
+              # Placeholder the trigger resolves, as the app's.
+              image: ${NAME}:${CHANNEL}
+              args: [migrate]
+              envFrom:
+                - secretRef: {name: "${NAME}-env", optional: true}
+              env:
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef: {fieldPath: metadata.namespace}
+                # The owner: CNPG-minted, at <name>-db-rw.
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-app", key: uri}
+                - name: DB_RUNTIME_ROLE
+                  valueFrom:
+                    secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-runtime", key: username}
+                - {name: PGSSLMODE, value: verify-full}
+                - {name: PGSSLROOTCERT, value: /etc/db-ca/ca.crt}
+                - {name: RUST_LOG, value: "${RUST_LOG}"}
+              volumeMounts:
+                - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {memory: "${MEMORY_LIMIT}"}
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+                seccompProfile: {type: RuntimeDefault}
           containers:
             - name: app
               # Placeholder the trigger resolves (lookupPolicy.local).
@@ -202,13 +250,17 @@ objects:
                 - name: POD_NAMESPACE
                   valueFrom:
                     fieldRef: {fieldPath: metadata.namespace}
-                # CNPG-minted; points at <name>-db-rw, so it follows a switchover and
-                # the password rotates without an edit here. This role owns the
-                # schema (migrations run under it), so it can disable the audit
-                # tables' triggers: owt_audit::privileges reports it.
-                - name: DATABASE_URL
+                # The runtime role, at <name>-db-rw, so it follows a switchover. Its
+                # password is hex (see the top), so it needs no escaping in the URL; a
+                # rotated one reaches pods when they restart.
+                - name: DB_RUNTIME_USER
                   valueFrom:
-                    secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-app", key: uri}
+                    secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-runtime", key: username}
+                - name: DB_RUNTIME_PASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-runtime", key: password}
+                - name: DATABASE_URL
+                  value: "postgres://$(DB_RUNTIME_USER):$(DB_RUNTIME_PASSWORD)@${NAME}-${DB_SUFFIX}-rw:5432/${NAME}"
                 # Postgres over TLS, verified against the CA CNPG minted for this
                 # cluster (sqlx reads both variables; the URL names no sslmode).
                 - {name: PGSSLMODE, value: verify-full}
@@ -222,8 +274,9 @@ objects:
               volumeMounts:
                 - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
                 - {name: tmp, mountPath: /tmp}
-              # Startup includes connecting and migrating; until Postgres is up the
-              # process exits and restarts, which this tolerates without flapping.
+              # Startup includes connecting (the init container migrated); until
+              # Postgres is up the process exits and restarts, which this tolerates
+              # without flapping.
               startupProbe:
                 httpGet: {path: /healthz, port: http}
                 periodSeconds: 5
@@ -310,6 +363,15 @@ objects:
         size: ${DB_SIZE}
         storageClass: ${STORAGE_CLASS}
       enableSuperuserAccess: false
+      # The app's runtime role: it logs in and owns nothing; the init container's
+      # grants are all it may do. Its password is the Secret made by hand (top).
+      managed:
+        roles:
+          - name: ${NAME}_runtime
+            ensure: present
+            login: true
+            inherit: true
+            passwordSecret: {name: "${NAME}-${DB_SUFFIX}-runtime"}
       resources:
         requests: {cpu: 100m, memory: 256Mi}
         limits: {memory: 512Mi}

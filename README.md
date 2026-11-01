@@ -33,7 +33,7 @@ Outside the crates:
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its action and workflow pins, its crates and its npm packages, minors and patches grouped |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
-| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger and the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
+| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, a `migrate` init container as the schema's owner and the app serving as a runtime role that owns nothing, the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone, connecting to nothing |
 | `templates/openshift/egress.yaml` | where the app's pods (or a task's) may connect: its database, its Redis, the cluster's DNS and port 443 of the internet, and nothing else |
 | `templates/openshift/tunnel.yaml` | the public address on a private cluster: a locally managed Cloudflare named tunnel of the app's own, two `cloudflared` connectors forwarding its host to the app's Service, and their NetworkPolicies |
@@ -1413,7 +1413,9 @@ then the app's step (its migrator, under its own lock), then `complete`. `run` a
 naming the step (`owt-accounts migrations`, `the app's migrations`, `completing the
 accounts tables`), so `main` reports it once (`{err:#}` prints the chain).
 The binary's `migrate` subcommand and its start-up both call it, so the order cannot
-differ between them.
+differ between them. Deployed from the OpenShift template, only the `migrate`
+subcommand does, in the init container, as the schema's owner; the app serves as a
+role that cannot migrate (see "Database roles").
 
 ```rust,no_run
 # async fn start(pool: sqlx::PgPool, app_migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
@@ -3360,7 +3362,9 @@ event).
 **Roles.** Run the migrations as the role that owns the schema. Give the app's role
 `INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
 or disable the triggers, which takes ownership. Only the role that runs the anchoring
-job inserts anchors, so the app cannot record a manifest of its own:
+job inserts anchors, so the app cannot record a manifest of its own. The OpenShift
+template does this for the app's role (`owt_audit::grant_runtime`, from its
+`migrate` init container; see "Database roles"); by hand it is:
 
 ```sql
 GRANT USAGE ON SCHEMA public TO myapp_app, myapp_anchor;
@@ -3375,8 +3379,9 @@ GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
 the audit tables: whether it owns them (or is a member of their owner), is a
 superuser, or holds `UPDATE`, `DELETE`, `TRUNCATE` or `TRIGGER` on them. Check it at
 startup, on the pool that serves requests. `templates/openshift/app.yaml`
-connects the app as the database's owner (the role its migrations run under), so a
-deployment from it fails this check until the app runs as a role granted as above.
+runs migrations as the database's owner and serves as a runtime role that
+`owt_audit::grant_runtime` grants as above, so a deployment from it passes this
+check.
 
 ```rust,no_run
 # async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
@@ -4927,6 +4932,54 @@ oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
   -p IMAGE=ghcr.io/onewaytek/myapp -p CHANNEL=rc -p PORT=8000 | oc apply -f -
 ```
 
+**Database roles.** The app serves as a runtime role, `myapp_runtime`, that owns
+nothing; the schema's owner (`myapp`, CNPG's `myapp-db-app` Secret) runs only in each
+pod's `migrate` init container, which runs the binary's `migrate` subcommand and exits
+before the app starts. So an injection or a compromised replica cannot drop the audit
+tables' triggers or rewrite their chain (see "Roles" under the audit log). CNPG
+manages the runtime role (`managed.roles`) from a Secret made once, by hand, before
+the first apply (a hex password needs no escaping in the URL the Deployment builds):
+
+```sh
+pw=$(openssl rand -hex 32)
+oc create secret generic myapp-db-runtime -n myapp --type=kubernetes.io/basic-auth \
+  --from-literal=username=myapp_runtime --from-literal=password="$pw"
+oc label secret myapp-db-runtime -n myapp cnpg.io/reload=true
+```
+
+The init container sets `DATABASE_URL` to the owner's and `DB_RUNTIME_ROLE` to the
+runtime role's name. The `migrate` subcommand runs the migration sequence (see
+"Tables" under accounts), then grants the runtime role what serving needs, and the
+app's serve path no longer migrates (it would fail: the runtime role cannot `CREATE`):
+
+```rust,no_run
+# async fn migrate(pool: sqlx::PgPool, app_migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
+owt_accounts::migrations::start(&pool, || {
+    owt_runtime::db::migrate_locked(&pool, app_migrator, 8_531_207)
+})
+.await?;
+owt_audit::migrate(&pool).await?;
+if let Ok(role) = std::env::var("DB_RUNTIME_ROLE") {
+    // Every table: SELECT, INSERT, UPDATE, DELETE; sequences; ledgers read-only.
+    owt_runtime::db::grant_runtime(&pool, &role).await?;
+    // Then the audit tables narrowed: SELECT, INSERT on events, SELECT on anchors.
+    owt_audit::grant_runtime(&pool, &role).await?;
+}
+# Ok(()) }
+```
+
+Tasks from `cronjob.yaml` connect as the runtime role too. A task that needs more
+gets a role of its own, never the owner's: the anchoring job inserts anchors, which
+the runtime role may only read, so it runs as `myapp_anchor`, a second managed role
+in the Cluster, its Secret `myapp-db-anchor` made like `myapp-db-runtime`, given the
+grants under "Roles" (Audit log) once by the owner, and the task processed
+with `-p DB_ROLE=anchor`.
+
+**Upgrading an app to the two roles:** add the `migrate` subcommand above (or the
+grants to the one it has) and stop migrating in the serve path; create the
+`myapp-db-runtime` Secret; apply. The first pod's init container grants the existing
+tables, and the role owns nothing to hand back.
+
 **The app's environment** (`SESSION_SECRET`, a provider's credentials, its own
 tuning) lives in a Secret named `myapp-env`, which the Deployment reads whole. It is
 optional: until it exists, the app starts without it. A variable the template sets
@@ -5019,7 +5072,8 @@ oc process -f templates/openshift/cronjob.yaml -p NAME=myapp -p NAMESPACE=myapp 
 ```
 
 It follows the app's channel through the same image trigger, and has the Deployment's
-database access: `DATABASE_URL` from `myapp-db-app`, `PGSSLMODE=verify-full` with
+database access: `DATABASE_URL` as the runtime role from `myapp-db-runtime` (or the
+role `DB_ROLE` names, from `myapp-db-<DB_ROLE>`), `PGSSLMODE=verify-full` with
 `PGSSLROOTCERT` at the mounted `myapp-db-ca`, `POD_NAMESPACE`, `REDIS_URL` and
 `myapp-env`. A credential only the task needs goes in a Secret of its own,
 `myapp-<JOB>-env` (`myapp-digest-env`), which the task reads after `myapp-env` (its
@@ -5154,8 +5208,8 @@ oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
   -p IMAGE=ghcr.io/onewaytek/myapp -p POSTGRES_MAJOR=16 | oc diff -f -
 ```
 
-**`DATABASE_URL` is the `uri` key of `myapp-db-app`** (`myapp-<DB_SUFFIX>-app`), in
-the Deployment and in every `cronjob.yaml` task. CloudNativePG creates that Secret,
+**The `migrate` init container's `DATABASE_URL` is the `uri` key of `myapp-db-app`**
+(`myapp-<DB_SUFFIX>-app`). CloudNativePG creates that Secret,
 `uri` included, only when the Cluster's bootstrap (`initdb`, `recovery` or
 `pg_basebackup`) names no `secret:` of its own, as the template's `initdb` and the
 restore under "Restoring" below do. A Cluster made elsewhere with `secret:` gets no
