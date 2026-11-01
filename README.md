@@ -3557,6 +3557,12 @@ run, and graceful shutdown:
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
 
+Choosing: `singleton` for periodic work that one replica at a time does and that
+needs only Postgres; `leased` when the work wants a sticky owner and a fast handover
+at shutdown, or the app sits behind a transaction-mode pooler; the durable queue
+("Durable job queue", below) for work items that must each run, survive a crash and
+retry, rather than a tick that may be skipped.
+
 ```rust,no_run
 use std::time::Duration;
 use owt_runtime::jobs::{CancellationToken, Every, JobMetrics, Jobs, lease::Leases};
@@ -3686,7 +3692,12 @@ enqueue.
   `JobError::permanent(..)`, the job is **dead**: kept with its payload and last error
   for `Queue::dead`, `Queue::redrive` (queued again with fresh attempts) or
   `Queue::discard_dead`.
-- **The worker** claims while it has free slots (`concurrency`), runs each job in its
+- **The worker** polls: it claims while it has free slots (`concurrency`) and, after
+  a claim that finds nothing due, waits `Worker::poll` (default 5 s) before claiming
+  again. A job that becomes due, a freshly enqueued one included, may therefore wait
+  up to that interval before it starts; a queue that needs a quicker start sets
+  `.poll(Duration::from_millis(500))` or so, at one claim query per interval per
+  replica. There is no `LISTEN/NOTIFY` (see "Decisions"). The worker runs each job in its
   own task (a panic is a failed attempt), renews running jobs' heartbeats every third
   of `stale_after`, and puts back jobs whose heartbeat went stale on any replica (a
   replica that died). Heartbeats and housekeeping run in tasks of their own, so a slow
@@ -5278,6 +5289,12 @@ this command, run when the app adopts a release, is the only thing that moves it
   dashboards and load-test reports keep their names.
 - **Bus channel names** (`<prefix>:<topic>`, `~changed`, `~beat`) are a wire format
   between replicas. Changing one is a rollout hazard: old and new replicas must agree.
+- **The job queue polls; it is not notified.** `LISTEN/NOTIFY` would pin a
+  connection per listening worker, and `NOTIFY` serialises committing transactions on
+  one server-wide lock, a ceiling for enqueue-heavy apps; a transaction-mode pooler
+  drops `LISTEN` without a word, so a safety poll is needed anyway. A claim is one
+  partial-index query per worker per interval (`Worker::poll`, default 5 s), and a
+  queue that needs a quicker start shortens its interval.
 - **One audit chain per tenant**, not one global chain. Appends to a chain are
   serialized, so a global chain would make every tenant's writes wait on one lock;
   per tenant, they never wait on each other. A tenant's chain verifies and exports
