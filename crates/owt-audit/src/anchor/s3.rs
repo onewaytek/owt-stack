@@ -1775,10 +1775,13 @@ mod tests {
     }
 
     fn listing(keys: &[&str], next: Option<&str>) -> String {
-        let contents: String = keys
-            .iter()
-            .map(|k| format!("<Contents><Key>{k}</Key><Size>1</Size></Contents>"))
-            .collect();
+        let mut contents = String::new();
+        for k in keys {
+            let _ = write!(
+                contents,
+                "<Contents><Key>{k}</Key><Size>1</Size></Contents>"
+            );
+        }
         let tail = match next {
             Some(t) => format!(
                 "<IsTruncated>true</IsTruncated><NextContinuationToken>{t}</NextContinuationToken>"
