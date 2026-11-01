@@ -2119,6 +2119,96 @@ async fn break_glass(session: Session<Data>) -> Result<&'static str, &'static st
 }
 ```
 
+#### The second-factor pages
+
+`owt_accounts::mfa::pages::MfaPages` mounts the pages the functions above need, so an app
+does not write them: enrolling an authenticator (a QR code and the secret as text; the
+first code turns it on and shows the recovery codes once), the sign-in challenge (a TOTP
+code or a recovery code), step-up re-authentication that honours `?next=`, and a page to
+see, remove or set up again the authenticator and make new recovery codes. It is built
+like the accounts admin: the app supplies its layout as a `Chrome` closure (or an
+`AsyncChrome` that awaits), the bodies are `owt-*` markup from `tailwind/owt.css`, and an
+app with its own design implements `pages::Views` for the pages it draws itself (the view
+models carry each form's URL; the fields are `code`, `recovery_code`, `password` and
+`next`).
+
+| Route | Page |
+|---|---|
+| `GET /mfa` | the account's factors: set up, remove, set up again, new recovery codes |
+| `GET, POST /mfa/challenge?next=` | the code a pending sign-in (`Next::Challenge`) waits for |
+| `GET, POST /mfa/enroll?next=` | enrolling; also where `RecentMfa` sends an account with no factor |
+| `POST /mfa/remove`, `/mfa/reenroll`, `/mfa/recovery-codes` | changes, each behind step-up |
+| `GET, POST /reauth?next=` | step-up: the password (if the account has one) and a code (if it has a factor) |
+
+`MfaPages::at("/account/mfa")` and `.reauth_at("/account/confirm")` move them; tell
+`Accounts::enroll_at` (`{base}/enroll`) and `Accounts::reauth_at` the same. What they hold
+to: `?next=` is followed only when it is a path on this site (`https://evil.example`,
+`//evil.example` and `/\evil.example` go to `/`); a change of factor needs a second factor
+used within 15 minutes (`MfaPages::change_within`), and without one the person is sent to
+`/reauth` and back; a provider's sign-in or a link never counts as that factor; every code,
+the enrollment's first included, is charged to the app's throttle under a key of the
+account's; every response is `no-store` and unframed; and a cross-origin `POST` is refused.
+The `Event`s the operations return (and the lock event of the answer that locked the
+authenticator) go to the app's `pages::Recorder` after the change: email the owner on the
+ones the previous section names.
+
+**What the app provides:** a real `SecretSealer` on its `Mfa` (`Mfa::sealer`, above; a
+release build refuses `Unsealed`), its layout, its sign-in throttle (`Throttle`, or
+`SharedThrottle` with the `redis` feature, shared with `Mfa::password_sign_in`), the
+client's address (serve with `into_make_service_with_connect_info`, as `ClientIp` reads
+it), and its own sign-in page, which redirects `Next::Challenge` to
+`/mfa/challenge?next=…` and `Next::Enroll` to `/mfa/enroll?next=…`. Merge the routes
+inside the session and accounts layers.
+
+- **The sealer over `owt-crypt`.** Wrap an `owt_crypt::Sealer` for one scope, loaded once
+  at start from the app's `LocalKek` keyring (`Crypt::sealer_max_age` set very long, since
+  a `SecretSealer` cannot refresh it per request: a key rotation then takes effect at the
+  next restart). `key_id` is the sealer's `version()` as text; `seal`/`open` use a `Field`
+  built from `context`. Run `owt_crypt::migrate` before the runtime grants are applied
+  (`grant_runtime`), like the accounts migrations.
+- **Sign-in by link or provider.** A door other than `Mfa::password_sign_in` (a one-time
+  link, as in link-only apps, or a provider) calls `Mfa::first_factor_passed` right after
+  the credential checks out, and redirects as its `Next` says: it signs in and stamps the
+  time of the sign-in, or makes the sign-in pending. A door that calls `session::sign_in`
+  alone must follow it with `mfa::mark_authenticated`; without that stamp a link-only
+  account has no recent sign-in, and can never enroll its first factor. Neither a link nor a
+  provider ever satisfies
+  `RecentMfa`: only a code entered on these pages does.
+
+```rust,no_run
+use std::sync::Arc;
+use axum::Router;
+use axum::middleware::from_fn_with_state;
+use axum::response::{Html, IntoResponse, Response};
+use owt_accounts::mfa::Mfa;
+use owt_accounts::mfa::pages::{MfaPages, Page};
+use owt_accounts::{Accounts, session::Data};
+use owt_auth::throttle::Throttle;
+use owt_web::session::Sessions;
+
+# fn demo(pool: sqlx::PgPool, sessions: Sessions<Data>, mfa: Mfa, recorder: impl owt_accounts::mfa::pages::Recorder) {
+let throttle = Arc::new(Throttle::default());
+
+// The app's layout. An Askama layout escapes the title and embeds the body as it is.
+let chrome = |page: Page<'_>| -> owt_web::Result<Response> {
+    Ok(Html(format!("<title>{}</title><main>{}</main>", page.title, page.body)).into_response())
+};
+let pages = MfaPages::new(pool.clone(), mfa.clone(), Arc::clone(&throttle), chrome)
+    .audit(recorder);
+
+let accounts = Accounts::new(pool, "/login").require_mfa::<Data>(mfa);
+let _app: Router = Router::new()
+    // .route("/login", ...) — the app's own, calling Mfa::password_sign_in with `throttle`
+    .merge(pages.routes())
+    .layer(from_fn_with_state(accounts, Accounts::load::<Data>))
+    .layer(from_fn_with_state(sessions, Sessions::layer));
+# }
+```
+
+An app with its own session type adds `.session::<MySession>()`. Under
+`MfaPolicy::Required` the last factor cannot be removed, and so cannot be set up again
+here either: staff unlock a locked one (`Mfa::unlock_totp`).
+
 #### Roles
 
 Three tiers, and the third is the app's:

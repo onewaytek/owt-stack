@@ -406,6 +406,13 @@ impl<S: Send + Sync, X: Clone + Send + Sync + 'static> FromRequestParts<S> for M
 /// The sentence a walled page answers with while the database is unreachable.
 const UNAVAILABLE: &str = "Signing in is unavailable for a moment. Please try again shortly.";
 
+/// The sign-in page the layer names (`/login` without the layer).
+pub(crate) fn sign_in_at(extensions: &Extensions) -> &str {
+    extensions
+        .get::<SignInAt>()
+        .map_or("/login", |s| s.0.as_str())
+}
+
 /// The wall an anonymous visitor meets: the sign-in redirect, or 503 when the
 /// database could not say who they are, since the sign-in page would fail them too.
 ///

@@ -1,0 +1,16 @@
+<section class="owt-section">
+<h1>Confirm it is you</h1>
+{% if let Some(e) = v.error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endif %}{% if v.password || v.code %}<p class="owt-hint">This page asks you to prove who you are again before going on.</p>
+<form class="owt-form" method="post" action="{{ v.action }}">
+{% if v.password %}<div class="owt-field"><label class="owt-label" for="reauth-password">Password</label>
+<input class="owt-input" id="reauth-password" name="password" type="password" autocomplete="current-password" required{% if !v.code %} autofocus{% endif %}></div>
+{% endif %}{% if v.code %}<div class="owt-field"><label class="owt-label" for="reauth-code">Code from your authenticator app</label>
+<input class="owt-input" id="reauth-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*"{% if !v.password %} autofocus{% endif %}></div>
+<div class="owt-field"><label class="owt-label" for="reauth-recovery">Or a recovery code</label>
+<input class="owt-input" id="reauth-recovery" name="recovery_code" autocomplete="off" spellcheck="false"></div>
+{% endif %}<input type="hidden" name="next" value="{{ v.next }}">
+<div class="owt-actions"><button class="owt-button" type="submit">Confirm</button></div>
+</form>
+{% else %}<p><a class="owt-button" href="{{ v.sign_in }}">Sign in again</a></p>
+{% endif %}</section>

@@ -18,7 +18,8 @@
 //!   own local ones.
 //! - [`links`]: one-time sign-in links.
 //! - [`mfa`]: a second factor (an authenticator app, recovery codes), the challenge
-//!   after the password, a policy that requires it, and step-up re-authentication.
+//!   after the password, a policy that requires it, and step-up re-authentication;
+//!   [`mfa::pages`] mounts the pages for them.
 //! - [`roles`]: user, staff, and the roles an app declares; the [`roles::Holds`]
 //!   extractor.
 //! - [`admin`]: the staff pages that find and change accounts.

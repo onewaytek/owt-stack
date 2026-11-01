@@ -1,0 +1,15 @@
+<section class="owt-section">
+<h1>Set up your authenticator</h1>
+{% if v.pending %}<p>This account needs a second factor before you can sign in.</p>
+{% endif %}<p class="owt-hint">Scan this code with an authenticator app, then enter the six digits it shows.</p>
+{% if let Some(e) = v.error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endif %}<figure class="owt-block" role="img" aria-label="QR code of your authenticator secret">{{ v.qr_svg|safe }}</figure>
+<div class="owt-secret"><p class="owt-hint">Or type this key into the app:</p>
+<code class="owt-secret-value">{{ v.secret }}</code></div>
+<form class="owt-form" method="post" action="{{ v.action }}">
+<div class="owt-field"><label class="owt-label" for="enroll-code">The code your app shows now</label>
+<input class="owt-input" id="enroll-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" required autofocus></div>
+<input type="hidden" name="next" value="{{ v.next }}">
+<div class="owt-actions"><button class="owt-button" type="submit">Turn it on</button></div>
+</form>
+</section>

@@ -2209,6 +2209,11 @@ mod tests {
             include_str!("../templates/policies/agree.html"),
             include_str!("../templates/policies/admin_list.html"),
             include_str!("../templates/policies/admin_form.html"),
+            include_str!("../templates/mfa/challenge.html"),
+            include_str!("../templates/mfa/reauth.html"),
+            include_str!("../templates/mfa/enroll.html"),
+            include_str!("../templates/mfa/codes.html"),
+            include_str!("../templates/mfa/settings.html"),
         ];
         for t in templates {
             for attr in t.split("class=\"").skip(1) {

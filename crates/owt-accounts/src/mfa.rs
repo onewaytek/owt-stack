@@ -94,6 +94,7 @@ use crate::session::{self, SignInRefused, Signed};
 use crate::store::{self, Account};
 
 mod challenge;
+pub mod pages;
 mod state;
 mod step_up;
 
@@ -403,6 +404,17 @@ impl Limiter for Throttle {
         } else {
             Err(Throttled::Spent)
         })
+    }
+}
+
+/// A limiter the app shares (its sign-in throttle, kept in its state).
+impl<L: Limiter + ?Sized> Limiter for Arc<L> {
+    fn charge(
+        &self,
+        ip: IpAddr,
+        key: Key<'_>,
+    ) -> impl Future<Output = Result<(), Throttled>> + Send {
+        (**self).charge(ip, key)
     }
 }
 
@@ -933,12 +945,38 @@ impl Mfa {
         if stored.rows_affected() == 0 {
             return Err(MfaError::AlreadyEnrolled);
         }
+        self.enrollment(account, &secret)
+    }
+
+    /// The enrollment `begin_totp` began for `account` and no code has confirmed yet, shown
+    /// again (the same secret): for the form a wrong first code returns to. `None` when
+    /// none is waiting.
+    pub(crate) async fn resume_totp(
+        &self,
+        pool: &PgPool,
+        account: &Account,
+    ) -> Result<Option<TotpEnrollment>, MfaError> {
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT secret FROM account_totp WHERE account_id = $1 AND confirmed_at IS NULL",
+        )
+        .bind(account.id)
+        .fetch_optional(pool)
+        .await?;
+        let Some((stored,)) = row else {
+            return Ok(None);
+        };
+        let (secret, _) = self.open(&stored, account.id)?;
+        self.enrollment(account, &secret).map(Some)
+    }
+
+    /// The three forms of `secret` an enrollment page shows.
+    fn enrollment(&self, account: &Account, secret: &Secret) -> Result<TotpEnrollment, MfaError> {
         let name = if account.email.is_empty() {
             &account.username
         } else {
             &account.email
         };
-        let uri = totp::otpauth_uri(&self.issuer, name, &secret);
+        let uri = totp::otpauth_uri(&self.issuer, name, secret);
         let qr_svg = qrcode::QrCode::new(uri.as_bytes())
             .map(|code| {
                 code.render::<qrcode::render::svg::Color<'_>>()
