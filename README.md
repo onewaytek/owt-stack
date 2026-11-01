@@ -1455,8 +1455,9 @@ subcommand that runs this sequence and exits, and both run it instead of `sqlx m
 run`: the template justfile's `migrate` recipe runs `SQLX_OFFLINE=true cargo run
 --locked -- migrate` (the offline build needs the committed `.sqlx/`), and
 `rust-ci.yml` takes `migrate-command: SQLX_OFFLINE=true cargo run --locked -- migrate`.
-A test's database is made the same way: `#[sqlx::test(migrations = false)]`, then the
-test awaits that sequence on its pool before anything else.
+A test's database is made the same way: a schema of its own (`TestSchema`, under
+"A schema per test" below), then the test awaits that sequence on its pool before
+anything else.
 
 **Names the migrations take**, in the schema they run in (the first on the
 `search_path`, usually `public`):
@@ -3127,8 +3128,9 @@ method, `open` included, returns `Stale`, which bounds how long a replica misses
 rotation or keeps opening a shredded scope. `open` of a version made after loading
 returns `CryptError::NotLoaded`. In each case `sealer.refresh(&crypt).await?` (or
 `crypt.sealer(scope)`) loads a new one; `sealer.is_stale()` asks without trying.
-Keys in a `Sealer` are zeroized when its last clone drops, and its `Debug` shows no
-key.
+A `Sealer` shares its keys with the key cache: a key is zeroized when its last holder
+drops, the last clone of every sealer holding it and its cache entry (expired, or
+`forget_keys`). Its `Debug` shows no key.
 
 **Shredding.** `crypt.shred(scope)` deletes a tenant's keys and records a tombstone
 in `owt_crypt_shredded`, in one transaction, so everything encrypted for the tenant is

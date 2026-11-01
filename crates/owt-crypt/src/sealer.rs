@@ -42,7 +42,8 @@ use crate::{
 /// the load too and is conservative.
 ///
 /// Load a sealer per request or job, or call [`Sealer::refresh`] on `Stale`. Cloning
-/// is cheap; clones share the keys, which are zeroized when the last one drops.
+/// is cheap; clones share the keys with each other and with the key cache, and a key is
+/// zeroized when its last holder (a sealer or a cache entry) drops.
 #[derive(Clone)]
 pub struct Sealer {
     inner: Arc<Inner>,
