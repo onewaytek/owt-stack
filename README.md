@@ -5113,7 +5113,7 @@ Secret's change reaches pods only when they start, so restart after one.
 # deploy/openshift/env.env, committed: it holds no secret value
 # Written as given; a changed value is patched in.
 PUBLIC_BASE_URL=https://myapp.example
-# 64 random bytes, made once and never regenerated.
+# 64 random bytes as base64 text, made once and never regenerated.
 SESSION_SECRET=@generate
 # The caller's $PROVIDER_TOKEN; kept when unset.
 PROVIDER_TOKEN=@env
@@ -5132,6 +5132,17 @@ file does not list (one set by hand with `oc set data`) is left alone. A value w
 newline is refused, and so is an `@env` key that is neither set (an empty variable
 counts as unset) nor already in the Secret; `@env` reads the exported environment
 only. Two runs at once race, the last patch winning. `templates/openshift/env-test.sh` proves it against a stand-in `oc`.
+
+A generated value is stored like every other: its base64 text is encoded once more in
+the Secret's `data`, so the pod reads the text (`SESSION_SECRET` is base64). The
+`env.sh` of v0.10.0 and v0.11.0 stored the 64 bytes themselves, which the app refuses
+as not base64. To replace such a key, remove it and apply again (this signs everyone
+out, as any new `SESSION_SECRET` does):
+
+```sh
+oc set data secret/myapp-env SESSION_SECRET-
+deploy/openshift/env.sh --apply && oc rollout restart deployment/myapp
+```
 
 **Moving from `oc set env` to `myapp-env`.** An entry added to the Deployment with
 `oc set env` lives outside the template, and `apply.sh` applies client-side, so the

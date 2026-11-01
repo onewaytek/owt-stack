@@ -53,7 +53,8 @@ command -v oc >/dev/null || { echo "oc is not on the PATH" >&2; exit 2; }
 patch=$(mktemp)
 trap 'rm -f "$patch"' EXIT
 
-# `encode`: stdin as one line of base64; `generate`: 64 random bytes, so encoded. A
+# `encode`: stdin as one line of base64; `generate`: 64 random bytes as base64 text,
+# which the Secret stores encoded once more, as every value, so the app reads text. A
 # failure in either pipeline is the caller's to refuse (exit 2, not the 1 of a diff).
 encode() { base64 | tr -d '\n'; }
 generate() { head -c 64 /dev/urandom | encode; }
@@ -118,7 +119,7 @@ for key in "${keys[@]}"; do
       if [ "${held[$key]+set}" ]; then
         report+=("kept $key")
       else
-        change[$key]=$(generate) || { echo "$key=@generate: could not make a value" >&2; exit 2; }
+        change[$key]=$(generate | encode) || { echo "$key=@generate: could not make a value" >&2; exit 2; }
         report+=("created $key (generated)")
       fi
       continue
