@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.12.0](https://github.com/onewaytek/owt-stack/compare/v0.11.0...v0.12.0) (2026-11-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** the layer's query names two columns of its own, owt_has_factor and owt_accepted. An Extra::QUERY that names a column of either name now fails the load as a duplicate column; rename it.
+* **audit:** `cli::run(&pool, cmd)` is `cli::run(&pool, store, cmd)`; pass `Some(&store)` (a read-only credential with `s3:ListBucket`, `s3:GetObject`, `s3:GetObjectVersion`, `s3:GetObjectRetention`) or `None::<&NoAnchor>`. An `Anchor` implemented outside owt-audit adds `get`. `VerifyError` has a `Store` variant. Anchors recorded with `NoAnchor` fail the default verify; use `--db-only` until the job anchors with the store.
+* **crypt:** a build without this change refuses 0x02 ciphertexts as CryptError::Malformed, so roll the release out to every replica (and every job) before any of them seals; there is no rollback past the first 0x02 write. owt_crypt::format changes: FORMAT, NONCE_LEN and MIN_LEN are replaced by the Format enum (byte, from_byte, nonce_len, min_len) and CURRENT; Sealed gains `format` and its `nonce` is a slice; aad and assemble take a Format first. Crypt, Sealer and their methods keep their signatures.
+* **runtime,web:** a statement running past 30 s now fails (57014) and a transaction idle for 60 s is ended; long work sets `SET LOCAL statement_timeout` or uses a pool with `statement_timeout: None`. A pool acquire fails after 5 s. A `PoolConfig` struct literal without `..PoolConfig::default()` adds `statement_timeout` and `idle_in_transaction_timeout`. Under `Stack`, the account loader's time counts toward `Limits::request_timeout`. A pooler in transaction mode that refuses startup parameters needs both timeouts set to `None`.
+* **templates:** an app deployed from templates/openshift/app.yaml must create the <NAME>-<DB_SUFFIX>-runtime Secret (kubernetes.io/basic-auth, username <NAME>_runtime, a hex password, label cnpg.io/reload=true) before applying, give its binary a `migrate` subcommand that migrates and then calls `owt_runtime::db::grant_runtime` and `owt_audit::grant_runtime` with DB_RUNTIME_ROLE, and stop migrating at serve time. See the README's "Database roles".
+* **crypt:** a build without this change refuses 0x02 ciphertexts as CryptError::Malformed, so roll the release out to every replica (and every job) before any of them seals; there is no rollback past the first 0x02 write. owt_crypt::format changes: FORMAT, NONCE_LEN and MIN_LEN are replaced by the Format enum (byte, from_byte, nonce_len, min_len) and CURRENT; Sealed gains `format` and its `nonce` is a slice; aad and assemble take a Format first. Crypt, Sealer and their methods keep their signatures.
+* **accounts:** an exemption without a trailing slash no longer covers sibling paths that merely start with the same letters (`.exempt(&["/ws"])` no longer exempts `/ws-live`). List each such path, or end the prefix in `/`.
+* **auth:** `owt_auth::password::{verify, check, verify_or_decoy, check_or_decoy}` and `owt_auth::recovery::find_match` return `Result<_, password::Busy>`. `hash` keeps its signature; its error downcasts to `Busy`. `SignInRefused::Fault` and `MfaError::Fault` lose their derived `From<owt_accounts::Error>` in favour of a hand-written one that maps `Error::Busy` to `Unavailable`.
+* **accounts:** staff must have a second factor and have used it within 15 minutes to change anything in the accounts admin; staff without a TOTP factor must enrol one, and the app must serve its re-authentication page (`Accounts::reauth_at`). An app with its own session type calls `Admin::session::<T>()`. `Admin::sign_in_links` caps the lifetime at 24 hours. Give the admin a recorder with `Admin::audit` to write its events to the audit log.
+* **accounts:** sessions end after 30 minutes without activity and 24 hours after they began unless the app sets idle_timeout/absolute_lifetime (a longer max_age still extends the absolute lifetime). Call without_idle_timeout() to keep the old idle behaviour. Responses to a request with a session now carry owt-idle-remaining. On upgrade, sessions older than the timeout end.
+* **accounts,runtime:** a release build using Mfa without Mfa::sealer can no longer enroll or verify TOTP factors; set a real SecretSealer.
+* **runtime:** `diagnosis`, `note`, `notes`, `transcript`, `mrn` and `patient_name` are no longer redacted by default (`patient_name` still is, by the word `name`). An app handling health records sets `redact_words: logging::HEALTH_WORDS.iter().map(|w| (*w).to_owned()).collect()`. An app building `logging::Options` as a struct literal without `..Default::default()` adds `redact_words`. JSON-output apps no longer see panic payloads in their logs.
+* **crypt:** CryptError is non_exhaustive and gains Stale and NotLoaded; add a wildcard arm.
+* **audit:** the S3 anchor's HTTP client ignores HTTPS_PROXY, HTTP_PROXY and ALL_PROXY; an app that reached its store only through a proxy must allow direct egress to the endpoint instead.
+
+### Features
+
+* **accounts:** audit admin changes and require a recent second factor ([#278](https://github.com/onewaytek/owt-stack/issues/278)) ([9287a0a](https://github.com/onewaytek/owt-stack/commit/9287a0a2cdfd62c87e44a1276a8d20d876325d99))
+* **accounts:** end sessions sooner and revoke the one sign_out ends ([#281](https://github.com/onewaytek/owt-stack/issues/281)) ([f221378](https://github.com/onewaytek/owt-stack/commit/f2213785c7a8aab1df3d4562ef5008db83574a03))
+* **audit:** report whether the connected role can unprotect the audit log ([#276](https://github.com/onewaytek/owt-stack/issues/276)) ([826e45f](https://github.com/onewaytek/owt-stack/commit/826e45f25109e1880bc65b65985d3ff8a6f8b8d9))
+* **audit:** verify against the anchor store by default ([#295](https://github.com/onewaytek/owt-stack/issues/295)) ([d261fdc](https://github.com/onewaytek/owt-stack/commit/d261fdcbd72032aea72480232f7ba266fe9fe860))
+* **audit:** verify the anchors as a chain and alarm on a stale anchor ([#277](https://github.com/onewaytek/owt-stack/issues/277)) ([86344ff](https://github.com/onewaytek/owt-stack/commit/86344ff0217db0c090035498793be714851602fe))
+* **crypt:** add a synchronous per-scope Sealer ([#272](https://github.com/onewaytek/owt-stack/issues/272)) ([05dbd02](https://github.com/onewaytek/owt-stack/commit/05dbd02d531d52c0560c9fd0d32562f801ccbbfb))
+* **crypt:** opt-in length padding for sealed values ([#291](https://github.com/onewaytek/owt-stack/issues/291)) ([6a13b93](https://github.com/onewaytek/owt-stack/commit/6a13b93d6c8c2a7533b80e9b392110a9ad5bee1e))
+* **crypt:** seal fields with XChaCha20-Poly1305 as ciphertext format 0x02 ([#287](https://github.com/onewaytek/owt-stack/issues/287)) ([6ec5975](https://github.com/onewaytek/owt-stack/commit/6ec5975bbce91c0d5cabac01ccc12998ab3b350b))
+* **runtime:** hold a singleton's lock on a dedicated connection ([#294](https://github.com/onewaytek/owt-stack/issues/294)) ([02996d7](https://github.com/onewaytek/owt-stack/commit/02996d74af986bbfb1588dadadb34a257f08372a))
+* **runtime:** poll the job queue every 5 s by default ([#293](https://github.com/onewaytek/owt-stack/issues/293)) ([12dfd79](https://github.com/onewaytek/owt-stack/commit/12dfd79a1e8e1cf6ef71391be0b0568d55441580))
+* **templates:** migrate as the owner in an init container, serve as a runtime role ([#279](https://github.com/onewaytek/owt-stack/issues/279)) ([73d2c55](https://github.com/onewaytek/owt-stack/commit/73d2c5527c679e504d4aa226651d08585c93b538))
+* **test:** add TestSchema, a per-test schema unique per checkout and process ([#271](https://github.com/onewaytek/owt-stack/issues/271)) ([b0ecd70](https://github.com/onewaytek/owt-stack/commit/b0ecd70cbbae6a2bbbca8eeeef8daa0860bc79f3))
+
+
+### Bug Fixes
+
+* **accounts,runtime:** refuse unsealed TOTP in release builds and redact env Vars ([#282](https://github.com/onewaytek/owt-stack/issues/282)) ([d3574e3](https://github.com/onewaytek/owt-stack/commit/d3574e35be9d9d18ae180ac03fb7f961fe3d845c))
+* **accounts:** match policy exemptions at a path-segment boundary ([#289](https://github.com/onewaytek/owt-stack/issues/289)) ([cd566a0](https://github.com/onewaytek/owt-stack/commit/cd566a009d47e52f8222b69e931e36d08fe42f27))
+* **audit:** harden the S3 Object Lock provider ([268366d](https://github.com/onewaytek/owt-stack/commit/268366d4cf8c8ceb02b7db4c0e816ad83d62775c))
+* **auth:** answer 503 when the Argon2 permit wait times out ([#290](https://github.com/onewaytek/owt-stack/issues/290)) ([05da234](https://github.com/onewaytek/owt-stack/commit/05da2341ff75f178bc07c9032420c93c05570dec))
+* **auth:** key the sign-in throttle on the NFKC login and warn when it is per replica ([#280](https://github.com/onewaytek/owt-stack/issues/280)) ([8d94a5a](https://github.com/onewaytek/owt-stack/commit/8d94a5a3d4b11f54f16cbe773d3d3c44503039a1))
+* **bus:** resync a subscriber that lost messages at a full queue ([#292](https://github.com/onewaytek/owt-stack/issues/292)) ([c807b1a](https://github.com/onewaytek/owt-stack/commit/c807b1a3f3478850b3bb60e8735d772e5c9065fc))
+* **ci:** install cosign without cosign-installer so attest runs on ARC ([#273](https://github.com/onewaytek/owt-stack/issues/273)) ([946883c](https://github.com/onewaytek/owt-stack/commit/946883cbe5040f4935216afc1c882ff4493c19f9))
+* **runtime,web:** bound the per-request DB hot path ([#284](https://github.com/onewaytek/owt-stack/issues/284)) ([4eecfcb](https://github.com/onewaytek/owt-stack/commit/4eecfcbbd0ef7bf5d46d78c3cf12d6acfaac05fe))
+* **runtime:** abort a queue handler whose heartbeat finds its claim lost ([#285](https://github.com/onewaytek/owt-stack/issues/285)) ([c64e18a](https://github.com/onewaytek/owt-stack/commit/c64e18a333d4f05e82b703217f94f6666e32716d))
+* **runtime:** make health vocabulary app-supplied; log panics without payload ([#283](https://github.com/onewaytek/owt-stack/issues/283)) ([bc9b083](https://github.com/onewaytek/owt-stack/commit/bc9b08375c5b71194cd97fa61d980d4a1e9d33b1))
+* **templates:** env.sh stores a generated value as base64 text, as the app reads it ([#298](https://github.com/onewaytek/owt-stack/issues/298)) ([bcdce50](https://github.com/onewaytek/owt-stack/commit/bcdce507e46a9100650421b1924e3b5878765ecd))
+
+
+### Performance Improvements
+
+* **accounts:** read the factor and policy state in the account's query ([#296](https://github.com/onewaytek/owt-stack/issues/296)) ([8560519](https://github.com/onewaytek/owt-stack/commit/85605198e869f9934150f8c31c5d6865c5bdb902))
+
 ## [0.11.0](https://github.com/onewaytek/owt-stack/compare/v0.10.0...v0.11.0) (2026-10-30)
 
 
