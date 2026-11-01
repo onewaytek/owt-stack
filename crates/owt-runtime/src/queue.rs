@@ -753,7 +753,7 @@ impl Queue {
             queue: self.clone(),
             handler: Arc::new(move |job| Box::pin(handler(job))),
             concurrency: 4,
-            poll: Duration::from_secs(1),
+            poll: Duration::from_secs(5),
             stale_after: Duration::from_mins(5),
             grace: Duration::from_secs(30),
             retain_done: Some(Duration::from_hours(24 * 7)),
@@ -873,8 +873,10 @@ impl Worker {
     }
 
     /// How long the worker waits before claiming again after finding nothing due
-    /// (default 1 s, at least 10 ms). A claim that fills every slot claims again at
-    /// once.
+    /// (default 5 s, at least 10 ms). A claim that fills every slot claims again at
+    /// once. The worker polls and is not notified, so a job that becomes due may wait
+    /// up to this long before it starts; a queue that needs a shorter start sets a
+    /// shorter interval at the cost of one claim query per interval per replica.
     #[must_use]
     pub fn poll(mut self, every: Duration) -> Self {
         self.poll = every.max(Duration::from_millis(10));
