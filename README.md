@@ -1288,6 +1288,10 @@ if let Some(i) = recovery::find_match(typed, &hashes).await {
 # }
 ```
 
+`Throttle` keys an account's budget on the login as the account store matches it
+(NFKC, lower case, trimmed), so `admin` and `ａｄｍｉｎ` spend one budget; a username and
+its account's email are two logins and two budgets. Its counts live in the process, and
+its first sign-in warns when `POD_NAMESPACE` is set (a pod, likely one of several).
 `throttle::shared::SharedThrottle` (the `redis` feature) is `Throttle` counted in Redis, so
 a budget holds across replicas instead of multiplying by their number. It has the same
 budgets and keys, in the same order, charged before the password is checked; its calls
