@@ -1,11 +1,17 @@
 //! The stored formats: ciphertexts, their associated data, and the contexts data
 //! keys are wrapped under. All are fixed: a change is a new format byte or domain.
 //!
-//! A ciphertext is `format || version (u32, big-endian) || nonce || sealed bytes`. Two
-//! formats exist ([`Format`]):
+//! A ciphertext is `format || version (u32, big-endian) || nonce || sealed bytes`.
+//! Three formats exist ([`Format`]):
 //!
 //! * `0x02`, written by every seal: a 24-byte random nonce, then XChaCha20-Poly1305
 //!   output (plaintext length + 16).
+//! * `0x03`, written by a padded seal ([`crate::Crypt::encrypt_padded`],
+//!   [`crate::Sealer::seal_padded`]): `0x02`'s construction over the plaintext padded
+//!   to a multiple of its [`Padding`] bucket, ISO/IEC 7816-4 style (one `0x80` byte,
+//!   then `0x00` bytes up to the boundary; always at least the `0x80`). The padding is
+//!   inside the AEAD and the format byte is in the associated data, so neither can be
+//!   changed or stripped without the value being refused. Opening removes it.
 //! * `0x01`, read only: a 12-byte random nonce, then AES-256-GCM output (plaintext
 //!   length + 16). [`crate::Crypt::reencrypt`] moves such a value to `0x02`.
 //!
@@ -17,6 +23,10 @@
 //! is `WRAP_DOMAIN || lp(scope) || lp(purpose) || version`. A blind index is
 //! HMAC-SHA256 over `INDEX_DOMAIN || lp(table) || lp(column) || lp(value)`.
 
+use std::num::NonZeroUsize;
+
+use zeroize::Zeroizing;
+
 use crate::Field;
 
 /// A ciphertext format: the cipher its format byte names, and that cipher's nonce.
@@ -27,6 +37,9 @@ pub enum Format {
     AesGcm,
     /// `0x02`: XChaCha20-Poly1305 with a random 192-bit nonce. Every seal writes it.
     XChaCha20Poly1305,
+    /// `0x03`: [`Format::XChaCha20Poly1305`] over a plaintext padded to a [`Padding`]
+    /// bucket ([`pad`]). Padded seals write it.
+    XChaCha20Poly1305Padded,
 }
 
 impl Format {
@@ -36,6 +49,7 @@ impl Format {
         match self {
             Self::AesGcm => 1,
             Self::XChaCha20Poly1305 => 2,
+            Self::XChaCha20Poly1305Padded => 3,
         }
     }
 
@@ -45,6 +59,7 @@ impl Format {
         match byte {
             1 => Some(Self::AesGcm),
             2 => Some(Self::XChaCha20Poly1305),
+            3 => Some(Self::XChaCha20Poly1305Padded),
             _ => None,
         }
     }
@@ -54,8 +69,18 @@ impl Format {
     pub const fn nonce_len(self) -> usize {
         match self {
             Self::AesGcm => 12,
-            Self::XChaCha20Poly1305 => 24,
+            Self::XChaCha20Poly1305 | Self::XChaCha20Poly1305Padded => 24,
         }
+    }
+
+    /// Whether this is a format seals write today: one that
+    /// [`crate::Crypt::reencrypt`] leaves alone under the current key.
+    #[must_use]
+    pub const fn is_current(self) -> bool {
+        matches!(
+            self,
+            Self::XChaCha20Poly1305 | Self::XChaCha20Poly1305Padded
+        )
     }
 
     /// The shortest ciphertext of this format: an empty plaintext's.
@@ -67,6 +92,8 @@ impl Format {
 
 /// The format every seal writes.
 pub const CURRENT: Format = Format::XChaCha20Poly1305;
+/// The format every padded seal writes.
+pub const PADDED: Format = Format::XChaCha20Poly1305Padded;
 /// The tag's length, in both formats.
 pub const TAG_LEN: usize = 16;
 /// The prefix of a field's associated data.
@@ -75,6 +102,67 @@ pub const FIELD_DOMAIN: &[u8] = b"owt-crypt/field/v1\0";
 pub const WRAP_DOMAIN: &[u8] = b"owt-crypt/key/v1\0";
 /// The prefix of a blind index's input.
 pub const INDEX_DOMAIN: &[u8] = b"owt-crypt/index/v1\0";
+
+/// The bucket a padded seal rounds a plaintext's length up to, so values whose lengths
+/// differ within one bucket have ciphertexts of one length. For a field whose length
+/// says something (a short code against a long one, a name, a diagnosis' wording).
+/// A padded value costs at least one byte and at most a bucket more than an unpadded
+/// one. It hides the length within a bucket only: choose the bucket to cover the
+/// lengths that must not be told apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Padding(NonZeroUsize);
+
+impl Padding {
+    /// 64-byte buckets.
+    pub const DEFAULT: Self = Self(NonZeroUsize::new(64).expect("64 is not zero"));
+
+    /// Buckets of `bucket` bytes.
+    #[must_use]
+    pub const fn new(bucket: NonZeroUsize) -> Self {
+        Self(bucket)
+    }
+
+    /// The bucket, in bytes.
+    #[must_use]
+    pub const fn bucket(self) -> usize {
+        self.0.get()
+    }
+
+    /// The length a plaintext of `len` bytes has once padded: the next multiple of the
+    /// bucket above `len` (a `len` already on a boundary takes a whole bucket more,
+    /// for the `0x80` byte).
+    #[must_use]
+    pub const fn padded_len(self, len: usize) -> usize {
+        (len / self.bucket() + 1) * self.bucket()
+    }
+}
+
+impl Default for Padding {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// `plaintext` padded to `padding`'s bucket: `plaintext || 0x80 || 0x00*`, of
+/// [`Padding::padded_len`] bytes.
+#[must_use]
+pub fn pad(plaintext: &[u8], padding: Padding) -> Zeroizing<Vec<u8>> {
+    let len = padding.padded_len(plaintext.len());
+    let mut out = Zeroizing::new(Vec::with_capacity(len));
+    out.extend_from_slice(plaintext);
+    out.push(0x80);
+    out.resize(len, 0);
+    out
+}
+
+/// The plaintext [`pad`] padded, or `None` when `padded` does not end in `0x80` and
+/// then only `0x00` bytes. It runs only on authenticated bytes, so its timing tells
+/// nothing an attacker could not learn from the length.
+#[must_use]
+pub fn unpad(padded: &[u8]) -> Option<&[u8]> {
+    let end = padded.iter().rposition(|&b| b != 0)?;
+    (padded[end] == 0x80).then(|| &padded[..end])
+}
 
 /// A ciphertext's parts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,16 +281,60 @@ mod tests {
         );
         assert!(Sealed::parse(&ct[..Format::XChaCha20Poly1305.min_len() - 1]).is_none());
 
-        for byte in [0, 3, 255] {
+        for byte in [0, 4, 255] {
             let mut other = ct.clone();
             other[0] = byte;
             assert!(Sealed::parse(&other).is_none(), "{byte}");
         }
         assert!(Sealed::parse(b"").is_none());
         assert_eq!(CURRENT, Format::XChaCha20Poly1305);
-        for f in [Format::AesGcm, Format::XChaCha20Poly1305] {
+        for f in [
+            Format::AesGcm,
+            Format::XChaCha20Poly1305,
+            Format::XChaCha20Poly1305Padded,
+        ] {
             assert_eq!(Format::from_byte(f.byte()), Some(f));
         }
+        let mut padded = ct.clone();
+        padded[0] = 3;
+        assert_eq!(
+            Sealed::parse(&padded).unwrap().format,
+            Format::XChaCha20Poly1305Padded
+        );
+        assert_eq!(PADDED, Format::XChaCha20Poly1305Padded);
+    }
+
+    /// The bucket edges: one short of a boundary fills it with the `0x80` alone; on a
+    /// boundary takes a whole bucket more; every length in a bucket pads alike.
+    #[test]
+    fn padding_rounds_up_to_the_bucket_and_comes_off_exactly() {
+        let p = Padding::new(NonZeroUsize::new(16).unwrap());
+        assert_eq!(Padding::default(), Padding::DEFAULT);
+        assert_eq!(Padding::DEFAULT.bucket(), 64);
+        for (len, padded) in [
+            (0, 16),
+            (1, 16),
+            (15, 16),
+            (16, 32),
+            (17, 32),
+            (31, 32),
+            (32, 48),
+        ] {
+            assert_eq!(p.padded_len(len), padded, "{len}");
+            // Trailing zeros and 0x80s in the value itself survive.
+            let value: Vec<u8> = (0..len).map(|i| [0x00, 0x80, 0x41][i % 3]).collect();
+            let out = pad(&value, p);
+            assert_eq!(out.len(), padded, "{len}");
+            assert_eq!(out[len], 0x80);
+            assert!(out[len + 1..].iter().all(|&b| b == 0));
+            assert_eq!(unpad(&out), Some(&value[..]), "{len}");
+        }
+        // Not padding: no marker, a marker followed by something else, nothing at all.
+        assert_eq!(unpad(b""), None);
+        assert_eq!(unpad(&[0, 0, 0]), None);
+        assert_eq!(unpad(b"abc\x00\x00"), None);
+        assert_eq!(unpad(b"abc\x80\x01"), None);
+        assert_eq!(unpad(b"\x80"), Some(&b""[..]));
     }
 
     #[test]

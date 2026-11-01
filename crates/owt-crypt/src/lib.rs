@@ -11,6 +11,10 @@
 //!   key version, nonce, sealed bytes ([`format`]). Values sealed with AES-256-GCM
 //!   (format byte `0x01`) still open, and [`Crypt::reencrypt`] moves them to the
 //!   current format.
+//! * **Padding.** [`Crypt::encrypt_padded`] and [`Sealer::seal_padded`] pad a value to
+//!   a [`Padding`] bucket (64 bytes by default) inside the AEAD before sealing, for a
+//!   field whose length is itself sensitive; opening removes it. Unpadded seals are
+//!   unchanged.
 //! * **Blind indexes.** [`Crypt::blind_index`] is HMAC-SHA256 of a value under the
 //!   scope's index key (separate from its data keys), for `WHERE email_idx = $1`
 //!   without decrypting. It reveals which rows hold equal values, so index only what
@@ -71,6 +75,7 @@ use sqlx::PgPool;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+pub use format::Padding;
 pub use migrations::{LEDGER, LOCK_ID, migrate, migrator};
 pub use sealer::Sealer;
 pub use zeroize;
@@ -328,6 +333,32 @@ impl Crypt {
         self.encrypt(field, plaintext.as_bytes()).await
     }
 
+    /// [`Crypt::encrypt`], with `plaintext` padded to `padding`'s bucket first (format
+    /// `0x03`, [`format`]), so every value whose length falls in one bucket has a
+    /// ciphertext of one length. [`Crypt::decrypt`] removes the padding;
+    /// [`Crypt::reencrypt`] keeps it.
+    pub async fn encrypt_padded(
+        &self,
+        field: &Field<'_>,
+        plaintext: &[u8],
+        padding: Padding,
+    ) -> Result<Vec<u8>, CryptError> {
+        check_field(field)?;
+        let (version, key) = self.current(field.scope, Purpose::Data).await?;
+        Ok(seal_padded(&key, version, field, plaintext, padding))
+    }
+
+    /// [`Crypt::encrypt_padded`] of a string.
+    pub async fn encrypt_str_padded(
+        &self,
+        field: &Field<'_>,
+        plaintext: &str,
+        padding: Padding,
+    ) -> Result<Vec<u8>, CryptError> {
+        self.encrypt_padded(field, plaintext.as_bytes(), padding)
+            .await
+    }
+
     /// Open a ciphertext sealed for `field`.
     pub async fn decrypt(
         &self,
@@ -416,7 +447,8 @@ impl Crypt {
 
     /// `ciphertext` sealed again under its scope's current data key in the current
     /// [`format`], or `None` when it already is (so an AES-256-GCM value under the
-    /// current key is sealed again too).
+    /// current key is sealed again too). A padded value stays padded, to the same
+    /// length.
     pub async fn reencrypt(
         &self,
         field: &Field<'_>,
@@ -425,12 +457,11 @@ impl Crypt {
         check_field(field)?;
         let sealed = Sealed::parse(ciphertext).ok_or(CryptError::Malformed)?;
         let (version, key) = self.current(field.scope, Purpose::Data).await?;
-        if sealed.version == version && sealed.format == format::CURRENT {
+        if sealed.version == version && sealed.format.is_current() {
             return Ok(None);
         }
         let old = self.key(field.scope, Purpose::Data, sealed.version).await?;
-        let plain = open(&old, &sealed, field)?;
-        Ok(Some(seal(&key, version, field, &plain)))
+        reseal(&old, &sealed, &key, version, field).map(Some)
     }
 
     /// Re-encrypt every value of a column that is not under its scope's current data
@@ -567,12 +598,11 @@ impl Crypt {
             currents.insert(field.scope.to_owned(), current);
         }
         let (version, key) = &currents[field.scope];
-        if sealed.version == *version && sealed.format == format::CURRENT {
+        if sealed.version == *version && sealed.format.is_current() {
             return Ok(None);
         }
         let old = self.key(field.scope, Purpose::Data, sealed.version).await?;
-        let plain = open(&old, &sealed, field)?;
-        Ok(Some(seal(key, *version, field, &plain)))
+        reseal(&old, &sealed, key, *version, field).map(Some)
     }
 
     /// Wrap every key not under the current KEK under it: the job after a KEK
@@ -873,6 +903,20 @@ fn seal(key: &Key, version: u32, field: &Field<'_>, plaintext: &[u8]) -> Vec<u8>
     seal_with(key, version, field, plaintext, nonce)
 }
 
+/// [`seal`] with `plaintext` padded to `padding`'s bucket, in format `0x03`.
+fn seal_padded(
+    key: &Key,
+    version: u32,
+    field: &Field<'_>,
+    plaintext: &[u8],
+    padding: Padding,
+) -> Vec<u8> {
+    let mut nonce = [0_u8; 24];
+    rand::rng().fill_bytes(&mut nonce);
+    let padded = format::pad(plaintext, padding);
+    seal_in(format::PADDED, key, version, field, &padded, nonce)
+}
+
 /// [`seal`] with a given nonce, in the current format.
 fn seal_with(
     key: &Key,
@@ -881,23 +925,72 @@ fn seal_with(
     plaintext: &[u8],
     nonce: [u8; 24],
 ) -> Vec<u8> {
+    seal_in(format::CURRENT, key, version, field, plaintext, nonce)
+}
+
+/// XChaCha20-Poly1305 over `bytes` as they are, labelled `format` (`0x02`, or `0x03`
+/// for bytes already padded).
+fn seal_in(
+    format: Format,
+    key: &Key,
+    version: u32,
+    field: &Field<'_>,
+    bytes: &[u8],
+    nonce: [u8; 24],
+) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new_from_slice(&key.0[..]).expect("a data key is 32 bytes");
-    let aad = format::aad(format::CURRENT, field, version);
+    let aad = format::aad(format, field, version);
     let sealed = cipher
         .encrypt(
             &XNonce::from(nonce),
             Payload {
-                msg: plaintext,
+                msg: bytes,
                 aad: &aad,
             },
         )
         .expect("XChaCha20-Poly1305 seals any length a Vec holds");
-    format::assemble(format::CURRENT, version, &nonce, &sealed)
+    format::assemble(format, version, &nonce, &sealed)
 }
 
-/// Opens `sealed` with the cipher its format byte names; the byte is in the associated
-/// data, so an edited byte is refused.
+/// `sealed` (opened under `old`) sealed again under `key` at `version`, in the current
+/// format: a padded value keeps its padding as it is, so its length does not change.
+fn reseal(
+    old: &Key,
+    sealed: &Sealed<'_>,
+    key: &Key,
+    version: u32,
+    field: &Field<'_>,
+) -> Result<Vec<u8>, CryptError> {
+    let mut nonce = [0_u8; 24];
+    rand::rng().fill_bytes(&mut nonce);
+    if sealed.format == format::PADDED {
+        let padded = open_raw(old, sealed, field)?;
+        format::unpad(&padded).ok_or(CryptError::Malformed)?;
+        return Ok(seal_in(format::PADDED, key, version, field, &padded, nonce));
+    }
+    let plain = open(old, sealed, field)?;
+    Ok(seal_with(key, version, field, &plain, nonce))
+}
+
+/// Opens `sealed` with the cipher its format byte names and removes a padded format's
+/// padding. Authentically sealed bytes whose padding is not [`format::pad`]'s are
+/// [`CryptError::Malformed`].
 fn open(
+    key: &Key,
+    sealed: &Sealed<'_>,
+    field: &Field<'_>,
+) -> Result<Zeroizing<Vec<u8>>, CryptError> {
+    let mut opened = open_raw(key, sealed, field)?;
+    if sealed.format == format::PADDED {
+        let len = format::unpad(&opened).ok_or(CryptError::Malformed)?.len();
+        opened.truncate(len);
+    }
+    Ok(opened)
+}
+
+/// Opens `sealed` with the cipher its format byte names, padding left on; the byte is
+/// in the associated data, so an edited byte is refused.
+fn open_raw(
     key: &Key,
     sealed: &Sealed<'_>,
     field: &Field<'_>,
@@ -918,7 +1011,7 @@ fn open(
                 .expect("a data key is 32 bytes")
                 .decrypt(&Nonce::from(nonce), payload)
         }
-        Format::XChaCha20Poly1305 => {
+        Format::XChaCha20Poly1305 | Format::XChaCha20Poly1305Padded => {
             let nonce: [u8; 24] = sealed.nonce.try_into().map_err(|_| refused())?;
             XChaCha20Poly1305::new_from_slice(&key.0[..])
                 .expect("a data key is 32 bytes")
@@ -1179,5 +1272,106 @@ mod tests {
     #[test]
     fn keys_do_not_print() {
         assert_eq!(format!("{:?}", key(9)), "Key([redacted])");
+    }
+
+    fn sixteen() -> Padding {
+        Padding::new(std::num::NonZeroUsize::new(16).unwrap())
+    }
+
+    /// At the bucket edges a padded value opens to exactly what was sealed, and every
+    /// length within one bucket seals to one ciphertext length.
+    #[test]
+    fn padded_values_round_trip_and_hide_their_length_within_a_bucket() {
+        let f = fixture_field();
+        let p = sixteen();
+        let header = Format::XChaCha20Poly1305Padded.min_len();
+        for (len, padded) in [(0, 16), (1, 16), (15, 16), (16, 32), (17, 32), (32, 48)] {
+            let value: Vec<u8> = (0..len).map(|i| [0x80, 0x00, 0x41][i % 3]).collect();
+            let ct = seal_padded(&key(1), 3, &f, &value, p);
+            assert_eq!(ct[0], 3, "{len}");
+            assert_eq!(ct.len(), header + padded, "{len}");
+            let sealed = Sealed::parse(&ct).unwrap();
+            assert_eq!(
+                &open(&key(1), &sealed, &f).unwrap()[..],
+                &value[..],
+                "{len}"
+            );
+        }
+        let lengths: Vec<usize> = (0..16)
+            .map(|len| seal_padded(&key(1), 3, &f, &vec![b'x'; len], p).len())
+            .collect();
+        assert!(lengths.iter().all(|&l| l == header + 16), "{lengths:?}");
+        assert_eq!(
+            seal_padded(&key(1), 3, &f, b"ab", Padding::DEFAULT).len(),
+            header + 64
+        );
+    }
+
+    /// Any edited byte, a truncation, a relabelled format byte (padded presented as
+    /// unpadded and the reverse) and an authentic seal of bytes that are not padding
+    /// are all refused.
+    #[test]
+    fn a_tampered_padded_value_is_refused() {
+        let f = fixture_field();
+        let ct = seal_padded(&key(1), 3, &f, b"F32.1", sixteen());
+        for i in 0..ct.len() {
+            let mut bent = ct.clone();
+            bent[i] ^= 0x01;
+            if let Some(s) = Sealed::parse(&bent) {
+                assert!(open(&key(1), &s, &f).is_err(), "byte {i}");
+            }
+        }
+        assert!(open(&key(1), &Sealed::parse(&ct[..ct.len() - 1]).unwrap(), &f).is_err());
+        let mut down = ct.clone();
+        down[0] = Format::XChaCha20Poly1305.byte();
+        assert!(open(&key(1), &Sealed::parse(&down).unwrap(), &f).is_err());
+        let mut up = seal(&key(1), 3, &f, b"F32.1");
+        up[0] = Format::XChaCha20Poly1305Padded.byte();
+        assert!(open(&key(1), &Sealed::parse(&up).unwrap(), &f).is_err());
+        // Labelled padded and authentic, but no `0x80` marker: malformed, not opened.
+        let nonce = [7_u8; 24];
+        let unpadded = seal_in(format::PADDED, &key(1), 3, &f, b"F32.1\0\0", nonce);
+        assert!(matches!(
+            open(&key(1), &Sealed::parse(&unpadded).unwrap(), &f),
+            Err(CryptError::Malformed)
+        ));
+    }
+
+    /// An unpadded seal is what it was: format `0x02`, the plaintext's length plus the
+    /// overhead, and its bytes back on opening, trailing `0x80` and zeros included.
+    #[test]
+    fn unpadded_values_are_unaffected() {
+        let f = fixture_field();
+        for value in [
+            &b""[..],
+            b"F32.1",
+            b"ends in a marker\x80",
+            b"zeros\x80\0\0",
+        ] {
+            let ct = seal(&key(1), 3, &f, value);
+            assert_eq!(ct[0], Format::XChaCha20Poly1305.byte());
+            assert_eq!(ct.len(), Format::XChaCha20Poly1305.min_len() + value.len());
+            assert_eq!(
+                &open(&key(1), &Sealed::parse(&ct).unwrap(), &f).unwrap()[..],
+                value
+            );
+        }
+    }
+
+    /// Moving a padded value to another key keeps it padded and its length unchanged;
+    /// an unpadded one stays unpadded.
+    #[test]
+    fn resealing_keeps_the_padding() {
+        let f = fixture_field();
+        let ct = seal_padded(&key(1), 3, &f, b"F32.1", sixteen());
+        let moved = reseal(&key(1), &Sealed::parse(&ct).unwrap(), &key(2), 4, &f).unwrap();
+        assert_eq!((moved[0], moved.len()), (3, ct.len()));
+        let s = Sealed::parse(&moved).unwrap();
+        assert_eq!(s.version, 4);
+        assert_eq!(&open(&key(2), &s, &f).unwrap()[..], b"F32.1");
+        let plain = seal(&key(1), 3, &f, b"F32.1");
+        let moved = reseal(&key(1), &Sealed::parse(&plain).unwrap(), &key(2), 4, &f).unwrap();
+        assert_eq!((moved[0], moved.len()), (2, plain.len()));
+        assert!(Format::XChaCha20Poly1305Padded.is_current() && !Format::AesGcm.is_current());
     }
 }

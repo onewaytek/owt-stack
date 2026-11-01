@@ -6,7 +6,7 @@ use std::sync::Arc;
 use owt_crypt::kek::{KekChain, KekProvider, LocalKek};
 use std::time::Duration;
 
-use owt_crypt::{Column, Crypt, CryptError, Field, Purpose, Scope};
+use owt_crypt::{Column, Crypt, CryptError, Field, Padding, Purpose, Scope};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Executor, PgPool};
 
@@ -767,5 +767,44 @@ async fn a_sealer_computes_blind_index_candidates_for_every_index_version() {
     assert_eq!(sync.len(), 2);
     assert_eq!(sync[1], old);
     assert_eq!(sync[0], after.blind_index("p", "email", b"a").unwrap());
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn padded_values_open_through_both_apis_and_survive_a_rotation() {
+    let Some(db) = Db::new().await else { return };
+    let crypt = Crypt::new(db.pool.clone(), local("k1"));
+    let f = Field::new("s1", "notes", "code", "1");
+    let short = crypt
+        .encrypt_str_padded(&f, "F32", Padding::DEFAULT)
+        .await
+        .unwrap();
+    let long = crypt
+        .encrypt_str_padded(&f, "F33.1 recurrent, severe", Padding::DEFAULT)
+        .await
+        .unwrap();
+    assert_eq!(short.len(), long.len(), "one bucket, one length");
+    assert_eq!(short[0], owt_crypt::format::PADDED.byte());
+    let sealer = crypt.sealer("s1").await.unwrap();
+    assert_eq!(&sealer.open_string(&f, &short).unwrap()[..], "F32");
+    let by_sealer = sealer.seal_str_padded(&f, "F32", Padding::DEFAULT).unwrap();
+    assert_eq!(by_sealer.len(), short.len());
+    assert_eq!(
+        &crypt.decrypt_string(&f, &by_sealer).await.unwrap()[..],
+        "F32"
+    );
+    // Unpadded beside it: shorter, and opens as before.
+    let plain = crypt.encrypt_str(&f, "F32").await.unwrap();
+    assert!(plain.len() < short.len());
+    assert_eq!(&crypt.decrypt_string(&f, &plain).await.unwrap()[..], "F32");
+    // Current already: left alone. After a rotation: moved, still padded, same length.
+    assert_eq!(crypt.reencrypt(&f, &long).await.unwrap(), None);
+    crypt.rotate("s1", Purpose::Data).await.unwrap();
+    let moved = crypt.reencrypt(&f, &long).await.unwrap().unwrap();
+    assert_eq!((moved[0], moved.len()), (long[0], long.len()));
+    assert_eq!(
+        &crypt.decrypt_string(&f, &moved).await.unwrap()[..],
+        "F33.1 recurrent, severe"
+    );
     db.drop().await;
 }

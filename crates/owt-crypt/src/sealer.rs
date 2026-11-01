@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use crate::format::Sealed;
-use crate::{Crypt, CryptError, Field, Key, Purpose, ScopeState, check_field, mac, open, seal};
+use crate::{
+    Crypt, CryptError, Field, Key, Padding, Purpose, ScopeState, check_field, mac, open, seal,
+    seal_padded,
+};
 
 /// One scope's unwrapped keys, held so that sealing, opening and blind indexes need
 /// no `.await`: for serde and template paths, `FromRow` decoding and other
@@ -210,6 +213,36 @@ impl Sealer {
     /// [`Sealer::seal`] of a string.
     pub fn seal_str(&self, field: &Field<'_>, plaintext: &str) -> Result<Vec<u8>, CryptError> {
         self.seal(field, plaintext.as_bytes())
+    }
+
+    /// [`Sealer::seal`], with `plaintext` padded to `padding`'s bucket first, as
+    /// [`Crypt::encrypt_padded`] does. [`Sealer::open`] removes the padding.
+    pub fn seal_padded(
+        &self,
+        field: &Field<'_>,
+        plaintext: &[u8],
+        padding: Padding,
+    ) -> Result<Vec<u8>, CryptError> {
+        self.check_field(field)?;
+        self.check(true)?;
+        let key = &self.inner.data[&self.inner.current];
+        Ok(seal_padded(
+            key,
+            self.inner.current,
+            field,
+            plaintext,
+            padding,
+        ))
+    }
+
+    /// [`Sealer::seal_padded`] of a string.
+    pub fn seal_str_padded(
+        &self,
+        field: &Field<'_>,
+        plaintext: &str,
+        padding: Padding,
+    ) -> Result<Vec<u8>, CryptError> {
+        self.seal_padded(field, plaintext.as_bytes(), padding)
     }
 
     /// Open a ciphertext sealed for `field`, under any data key version the sealer
