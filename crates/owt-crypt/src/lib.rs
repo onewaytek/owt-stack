@@ -4,11 +4,13 @@
 //!   stored in `owt_crypt_keys` only wrapped by a KEK ([`kek::KekProvider`]). The
 //!   newest version encrypts; every version decrypts. [`Crypt::rotate`] adds a
 //!   version, and [`Crypt::reencrypt_column`] moves a column's values onto it.
-//! * **Fields.** [`Crypt::encrypt`] seals a value with AES-256-GCM under its scope's
-//!   current data key. The associated data binds the ciphertext to its [`Field`]
+//! * **Fields.** [`Crypt::encrypt`] seals a value with XChaCha20-Poly1305 under its
+//!   scope's current data key. The associated data binds the ciphertext to its [`Field`]
 //!   (scope, table, column and row), so a value copied to another row, column or
 //!   tenant does not decrypt there. The ciphertext is self-describing: format byte,
-//!   key version, nonce, sealed bytes ([`format`]).
+//!   key version, nonce, sealed bytes ([`format`]). Values sealed with AES-256-GCM
+//!   (format byte `0x01`) still open, and [`Crypt::reencrypt`] moves them to the
+//!   current format.
 //! * **Blind indexes.** [`Crypt::blind_index`] is HMAC-SHA256 of a value under the
 //!   scope's index key (separate from its data keys), for `WHERE email_idx = $1`
 //!   without decrypting. It reveals which rows hold equal values, so index only what
@@ -31,14 +33,17 @@
 //!
 //! # Limits
 //!
-//! * A data key seals with random 96-bit nonces, so one key is good for about 2^32
-//!   messages (NIST SP 800-38D). A high-volume scope, and every re-encryption, count
-//!   against it: [`Crypt::rotate`] data keys well before that, yearly or every N writes.
+//! * A data key seals with random 192-bit nonces, so the number of seals per key sets
+//!   no practical limit (a repeat is expected after about 2^96). Rotate data keys for
+//!   other reasons (a suspected leak, a policy), not to stay under a nonce budget.
+//! * One data key serves both formats: it opens its old AES-256-GCM values and seals
+//!   new XChaCha20-Poly1305 ones. The format byte is in the associated data and picks
+//!   the cipher, so a value cannot be opened as the other format.
 //! * Concurrent [`Crypt::rotate`] calls may each add a version. That is harmless: the
 //!   newest encrypts and all decrypt.
-//! * AES-GCM is not key-committing. Keys are chosen by (scope, version) from the
-//!   database and the associated data carries both, so this has no practical attack
-//!   here.
+//! * Neither AES-GCM nor XChaCha20-Poly1305 is key-committing. Keys are chosen by
+//!   (scope, version) from the database and the associated data carries both, so this
+//!   has no practical attack here.
 //! * The `hmac` and `sha2` states derived from an index key are not zeroized.
 //! * A `LocalKek` read from an environment variable leaves the secret in the process
 //!   environment for the process's life; prefer `from_file`.
@@ -58,6 +63,7 @@ use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
@@ -69,7 +75,7 @@ pub use migrations::{LEDGER, LOCK_ID, migrate, migrator};
 pub use sealer::Sealer;
 pub use zeroize;
 
-use crate::format::{Sealed, lp};
+use crate::format::{Format, Sealed, lp};
 use crate::kek::{KekError, KekProvider};
 
 /// Where a value lives: what its ciphertext is bound to.
@@ -408,8 +414,9 @@ impl Crypt {
         Ok(self.current(scope, Purpose::Data).await?.0)
     }
 
-    /// `ciphertext` sealed again under its scope's current data key, or `None` when it
-    /// already is.
+    /// `ciphertext` sealed again under its scope's current data key in the current
+    /// [`format`], or `None` when it already is (so an AES-256-GCM value under the
+    /// current key is sealed again too).
     pub async fn reencrypt(
         &self,
         field: &Field<'_>,
@@ -418,7 +425,7 @@ impl Crypt {
         check_field(field)?;
         let sealed = Sealed::parse(ciphertext).ok_or(CryptError::Malformed)?;
         let (version, key) = self.current(field.scope, Purpose::Data).await?;
-        if sealed.version == version {
+        if sealed.version == version && sealed.format == format::CURRENT {
             return Ok(None);
         }
         let old = self.key(field.scope, Purpose::Data, sealed.version).await?;
@@ -560,7 +567,7 @@ impl Crypt {
             currents.insert(field.scope.to_owned(), current);
         }
         let (version, key) = &currents[field.scope];
-        if sealed.version == *version {
+        if sealed.version == *version && sealed.format == format::CURRENT {
             return Ok(None);
         }
         let old = self.key(field.scope, Purpose::Data, sealed.version).await?;
@@ -861,42 +868,64 @@ pub enum Scope<'a> {
 }
 
 fn seal(key: &Key, version: u32, field: &Field<'_>, plaintext: &[u8]) -> Vec<u8> {
-    let cipher = Aes256Gcm::new_from_slice(&key.0[..]).expect("a data key is 32 bytes");
-    let mut nonce = [0_u8; format::NONCE_LEN];
+    let mut nonce = [0_u8; 24];
     rand::rng().fill_bytes(&mut nonce);
-    let aad = format::aad(field, version);
+    seal_with(key, version, field, plaintext, nonce)
+}
+
+/// [`seal`] with a given nonce, in the current format.
+fn seal_with(
+    key: &Key,
+    version: u32,
+    field: &Field<'_>,
+    plaintext: &[u8],
+    nonce: [u8; 24],
+) -> Vec<u8> {
+    let cipher = XChaCha20Poly1305::new_from_slice(&key.0[..]).expect("a data key is 32 bytes");
+    let aad = format::aad(format::CURRENT, field, version);
     let sealed = cipher
         .encrypt(
-            &Nonce::from(nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: plaintext,
                 aad: &aad,
             },
         )
-        .expect("AES-GCM seals any length a Vec holds");
-    format::assemble(version, &nonce, &sealed)
+        .expect("XChaCha20-Poly1305 seals any length a Vec holds");
+    format::assemble(format::CURRENT, version, &nonce, &sealed)
 }
 
+/// Opens `sealed` with the cipher its format byte names; the byte is in the associated
+/// data, so an edited byte is refused.
 fn open(
     key: &Key,
     sealed: &Sealed<'_>,
     field: &Field<'_>,
 ) -> Result<Zeroizing<Vec<u8>>, CryptError> {
-    let cipher = Aes256Gcm::new_from_slice(&key.0[..]).expect("a data key is 32 bytes");
-    let aad = format::aad(field, sealed.version);
-    cipher
-        .decrypt(
-            &Nonce::from(sealed.nonce),
-            Payload {
-                msg: sealed.body,
-                aad: &aad,
-            },
-        )
-        .map(Zeroizing::new)
-        .map_err(|_| CryptError::Refused {
-            table: field.table.into(),
-            column: field.column.into(),
-        })
+    let refused = || CryptError::Refused {
+        table: field.table.into(),
+        column: field.column.into(),
+    };
+    let aad = format::aad(sealed.format, field, sealed.version);
+    let payload = Payload {
+        msg: sealed.body,
+        aad: &aad,
+    };
+    let opened = match sealed.format {
+        Format::AesGcm => {
+            let nonce: [u8; 12] = sealed.nonce.try_into().map_err(|_| refused())?;
+            Aes256Gcm::new_from_slice(&key.0[..])
+                .expect("a data key is 32 bytes")
+                .decrypt(&Nonce::from(nonce), payload)
+        }
+        Format::XChaCha20Poly1305 => {
+            let nonce: [u8; 24] = sealed.nonce.try_into().map_err(|_| refused())?;
+            XChaCha20Poly1305::new_from_slice(&key.0[..])
+                .expect("a data key is 32 bytes")
+                .decrypt(&XNonce::from(nonce), payload)
+        }
+    };
+    opened.map(Zeroizing::new).map_err(|_| refused())
 }
 
 fn mac(key: &Key, table: &str, column: &str, value: &[u8]) -> [u8; 32] {
@@ -990,6 +1019,143 @@ mod tests {
         assert!(open(&key(1), &s, &f).is_err());
         // Two seals of one value differ (fresh nonces).
         assert_ne!(seal(&key(1), 3, &f, b"plain"), ct);
+    }
+
+    const FIXTURE_PLAIN: &[u8] = b"Patient reports better sleep.";
+
+    /// `FIXTURE_PLAIN` sealed as format `0x01` (AES-256-GCM) for
+    /// `Field::new("t1", "notes", "body", "7")` under `key(1)`, version 3, nonce
+    /// `00 01 .. 0b`. Made by an independent AES-GCM implementation (Python
+    /// `cryptography`), and equal to [`seal_aes_gcm`]'s output.
+    const AES_GCM_FIXTURE: &str = "0100000003000102030405060708090a0bebc7e14f459072598c0f97ab52\
+        1dbb83cca31f7e90e365731daf5df08faa9fcbfd8e0b1d93c5ab8d58637a4b5d";
+
+    /// The same value sealed as format `0x02` (XChaCha20-Poly1305), nonce
+    /// `00 01 .. 17`, by an independent implementation (libsodium).
+    const XCHACHA_FIXTURE: &str = "0200000003000102030405060708090a0b0c0d0e0f1011121314151617\
+        28b1afecf8ffa3a891231a276646059097d3e8ba9d39a0a14c699ec1c1e220d0a7c249c55a8840\
+        5908105d977f";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let s: Vec<u8> = s.bytes().filter(u8::is_ascii_hexdigit).collect();
+        s.chunks(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    fn fixture_field() -> Field<'static> {
+        Field::new("t1", "notes", "body", "7")
+    }
+
+    /// Seals as format `0x01` does: AES-256-GCM over the format-`0x01` associated data.
+    /// The fixtures' writer.
+    fn seal_aes_gcm(key: &Key, version: u32, field: &Field<'_>, plaintext: &[u8]) -> Vec<u8> {
+        let nonce: [u8; 12] = std::array::from_fn(|i| u8::try_from(i).unwrap());
+        let aad = format::aad(Format::AesGcm, field, version);
+        let sealed = Aes256Gcm::new_from_slice(&key.0[..])
+            .unwrap()
+            .encrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        format::assemble(Format::AesGcm, version, &nonce, &sealed)
+    }
+
+    #[test]
+    fn new_seals_are_xchacha20_poly1305() {
+        let f = fixture_field();
+        let ct = seal(&key(1), 3, &f, FIXTURE_PLAIN);
+        let sealed = Sealed::parse(&ct).unwrap();
+        assert_eq!(sealed.format, Format::XChaCha20Poly1305);
+        assert_eq!(ct[0], 2);
+        assert_eq!(sealed.nonce.len(), 24);
+        assert_eq!(
+            ct.len(),
+            Format::XChaCha20Poly1305.min_len() + FIXTURE_PLAIN.len()
+        );
+        assert_eq!(&open(&key(1), &sealed, &f).unwrap()[..], FIXTURE_PLAIN);
+        // Byte for byte the independent implementation's output, and it opens.
+        let nonce: [u8; 24] = std::array::from_fn(|i| u8::try_from(i).unwrap());
+        let known = unhex(XCHACHA_FIXTURE);
+        assert_eq!(seal_with(&key(1), 3, &f, FIXTURE_PLAIN, nonce), known);
+        let sealed = Sealed::parse(&known).unwrap();
+        assert_eq!(&open(&key(1), &sealed, &f).unwrap()[..], FIXTURE_PLAIN);
+    }
+
+    #[test]
+    fn aes_gcm_values_still_open() {
+        let f = fixture_field();
+        let old = unhex(AES_GCM_FIXTURE);
+        assert_eq!(seal_aes_gcm(&key(1), 3, &f, FIXTURE_PLAIN), old);
+        let sealed = Sealed::parse(&old).unwrap();
+        assert_eq!((sealed.format, sealed.version), (Format::AesGcm, 3));
+        assert_eq!(&open(&key(1), &sealed, &f).unwrap()[..], FIXTURE_PLAIN);
+        // Bound to its field, version and key as before.
+        for other in [
+            Field::new("t2", "notes", "body", "7"),
+            Field::new("t1", "notez", "body", "7"),
+            Field::new("t1", "notes", "title", "7"),
+            Field::new("t1", "notes", "body", "8"),
+        ] {
+            assert!(open(&key(1), &sealed, &other).is_err(), "{other:?}");
+        }
+        assert!(open(&key(2), &sealed, &f).is_err());
+        let mut bent = old.clone();
+        bent[4] = 4;
+        assert!(open(&key(1), &Sealed::parse(&bent).unwrap(), &f).is_err());
+    }
+
+    #[test]
+    fn a_tampered_byte_is_refused_in_both_formats() {
+        let f = fixture_field();
+        for ct in [unhex(AES_GCM_FIXTURE), seal(&key(1), 3, &f, FIXTURE_PLAIN)] {
+            for i in 0..ct.len() {
+                let mut bent = ct.clone();
+                bent[i] ^= 0x01;
+                if let Some(s) = Sealed::parse(&bent) {
+                    assert!(
+                        open(&key(1), &s, &f).is_err(),
+                        "byte {i} of format {}",
+                        ct[0]
+                    );
+                }
+            }
+            // Truncated, or a byte longer, refused too.
+            let mut longer = ct.clone();
+            longer.push(0);
+            for bent in [&ct[..ct.len() - 1], &longer[..]] {
+                if let Some(s) = Sealed::parse(bent) {
+                    assert!(open(&key(1), &s, &f).is_err(), "format {}", ct[0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_format_byte_cannot_be_swapped() {
+        let f = fixture_field();
+        // A new value relabelled as AES-GCM parses (it is long enough) and is refused,
+        // whether the reader takes the first 12 nonce bytes or the attacker drops the
+        // rest of the nonce.
+        let new = seal(&key(1), 3, &f, FIXTURE_PLAIN);
+        let mut down = new.clone();
+        down[0] = Format::AesGcm.byte();
+        let s = Sealed::parse(&down).unwrap();
+        assert_eq!(s.format, Format::AesGcm);
+        assert!(open(&key(1), &s, &f).is_err());
+        let parsed = Sealed::parse(&new).unwrap();
+        let cut = format::assemble(Format::AesGcm, 3, &parsed.nonce[..12], parsed.body);
+        assert!(open(&key(1), &Sealed::parse(&cut).unwrap(), &f).is_err());
+        // An old value relabelled as XChaCha20-Poly1305 is refused too.
+        let mut up = unhex(AES_GCM_FIXTURE);
+        up[0] = Format::XChaCha20Poly1305.byte();
+        let s = Sealed::parse(&up).unwrap();
+        assert_eq!(s.format, Format::XChaCha20Poly1305);
+        assert!(open(&key(1), &s, &f).is_err());
     }
 
     #[test]

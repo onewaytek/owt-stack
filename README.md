@@ -9,7 +9,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
-| `owt-crypt` | envelope field encryption: AES-256-GCM data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
+| `owt-crypt` | envelope field encryption: XChaCha20-Poly1305 field seals under data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
 | `owt-storage` | objects in an S3-compatible bucket (B2, R2, MinIO): client-side encryption through `owt-crypt` in bounded memory, streaming multipart uploads, presigned URLs, verified deletion |
 | `owt-audit` | an append-only, hash-chained audit log: one chain per tenant, SHA-256 over a canonical encoding, triggers that refuse changes, a verifier (and its clap subcommand, feature `cli`), and anchoring of the chain heads to external write-once storage |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
@@ -2923,9 +2923,21 @@ let social = social.on_arrival(move |arrived| {
 `owt-crypt` encrypts the columns that hold health or other sensitive data, so the
 database, its backups and its replicas hold only ciphertext. Each tenant (a
 *scope*) has its own AES-256 data keys, stored only wrapped by a key-encryption key
-(KEK). A value is sealed with AES-256-GCM, and its associated data binds it to its
-`Field`: scope, table, column and row. A ciphertext copied into another row, column
+(KEK). A value is sealed with XChaCha20-Poly1305, and its associated data binds it to
+its `Field`: scope, table, column and row. A ciphertext copied into another row, column
 or tenant does not decrypt there.
+
+**Ciphertext format.** `format (1 byte) || key version (u32, big-endian) || nonce ||
+sealed bytes (plaintext + 16-byte tag)`. Format `0x02`, which every seal writes, is
+XChaCha20-Poly1305 with a random 24-byte nonce; format `0x01` is AES-256-GCM with a
+random 12-byte nonce, which `owt-crypt` only reads. The format byte is in the
+associated data and picks the cipher, so a value relabelled as the other format does
+not open. The same data keys serve both, so values sealed before format `0x02` keep
+opening with no migration; `reencrypt` and `reencrypt_column` seal them again as
+`0x02` (a value under the current key in format `0x01` counts as not yet moved). A
+release that writes `0x02` must be on every replica before the first `0x02` value is
+read: a build that knows only `0x01` refuses it as `CryptError::Malformed`.
+`owt_crypt::format` has the parser (`Sealed::parse`, `Format`).
 
 ```rust,no_run
 use std::sync::Arc;
@@ -3023,10 +3035,10 @@ visited at all: they are counted in `no_key`, not listed. Those two stops, and a
 `no_key`, return `complete: false`:
 retire an old key version only after a run that is `complete` with nothing in
 `failed`, never on `moved: 0` alone. A KEK id no provider knows aborts the job with an
-error. A data key seals with random 96-bit nonces, which is safe for
-about 2^32 messages per key (NIST SP 800-38D): rotate data keys well before that,
-yearly or every N writes. Two concurrent `rotate` calls may each add a version; that
-is harmless.
+error. A data key seals with random 192-bit nonces, so the number of seals per key
+is not a limit (a repeated nonce is expected only after about 2^96 seals): rotate data
+keys for a suspected leak or a policy, not for a nonce budget. Two concurrent `rotate`
+calls may each add a version; that is harmless.
 
 **Synchronous sealing.** `encrypt` and `decrypt` are `async`, because they may ask the
 database or the KEK for a key. Code that cannot `.await` (serde and template paths,

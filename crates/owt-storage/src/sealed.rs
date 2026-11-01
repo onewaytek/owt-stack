@@ -32,7 +32,8 @@ pub const CHUNK: usize = 1 << 20;
 pub const TAG: usize = 16;
 /// The nonce prefix's length.
 pub const PREFIX: usize = 7;
-/// The longest header this reads: a sealed 32-byte key is 65 bytes.
+/// The longest header this reads: a sealed 32-byte key is 77 bytes (65 in
+/// `owt-crypt`'s AES-256-GCM format).
 pub const MAX_HEADER: usize = 4 + 1 + 4 + 2 + 256 + PREFIX;
 
 /// Bytes that are not an encrypted object, or a chunk that does not authenticate.
