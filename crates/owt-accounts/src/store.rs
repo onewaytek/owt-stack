@@ -464,6 +464,8 @@ pub async fn revoke_session(
 /// query names its columns apart from [`COLUMNS`]' (`AS display_name`, not
 /// `username`). A row with two columns of one name fails the load like a database
 /// error, so an extra `roles` or `is_staff` can never stand in for the account's.
+/// The accounts layer reads two columns of its own in that row, `owt_has_factor` and
+/// `owt_accepted`, so those names are taken too.
 /// A query that finds no row reads as `NULL` in each column, so a field it may miss
 /// is an `Option`; a column that fails to decode fails the load too. It yields at
 /// most one row: several fail the load as well, rather than pass one of them off as
@@ -487,51 +489,162 @@ pub async fn by_id_in_epoch_with<X: Extra>(
     epoch: i32,
     session: Option<&str>,
 ) -> sqlx::Result<Option<(Account, X)>> {
-    use sqlx::{Column, FromRow, Row};
+    use sqlx::FromRow;
+    let Some(row) = row_in_epoch(db, id, epoch, session, Some(Queried::of::<X>()), false).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((Account::from_row(&row)?, X::from_row(&row)?)))
+}
+
+/// What the accounts layer's gates need to know about the signed-in account, read in
+/// the query that loads it: whether it holds a second factor (for the MFA gate) and
+/// which policy versions it last accepted (for the policies gate).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Standing {
+    /// A confirmed authenticator: [`Factors::any`](crate::mfa::Factors::any).
+    pub(crate) has_factor: bool,
+    /// The `policy_acceptances` version ids, one per document the account accepted.
+    pub(crate) accepted: Vec<i64>,
+}
+
+/// The columns [`signed_in`] reads for [`Standing`]. Both lookups are on a primary
+/// key: `account_totp (account_id)` and the `(account_id, kind)` prefix of
+/// `policy_acceptances`.
+const STANDING: &str = "SELECT
+             EXISTS (SELECT 1 FROM account_totp t
+                     WHERE t.account_id = accounts.id AND t.confirmed_at IS NOT NULL)
+               AS owt_has_factor,
+             ARRAY(SELECT p.version_id FROM policy_acceptances p
+                   WHERE p.account_id = accounts.id) AS owt_accepted";
+
+/// The layer's one query for a signed-in request under [`Accounts::load`](crate::Accounts::load):
+/// [`by_id_in_epoch`] and the account's [`Standing`], in a single statement.
+pub(crate) async fn signed_in(
+    db: impl PgExecutor<'_>,
+    id: i64,
+    epoch: i32,
+    session: Option<&str>,
+) -> sqlx::Result<Option<(Account, Standing)>> {
+    use sqlx::FromRow;
+    let Some(row) = row_in_epoch(db, id, epoch, session, None, true).await? else {
+        return Ok(None);
+    };
+    Ok(Some((Account::from_row(&row)?, Standing::from_row(&row)?)))
+}
+
+/// [`signed_in`] under [`Accounts::load_with`](crate::Accounts::load_with): also what
+/// `X` reads, as [`by_id_in_epoch_with`] does.
+pub(crate) async fn signed_in_with<X: Extra>(
+    db: impl PgExecutor<'_>,
+    id: i64,
+    epoch: i32,
+    session: Option<&str>,
+) -> sqlx::Result<Option<(Account, X, Standing)>> {
+    use sqlx::FromRow;
+    let Some(row) = row_in_epoch(db, id, epoch, session, Some(Queried::of::<X>()), true).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        Account::from_row(&row)?,
+        X::from_row(&row)?,
+        Standing::from_row(&row)?,
+    )))
+}
+
+impl Standing {
+    fn from_row(row: &sqlx::postgres::PgRow) -> sqlx::Result<Self> {
+        use sqlx::Row;
+        Ok(Self {
+            has_factor: row.try_get("owt_has_factor")?,
+            accepted: row.try_get("owt_accepted")?,
+        })
+    }
+}
+
+/// The `QUERY` of an [`Extra`] and its type's name, for the errors.
+struct Queried {
+    query: &'static str,
+    name: &'static str,
+}
+
+impl Queried {
+    fn of<X: Extra>() -> Self {
+        Self {
+            query: X::QUERY,
+            name: std::any::type_name::<X>(),
+        }
+    }
+}
+
+/// The row of the active account `id` in `epoch` whose session `session` stands, with
+/// `extra`'s columns and, if `standing`, [`STANDING`]'s beside [`COLUMNS`]'.
+async fn row_in_epoch(
+    db: impl PgExecutor<'_>,
+    id: i64,
+    epoch: i32,
+    session: Option<&str>,
+    extra: Option<Queried>,
+    standing: bool,
+) -> sqlx::Result<Option<sqlx::postgres::PgRow>> {
+    use sqlx::{Column, Row};
     // The account's columns are computed in a lateral of their own, which sees only
     // `accounts`: an extra column named `id` does not make them ambiguous. The newline
     // before each `)` keeps a `--` comment ending QUERY from swallowing it.
     // LIMIT 2: enough to tell one row from several.
+    let (standing_cols, standing_join) = if standing {
+        (
+            ", standing.*",
+            format!("CROSS JOIN LATERAL ({STANDING}\n) standing"),
+        )
+    } else {
+        ("", String::new())
+    };
+    let (extra_cols, extra_join) = match &extra {
+        Some(e) => (
+            ", extra.*",
+            format!("LEFT JOIN LATERAL ({}\n) extra ON true", e.query),
+        ),
+        None => ("", String::new()),
+    };
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT account.*, extra.* FROM accounts
+        "SELECT account.*{standing_cols}{extra_cols} FROM accounts
          CROSS JOIN LATERAL (SELECT {COLUMNS}\n) account
-         LEFT JOIN LATERAL ({}\n) extra ON true
+         {standing_join}
+         {extra_join}
          WHERE accounts.id = $1 AND accounts.is_active AND accounts.session_epoch = $2
          AND NOT EXISTS (SELECT 1 FROM revoked_sessions r WHERE r.id = $3)
-         LIMIT 2",
-        X::QUERY
+         LIMIT 2"
     )))
     .bind(id)
     .bind(epoch)
     .bind(session)
     .fetch_all(db)
     .await?;
+    let name = extra.as_ref().map_or("the account", |e| e.name);
     if rows.len() > 1 {
         return Err(sqlx::Error::Decode(
-            format!(
-                "the Extra::QUERY of {} yields several rows for one account",
-                std::any::type_name::<X>()
-            )
-            .into(),
+            format!("the Extra::QUERY of {name} yields several rows for one account").into(),
         ));
     }
     let Some(row) = rows.into_iter().next() else {
         return Ok(None);
     };
     // Decoding by name reads the last column of a name: refuse any name twice, so
-    // the extra cannot replace what the account says (its roles, its staff flag).
+    // the extra cannot replace what the account says (its roles, its staff flag) or
+    // what the gates read (`owt_has_factor`, `owt_accepted`).
     let mut names = std::collections::HashSet::new();
     if let Some(twice) = row.columns().iter().find(|c| !names.insert(c.name())) {
         return Err(sqlx::Error::Decode(
             format!(
-                "the Extra::QUERY of {} names a column {:?}, which the row already has",
-                std::any::type_name::<X>(),
+                "the Extra::QUERY of {name} names a column {:?}, which the row already has",
                 twice.name()
             )
             .into(),
         ));
     }
-    Ok(Some((Account::from_row(&row)?, X::from_row(&row)?)))
+    Ok(Some(row))
 }
 
 /// The account with this username, active or not: a deactivated account is found

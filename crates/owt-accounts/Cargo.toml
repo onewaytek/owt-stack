@@ -49,6 +49,7 @@ owt-runtime.workspace = true
 owt-test.workspace = true
 tokio.workspace = true
 tower.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

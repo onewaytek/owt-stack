@@ -1235,27 +1235,28 @@ impl Mfa {
     /// passed for this account and epoch, or if the account has none and the policy does
     /// not require one. Otherwise the session becomes the pending sign-in it should have
     /// been (so a challenge or enrollment form can follow), and the request is
-    /// anonymous. `Ok(Some(has_factor))` when it stands.
-    pub(crate) async fn gate<T: MfaSession>(
+    /// anonymous. `has` is whether the account holds a factor ([`Factors::any`]), which
+    /// the layer reads in the query that loads the account. `Some(has_factor)` when it
+    /// stands.
+    pub(crate) fn gate<T: MfaSession>(
         &self,
-        pool: &PgPool,
         session: &Session<T>,
         account: &Account,
-    ) -> sqlx::Result<Option<bool>> {
+        has: bool,
+    ) -> Option<bool> {
         let passed = session.read(|d| {
             d.signature()
                 .and_then(|s| state::auth_for(d.mfa(), s))
                 .is_some_and(|a| a.mfa_at.is_some())
         });
         if passed {
-            return Ok(Some(true));
+            return Some(true);
         }
-        let has = self.factors(pool, account.id).await?.any();
         match self.pending_kind(account, has) {
-            None => Ok(Some(false)),
+            None => Some(false),
             Some(kind) => {
                 Self::make_pending(session, account, kind, SystemTime::now());
-                Ok(None)
+                None
             }
         }
     }

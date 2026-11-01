@@ -757,3 +757,92 @@ async fn an_app_draws_the_pages_at_its_paths_in_its_words() {
     assert_eq!(client.get("/whoami").await.text(), "anonymous");
     db.drop().await;
 }
+
+/// Counts the statements sqlx runs on this thread: each one logs an event with target
+/// `sqlx::query` when it finishes.
+struct Statements(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Statements {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// The statements `client` runs for `GET uri` as a page, and the response.
+async fn statements_for(client: &owt_test::Client, uri: &str) -> (usize, owt_test::Response) {
+    use tracing_subscriber::layer::SubscriberExt;
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Statements(count.clone()));
+    let response = {
+        let _on = tracing::subscriber::set_default(subscriber);
+        client.get_page(uri).await
+    };
+    (count.load(std::sync::atomic::Ordering::SeqCst), response)
+}
+
+#[tokio::test]
+async fn a_signed_in_page_reads_the_account_factor_and_policies_in_one_query() {
+    async fn whoami(Maybe(account): Maybe) -> String {
+        account.map_or_else(|| "anonymous".to_owned(), |a| a.username)
+    }
+    let db = db!();
+    published(&db, "terms", "Terms of Service", "First.", "").await;
+    published(&db, "privacy", "Privacy Notice", "We keep little.", "").await;
+    let sessions = sessions();
+    // The policies' copy of the current versions lasts the test, as in production
+    // between refreshes: what is counted is the per-request work.
+    let policies = Policies::new(
+        db.pool.clone(),
+        |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
+            Ok(axum::response::Html(format!("{}", page.body)).into_response())
+        },
+        &[TERMS, PRIVACY],
+    );
+    let accounts = Accounts::new(db.pool.clone(), "/login")
+        .require_mfa::<Data>(owt_accounts::mfa::Mfa::new("Acme Health"));
+    let app = Router::new()
+        .merge(policies.routes())
+        .route("/whoami", get(whoami))
+        .layer(from_fn_with_state(policies, Policies::gate))
+        .layer(from_fn_with_state(accounts, Accounts::load::<Data>))
+        .layer(from_fn_with_state(sessions.clone(), Sessions::layer));
+
+    // Agreed, no second factor: the page.
+    let agreed = owt_test::Client::new(app.clone());
+    let ada = account(&db, "ada", false).await;
+    policies::agree_to_current(&db.pool, ada.id).await.unwrap();
+    agreed.sign_in_as(&sessions, &ada);
+    // Warm the pool and the policies' copy of the current versions.
+    assert_eq!(agreed.get_page("/whoami").await.text(), "ada");
+    let (n, r) = statements_for(&agreed, "/whoami").await;
+    assert_eq!(r.text(), "ada");
+    assert_eq!(n, 1, "account, factor and policies in one query");
+
+    // Agreed to nothing: sent to the page that asks, still in one query.
+    let asked = owt_test::Client::new(app.clone());
+    let bob = account(&db, "bob", false).await;
+    asked.sign_in_as(&sessions, &bob);
+    let (n, r) = statements_for(&asked, "/whoami").await;
+    assert_eq!(r.location(), Some("/agree?next=%2Fwhoami"));
+    assert_eq!(n, 1, "account, factor and policies in one query");
+
+    // A confirmed authenticator not yet used this session: held as a pending sign-in,
+    // anonymous, in one query.
+    let held = owt_test::Client::new(app);
+    let cy = account(&db, "cy", false).await;
+    policies::agree_to_current(&db.pool, cy.id).await.unwrap();
+    sqlx::query(
+        "INSERT INTO account_totp (account_id, secret, confirmed_at) VALUES ($1, '\\x01', now())",
+    )
+    .bind(cy.id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    held.sign_in_as(&sessions, &cy);
+    let (n, r) = statements_for(&held, "/whoami").await;
+    assert_eq!(r.text(), "anonymous");
+    assert_eq!(n, 1, "account, factor and policies in one query");
+    db.drop().await;
+}
