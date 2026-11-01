@@ -14,7 +14,7 @@ async fn the_bound_is_set_once_and_then_holds() {
         .map(|i| {
             let stored = stored.clone();
             let given = if i % 2 == 0 { "correct horse" } else { "wrong" };
-            tokio::spawn(async move { password::verify(given, &stored).await })
+            tokio::spawn(async move { password::verify(given, &stored).await.unwrap() })
         })
         .collect();
     let mut matched = 0;

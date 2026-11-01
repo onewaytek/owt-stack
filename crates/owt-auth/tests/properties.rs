@@ -66,7 +66,7 @@ proptest! {
             m.is_none_or(|m| m <= 65_536)
         });
         let started = std::time::Instant::now();
-        let matched = runtime().block_on(password::verify(&given, &stored));
+        let matched = runtime().block_on(password::verify(&given, &stored)).unwrap();
         prop_assert!(!matched, "{given:?} verified against {stored:?}");
         prop_assert!(started.elapsed() < std::time::Duration::from_secs(20));
         // Deciding whether to rehash never panics either.

@@ -960,7 +960,12 @@ if !throttle.sign_in(ip, account) {
 }
 // Argon2id on the blocking pool, a bounded number at once. An unknown account
 // (`None`) costs a real check too, so timing does not tell which accounts exist.
-let checked = password::check_or_decoy(given, stored_hash).await;
+// A check that finds no permit within `password::DEFAULT_PERMIT_TIMEOUT` (5 s) fails
+// with `password::Busy`: answer 503 (`owt_web::Error::unavailable`), not a mismatch.
+let checked = match password::check_or_decoy(given, stored_hash).await {
+    Ok(checked) => checked,
+    Err(busy) => return Err(owt_web::Error::unavailable(busy.to_string()).into()),
+};
 if checked.matched() {
     // A hash made with weaker parameters than today's, or of the password as typed
     // before passwords were normalized (`Check::MatchRaw`): store a fresh one.
@@ -1037,6 +1042,17 @@ let verifier = jwt::Verifier::discover(http, "https://sso.example/realms/x", "my
 let claims: jwt::Claims = verifier.verify("eyJ...").await?;
 # let _ = claims; Ok(()) }
 ```
+
+**A saturated hasher answers 503.** Argon2 checks run a bounded number at once
+(`password::set_concurrency`; the CPU count, at most 8). A check waits for a permit
+at most `password::DEFAULT_PERMIT_TIMEOUT`, five seconds, then fails with
+`password::Busy` instead of queueing for as long as the burst lasts; change the wait
+at startup with `password::set_permit_timeout`. `verify`, `check`, `verify_or_decoy`,
+`check_or_decoy` and `recovery::find_match` return `Result<_, Busy>`, and `hash`'s
+`anyhow::Error` downcasts to `Busy`. `owt_accounts` turns it into
+`SignInRefused::Unavailable`, `MfaError::Unavailable` or `Error::Busy`, each a 503
+with `Retry-After` through `owt_web::Error::Unavailable`; it is never counted as a
+wrong password.
 
 **The client's address** is configuration, never a guess. `Source::from_env()` reads
 `CLIENT_IP` (`forwarded-for:N`, `header:NAME` or `peer`), else `TRUSTED_PROXIES` (a

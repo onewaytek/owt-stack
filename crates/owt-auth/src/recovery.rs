@@ -112,8 +112,18 @@ pub fn normalize(input: &str) -> Option<String> {
 /// one matched, and one attempt takes one permit, not ten. That permit is held for the
 /// whole run (ten Argon2 checks, a few hundred milliseconds), so each attempt costs the
 /// pool that long: the throttle bounds how many a person can make.
-pub async fn find_match<S: AsRef<str>>(input: &str, hashes: &[S]) -> Option<usize> {
-    let code = normalize(input)?;
+///
+/// # Errors
+///
+/// [`crate::password::Busy`]: no permit of the hasher's pool came free in time, and
+/// nothing was checked. Answer 503; it is not a wrong code.
+pub async fn find_match<S: AsRef<str>>(
+    input: &str,
+    hashes: &[S],
+) -> Result<Option<usize>, crate::password::Busy> {
+    let Some(code) = normalize(input) else {
+        return Ok(None);
+    };
     let hashes: Vec<&str> = hashes.iter().map(AsRef::as_ref).collect();
     crate::password::find_matching(&code, &hashes, DEFAULT_COUNT).await
 }
@@ -155,14 +165,19 @@ mod tests {
         let hashes: Vec<&str> = codes.iter().map(|c| c.hash.as_str()).collect();
         // Typed lower case, without the hyphen, and with the look-alike letters.
         let typed = codes[1].code.to_lowercase().replace('-', " ");
-        assert_eq!(find_match(&typed, &hashes).await, Some(1));
-        assert_eq!(find_match(&codes[2].code, &hashes).await, Some(2));
-        assert_eq!(find_match("ZZZZZ-ZZZZZ", &hashes).await, None);
-        assert_eq!(find_match("nonsense", &hashes).await, None);
+        assert_eq!(find_match(&typed, &hashes).await.unwrap(), Some(1));
+        assert_eq!(find_match(&codes[2].code, &hashes).await.unwrap(), Some(2));
+        assert_eq!(find_match("ZZZZZ-ZZZZZ", &hashes).await.unwrap(), None);
+        assert_eq!(find_match("nonsense", &hashes).await.unwrap(), None);
         // A used code is passed no more, and then matches nothing.
-        assert_eq!(find_match(&codes[1].code, &hashes[..1]).await, None);
         assert_eq!(
-            find_match(&codes[0].code, &Vec::<String>::new()).await,
+            find_match(&codes[1].code, &hashes[..1]).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            find_match(&codes[0].code, &Vec::<String>::new())
+                .await
+                .unwrap(),
             None
         );
     }

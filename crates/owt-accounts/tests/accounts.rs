@@ -1483,12 +1483,20 @@ mod cli {
         )
         .await
         .unwrap();
-        assert!(owt_auth::password::verify("shared passphrase", out.trim()).await);
+        assert!(
+            owt_auth::password::verify("shared passphrase", out.trim())
+                .await
+                .unwrap()
+        );
         let out = exec(&db, AccountCommand::Hash { generate: true }, None)
             .await
             .unwrap();
         let secret = shown(&out, "password");
-        assert!(owt_auth::password::verify(&secret, out.lines().last().unwrap()).await);
+        assert!(
+            owt_auth::password::verify(&secret, out.lines().last().unwrap())
+                .await
+                .unwrap()
+        );
         db.drop().await;
     }
 }

@@ -136,13 +136,31 @@ pub enum SignInRefused {
     #[error("That username or email and password do not match an account.")]
     Mismatch,
     /// The shared throttle could not be reached and fails closed (see
-    /// [`owt_auth::throttle::shared`]): nothing was checked. Answer 503.
+    /// [`owt_auth::throttle::shared`]), or the password hasher stayed saturated for
+    /// its permit timeout ([`owt_auth::password::Busy`]): nothing was checked.
+    /// Answer 503.
     #[error("Signing in is unavailable for a moment. Please try again shortly.")]
     Unavailable,
     /// A fault: the database. Its message says only that; log its source, which
     /// may name tables and columns, and never show it.
     #[error("The sign-in could not be checked. Try again in a moment.")]
-    Fault(#[from] crate::Error),
+    Fault(crate::Error),
+}
+
+impl From<crate::Error> for SignInRefused {
+    /// A busy hasher is [`SignInRefused::Unavailable`]; anything else a fault.
+    fn from(e: crate::Error) -> Self {
+        match e {
+            crate::Error::Busy(_) => Self::Unavailable,
+            e => Self::Fault(e),
+        }
+    }
+}
+
+impl From<owt_auth::password::Busy> for SignInRefused {
+    fn from(_: owt_auth::password::Busy) -> Self {
+        Self::Unavailable
+    }
 }
 
 impl SignInRefused {
@@ -248,7 +266,7 @@ pub async fn password_gate<T: Signed>(
     if !throttle.sign_in(ip, &format!("\0gate\0{}", gate.account)) {
         return Err(SignInRefused::Throttled);
     }
-    let checked = owt_auth::password::check_or_decoy(password, Some(gate.hash)).await;
+    let checked = owt_auth::password::check_or_decoy(password, Some(gate.hash)).await?;
     if !checked.matched() {
         return Err(SignInRefused::Mismatch);
     }
