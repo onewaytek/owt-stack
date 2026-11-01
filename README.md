@@ -1288,6 +1288,10 @@ if let Some(i) = recovery::find_match(typed, &hashes).await {
 # }
 ```
 
+`Throttle` keys an account's budget on the login as the account store matches it
+(NFKC, lower case, trimmed), so `admin` and `ａｄｍｉｎ` spend one budget; a username and
+its account's email are two logins and two budgets. Its counts live in the process, and
+its first sign-in warns when `POD_NAMESPACE` is set (a pod, likely one of several).
 `throttle::shared::SharedThrottle` (the `redis` feature) is `Throttle` counted in Redis, so
 a budget holds across replicas instead of multiplying by their number. It has the same
 budgets and keys, in the same order, charged before the password is checked; its calls
@@ -3232,6 +3236,22 @@ call it last in the transaction, and the transaction must be READ COMMITTED (the
 default; the database refuses others, whose snapshot could miss the chain's last
 event).
 
+**Locks and refusals.** The chain lock is per tenant and lasts until commit, so:
+
+- Record for one tenant per transaction. Two transactions that record for tenants
+  `a` and `b` in opposite orders deadlock; Postgres aborts one of them
+  (`40P01`). If one transaction must record for several tenants, record them in a
+  fixed order (sorted by tenant).
+- Never call `audit.record` for a tenant while your own open transaction has already
+  run `record_in` for that tenant. `record` takes another pool connection, which
+  waits for your transaction's lock while your task waits for `record`. Postgres
+  cannot see that wait, so it lasts until a statement timeout ends it, or forever
+  without one.
+- Record refusals and failures (`Outcome::Denied`, a failed attempt) with
+  `audit.record`, in a transaction of their own, as in the example above. An event
+  recorded with `record_in` rolls back with its transaction, and the transaction of
+  a refused or failed request is usually the one that rolls back.
+
 **Roles.** Run the migrations as the role that owns the schema. Give the app's role
 `INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
 or disable the triggers, which takes ownership. Only the role that runs the anchoring
@@ -3246,6 +3266,24 @@ GRANT SELECT ON owt_audit_anchors TO myapp_app;
 GRANT SELECT ON owt_audit_events TO myapp_anchor;
 GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
 -- Nothing else: no UPDATE, DELETE, TRUNCATE, TRIGGER or ownership.
+```
+
+`owt_audit::privileges(&pool)` reports what the role a pool connects as may do to
+the audit tables: whether it owns them (or is a member of their owner), is a
+superuser, or holds `UPDATE`, `DELETE`, `TRUNCATE` or `TRIGGER` on them. Check it at
+startup, on the pool that serves requests. `templates/openshift/app.yaml`
+runs migrations as the database's owner and serves as a runtime role that
+`owt_audit::grant_runtime` grants as above, so a deployment from it passes this
+check.
+
+```rust,no_run
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+let p = owt_audit::privileges(&pool).await?;
+if !p.least() {
+    // Refuse instead where the log must hold: `anyhow::bail!("{p}")`.
+    tracing::warn!(%p, "the audit log is not append-only for this role");
+}
+# Ok(()) }
 ```
 
 **Anchoring.** The schema's owner can still drop the triggers and rewrite a chain
@@ -3382,10 +3420,16 @@ std::fs::write("m.json", store.fetch(&key, Some(&anchored.receipt)).await?)?;
 
 **Verifying.** `owt_audit::verify(&pool, tenant)` walks a chain and names the first
 event that was edited (`Broken::Hash`), removed (`Broken::Gap`) or swapped
-(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads. With
-the `cli` feature the app gets both as operator commands (`myapp audit verify`,
-`myapp audit verify --manifest m.json` for a manifest fetched from the store, and
-`myapp audit heads`):
+(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads.
+`anchor::history(&pool)` reads every manifest the database records and fails, rather
+than skipping, on one that does not match its digest or does not name the one before
+it; `anchor::age(&pool)` is how old the latest is, for an alert when anchoring stops
+(a store credential rotated, a job not running). With the `cli` feature the app gets
+these as operator commands: `myapp audit verify` checks every chain, that the
+database's anchors chain, and the latest one's heads; `myapp audit verify --manifest
+m.json`, for a manifest fetched from the store, also fails unless the database
+records it; `--max-age 2h` fails when the latest anchor is older (schedule it a
+margin above the anchoring interval); and `myapp audit heads`:
 
 ```rust,no_run
 use clap::{Parser, Subcommand};
@@ -3520,7 +3564,8 @@ struct Msg(String);
 impl owt_bus::Message for Msg {
     fn decode(text: String) -> Option<Self> { Some(Msg(text)) }
     fn text(&self) -> &str { &self.0 }
-    // What every subscriber gets after a resubscribe, when broadcasts may be lost.
+    // What a subscriber gets when broadcasts may have been lost: after a resubscribe,
+    // and after its own full queue dropped messages, once it has room again.
     fn resync() -> Option<Self> { Some(Msg(r#"{"type":"resync"}"#.into())) }
 }
 
@@ -3535,6 +3580,12 @@ bus.publish(Topic::Room(7), Arc::new(Msg("hello".into()))).await;
 let _first = socket.recv().await;
 # Ok(()) }
 ```
+
+A subscriber that falls behind loses messages rather than stalling the publisher.
+The first loss marks it lagged (`Subscription::is_lagged`) and logs one warning, not
+one per message; the drop counter counts each. It gets `resync()` once it has room:
+from `recv` when it has read what was queued, or ahead of its next message when the
+loop reads `rx` directly. So a slow tab replays its state instead of staying stale.
 
 `Bus::local` is the same API in one process, for tests. Channel names are a wire
 format between replicas: change them only with every replica. The prefix is ASCII
@@ -3556,10 +3607,22 @@ run, and graceful shutdown:
   idle timeout) is aborted at its next `.await`, as a crash would stop it, before
   another replica's run can overlap it. It needs a direct connection, not a
   transaction-mode pooler, behind which every run longer than a check is aborted;
-  a check that itself takes longer than `LOCK_CHECK` aborts the run too.
+  a check that itself takes longer than `LOCK_CHECK` aborts the run too. By default
+  the lock's connection comes from the app's pool and is held for the whole run, so a
+  task that also uses the pool needs a pool of two. `singleton_with` takes
+  `PgConnectOptions` instead and holds the lock on a dedicated connection outside the
+  pool, kept between ticks (one idle server connection per replica): an hour-long
+  singleton then holds no pool slot. If that connection drops, the run is stopped as
+  above and the next tick reconnects and contends for the lock again.
 - `leased` (feature `redis`): one replica, the same one while it lives, by a Redis
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
+
+Choosing: `singleton` for periodic work that one replica at a time does and that
+needs only Postgres; `leased` when the work wants a sticky owner and a fast handover
+at shutdown, or the app sits behind a transaction-mode pooler; the durable queue
+("Durable job queue", below) for work items that must each run, survive a crash and
+retry, rather than a tick that may be skipped.
 
 ```rust,no_run
 use std::time::Duration;
@@ -3578,6 +3641,10 @@ jobs.every_replica("weekly_pass", Every::new(Duration::from_secs(60)), move || {
 
 // One replica at a time drives the bots; the others skip that tick.
 jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_001, || async { Ok(()) });
+
+// A long singleton on a connection of its own, outside the app's pool.
+let opts = pool.connect_options().as_ref().clone();
+jobs.singleton_with("rebuild", Every::new(Duration::from_hours(1)), opts, 7_210_003, || async { Ok(()) });
 
 // One replica owns the clock; the TTL outlasts the period so ownership sticks.
 let leases = Leases::new(redis, Leases::new_holder_id(), "myapp")?;
@@ -3690,9 +3757,15 @@ enqueue.
   `JobError::permanent(..)`, the job is **dead**: kept with its payload and last error
   for `Queue::dead`, `Queue::redrive` (queued again with fresh attempts) or
   `Queue::discard_dead`.
-- **The worker** claims while it has free slots (`concurrency`), runs each job in its
+- **The worker** polls: it claims while it has free slots (`concurrency`) and, after
+  a claim that finds nothing due, waits `Worker::poll` (default 5 s) before claiming
+  again. A job that becomes due, a freshly enqueued one included, may therefore wait
+  up to that interval before it starts; a queue that needs a quicker start sets
+  `.poll(Duration::from_millis(500))` or so, at one claim query per interval per
+  replica. There is no `LISTEN/NOTIFY` (see "Decisions"). The worker runs each job in its
   own task (a panic is a failed attempt), renews running jobs' heartbeats every third
-  of `stale_after`, and puts back jobs whose heartbeat went stale on any replica (a
+  of `stale_after` (aborting a handler whose claim the heartbeat finds taken over, so
+  a lost claim does not run on beside its replacement), and puts back jobs whose heartbeat went stale on any replica (a
   replica that died). Heartbeats and housekeeping run in tasks of their own, so a slow
   claim or purge never delays a heartbeat. Done jobs are purged after `retain_done`
   (7 days) in batches, which frees their keys. On shutdown it claims nothing more,
@@ -4541,6 +4614,13 @@ workflow cannot take a permission its caller withholds, and a caller that grants
 less fails to start, `attest: false` or not. `attest: false` skips the signature and
 the SBOM, not the scan.
 
+**Base images float on purpose.** The template's `FROM` lines name tags (`rust:1`,
+`core-runtime:2`), not digests, so every build picks up the base's latest patches
+without a bot bumping pins. Two builds of one commit can therefore differ. What a
+given image was built from is still on record: the signature binds its digest, and
+the SBOM attestation lists the base's packages and versions. An app that needs a
+rebuild to be byte-reproducible passes `base-image` as a digest (used as given).
+
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
 image and the Dockerfile in Hummingbird's. The template Dockerfile owns `/app/static`
@@ -5331,6 +5411,12 @@ this command, run when the app adopts a release, is the only thing that moves it
   dashboards and load-test reports keep their names.
 - **Bus channel names** (`<prefix>:<topic>`, `~changed`, `~beat`) are a wire format
   between replicas. Changing one is a rollout hazard: old and new replicas must agree.
+- **The job queue polls; it is not notified.** `LISTEN/NOTIFY` would pin a
+  connection per listening worker, and `NOTIFY` serialises committing transactions on
+  one server-wide lock, a ceiling for enqueue-heavy apps; a transaction-mode pooler
+  drops `LISTEN` without a word, so a safety poll is needed anyway. A claim is one
+  partial-index query per worker per interval (`Worker::poll`, default 5 s), and a
+  queue that needs a quicker start shortens its interval.
 - **One audit chain per tenant**, not one global chain. Appends to a chain are
   serialized, so a global chain would make every tenant's writes wait on one lock;
   per tenant, they never wait on each other. A tenant's chain verifies and exports

@@ -17,7 +17,8 @@
 //! * **Append-only.** Triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on the
 //!   tables while they stand. The app's role is granted `INSERT` and `SELECT` only
 //!   (see the README), so it cannot drop or disable them; the tables' owner could,
-//!   which is what anchoring is for. A role that may insert can still record false
+//!   which is what anchoring is for. [`privileges()`] reports whether the role a pool
+//!   connects as holds more than that. A role that may insert can still record false
 //!   events, as it can make false changes: the log shows what was recorded and that
 //!   nothing recorded was altered since.
 //! * **Verification.** [`verify`] walks a chain, recomputing every hash and link;
@@ -39,6 +40,7 @@ pub mod canonical;
 #[cfg(feature = "cli")]
 pub mod cli;
 mod migrations;
+mod privileges;
 mod verify;
 
 use std::net::IpAddr;
@@ -47,6 +49,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sqlx::{PgConnection, PgPool};
 
 pub use migrations::{LEDGER, LOCK_ID, grant_runtime, migrate, migrator};
+pub use privileges::{Privileges, privileges};
 pub use verify::{Broken, Head, Verified, VerifyError, heads, verify, verify_anchor, verify_since};
 
 /// The hash of an event, or of the nothing before a chain's first event (all zeros).
@@ -338,6 +341,12 @@ impl Audit {
 /// locked from here until that transaction ends, so record late in it. The
 /// transaction must be READ COMMITTED (Postgres's default); the database refuses
 /// others.
+///
+/// An event recorded here rolls back with its transaction, so record a refusal or
+/// failure with [`Audit::record`] (a transaction of its own) instead. Record for one
+/// tenant per transaction, or for several in a fixed order: two transactions that
+/// lock two tenants' chains in opposite orders deadlock. While this transaction holds
+/// a tenant's chain, an [`Audit::record`] for that tenant waits on it.
 ///
 /// The database assigns the event's place, time and hash; this checks that its hash
 /// is the one the crate's encoding gives, and fails ([`RecordError::Mismatch`])
