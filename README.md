@@ -2873,6 +2873,30 @@ Store ciphertexts as `bytea`. A value's row reference must be known before the
 insert and never change: an id the app makes (a UUID as text), not a sequence the
 database assigns on insert.
 
+**Length padding.** A ciphertext is its plaintext's length plus a fixed overhead, so
+a short value tells itself apart from a long one (a three-character diagnosis code
+from a five-character one). For a field where that matters, seal it padded: the
+plaintext is padded to a multiple of a bucket (`Padding::DEFAULT`, 64 bytes, or
+`Padding::new(n)`) inside the AEAD, ISO/IEC 7816-4 style (`0x80`, then zeros), as
+format `0x03`. Every value whose length falls in one bucket has a ciphertext of one
+length; a value on a boundary takes the next bucket. `decrypt` and `Sealer::open`
+remove the padding, and the format byte (in the associated data) says it is there,
+so a padded value relabelled as unpadded, or the reverse, does not open. Unpadded
+seals are unchanged; `reencrypt` keeps a padded value padded, at the same length.
+A build without format `0x03` refuses such a value as `CryptError::Malformed`: roll
+the release out everywhere before sealing padded.
+
+```rust,no_run
+use owt_crypt::{Crypt, Field, Padding};
+# async fn demo(crypt: Crypt, sealer: owt_crypt::Sealer) -> anyhow::Result<()> {
+let field = Field::new("practice-3", "diagnoses", "code", "4b2e");
+let sealed = crypt.encrypt_str_padded(&field, "F32.1", Padding::DEFAULT).await?;
+let other = sealer.seal_str_padded(&field, "F33.40", Padding::DEFAULT)?;
+assert_eq!(sealed.len(), other.len());
+assert_eq!(&*crypt.decrypt_string(&field, &sealed).await?, "F32.1");
+# Ok(()) }
+```
+
 **Equality search.** A blind index is HMAC-SHA256 of the value under the tenant's
 index key (not its data key), stored beside the ciphertext and searched instead of
 it. It shows which rows hold equal values, so index only what must be found by
