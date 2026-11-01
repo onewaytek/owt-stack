@@ -5,10 +5,17 @@
 //! logs are JSON lines; development logs are human-readable. `RUST_LOG` overrides the
 //! default filter.
 //!
-//! A field whose name matches a denylist (`password`, `token`, `email`, `name`, `note`
-//! and others; see [`Options::redact_fields`]) is logged as `[redacted]` in both
-//! formats and, with feature `otel`, in the exported span and event attributes.
+//! A field whose name matches a denylist (`password`, `token`, `email`, `name` and
+//! others; see [`Options::redact_fields`]) is logged as `[redacted]` in both formats
+//! and, with feature `otel`, in the exported span and event attributes. The defaults
+//! are credentials and personal identifiers; a domain's vocabulary is the app's to add
+//! through [`Options::redact_words`] ([`HEALTH_WORDS`] for health records).
 //! [`Sensitive`] wraps a value that must never print.
+//!
+//! With JSON output, [`init`] also installs a panic hook that logs a panic's location
+//! and thread as one `error` event and leaves out its payload: an `expect` message or
+//! an unwrapped error's `Debug` can carry data, and the default hook writes it to
+//! stderr, which is the log stream.
 //!
 //! Both are a safety net, and they judge names only:
 //!
@@ -39,6 +46,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 
+pub use redaction::HEALTH_WORDS;
 pub use sensitive::Sensitive;
 
 use redaction::{RedactingFields, RedactingJsonEvent, RedactingJsonFields, Redactor};
@@ -60,17 +68,23 @@ pub struct Options {
     /// (`password.value`). The defaults are the names `password`, `passwd`, `pwd`,
     /// `secret`, `token`, `access_token`, `refresh_token`, `id_token`, `authorization`,
     /// `cookie`, `set_cookie`, `api_key`, `apikey`, `private_key`, `ssn`, `dob`,
-    /// `date_of_birth`, `email`, `phone`, `address`, `name`, `first_name`, `last_name`,
-    /// `diagnosis`, `note`, `notes`, `content`, `transcript`, `mrn` and `patient_name`;
+    /// `date_of_birth`, `email`, `phone`, `address`, `name`, `first_name`, `last_name`
+    /// and `content`;
     /// a name ending `_secret`, `_token` or `_password`; a name that is, or ends in
     /// `_`, one of `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key`
     /// and `encryption_key`; a name starting `ssn` or `authorization`; and a name with
     /// a `_`-separated word (trailing digits ignored) `password`, `passwd`, `pwd`,
     /// `secret`, `token`, `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`,
-    /// `phone`, `address`, `name`, `diagnosis`, `note`, `notes`, `transcript` or
-    /// `mrn`, so `user_email`, `phone_number` and `password1` are caught. Operational
-    /// names the word rule would catch are listed in `redact_allow`.
+    /// `phone`, `address` or `name`, so `user_email`, `phone_number` and `password1`
+    /// are caught. Operational names the word rule would catch are listed in
+    /// `redact_allow`.
     pub redact_fields: Vec<String>,
+    /// `_`-separated words (trailing digits ignored) that redact a name wherever they
+    /// appear in it, like the default words: the app's own vocabulary. It applies
+    /// whether or not `redact_defaults` does. An app handling health records adds
+    /// [`HEALTH_WORDS`] (`diagnosis`, `note`, `notes`, `transcript`, `mrn`), so
+    /// `diagnosis_code` and `visit_notes` are caught.
+    pub redact_words: Vec<String>,
     /// Whether the defaults apply. `false` redacts exactly `redact_fields`.
     pub redact_defaults: bool,
     /// Names that are never redacted, normalized like `redact_fields`; it wins over
@@ -92,6 +106,7 @@ impl Default for Options {
             json: false,
             otel_endpoint: None,
             redact_fields: Vec::new(),
+            redact_words: Vec::new(),
             redact_defaults: true,
             redact_allow: Vec::new(),
         }
@@ -105,11 +120,7 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    let redactor = Redactor::new(
-        opts.redact_defaults,
-        &opts.redact_fields,
-        &opts.redact_allow,
-    );
+    let redactor = redactor(opts);
     if opts.json {
         fmt::layer()
             .fmt_fields(RedactingJsonFields::new(redactor.clone()))
@@ -125,6 +136,31 @@ where
             None => layer.boxed(),
         }
     }
+}
+
+/// The matcher `opts` describes.
+fn redactor(opts: &Options) -> Redactor {
+    Redactor::new(
+        opts.redact_defaults,
+        &opts.redact_fields,
+        &opts.redact_allow,
+    )
+    .words(&opts.redact_words)
+}
+
+/// Logs a panic as one `error` event naming its location and thread. The payload is
+/// left out: it can carry data (an `expect` message, an unwrapped error's `Debug`).
+fn log_panic(info: &std::panic::PanicHookInfo<'_>) {
+    let location = info.location().map_or_else(
+        || "unknown".to_owned(),
+        |l| format!("{}:{}", l.file(), l.line()),
+    );
+    let thread = std::thread::current();
+    tracing::error!(
+        panic.location = %location,
+        thread.name = thread.name().unwrap_or("unnamed"),
+        "panic; payload not logged"
+    );
 }
 
 /// Keeps the trace exporter alive; dropping it flushes and shuts the exporter down.
@@ -150,6 +186,9 @@ pub fn init(opts: &Options) -> Guard {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&opts.default_filter));
     let fmt_layer = fmt_layer(opts, std::io::stderr, None);
+    if opts.json {
+        std::panic::set_hook(Box::new(log_panic));
+    }
 
     #[cfg(feature = "otel")]
     {
@@ -191,11 +230,7 @@ pub fn init(opts: &Options) -> Guard {
                 opentelemetry_sdk::trace::SdkTracerProvider::builder()
                     .with_batch_exporter(redaction::RedactingExporter::new(
                         exporter,
-                        Redactor::new(
-                            opts.redact_defaults,
-                            &opts.redact_fields,
-                            &opts.redact_allow,
-                        ),
+                        redactor(opts),
                     ))
                     .with_resource(
                         opentelemetry_sdk::Resource::builder()
@@ -315,7 +350,7 @@ mod tests {
                 ssn = 123_456_789_u64,
                 dob = -19_800_101_i64,
                 phone = 5.55123,
-                note = true,
+                secret = true,
                 address = ?vec!["12 Elm St"],
                 content = %"free text",
             );
@@ -369,8 +404,6 @@ mod tests {
             "home_address",
             "patient_dob",
             "dob_year",
-            "mrn_number",
-            "diagnosis_code",
             "password1",
             "token2",
             "secret2",
@@ -420,6 +453,50 @@ mod tests {
         ] {
             assert!(!r.denies(name), "{name} should pass");
         }
+    }
+
+    #[test]
+    fn health_words_are_the_apps_to_add() {
+        let neutral = redaction::Redactor::new(true, &[], &[]);
+        for name in ["diagnosis_code", "mrn_number", "visit_notes", "transcript"] {
+            assert!(!neutral.denies(name), "{name} is not a default");
+        }
+        let words: Vec<String> = HEALTH_WORDS.iter().map(|w| (*w).to_owned()).collect();
+        let health = redaction::Redactor::new(true, &[], &[]).words(&words);
+        for name in [
+            "diagnosis_code",
+            "mrn_number",
+            "visitNotes",
+            "transcript2",
+            "note",
+        ] {
+            assert!(health.denies(name), "{name} should be denied");
+        }
+        assert!(health.denies("password"), "the defaults still apply");
+        let only = redaction::Redactor::new(false, &[], &[]).words(&words);
+        assert!(only.denies("diagnosis") && !only.denies("password"));
+        let allowed = redaction::Redactor::new(true, &[], &["note_count".into()]).words(&words);
+        assert!(!allowed.denies("note_count"));
+    }
+
+    #[test]
+    fn a_panic_logs_its_location_and_not_its_payload() {
+        let out = capture(
+            &Options {
+                json: true,
+                ..Options::default()
+            },
+            || {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(log_panic));
+                let caught = std::panic::catch_unwind(|| panic!("patient 4711"));
+                std::panic::set_hook(previous);
+                assert!(caught.is_err());
+            },
+        );
+        assert!(!out.contains("4711"), "{out}");
+        assert!(out.contains("logging.rs"), "{out}");
+        assert!(out.contains("payload not logged"), "{out}");
     }
 
     #[test]

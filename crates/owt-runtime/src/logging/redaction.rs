@@ -56,13 +56,7 @@ const DEFAULT_NAMES: &[&str] = &[
     "name",
     "first_name",
     "last_name",
-    "diagnosis",
-    "note",
-    "notes",
     "content",
-    "transcript",
-    "mrn",
-    "patient_name",
 ];
 
 /// Key names redacted when they are the whole name or its last `_` segment.
@@ -98,12 +92,13 @@ const DEFAULT_WORDS: &[&str] = &[
     "phone",
     "address",
     "name",
-    "diagnosis",
-    "note",
-    "notes",
-    "transcript",
-    "mrn",
 ];
+
+/// Health-record words an app handling health data adds through
+/// [`Options::redact_words`](super::Options::redact_words). They are not among the
+/// defaults: the defaults hold credentials and personal identifiers any app has, and a
+/// domain's vocabulary is the app's to supply.
+pub const HEALTH_WORDS: &[&str] = &["diagnosis", "note", "notes", "transcript", "mrn"];
 
 /// Normalized names the defaults never redact: the attributes the tracing layers
 /// write, OpenTelemetry's operational ones, and names the word rule would catch by
@@ -141,10 +136,12 @@ const DEFAULT_ALLOW: &[&str] = &[
 ];
 
 /// Decides which field names are redacted. The order of precedence is `allow`, then
-/// `extra`, then the defaults' own allowlist, then the default rules.
+/// `extra`, then the defaults' own allowlist, then the default rules and the app's
+/// words.
 #[derive(Clone, Debug)]
 pub(crate) struct Redactor {
     extra: Arc<HashSet<String>>,
+    words: Arc<HashSet<String>>,
     allow: Arc<HashSet<String>>,
     defaults: bool,
 }
@@ -158,9 +155,18 @@ impl Redactor {
         };
         Self {
             extra: set(extra),
+            words: Arc::default(),
             allow: set(allow),
             defaults,
         }
+    }
+
+    /// Adds `_`-separated words that redact a name wherever they appear in it, like
+    /// the default words, whether or not the defaults apply.
+    #[must_use]
+    pub(crate) fn words(mut self, words: &[String]) -> Self {
+        self.words = Arc::new(words.iter().map(|w| normalize(w).into_owned()).collect());
+        self
     }
 
     /// Whether the value of the field called `name` is redacted. The whole name is
@@ -195,6 +201,14 @@ impl Redactor {
     /// Judges a normalized name against the rules.
     fn judge(&self, n: &str) -> bool {
         if self.extra.contains(n) {
+            return true;
+        }
+        if !self.words.is_empty()
+            && n.split('_').any(|w| {
+                self.words
+                    .contains(w.trim_end_matches(|c: char| c.is_ascii_digit()))
+            })
+        {
             return true;
         }
         self.defaults

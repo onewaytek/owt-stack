@@ -587,16 +587,20 @@ segment of a dotted name is judged on its own (`password.value`). Redacted by de
 * the names `password`, `passwd`, `pwd`, `secret`, `token`, `access_token`,
   `refresh_token`, `id_token`, `authorization`, `cookie`, `set_cookie`, `api_key`,
   `apikey`, `private_key`, `ssn`, `dob`, `date_of_birth`, `email`, `phone`, `address`,
-  `name`, `first_name`, `last_name`, `diagnosis`, `note`, `notes`, `content`,
-  `transcript`, `mrn` and `patient_name`;
+  `name`, `first_name`, `last_name` and `content`;
 * a name ending `_secret`, `_token` or `_password`, and one that is or ends in `_` and
   `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key` or
   `encryption_key` (`cache_key` and `idempotency_key` are not);
 * a name starting `ssn` or `authorization`, and a name with a `_`-separated word
   (trailing digits ignored) `password`, `passwd`, `pwd`, `secret`, `token`,
-  `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`, `phone`, `address`,
-  `name`, `diagnosis`, `note`, `notes`, `transcript` or `mrn`, so `user_email`,
-  `phone_number` and `password1` are caught.
+  `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`, `phone`, `address` or
+  `name`, so `user_email`, `phone_number` and `password1` are caught.
+
+The defaults are credentials and personal identifiers any app has. A domain's vocabulary
+is the app's to add: `Options::redact_words` takes `_`-separated words that redact a name
+wherever they appear, like the default words, and applies whether or not the defaults
+do. An app handling health records adds `logging::HEALTH_WORDS` (`diagnosis`, `note`,
+`notes`, `transcript`, `mrn`), so `diagnosis_code` and `visit_notes` are caught.
 
 The word rule catches operational names too (`bind_address`, `file_name`), so a name can be
 allowed. The defaults never redact the attributes the tracing layers write, by exact
@@ -631,6 +635,8 @@ let _logging = logging::init(&logging::Options {
     service: "myapp",
     // Redacted in addition to the defaults.
     redact_fields: vec!["nickname".into()],
+    // A health-records app's vocabulary.
+    redact_words: logging::HEALTH_WORDS.iter().map(|w| (*w).to_owned()).collect(),
     ..logging::Options::default()
 });
 // `email` is denied by name; `credential` is not, so `Sensitive` keeps the password out.
@@ -653,6 +659,12 @@ logged. Only names are judged:
   member of `login`, because the field is named `req`; wrap the members in `Sensitive`.
   An error's message prints whatever it contains (a unique violation names the
   duplicate value), so log an error's code or kind where data may appear.
+
+With JSON output (production), `logging::init` also replaces the panic hook: a panic is
+logged as one `error` event with its `panic.location` and `thread.name`, and its payload
+is left out, because an `expect` message or an unwrapped error's `Debug` can carry data
+and the default hook writes it to stderr, the log stream. Text output keeps the default
+hook, payload and all, for development.
 
 ### Handlers, errors and pages
 
