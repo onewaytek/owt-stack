@@ -143,6 +143,11 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+A credential is read with `env::secret`, which returns a
+`logging::Sensitive<String>` that prints as `[redacted]` (`expose()` reads it), so
+a derived `Debug` of the config that keeps it does not print it. `env::Vars`, a map
+of variables for tests, prints its names and never its values.
+
 `serve::serve` is the same with `ServeOptions::default()`: a request head must arrive
 within 30 s (an idle kept-alive connection closes then too), at most 4096 connections
 are open at once, and a stop drains for up to 20 s. `ServeOptions` is built from its
@@ -233,7 +238,7 @@ async fn account_epoch(pool: &sqlx::PgPool, user_id: i64) -> sqlx::Result<Option
 
 pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool: sqlx::PgPool) -> Router {
     // `__Host-`: browsers refuse a copy set over plain HTTP or by a sibling subdomain.
-    let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_secs(14 * 86_400), true)
+    let sessions = Sessions::<SessionData>::new(key, "__Host-session", Duration::from_hours(12), true)
         .validate_with(move |s: Presented<SessionData>| {
             let pool = pool.clone();
             async move {
@@ -264,15 +269,19 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
 }
 ```
 
-**Idle timeout and lifetimes.** Three limits end a session, and an app handling
-health data sets all three: `max_age` (how long a cookie lives without being
-resealed), `absolute_lifetime` (from sign-in, however active: 30 days unless set),
-and `idle_timeout` (since the person's last activity). Revocation is the epoch above:
+**Idle timeout and lifetimes.** Three limits end a session: `max_age` (how long a
+cookie lives without being resealed), `absolute_lifetime` (from sign-in, however
+active: `session::ABSOLUTE_LIFETIME`, 24 hours, unless set, or `max_age` if longer),
+and `idle_timeout` (since the person's last activity: `session::IDLE_TIMEOUT`, 30
+minutes, unless set). These are NIST SP 800-63B-4's AAL2 bounds; an app handling
+health data sets AAL3's (12 hours, 15 minutes). An app whose sessions guard nothing
+a copied cookie could misuse (a game's guest identity) may call
+`without_idle_timeout()`. Revocation is the epoch above:
 `sign_out_everywhere`, a password change or a deactivation moves the account's
 `session_epoch`, and the validator refuses every session sealed under the old one on
 its next request, on every replica.
 
-With `idle_timeout`, the cookie also carries the last-active time. Activity (a
+With an idle timeout, the cookie also carries the last-active time. Activity (a
 request that carries the session, is not passive and does not fail) refreshes it at
 most once per `idle_refresh` (a tenth of the timeout, at least 15 s, by default;
 never more than half the timeout), so a busy page does not rewrite a cookie on every
@@ -299,9 +308,11 @@ request whose session stands carries
 `owt-idle-remaining: <seconds>` (`session::IDLE_REMAINING_HEADER`), with
 `Cache-Control: no-store` and `Vary: cookie`, since the value is one person's.
 
-Turning the timeout on ends every session older than it (a cookie sealed without the
-last-active time counts from its sign-in), and replicas without it drop the time
-when they reseal: enable it once every replica runs a build that knows it.
+Turning the timeout on (an upgrade to a build where it is the default included) ends
+every session older than it (a cookie sealed without the last-active time counts from
+its sign-in), and replicas without it drop the time when they reseal: enable it once
+every replica runs a build that knows it, or call `without_idle_timeout()` until
+then.
 
 ```rust,no_run
 use std::time::Duration;
@@ -468,16 +479,17 @@ the handler and write `<script nonce="{{ nonce }}">`.
   # fn main() -> anyhow::Result<()> {
   use owt_web::session::{Sessions, key_for, key_from_base64};
   # #[derive(Clone, Default, serde::Serialize, serde::Deserialize)] struct SessionData;
-  let secret = owt_runtime::env::required("SESSION_SECRET")?;
+  // `secret`, not `required`: a `Sensitive<String>`, which prints as `[redacted]`.
+  let secret = owt_runtime::env::secret("SESSION_SECRET")?;
   let purpose = format!("myapp/{}", owt_runtime::env::required("POD_NAMESPACE")?);
   let sessions = Sessions::<SessionData>::new(
-      key_for(&secret, &purpose)?,
+      key_for(secret.expose(), &purpose)?,
       "__Host-session",
       std::time::Duration::from_secs(14 * 86_400),
       true,
   )
   // For one `max_age` after the move, then drop it (never after a leak).
-  .also_open_with(key_from_base64(&secret)?);
+  .also_open_with(key_from_base64(secret.expose())?);
   # Ok(()) }
   ```
 - **Failed requests change no session:** a 5xx response (the `Limits` timeout's
@@ -587,16 +599,20 @@ segment of a dotted name is judged on its own (`password.value`). Redacted by de
 * the names `password`, `passwd`, `pwd`, `secret`, `token`, `access_token`,
   `refresh_token`, `id_token`, `authorization`, `cookie`, `set_cookie`, `api_key`,
   `apikey`, `private_key`, `ssn`, `dob`, `date_of_birth`, `email`, `phone`, `address`,
-  `name`, `first_name`, `last_name`, `diagnosis`, `note`, `notes`, `content`,
-  `transcript`, `mrn` and `patient_name`;
+  `name`, `first_name`, `last_name` and `content`;
 * a name ending `_secret`, `_token` or `_password`, and one that is or ends in `_` and
   `api_key`, `private_key`, `secret_key`, `access_key`, `signing_key` or
   `encryption_key` (`cache_key` and `idempotency_key` are not);
 * a name starting `ssn` or `authorization`, and a name with a `_`-separated word
   (trailing digits ignored) `password`, `passwd`, `pwd`, `secret`, `token`,
-  `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`, `phone`, `address`,
-  `name`, `diagnosis`, `note`, `notes`, `transcript` or `mrn`, so `user_email`,
-  `phone_number` and `password1` are caught.
+  `authorization`, `cookie`, `apikey`, `ssn`, `dob`, `email`, `phone`, `address` or
+  `name`, so `user_email`, `phone_number` and `password1` are caught.
+
+The defaults are credentials and personal identifiers any app has. A domain's vocabulary
+is the app's to add: `Options::redact_words` takes `_`-separated words that redact a name
+wherever they appear, like the default words, and applies whether or not the defaults
+do. An app handling health records adds `logging::HEALTH_WORDS` (`diagnosis`, `note`,
+`notes`, `transcript`, `mrn`), so `diagnosis_code` and `visit_notes` are caught.
 
 The word rule catches operational names too (`bind_address`, `file_name`), so a name can be
 allowed. The defaults never redact the attributes the tracing layers write, by exact
@@ -631,6 +647,8 @@ let _logging = logging::init(&logging::Options {
     service: "myapp",
     // Redacted in addition to the defaults.
     redact_fields: vec!["nickname".into()],
+    // A health-records app's vocabulary.
+    redact_words: logging::HEALTH_WORDS.iter().map(|w| (*w).to_owned()).collect(),
     ..logging::Options::default()
 });
 // `email` is denied by name; `credential` is not, so `Sensitive` keeps the password out.
@@ -653,6 +671,12 @@ logged. Only names are judged:
   member of `login`, because the field is named `req`; wrap the members in `Sensitive`.
   An error's message prints whatever it contains (a unique violation names the
   duplicate value), so log an error's code or kind where data may appear.
+
+With JSON output (production), `logging::init` also replaces the panic hook: a panic is
+logged as one `error` event with its `panic.location` and `thread.name`, and its payload
+is left out, because an `expect` message or an unwrapped error's `Debug` can carry data
+and the default hook writes it to stderr, the log stream. Text output keeps the default
+hook, payload and all, for development.
 
 ### Handlers, errors and pages
 
@@ -960,7 +984,12 @@ if !throttle.sign_in(ip, account) {
 }
 // Argon2id on the blocking pool, a bounded number at once. An unknown account
 // (`None`) costs a real check too, so timing does not tell which accounts exist.
-let checked = password::check_or_decoy(given, stored_hash).await;
+// A check that finds no permit within `password::DEFAULT_PERMIT_TIMEOUT` (5 s) fails
+// with `password::Busy`: answer 503 (`owt_web::Error::unavailable`), not a mismatch.
+let checked = match password::check_or_decoy(given, stored_hash).await {
+    Ok(checked) => checked,
+    Err(busy) => return Err(owt_web::Error::unavailable(busy.to_string()).into()),
+};
 if checked.matched() {
     // A hash made with weaker parameters than today's, or of the password as typed
     // before passwords were normalized (`Check::MatchRaw`): store a fresh one.
@@ -1037,6 +1066,17 @@ let verifier = jwt::Verifier::discover(http, "https://sso.example/realms/x", "my
 let claims: jwt::Claims = verifier.verify("eyJ...").await?;
 # let _ = claims; Ok(()) }
 ```
+
+**A saturated hasher answers 503.** Argon2 checks run a bounded number at once
+(`password::set_concurrency`; the CPU count, at most 8). A check waits for a permit
+at most `password::DEFAULT_PERMIT_TIMEOUT`, five seconds, then fails with
+`password::Busy` instead of queueing for as long as the burst lasts; change the wait
+at startup with `password::set_permit_timeout`. `verify`, `check`, `verify_or_decoy`,
+`check_or_decoy` and `recovery::find_match` return `Result<_, Busy>`, and `hash`'s
+`anyhow::Error` downcasts to `Busy`. `owt_accounts` turns it into
+`SignInRefused::Unavailable`, `MfaError::Unavailable` or `Error::Busy`, each a 503
+with `Retry-After` through `owt_web::Error::Unavailable`; it is never counted as a
+wrong password.
 
 **The client's address** is configuration, never a guess. `Source::from_env()` reads
 `CLIENT_IP` (`forwarded-for:N`, `header:NAME` or `peer`), else `TRUSTED_PROXIES` (a
@@ -1279,15 +1319,20 @@ let codes = recovery::generate(recovery::DEFAULT_COUNT).await?;
 let _show_once: Vec<&str> = codes.iter().map(|c| c.code.as_str()).collect();
 let _store: Vec<&str> = codes.iter().map(|c| c.hash.as_str()).collect();
 
-// Sign-in: which unused code, if any, was typed.
+// Sign-in: which unused code, if any, was typed. `password::Busy` (no hashing
+// permit in time) is a 503, not a wrong code.
 let hashes: Vec<&str> = unused.iter().map(|(_, hash)| hash.as_str()).collect();
-if let Some(i) = recovery::find_match(typed, &hashes).await {
+if let Some(i) = recovery::find_match(typed, &hashes).await? {
     let _row_to_mark_used = unused[i].0;
 }
 # Ok(())
 # }
 ```
 
+`Throttle` keys an account's budget on the login as the account store matches it
+(NFKC, lower case, trimmed), so `admin` and `ａｄｍｉｎ` spend one budget; a username and
+its account's email are two logins and two budgets. Its counts live in the process, and
+its first sign-in warns when `POD_NAMESPACE` is set (a pod, likely one of several).
 `throttle::shared::SharedThrottle` (the `redis` feature) is `Throttle` counted in Redis, so
 a budget holds across replicas instead of multiplying by their number. It has the same
 budgets and keys, in the same order, charged before the password is checked; its calls
@@ -1525,8 +1570,13 @@ every name made after.
 
 **Revocation, and what it does not reach:**
 
-- `session::sign_out` replaces this browser's cookie; a copy of it taken earlier
-  still opens until it expires. Only `sign_out_everywhere` (the epoch) revokes.
+- `session::sign_out` revokes this session alone: its id goes into
+  `revoked_sessions` (migration 0009) until its cookie would have expired anyway,
+  and the per-request account load checks it by primary key in the same query, so a
+  copy of the cookie taken earlier opens nothing. Expired rows are deleted by later
+  sign-outs. `sign_out_everywhere` bumps the epoch and ends every session of the
+  account. A database error from `sign_out` still replaces the cookie, but the
+  copy stays good until it expires.
 - A password change, deactivation or a demotion ends every session at its next
   request, but a stream opened before (SSE, a WebSocket) was checked at its start:
   an app that streams to signed-in people re-checks `store::by_id_in_epoch` on
@@ -1626,7 +1676,7 @@ match session::password_gate(&pool, &gate_throttle, &session, ip, given, gate).a
     Ok(account) => { let _ = account; /* redirect */ }
     Err(refused) => { let _ = (refused.status(), refused.to_string()); /* the form again */ }
 }
-session::sign_out(&session); // this session
+session::sign_out(&pool, &session).await?; // this session, copies of its cookie too
 session::sign_out_everywhere(&pool, &session).await?; // every session: the epoch moves
 
 // Accounts: normalized, password rules checked (`owt_accounts::password`), a taken
@@ -1957,8 +2007,9 @@ supply a `SecretSealer` that encrypts it with a key the database does not hold
 (`owt-crypt`'s, say). The stored value carries a format byte and the sealer's key id, so
 keys rotate (a secret sealed under an older id is opened with it and resealed at its next
 use). The default, `Unsealed`, stores it in the clear, marked plain, and logs a warning; it is
-for development, and a plain row is accepted and sealed at its next use once a real sealer is
-set, so adopting one later locks nobody out. Then turn `Mfa::accept_plaintext(false)` on once
+for development, and a release build (no `debug_assertions`) refuses it: enrolling, and
+signing in with a factor it stored, fail as a fault until a real sealer is set. A plain row is
+accepted and sealed at its next use once one is, so adopting one later locks nobody out. Then turn `Mfa::accept_plaintext(false)` on once
 none remain (`SELECT count(*) FROM account_totp WHERE get_byte(secret, 0) = 0` is 0): until
 then anyone who can write to the table can plant a known secret in a plain row, which the
 sealer's authentication would have stopped. A sealer must treat the key id it is handed as
@@ -2111,7 +2162,12 @@ there removes the password and signs the account out everywhere, as
 (key, subject, when added and last used), each with a button that retires it through
 `identities::forget_as`, which signs the account out everywhere too.
 
-- **Who:** only `Staff`, and each change re-checks inside its transaction that its
+- **Who:** only `Staff` who used a second factor within `admin::STEP_UP` (15
+  minutes) for every change (any `POST`): a member of staff without one is sent to
+  the re-authentication page (`Accounts::reauth_at`), or to enrollment when the
+  account has no factor under `require_mfa`, with `?next=` the account's page. Pages
+  that only show still open on `Staff` alone. Each change re-checks inside its
+  transaction that its
   author is still active staff (locking both rows, so two staff removing each other at
   once cannot leave none). It refuses your own staff access, deactivating yourself,
   turning your own password sign-in off, retiring your own local identity, unlinking
@@ -2124,10 +2180,45 @@ there removes the password and signs the account out everywhere, as
   everywhere" end every session and void the account's unused sign-in links (in the
   same statement); removing a sign-in connection, retiring a local identity and
   turning password sign-in off sign the account out everywhere too.
-  A link is not issued to a deactivated account.
+  A link is not issued to a deactivated account, and lives at most
+  `admin::MAX_LINK_TTL` (24 hours), whatever `Admin::sign_in_links` asks.
 - **What is kept:** every response is `no-store` and never framed, a refusal (a 403,
   a 404, a 422) included; a password or link is shown once; each change is logged at
   `info` with who made it and what changed.
+- **What is recorded:** each change is an `admin::Event` (actor, account, an
+  `EventKind`, a dotted `name()` such as `admin.password.reset`) handed to the app's
+  `admin::Recorder` (`Admin::audit`) on the change's own transaction, so the change
+  and its audit record commit together; a recorder that fails rolls the change back
+  and answers 500. Without a recorder `Admin::routes` warns at startup. An app with
+  its own session type names it with `Admin::session::<T>()`, where the step-up
+  proof is read.
+
+```rust,no_run
+use std::pin::Pin;
+use owt_accounts::admin::{Admin, Event, Recorder};
+use owt_audit::{ActorKind, Event as AuditEvent};
+
+/// The admin's changes, into the audit chain, in the change's transaction.
+struct Audited;
+
+impl Recorder for Audited {
+    fn record<'a>(
+        &'a self,
+        conn: &'a mut sqlx::PgConnection,
+        event: &'a Event,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let audit = AuditEvent::new(ActorKind::Account, event.actor.to_string(), event.name(), "account")
+                .resource_id(event.account.to_string());
+            owt_audit::record_in(conn, &audit).await?;
+            Ok(())
+        })
+    }
+}
+# fn demo(pool: sqlx::PgPool, chrome: fn(owt_accounts::admin::Page<'_>) -> owt_web::Result<axum::response::Response>) {
+let _admin = Admin::new(pool, "/staff/accounts", chrome).audit(Audited);
+# }
+```
 
 The app gives it a layout and, optionally, its roles, a sign-in-link route, a link
 to its own page about each account (what the admin does not show: a nickname, what
@@ -2635,6 +2726,7 @@ let app: Router = Router::new()
 An app with its own session type adds one field and the trait:
 
 ```rust
+use owt_accounts::mfa::{MfaSession, State};
 use owt_accounts::session::{Signature, Signed};
 use owt_accounts::social::{Social, Started};
 
@@ -2649,6 +2741,13 @@ struct MySession {
 impl Signed for MySession {
     fn signature(&self) -> Option<Signature> { self.signed.signature() }
     fn set_signature(&mut self, s: Option<Signature>) { self.signed.set_signature(s) }
+    fn on_sign_in(&mut self) { self.signed.on_sign_in() }
+}
+// A provider's sign-in is recorded here as a recent sign-in (`Recent`), never as a
+// second factor (`RecentMfa` takes the app's own TOTP or a recovery code).
+impl MfaSession for MySession {
+    fn mfa(&self) -> &State { &self.signed.mfa }
+    fn mfa_mut(&mut self) -> &mut State { &mut self.signed.mfa }
 }
 impl Social for MySession {
     fn started(&self) -> Option<&Started> { self.started.as_ref() }
@@ -3266,6 +3365,22 @@ call it last in the transaction, and the transaction must be READ COMMITTED (the
 default; the database refuses others, whose snapshot could miss the chain's last
 event).
 
+**Locks and refusals.** The chain lock is per tenant and lasts until commit, so:
+
+- Record for one tenant per transaction. Two transactions that record for tenants
+  `a` and `b` in opposite orders deadlock; Postgres aborts one of them
+  (`40P01`). If one transaction must record for several tenants, record them in a
+  fixed order (sorted by tenant).
+- Never call `audit.record` for a tenant while your own open transaction has already
+  run `record_in` for that tenant. `record` takes another pool connection, which
+  waits for your transaction's lock while your task waits for `record`. Postgres
+  cannot see that wait, so it lasts until a statement timeout ends it, or forever
+  without one.
+- Record refusals and failures (`Outcome::Denied`, a failed attempt) with
+  `audit.record`, in a transaction of their own, as in the example above. An event
+  recorded with `record_in` rolls back with its transaction, and the transaction of
+  a refused or failed request is usually the one that rolls back.
+
 **Roles.** Run the migrations as the role that owns the schema. Give the app's role
 `INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
 or disable the triggers, which takes ownership. Only the role that runs the anchoring
@@ -3278,6 +3393,23 @@ GRANT SELECT ON owt_audit_anchors TO myapp_app;
 GRANT SELECT ON owt_audit_events TO myapp_anchor;
 GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
 -- Nothing else: no UPDATE, DELETE, TRUNCATE, TRIGGER or ownership.
+```
+
+`owt_audit::privileges(&pool)` reports what the role a pool connects as may do to
+the audit tables: whether it owns them (or is a member of their owner), is a
+superuser, or holds `UPDATE`, `DELETE`, `TRUNCATE` or `TRIGGER` on them. Check it at
+startup, on the pool that serves requests. `templates/openshift/app.yaml`
+connects the app as the database's owner (the role its migrations run under), so a
+deployment from it fails this check until the app runs as a role granted as above.
+
+```rust,no_run
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+let p = owt_audit::privileges(&pool).await?;
+if !p.least() {
+    // Refuse instead where the log must hold: `anyhow::bail!("{p}")`.
+    tracing::warn!(%p, "the audit log is not append-only for this role");
+}
+# Ok(()) }
 ```
 
 **Anchoring.** The schema's owner can still drop the triggers and rewrite a chain
@@ -3414,10 +3546,16 @@ std::fs::write("m.json", store.fetch(&key, Some(&anchored.receipt)).await?)?;
 
 **Verifying.** `owt_audit::verify(&pool, tenant)` walks a chain and names the first
 event that was edited (`Broken::Hash`), removed (`Broken::Gap`) or swapped
-(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads. With
-the `cli` feature the app gets both as operator commands (`myapp audit verify`,
-`myapp audit verify --manifest m.json` for a manifest fetched from the store, and
-`myapp audit heads`):
+(`Broken::Link`); `verify_anchor(&pool, &manifest)` checks a manifest's heads.
+`anchor::history(&pool)` reads every manifest the database records and fails, rather
+than skipping, on one that does not match its digest or does not name the one before
+it; `anchor::age(&pool)` is how old the latest is, for an alert when anchoring stops
+(a store credential rotated, a job not running). With the `cli` feature the app gets
+these as operator commands: `myapp audit verify` checks every chain, that the
+database's anchors chain, and the latest one's heads; `myapp audit verify --manifest
+m.json`, for a manifest fetched from the store, also fails unless the database
+records it; `--max-age 2h` fails when the latest anchor is older (schedule it a
+margin above the anchoring interval); and `myapp audit heads`:
 
 ```rust,no_run
 use clap::{Parser, Subcommand};
@@ -3552,7 +3690,8 @@ struct Msg(String);
 impl owt_bus::Message for Msg {
     fn decode(text: String) -> Option<Self> { Some(Msg(text)) }
     fn text(&self) -> &str { &self.0 }
-    // What every subscriber gets after a resubscribe, when broadcasts may be lost.
+    // What a subscriber gets when broadcasts may have been lost: after a resubscribe,
+    // and after its own full queue dropped messages, once it has room again.
     fn resync() -> Option<Self> { Some(Msg(r#"{"type":"resync"}"#.into())) }
 }
 
@@ -3567,6 +3706,12 @@ bus.publish(Topic::Room(7), Arc::new(Msg("hello".into()))).await;
 let _first = socket.recv().await;
 # Ok(()) }
 ```
+
+A subscriber that falls behind loses messages rather than stalling the publisher.
+The first loss marks it lagged (`Subscription::is_lagged`) and logs one warning, not
+one per message; the drop counter counts each. It gets `resync()` once it has room:
+from `recv` when it has read what was queued, or ahead of its next message when the
+loop reads `rx` directly. So a slow tab replays its state instead of staying stale.
 
 `Bus::local` is the same API in one process, for tests. Channel names are a wire
 format between replicas: change them only with every replica. The prefix is ASCII
@@ -3588,10 +3733,22 @@ run, and graceful shutdown:
   idle timeout) is aborted at its next `.await`, as a crash would stop it, before
   another replica's run can overlap it. It needs a direct connection, not a
   transaction-mode pooler, behind which every run longer than a check is aborted;
-  a check that itself takes longer than `LOCK_CHECK` aborts the run too.
+  a check that itself takes longer than `LOCK_CHECK` aborts the run too. By default
+  the lock's connection comes from the app's pool and is held for the whole run, so a
+  task that also uses the pool needs a pool of two. `singleton_with` takes
+  `PgConnectOptions` instead and holds the lock on a dedicated connection outside the
+  pool, kept between ticks (one idle server connection per replica): an hour-long
+  singleton then holds no pool slot. If that connection drops, the run is stopped as
+  above and the next tick reconnects and contends for the lock again.
 - `leased` (feature `redis`): one replica, the same one while it lives, by a Redis
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
+
+Choosing: `singleton` for periodic work that one replica at a time does and that
+needs only Postgres; `leased` when the work wants a sticky owner and a fast handover
+at shutdown, or the app sits behind a transaction-mode pooler; the durable queue
+("Durable job queue", below) for work items that must each run, survive a crash and
+retry, rather than a tick that may be skipped.
 
 ```rust,no_run
 use std::time::Duration;
@@ -3610,6 +3767,10 @@ jobs.every_replica("weekly_pass", Every::new(Duration::from_secs(60)), move || {
 
 // One replica at a time drives the bots; the others skip that tick.
 jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_001, || async { Ok(()) });
+
+// A long singleton on a connection of its own, outside the app's pool.
+let opts = pool.connect_options().as_ref().clone();
+jobs.singleton_with("rebuild", Every::new(Duration::from_hours(1)), opts, 7_210_003, || async { Ok(()) });
 
 // One replica owns the clock; the TTL outlasts the period so ownership sticks.
 let leases = Leases::new(redis, Leases::new_holder_id(), "myapp")?;
@@ -3722,9 +3883,15 @@ enqueue.
   `JobError::permanent(..)`, the job is **dead**: kept with its payload and last error
   for `Queue::dead`, `Queue::redrive` (queued again with fresh attempts) or
   `Queue::discard_dead`.
-- **The worker** claims while it has free slots (`concurrency`), runs each job in its
+- **The worker** polls: it claims while it has free slots (`concurrency`) and, after
+  a claim that finds nothing due, waits `Worker::poll` (default 5 s) before claiming
+  again. A job that becomes due, a freshly enqueued one included, may therefore wait
+  up to that interval before it starts; a queue that needs a quicker start sets
+  `.poll(Duration::from_millis(500))` or so, at one claim query per interval per
+  replica. There is no `LISTEN/NOTIFY` (see "Decisions"). The worker runs each job in its
   own task (a panic is a failed attempt), renews running jobs' heartbeats every third
-  of `stale_after`, and puts back jobs whose heartbeat went stale on any replica (a
+  of `stale_after` (aborting a handler whose claim the heartbeat finds taken over, so
+  a lost claim does not run on beside its replacement), and puts back jobs whose heartbeat went stale on any replica (a
   replica that died). Heartbeats and housekeeping run in tasks of their own, so a slow
   claim or purge never delays a heartbeat. Done jobs are purged after `retain_done`
   (7 days) in batches, which frees their keys. On shutdown it claims nothing more,
@@ -4573,6 +4740,13 @@ workflow cannot take a permission its caller withholds, and a caller that grants
 less fails to start, `attest: false` or not. `attest: false` skips the signature and
 the SBOM, not the scan.
 
+**Base images float on purpose.** The template's `FROM` lines name tags (`rust:1`,
+`core-runtime:2`), not digests, so every build picks up the base's latest patches
+without a bot bumping pins. Two builds of one commit can therefore differ. What a
+given image was built from is still on record: the signature binds its digest, and
+the SBOM attestation lists the base's packages and versions. An app that needs a
+rebuild to be byte-reproducible passes `base-image` as a digest (used as given).
+
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
 image and the Dockerfile in Hummingbird's. The template Dockerfile owns `/app/static`
@@ -5274,8 +5448,8 @@ this command, run when the app adopts a release, is the only thing that moves it
   header. Session cookies stay `SameSite=Lax` as a second line.
 - **Sessions are cookies.** Sealed with AES-GCM; no store. Revoke by epoch (a counter
   in the account, copied into the session at sign-in, bumped at sign-out) checked in
-  `Sessions::validate_with`. A session ends at its absolute lifetime however often it
-  is re-sealed, and a response that sets the cookie is never cacheable.
+  `Sessions::validate_with`. A session ends after 30 minutes idle and at its absolute
+  lifetime (24 hours) however often it is re-sealed, both unless the app sets others, and a response that sets the cookie is never cacheable.
 - **Fragments have their own URLs.** Nothing varies by request header, so every
   response stays cacheable behind a CDN that ignores `Vary`.
 - **Password policy: NIST SP 800-63B-4, not folklore.** 15 characters at least for a password
@@ -5314,6 +5488,12 @@ this command, run when the app adopts a release, is the only thing that moves it
   dashboards and load-test reports keep their names.
 - **Bus channel names** (`<prefix>:<topic>`, `~changed`, `~beat`) are a wire format
   between replicas. Changing one is a rollout hazard: old and new replicas must agree.
+- **The job queue polls; it is not notified.** `LISTEN/NOTIFY` would pin a
+  connection per listening worker, and `NOTIFY` serialises committing transactions on
+  one server-wide lock, a ceiling for enqueue-heavy apps; a transaction-mode pooler
+  drops `LISTEN` without a word, so a safety poll is needed anyway. A claim is one
+  partial-index query per worker per interval (`Worker::poll`, default 5 s), and a
+  queue that needs a quicker start shortens its interval.
 - **One audit chain per tenant**, not one global chain. Appends to a chain are
   serialized, so a global chain would make every tenant's writes wait on one lock;
   per tenant, they never wait on each other. A tenant's chain verifies and exports

@@ -6,7 +6,7 @@
 //! | mode | runs on | for |
 //! |---|---|---|
 //! | [`Jobs::every_replica`] | each replica, each period | idempotent work: the task takes its rows with `FOR UPDATE SKIP LOCKED`, so replicas share it |
-//! | [`Jobs::singleton`] | at most one replica at a time | work that must not overlap (a simulation driver): a Postgres advisory lock, tried and skipped, never waited on; a run whose lock's connection drops is stopped |
+//! | [`Jobs::singleton`] | at most one replica at a time | work that must not overlap (a simulation driver): a Postgres advisory lock, tried and skipped, never waited on; a run whose lock's connection drops is stopped. [`Jobs::singleton_with`] holds the lock on a dedicated connection outside the app's pool |
 //! | [`Jobs::leased`] (feature `redis`) | one replica, the same one while it lives | work whose owner should stick (a clock): a Redis lease with a TTL, renewed while held, taken over when its holder dies |
 //!
 //! All three share a loop:
@@ -339,7 +339,8 @@ impl Jobs {
     /// its own for exactly the run, and that connection is closed rather than pooled
     /// if the unlock fails, so a lock can never leak into the pool. The run holds that
     /// connection throughout, so a task that also takes connections from `pool` needs
-    /// a pool of at least two, or it waits on itself.
+    /// a pool of at least two, or it waits on itself; a run that lasts long keeps a
+    /// slot of the app's pool for as long, which [`Jobs::singleton_with`] avoids.
     ///
     /// The lock lives as long as its session. If that connection drops mid-run (an
     /// idle-session timeout, a failover, a network reset), Postgres releases the lock
@@ -371,24 +372,8 @@ impl Jobs {
             while this.wait(every, std::mem::take(&mut first)).await {
                 let outcome = match try_lock(&pool, lock_id).await {
                     Ok(Some(mut conn)) => {
-                        let task = task.clone();
-                        let outcome = this
-                            .run_until(name, move || task(), lock_lost(&mut conn, name, lock_id))
-                            .await;
-                        // Bounded like the checks: a hung connection is closed, which
-                        // ends the session and its lock, rather than waited on.
-                        let unlocked = tokio::time::timeout(
-                            LOCK_CHECK,
-                            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
-                                .bind(lock_id)
-                                .fetch_one(&mut *conn),
-                        )
-                        .await;
-                        if !matches!(unlocked, Ok(Ok(true))) {
-                            tracing::warn!(
-                                job = name,
-                                "advisory unlock failed; closing its connection"
-                            );
+                        let (outcome, keep) = this.hold(name, &task, &mut conn, lock_id).await;
+                        if !keep {
                             conn.close_on_drop();
                         }
                         outcome
@@ -407,6 +392,105 @@ impl Jobs {
             }
             tracing::debug!(job = name, "job stopped");
         });
+    }
+
+    /// [`Jobs::singleton`], with the advisory lock on a dedicated connection opened
+    /// from `connect` outside the app's pool, so a long run never holds a pool slot
+    /// and a task that uses the pool needs no spare connection for the lock. Pass
+    /// the pool's own settings with `pool.connect_options().as_ref().clone()`.
+    ///
+    /// The connection is opened at the first tick and kept between ticks, so trying
+    /// the lock costs no new connection each period; each replica keeps one idle
+    /// server connection for the job, beyond the pool's cap. A kept connection that
+    /// no longer answers (an idle-session timeout closed it) is dropped and replaced
+    /// once in the same tick. If the connection drops during a run, its session's
+    /// lock is gone: the run is stopped as [`Jobs::singleton`] describes, the
+    /// connection is discarded, and the next tick opens a fresh one and contends for
+    /// the lock again like any replica. A connection whose unlock fails is closed
+    /// too, which ends its session and the lock with it.
+    pub fn singleton_with<F, Fut>(
+        &self,
+        name: &'static str,
+        every: Every,
+        connect: sqlx::postgres::PgConnectOptions,
+        lock_id: i64,
+        task: F,
+    ) where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let this = self.clone();
+        let task = Arc::new(task);
+        self.spawn(async move {
+            let mut first = true;
+            let mut kept: Option<sqlx::PgConnection> = None;
+            while this.wait(every, std::mem::take(&mut first)).await {
+                let locked = try_lock_dedicated(&mut kept, &connect, lock_id).await;
+                let outcome = match locked {
+                    Ok(Some(conn)) => {
+                        let (outcome, keep) = this.hold(name, &task, conn, lock_id).await;
+                        if !keep {
+                            kept = None;
+                        }
+                        outcome
+                    }
+                    Ok(None) => Outcome::Skipped,
+                    Err(e) => {
+                        tracing::warn!(job = name, error = %e, "could not try the job's lock");
+                        this.record(name, Outcome::Failed, None);
+                        Outcome::Failed
+                    }
+                };
+                if outcome == Outcome::Skipped {
+                    this.record(name, outcome, None);
+                }
+                tracing::trace!(job = name, outcome = outcome.as_str(), "job tick");
+            }
+            tracing::debug!(job = name, "job stopped");
+        });
+    }
+
+    /// Run one tick of a singleton whose lock `conn` holds, watching the lock, then
+    /// unlock. The flag is false when the connection must not be used again: the lock
+    /// was lost, or the unlock did not succeed, so closing the connection is what
+    /// ends the session and any lock left on it.
+    async fn hold<F, Fut>(
+        &self,
+        name: &'static str,
+        task: &Arc<F>,
+        conn: &mut sqlx::PgConnection,
+        lock_id: i64,
+    ) -> (Outcome, bool)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    {
+        let task = task.clone();
+        let mut lost = false;
+        let outcome = self
+            .run_until(name, move || task(), async {
+                lock_lost(&mut *conn, name, lock_id).await;
+                lost = true;
+            })
+            .await;
+        if lost {
+            return (outcome, false);
+        }
+        // Bounded like the checks: a hung connection is closed, which ends the session
+        // and its lock, rather than waited on.
+        let unlocked = tokio::time::timeout(
+            LOCK_CHECK,
+            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+                .bind(lock_id)
+                .fetch_one(&mut *conn),
+        )
+        .await;
+        if matches!(unlocked, Ok(Ok(true))) {
+            (outcome, true)
+        } else {
+            tracing::warn!(job = name, "advisory unlock failed; closing its connection");
+            (outcome, false)
+        }
     }
 
     /// Run one tick of `task` as its own task, so a panic is a failed run, not a dead
@@ -497,15 +581,14 @@ impl Jobs {
 /// How often a singleton's run checks that its lock's connection is alive.
 pub const LOCK_CHECK: Duration = Duration::from_secs(2);
 
-/// Resolves (and marks the connection to be closed) when the lock is not seen held
-/// within a check: the session ended, or its connection hangs half-open (a lost
-/// node, a partition), which a check without a deadline would wait out for as long
-/// as TCP takes to give up while another replica takes the lock.
-async fn lock_lost(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
-    name: &'static str,
-    lock_id: i64,
-) {
+/// How long a dedicated singleton connection may take to open and try its lock.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Resolves when the lock is not seen held within a check: the session ended, or its
+/// connection hangs half-open (a lost node, a partition), which a check without a
+/// deadline would wait out for as long as TCP takes to give up while another replica
+/// takes the lock. The caller then closes the connection.
+async fn lock_lost(conn: &mut sqlx::PgConnection, name: &'static str, lock_id: i64) {
     loop {
         tokio::time::sleep(LOCK_CHECK).await;
         let held = tokio::time::timeout(
@@ -517,18 +600,25 @@ async fn lock_lost(
                     AND ((classid::bigint << 32) | objid::bigint) = $1)",
             )
             .bind(lock_id)
-            .fetch_one(&mut **conn),
+            .fetch_one(&mut *conn),
         )
         .await;
         match held {
             Ok(Ok(true)) => {}
             outcome => {
                 tracing::warn!(job = name, ?outcome, "the job's lock is no longer held");
-                conn.close_on_drop();
                 return;
             }
         }
     }
+}
+
+/// Whether this session took the advisory lock.
+async fn try_lock_on(conn: &mut sqlx::PgConnection, lock_id: i64) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(lock_id)
+        .fetch_one(conn)
+        .await
 }
 
 /// The advisory lock on a connection of its own, or `None` if another session holds it.
@@ -537,11 +627,44 @@ async fn try_lock(
     lock_id: i64,
 ) -> sqlx::Result<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>> {
     let mut conn = pool.acquire().await?;
-    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(lock_id)
-        .fetch_one(&mut *conn)
-        .await?;
+    let got = try_lock_on(&mut conn, lock_id).await?;
     Ok(got.then_some(conn))
+}
+
+/// The advisory lock on the dedicated connection in `kept`, or `None` if another
+/// session holds it. A kept connection that fails to answer is dropped and replaced
+/// once; a fresh one that fails is dropped too, and the error returned, so the next
+/// tick starts from a new connection.
+async fn try_lock_dedicated<'a>(
+    kept: &'a mut Option<sqlx::PgConnection>,
+    connect: &sqlx::postgres::PgConnectOptions,
+    lock_id: i64,
+) -> anyhow::Result<Option<&'a mut sqlx::PgConnection>> {
+    use sqlx::ConnectOptions as _;
+
+    let reused = match kept.as_mut() {
+        Some(conn) => Some(tokio::time::timeout(LOCK_CHECK, try_lock_on(conn, lock_id)).await),
+        None => None,
+    };
+    let got = if let Some(Ok(Ok(got))) = reused {
+        got
+    } else {
+        if let Some(failed) = reused {
+            tracing::debug!(?failed, "the singleton's connection failed; reconnecting");
+        }
+        *kept = None;
+        let fresh = tokio::time::timeout(CONNECT_DEADLINE, async {
+            let mut conn = connect.connect().await?;
+            let got = try_lock_on(&mut conn, lock_id).await?;
+            Ok::<_, sqlx::Error>((conn, got))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("opening the singleton's connection timed out"))??;
+        let (conn, got) = fresh;
+        *kept = Some(conn);
+        got
+    };
+    Ok(if got { kept.as_mut() } else { None })
 }
 
 #[cfg(test)]

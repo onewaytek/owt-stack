@@ -81,6 +81,10 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_recovery_codes_index",
         sql: include_str!("../migrations/0008_recovery_codes_index.sql"),
     },
+    Migration {
+        name: "owt_accounts_revoked_sessions",
+        sql: include_str!("../migrations/0009_revoked_sessions.sql"),
+    },
 ];
 
 /// The table [`run`] records the library's migrations in, in the schema they run in
@@ -749,6 +753,7 @@ const SHIPPED_SHA256: &[&str] = &[
     "78ba0baf7def1dd8206f5479f79c88549ecc809c82f7c7ed6421aaa8b7f47a33",
     "936dcc0d4c1736b7631055589072d42e8bf966aeab73b2bc070d842a73850a17",
     "50d4c3618cbbe298ad4ade48bdb68015b7f947e4c25d78a24b7a3692072e34ac",
+    "aa6faf71cfa9f5136beed2899744ab0ac1e964b7e92da7e4c9509eaa1bc8ffae",
 ];
 
 /// The names each of [`ALL`] gives a relation (table, index, sequence) in the schema
@@ -820,6 +825,14 @@ const RELATIONS: &[(&str, &[&str])] = &[
     (
         "owt_accounts_recovery_codes_index",
         &["account_recovery_codes_account_all"],
+    ),
+    (
+        "owt_accounts_revoked_sessions",
+        &[
+            "revoked_sessions",
+            "revoked_sessions_pkey",
+            "revoked_sessions_expires_at",
+        ],
     ),
 ];
 

@@ -13,14 +13,30 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-/// Where variables come from.
-#[derive(Clone, Debug, Default)]
+use crate::logging::Sensitive;
+
+/// Where variables come from. `Debug` names a map's variables, never their values,
+/// which may be secrets.
+#[derive(Clone, Default)]
 pub enum Vars {
     /// The process environment.
     #[default]
     Process,
     /// A fixed map.
     Map(HashMap<String, String>),
+}
+
+impl std::fmt::Debug for Vars {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Process => f.write_str("Process"),
+            Self::Map(m) => {
+                let mut names: Vec<&str> = m.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                f.debug_tuple("Map").field(&names).finish()
+            }
+        }
+    }
 }
 
 impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Vars {
@@ -48,6 +64,13 @@ impl Vars {
     pub fn required(&self, name: &str) -> anyhow::Result<String> {
         self.var(name)
             .with_context(|| format!("{name} must be set"))
+    }
+
+    /// The variable's value as a secret, which prints as `[redacted]`; an error naming
+    /// it if unset. Read a credential with this rather than [`required`](Self::required),
+    /// so a `Debug` of the struct that keeps it does not print it.
+    pub fn secret(&self, name: &str) -> anyhow::Result<Sensitive<String>> {
+        self.required(name).map(Sensitive::new)
     }
 
     /// The variable parsed, if set.
@@ -127,6 +150,11 @@ pub fn required(name: &str) -> anyhow::Result<String> {
     Vars::Process.required(name)
 }
 
+/// [`Vars::secret`] on the process environment.
+pub fn secret(name: &str) -> anyhow::Result<Sensitive<String>> {
+    Vars::Process.secret(name)
+}
+
 /// [`Vars::parse`] on the process environment.
 pub fn parse<T>(name: &str) -> anyhow::Result<Option<T>>
 where
@@ -164,6 +192,18 @@ pub fn duration(name: &str, default: Duration) -> anyhow::Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_names_the_variables_and_never_their_values() {
+        let vars: Vars = [("SESSION_SECRET", "hunter2"), ("A", "b")]
+            .into_iter()
+            .collect();
+        assert_eq!(format!("{vars:?}"), r#"Map(["A", "SESSION_SECRET"])"#);
+        let secret = vars.secret("SESSION_SECRET").unwrap();
+        assert_eq!(format!("{secret:?}"), "[redacted]");
+        assert_eq!(secret.expose(), "hunter2");
+        assert!(vars.secret("MISSING").is_err());
+    }
 
     #[test]
     fn blank_is_unset_and_garbage_is_an_error() {

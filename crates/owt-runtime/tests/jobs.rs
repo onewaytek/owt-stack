@@ -529,6 +529,130 @@ async fn a_singleton_run_stops_when_its_lock_is_lost() {
     jobs.stopped().await;
 }
 
+/// Wait in real time, up to `limit`, until `done` holds.
+async fn within(limit: Duration, done: impl Fn() -> bool) -> bool {
+    let end = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < end {
+        if done() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    done()
+}
+
+/// A singleton on a dedicated connection takes no slot of the app's pool: its run
+/// gets the only connection of a one-connection pool, and the lock is held by
+/// another session than that connection's.
+#[tokio::test]
+async fn a_dedicated_singleton_holds_no_pool_connection() {
+    let Some(url) = owt_runtime::env::var("DATABASE_URL") else {
+        return;
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect(&url)
+        .await
+        .expect("DATABASE_URL connects");
+    let id = lock_id();
+    let shutdown = CancellationToken::new();
+    let jobs = Jobs::new(shutdown.clone());
+    let seen = Arc::new(Mutex::new(None::<(i32, i32)>));
+    let (p, s) = (pool.clone(), seen.clone());
+    jobs.singleton_with(
+        "dedicated",
+        Every::new(Duration::from_secs(3600)).jitter(Duration::ZERO),
+        pool.connect_options().as_ref().clone(),
+        id,
+        move || {
+            let (p, s) = (p.clone(), s.clone());
+            async move {
+                let mut conn = p.acquire().await?;
+                let mine: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *conn)
+                    .await?;
+                let holder: i32 = sqlx::query_scalar(
+                    "SELECT pid FROM pg_locks
+                     WHERE locktype = 'advisory' AND granted
+                       AND ((classid::bigint << 32) | objid::bigint) = $1",
+                )
+                .bind(id)
+                .fetch_one(&mut *conn)
+                .await?;
+                *s.lock().unwrap() = Some((mine, holder));
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        within(Duration::from_secs(10), || seen.lock().unwrap().is_some()).await,
+        "the run never got the pool's only connection"
+    );
+    let (mine, holder) = seen.lock().unwrap().unwrap();
+    assert_ne!(mine, holder, "the lock is held on the pool's connection");
+    shutdown.cancel();
+    jobs.stopped().await;
+}
+
+/// The dedicated connection drops mid-run: the lock went with it, so the run is
+/// stopped; the next tick opens a fresh connection, takes the lock again and runs.
+#[tokio::test]
+async fn a_dedicated_singleton_stops_when_its_connection_drops_and_contends_again() {
+    let Some(pool) = pool().await else { return };
+    let id = lock_id();
+    let shutdown = CancellationToken::new();
+    let jobs = Jobs::new(shutdown.clone());
+    let (started, finished) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (s, f) = (started.clone(), finished.clone());
+    jobs.singleton_with(
+        "dedicated_long",
+        Every::new(Duration::from_secs(1)).jitter(Duration::ZERO),
+        pool.connect_options().as_ref().clone(),
+        id,
+        move || {
+            let (s, f) = (s.clone(), f.clone());
+            async move {
+                // The first run lasts long enough to lose its connection; later ones
+                // end at once.
+                if s.fetch_add(1, SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                f.fetch_add(1, SeqCst);
+                Ok(())
+            }
+        },
+    );
+    assert!(within(Duration::from_secs(5), || started.load(SeqCst) == 1).await);
+    // End the dedicated session holding the lock, as a failover would.
+    let killed: bool = sqlx::query_scalar(
+        "SELECT pg_terminate_backend(pid) FROM pg_locks
+         WHERE locktype = 'advisory' AND granted
+           AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(killed);
+    // The first run is stopped, not finished, and a later tick runs on a new
+    // connection holding the lock again.
+    assert!(
+        within(
+            owt_runtime::jobs::LOCK_CHECK * 3 + Duration::from_secs(10),
+            || { finished.load(SeqCst) >= 1 }
+        )
+        .await,
+        "the job never ran again after losing its connection"
+    );
+    assert!(
+        started.load(SeqCst) >= 2,
+        "the first run finished without its lock"
+    );
+    shutdown.cancel();
+    jobs.stopped().await;
+}
+
 /// An aligned singleton: two replicas wake at each boundary of the wall clock, one
 /// runs at a time, and the runs land on successive boundaries.
 #[tokio::test]

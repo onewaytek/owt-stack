@@ -224,7 +224,7 @@ async fn changing_the_password_deactivating_or_demoting_moves_the_epoch() {
     let after = store::by_id(&db.pool, a.id).await.unwrap().unwrap();
     assert_eq!(after.session_epoch, a.session_epoch + 1);
     assert!(
-        store::by_id_in_epoch(&db.pool, a.id, a.session_epoch)
+        store::by_id_in_epoch(&db.pool, a.id, a.session_epoch, None)
             .await
             .unwrap()
             .is_none()
@@ -290,8 +290,11 @@ fn app(db: &Db, sessions: &Sessions<Data>, extra: Router) -> Router {
     async fn staff(Staff(account): Staff) -> String {
         format!("staff room for {}", account.username)
     }
-    async fn sign_out(session: Session<Data>) -> &'static str {
-        session::sign_out(&session);
+    async fn sign_out(
+        axum::extract::State(pool): axum::extract::State<PgPool>,
+        session: Session<Data>,
+    ) -> &'static str {
+        session::sign_out(&pool, &session).await.unwrap();
         "out"
     }
     let accounts = Accounts::new(db.pool.clone(), "/login");
@@ -300,7 +303,7 @@ fn app(db: &Db, sessions: &Sessions<Data>, extra: Router) -> Router {
         .route("/whoami", get(whoami))
         .route("/private", get(private))
         .route("/staff", get(staff))
-        .route("/out", post(sign_out))
+        .route("/out", post(sign_out).with_state(db.pool.clone()))
         .layer(from_fn_with_state(accounts, Accounts::load::<Data>))
         .layer(axum::middleware::from_fn_with_state(
             sessions.clone(),
@@ -317,8 +320,19 @@ fn sessions() -> Sessions<Data> {
     )
 }
 
-/// A cookie signed in as `account`, sealed as the app would seal it.
+/// A cookie signed in as `account` with a second factor used just now, sealed as the
+/// app would seal it: enough for the admin's changes ([`owt_accounts::admin::STEP_UP`]).
 fn cookie_for(sessions: &Sessions<Data>, account: &store::Account) -> String {
+    cookie_proved(sessions, account, Some(Duration::ZERO))
+}
+
+/// A cookie signed in as `account` whose second factor was used `mfa_ago`, or never.
+fn cookie_proved(
+    sessions: &Sessions<Data>,
+    account: &store::Account,
+    mfa_ago: Option<Duration>,
+) -> String {
+    use owt_accounts::mfa::{Auth, MfaSession};
     let mut data = Data::default();
     session::Signed::set_signature(
         &mut data,
@@ -327,6 +341,15 @@ fn cookie_for(sessions: &Sessions<Data>, account: &store::Account) -> String {
             epoch: account.session_epoch,
         }),
     );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    data.mfa_mut().auth = Some(Auth {
+        account: account.id,
+        epoch: account.session_epoch,
+        at: now.as_secs(),
+        mfa_at: mfa_ago.map(|ago| now.saturating_sub(ago).as_secs()),
+    });
     sessions.seal(&owt_web::session::new_id(), &data)
 }
 
@@ -412,8 +435,9 @@ async fn an_extra_is_read_with_the_account_in_its_epoch() {
         .await
         .unwrap();
 
-    let read =
-        |a: &store::Account, epoch| store::by_id_in_epoch_with::<Viewer>(&db.pool, a.id, epoch);
+    let read = |a: &store::Account, epoch| {
+        store::by_id_in_epoch_with::<Viewer>(&db.pool, a.id, epoch, None)
+    };
     let (account, viewer) = read(&ada, ada.session_epoch).await.unwrap().unwrap();
     assert_eq!(account, ada);
     let ada_viewer = Viewer {
@@ -528,7 +552,7 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
         .unwrap();
     let epoch = ada.session_epoch;
 
-    let (account, joined) = store::by_id_in_epoch_with::<Joined>(&db.pool, ada.id, epoch)
+    let (account, joined) = store::by_id_in_epoch_with::<Joined>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap()
         .unwrap();
@@ -536,7 +560,7 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
     assert_eq!(joined.display_name.as_deref(), Some("Ada L."));
     assert!(joined.profile_id.is_some());
 
-    let err = store::by_id_in_epoch_with::<Sneaky>(&db.pool, ada.id, epoch)
+    let err = store::by_id_in_epoch_with::<Sneaky>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap_err();
     assert!(
@@ -544,7 +568,7 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
             .contains("\"roles\", which the row already has"),
         "{err}"
     );
-    let err = store::by_id_in_epoch_with::<Everything>(&db.pool, ada.id, epoch)
+    let err = store::by_id_in_epoch_with::<Everything>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap_err();
     assert!(
@@ -552,12 +576,12 @@ async fn an_extra_cannot_stand_in_for_the_account_and_a_bad_one_fails_closed() {
             .contains("\"id\", which the row already has"),
         "{err}"
     );
-    store::by_id_in_epoch_with::<Mistyped>(&db.pool, ada.id, epoch)
+    store::by_id_in_epoch_with::<Mistyped>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap_err();
     // With a second account, the whole table is two rows: refused, not the first.
     store::create(&db.pool, new("bob", "", None)).await.unwrap();
-    let err = store::by_id_in_epoch_with::<WholeTable>(&db.pool, ada.id, epoch)
+    let err = store::by_id_in_epoch_with::<WholeTable>(&db.pool, ada.id, epoch, None)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("several rows"), "{err}");
@@ -719,11 +743,18 @@ async fn signing_in_cycles_the_id_and_signing_out_empties_the_session() {
     assert_eq!(id, new_id);
     assert_eq!(data.account, Some(ada.id));
 
+    let copied = client.cookie("s").unwrap();
     client.post_form("/out", &[]).await;
     assert_eq!(client.get("/whoami").await.text(), "anonymous");
     let (id, data) = sessions.unseal(&client.cookie("s").unwrap()).unwrap();
     assert_ne!(id, new_id);
     assert_eq!(data, Data::default());
+    // A copy of the signed-out cookie opens nothing, while the account's other
+    // sessions stand.
+    client.set_cookie("s", &copied);
+    assert_eq!(client.get("/whoami").await.text(), "anonymous");
+    client.set_cookie("s", &cookie_for(&sessions, &ada));
+    assert_eq!(client.get("/whoami").await.text(), "ada");
     db.drop().await;
 }
 
@@ -1483,12 +1514,20 @@ mod cli {
         )
         .await
         .unwrap();
-        assert!(owt_auth::password::verify("shared passphrase", out.trim()).await);
+        assert!(
+            owt_auth::password::verify("shared passphrase", out.trim())
+                .await
+                .unwrap()
+        );
         let out = exec(&db, AccountCommand::Hash { generate: true }, None)
             .await
             .unwrap();
         let secret = shown(&out, "password");
-        assert!(owt_auth::password::verify(&secret, out.lines().last().unwrap()).await);
+        assert!(
+            owt_auth::password::verify(&secret, out.lines().last().unwrap())
+                .await
+                .unwrap()
+        );
         db.drop().await;
     }
 }
@@ -2896,7 +2935,12 @@ async fn an_admin_page_keeps_the_apps_csp() {
 /// answers: the nest's layers put both headers on it, and a route moved out of the
 /// nest would lose them silently.
 fn assert_admin_headers(r: &owt_test::Response) {
-    assert_eq!(r.header("cache-control"), Some("no-store"), "{}", r.status);
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE),
+        "{}",
+        r.status
+    );
     assert_eq!(r.header("x-frame-options"), Some("DENY"), "{}", r.status);
 }
 
@@ -2935,7 +2979,10 @@ async fn the_admin_is_for_staff_and_finds_accounts_by_name_email_and_role() {
     client.set_cookie("s", &cookie_for(&sessions, &boss));
     let r = client.get("/staff/accounts").await;
     assert_eq!(r.status, 200);
-    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE)
+    );
     assert_eq!(r.header("x-frame-options"), Some("DENY"), "never framed");
     let html = r.text();
     assert!(
@@ -3212,7 +3259,10 @@ async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
     // A generated password, shown in the answer to the POST and nowhere after.
     let r = client.post_form(&format!("{at}/password"), &[]).await;
     assert_eq!(r.status, 200);
-    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE)
+    );
     let password = secret(&r.text());
     assert_eq!(password.len(), 20);
     assert!(
@@ -3317,6 +3367,108 @@ async fn the_admin_gives_a_way_in_once_and_takes_them_away() {
     );
 
     assert_eq!(client.get("/staff/accounts/999999").await.status, 404);
+    db.drop().await;
+}
+
+/// Each admin change asks for a second factor used within 15 minutes, sending staff
+/// to re-authenticate and back to the form's page, and hands the app's recorder an
+/// event in the change's transaction: a recorder that fails rolls the change back.
+#[tokio::test]
+async fn the_admin_asks_for_a_recent_second_factor_and_records_each_change() {
+    use owt_accounts::admin::{Event, EventKind, Recorder};
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    struct Log(Arc<Mutex<Vec<Event>>>, bool);
+    impl Recorder for Log {
+        fn record<'a>(
+            &'a self,
+            conn: &'a mut sqlx::PgConnection,
+            event: &'a Event,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                // On the change's own connection.
+                sqlx::query("SELECT 1").execute(conn).await?;
+                anyhow::ensure!(!self.1, "the audit log is down");
+                self.0.lock().unwrap().push(event.clone());
+                Ok(())
+            })
+        }
+    }
+    async fn epoch_of(pool: &PgPool, id: i64) -> i32 {
+        store::by_id(pool, id).await.unwrap().unwrap().session_epoch
+    }
+    let db = db!();
+    let sessions = sessions();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let link = |token: &str| format!("https://app.example/login/link/{token}");
+    let routes = admin(&db)
+        .sign_in_links(Duration::from_hours(30 * 24), link)
+        .audit(Log(Arc::clone(&log), false))
+        .routes();
+    let client = owt_test::Client::new(app(&db, &sessions, routes));
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let at = format!("/staff/accounts/{}", ada.id);
+    let before = epoch_of(&db.pool, ada.id).await;
+
+    // No second factor, or one 16 minutes ago: pages show, changes wait.
+    for proof in [None, Some(Duration::from_mins(16))] {
+        client.set_cookie("s", &cookie_proved(&sessions, &boss, proof));
+        assert_eq!(client.get(&at).await.status, 200);
+        let r = client.post_form(&format!("{at}/sign-out"), &[]).await;
+        assert_eq!(r.status, 303);
+        let back = format!("/reauth?next=%2Fstaff%2Faccounts%2F{}", ada.id);
+        assert_eq!(r.location(), Some(back.as_str()));
+        let r = client
+            .post_form("/staff/accounts", &[("username", "eve"), ("email", "")])
+            .await;
+        assert_eq!(r.location(), Some("/reauth?next=%2Fstaff%2Faccounts%2Fnew"));
+    }
+    assert_eq!(epoch_of(&db.pool, ada.id).await, before);
+    assert!(store::by_username(&db.pool, "eve").await.unwrap().is_none());
+    assert!(log.lock().unwrap().is_empty());
+
+    // Within the window: done, and recorded.
+    client.set_cookie(
+        "s",
+        &cookie_proved(&sessions, &boss, Some(Duration::from_mins(14))),
+    );
+    let r = client.post_form(&format!("{at}/sign-out"), &[]).await;
+    assert_eq!(
+        r.location(),
+        Some(format!("{at}?notice=signed-out").as_str())
+    );
+    assert!(epoch_of(&db.pool, ada.id).await > before);
+    // A link asked for 30 days lives one.
+    let r = client.post_form(&format!("{at}/link"), &[]).await;
+    assert!(r.text().contains("within 1 day"), "{}", r.text());
+    {
+        let events = log.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].actor, events[0].account), (boss.id, ada.id));
+        assert_eq!(events[0].kind, EventKind::SignedOut);
+        assert_eq!(events[0].name(), "admin.account.signed_out");
+        assert_eq!(
+            events[1].kind,
+            EventKind::LinkIssued {
+                ttl: Duration::from_hours(24)
+            }
+        );
+    }
+
+    // A recorder that fails takes the change with it.
+    let failing = admin(&db).audit(Log(Arc::clone(&log), true)).routes();
+    let client = owt_test::Client::new(app(&db, &sessions, failing));
+    client.set_cookie("s", &cookie_for(&sessions, &boss));
+    let now = epoch_of(&db.pool, ada.id).await;
+    let r = client.post_form(&format!("{at}/sign-out"), &[]).await;
+    assert_eq!(r.status, 500);
+    assert_eq!(epoch_of(&db.pool, ada.id).await, now);
+    assert_eq!(log.lock().unwrap().len(), 2);
     db.drop().await;
 }
 
@@ -3767,7 +3919,10 @@ async fn a_secret_survives_the_apps_page_failing() {
     for action in ["password", "link"] {
         let r = client.post_form(&format!("{at}/{action}"), &[]).await;
         assert_eq!(r.status, 200, "{action}");
-        assert_eq!(r.header("cache-control"), Some("no-store"));
+        assert_eq!(
+            r.header("cache-control"),
+            Some(owt_web::headers::NEVER_CACHE)
+        );
         assert_eq!(r.header("x-frame-options"), Some("DENY"));
         let value = secret(&r.text());
         if action == "password" {
@@ -3816,7 +3971,10 @@ async fn an_app_draws_the_admin_with_its_own_templates() {
 
     let r = client.get("/staff/accounts?role=editor").await;
     assert_eq!(r.status, 200);
-    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE)
+    );
     assert_eq!(r.header("x-frame-options"), Some("DENY"));
     let html = r.text();
     assert!(!html.contains("owt-"), "{html}");
@@ -3865,7 +4023,10 @@ async fn an_app_draws_the_admin_with_its_own_templates() {
 
     let r = client.post_form(&format!("{at}/password"), &[]).await;
     assert_eq!(r.status, 200);
-    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        r.header("cache-control"),
+        Some(owt_web::headers::NEVER_CACHE)
+    );
     assert_eq!(r.header("x-frame-options"), Some("DENY"));
     let html = r.text();
     assert!(!html.contains("owt-"), "{html}");

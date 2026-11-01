@@ -68,7 +68,7 @@
 //! [`SecretSealer`] encrypt it with a key the database does not hold (`owt-crypt`'s,
 //! say). What is stored carries a format byte and the key id, so keys rotate; the
 //! development default [`Unsealed`] stores it in the clear, marked plain, and says so in
-//! the log. A plain row is accepted and sealed at its next use once a real sealer is set.
+//! the log; a release build refuses it. A plain row is accepted and sealed at its next use once a real sealer is set.
 //!
 //! # Audit
 //!
@@ -99,6 +99,7 @@ mod step_up;
 
 pub use challenge::Answer;
 pub use state::{Auth, Kind, MfaSession, Pending, State};
+pub(crate) use step_up::guard_to;
 pub use step_up::{
     Recent, RecentMfa, StepUp, require_recent, require_recent_at, require_recent_mfa,
     require_recent_mfa_for,
@@ -294,9 +295,24 @@ pub trait SecretSealer: Send + Sync {
 /// The development sealer: stores the secret **in the clear**, marked as plain. Not for
 /// production: a read of the database (a backup, a SQL injection, a replica) would then
 /// hand over every account's second factor. [`Mfa::new`] logs a warning when it is in
+/// use, and a build without `debug_assertions` (a release build) refuses it: enrolling,
+/// and signing in with a factor stored by it, fail with [`MfaError::Fault`] until
+/// [`Mfa::sealer`] sets a real sealer, which then reseals each plain secret at its next
 /// use.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Unsealed;
+
+/// [`Unsealed`] in a release build: a fault, so no secret is stored or read in the
+/// clear outside development.
+fn refuse_unsealed() -> Result<(), MfaError> {
+    if cfg!(debug_assertions) {
+        Ok(())
+    } else {
+        Err(MfaError::fault(anyhow::anyhow!(
+            "TOTP secrets are unsealed in a release build: set Mfa::sealer"
+        )))
+    }
+}
 
 impl SecretSealer for Unsealed {
     #[allow(clippy::unnecessary_literal_bound)] // the trait's signature
@@ -424,7 +440,9 @@ pub enum MfaError {
     /// A budget of the throttle is spent: nothing was checked.
     #[error("Too many attempts. Wait a minute and try again.")]
     Throttled,
-    /// The shared throttle could not be reached and fails closed. Answer 503.
+    /// The shared throttle could not be reached and fails closed, or the password
+    /// hasher stayed saturated for its permit timeout ([`owt_auth::password::Busy`]).
+    /// Answer 503.
     #[error("Signing in is unavailable for a moment. Please try again shortly.")]
     Unavailable,
     /// The authenticator is locked for [`LOCK_FOR`] after too many wrong codes in a row.
@@ -469,7 +487,23 @@ pub enum MfaError {
     /// A fault: the database, the random source or the sealer. Its source may name
     /// tables; log it and never show it.
     #[error("The check could not be made. Try again in a moment.")]
-    Fault(#[from] crate::Error),
+    Fault(crate::Error),
+}
+
+impl From<crate::Error> for MfaError {
+    /// A busy hasher is [`MfaError::Unavailable`]; anything else a fault.
+    fn from(e: crate::Error) -> Self {
+        match e {
+            crate::Error::Busy(_) => Self::Unavailable,
+            e => Self::Fault(e),
+        }
+    }
+}
+
+impl From<owt_auth::password::Busy> for MfaError {
+    fn from(_: owt_auth::password::Busy) -> Self {
+        Self::Unavailable
+    }
 }
 
 impl From<sqlx::Error> for MfaError {
@@ -515,7 +549,7 @@ impl MfaError {
     }
 
     fn fault(e: anyhow::Error) -> Self {
-        Self::Fault(crate::Error::Hash(e))
+        crate::Error::hash(e).into()
     }
 }
 
@@ -628,7 +662,7 @@ impl std::fmt::Debug for Mfa {
 impl Mfa {
     /// Second factors named `issuer` in the person's authenticator app (the service's
     /// name), [`Optional`](MfaPolicy::Optional), with the development sealer
-    /// ([`Unsealed`]): set [`sealer`](Self::sealer) before production.
+    /// ([`Unsealed`]), which a release build refuses: set [`sealer`](Self::sealer).
     #[must_use]
     pub fn new(issuer: impl Into<String>) -> Self {
         static WARN: Once = Once::new();
@@ -700,6 +734,7 @@ impl Mfa {
     /// `1`, the key id's length, the key id, and what the sealer returned.
     fn pack(&self, secret: &Secret, account: i64) -> Result<Vec<u8>, MfaError> {
         if self.sealer.is_plaintext() {
+            refuse_unsealed()?;
             let mut out = vec![0u8];
             out.extend_from_slice(secret.as_bytes());
             return Ok(out);
@@ -722,10 +757,15 @@ impl Mfa {
     fn unpack(&self, stored: &[u8], account: i64) -> Result<(Secret, bool), MfaError> {
         let bad = || MfaError::fault(anyhow::anyhow!("a stored TOTP secret in an unknown format"));
         let (plain, reseal) = match stored.first().copied() {
-            Some(0) if self.sealer.is_plaintext() || self.accept_plaintext => (
-                Zeroizing::new(stored[1..].to_vec()),
-                !self.sealer.is_plaintext(),
-            ),
+            Some(0) if self.sealer.is_plaintext() || self.accept_plaintext => {
+                if self.sealer.is_plaintext() {
+                    refuse_unsealed()?;
+                }
+                (
+                    Zeroizing::new(stored[1..].to_vec()),
+                    !self.sealer.is_plaintext(),
+                )
+            }
             Some(1) if !self.sealer.is_plaintext() => {
                 let len = usize::from(*stored.get(1).ok_or_else(bad)?);
                 let id = stored.get(2..2 + len).ok_or_else(bad)?;
@@ -785,7 +825,13 @@ impl Mfa {
         if !state::within(pending.at, self.pending_ttl, state::unix(SystemTime::now())) {
             return Ok(None);
         }
-        let account = store::by_id_in_epoch(pool, pending.account, pending.epoch).await?;
+        let account = store::by_id_in_epoch(
+            pool,
+            pending.account,
+            pending.epoch,
+            session.id().as_deref(),
+        )
+        .await?;
         Ok(account.map(|a| (a, pending.kind)))
     }
 
@@ -1248,6 +1294,7 @@ impl Mfa {
             .await
             .map_err(|e| match e {
                 MfaError::Fault(e) => SignInRefused::Fault(e),
+                MfaError::Unavailable => SignInRefused::Unavailable,
                 other => SignInRefused::Fault(crate::Error::Hash(anyhow::anyhow!(other))),
             })
     }

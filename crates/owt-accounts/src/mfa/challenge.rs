@@ -89,14 +89,19 @@ impl Mfa {
         limiter
             .charge(ip, Key::SecondFactor(pending.account))
             .await?;
-        let account = store::by_id_in_epoch(pool, pending.account, pending.epoch)
-            .await?
-            .filter(|a| {
-                pending.kind == Kind::Challenge
-                    || session
-                        .read(Signed::signature)
-                        .is_some_and(|s| s.account == a.id && s.epoch == a.session_epoch)
-            });
+        let account = store::by_id_in_epoch(
+            pool,
+            pending.account,
+            pending.epoch,
+            session.id().as_deref(),
+        )
+        .await?
+        .filter(|a| {
+            pending.kind == Kind::Challenge
+                || session
+                    .read(Signed::signature)
+                    .is_some_and(|s| s.account == a.id && s.epoch == a.session_epoch)
+        });
         let Some(account) = account else {
             session.update(|d| d.mfa_mut().pending = None);
             return Err(MfaError::NoChallenge);
@@ -252,7 +257,7 @@ impl Mfa {
         .await?;
         let hashes: Vec<&str> = unused.iter().map(|(_, h)| h.as_str()).collect();
         let found = recovery::find_match(typed, &hashes)
-            .await
+            .await?
             .ok_or(MfaError::Invalid)?;
         let used = sqlx::query(
             "UPDATE account_recovery_codes SET used_at = now()

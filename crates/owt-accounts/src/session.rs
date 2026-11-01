@@ -3,8 +3,9 @@
 //!
 //! The cookie holds the account's id and the `session_epoch` it was issued under.
 //! On every request the epoch is compared with the account's (by [`crate::layer`]):
-//! bumping the account's epoch ends every session it has anywhere. That is the
-//! whole of revocation; there is no session table.
+//! bumping the account's epoch ends every session it has anywhere. [`sign_out`] ends
+//! one session: its id goes into `revoked_sessions`, which the same read checks by
+//! primary key, so a kept copy of its cookie opens nothing.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -136,13 +137,31 @@ pub enum SignInRefused {
     #[error("That username or email and password do not match an account.")]
     Mismatch,
     /// The shared throttle could not be reached and fails closed (see
-    /// [`owt_auth::throttle::shared`]): nothing was checked. Answer 503.
+    /// [`owt_auth::throttle::shared`]), or the password hasher stayed saturated for
+    /// its permit timeout ([`owt_auth::password::Busy`]): nothing was checked.
+    /// Answer 503.
     #[error("Signing in is unavailable for a moment. Please try again shortly.")]
     Unavailable,
     /// A fault: the database. Its message says only that; log its source, which
     /// may name tables and columns, and never show it.
     #[error("The sign-in could not be checked. Try again in a moment.")]
-    Fault(#[from] crate::Error),
+    Fault(crate::Error),
+}
+
+impl From<crate::Error> for SignInRefused {
+    /// A busy hasher is [`SignInRefused::Unavailable`]; anything else a fault.
+    fn from(e: crate::Error) -> Self {
+        match e {
+            crate::Error::Busy(_) => Self::Unavailable,
+            e => Self::Fault(e),
+        }
+    }
+}
+
+impl From<owt_auth::password::Busy> for SignInRefused {
+    fn from(_: owt_auth::password::Busy) -> Self {
+        Self::Unavailable
+    }
 }
 
 impl SignInRefused {
@@ -248,7 +267,7 @@ pub async fn password_gate<T: Signed>(
     if !throttle.sign_in(ip, &format!("\0gate\0{}", gate.account)) {
         return Err(SignInRefused::Throttled);
     }
-    let checked = owt_auth::password::check_or_decoy(password, Some(gate.hash)).await;
+    let checked = owt_auth::password::check_or_decoy(password, Some(gate.hash)).await?;
     if !checked.matched() {
         return Err(SignInRefused::Mismatch);
     }
@@ -267,10 +286,33 @@ pub async fn password_gate<T: Signed>(
     Ok(account)
 }
 
-/// Sign this session out: a new, empty one replaces it. Other sessions of the
+/// Sign this session out: its id is recorded as revoked ([`store::revoke_session`],
+/// kept until its cookie would have expired anyway), so a copy of the cookie someone
+/// kept opens it no more, and a new, empty session replaces it. Other sessions of the
 /// account stay; see [`sign_out_everywhere`].
-pub fn sign_out<T: Signed>(session: &Session<T>) {
+///
+/// # Errors
+///
+/// The database: the session is still replaced, but a copied cookie still opens it.
+pub async fn sign_out<T: Signed>(
+    db: impl PgExecutor<'_>,
+    session: &Session<T>,
+) -> sqlx::Result<()> {
+    let revoked = match (session.read(Signed::signature), session.id()) {
+        (Some(_), Some(id)) => {
+            // Outside the session layer the lifetime is unknown: a month covers any.
+            let expires = session.expires().unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+                    .saturating_add(30 * 24 * 3600)
+            });
+            store::revoke_session(db, &id, expires).await
+        }
+        _ => Ok(()),
+    };
     session.flush();
+    revoked
 }
 
 /// Sign out here and everywhere else: the account's epoch moves on, so every other
@@ -290,12 +332,18 @@ pub async fn sign_out_everywhere<T: Signed>(
 /// [`owt_web::session::Sessions::validate_with`]. [`crate::layer::Accounts`] makes
 /// the same check and loads the account in one read, so an app using the layer does
 /// not also need this; it is for an app that wants the cookie removed at the layer
-/// below, or that reads the signature without loading the account.
-pub async fn verdict(db: impl PgExecutor<'_>, signature: Option<Signature>) -> Verdict {
+/// below, or that reads the signature without loading the account. `session` is the
+/// presented session's id ([`owt_web::session::Presented::id`]), checked against the
+/// sessions [`sign_out`] revoked.
+pub async fn verdict(
+    db: impl PgExecutor<'_>,
+    signature: Option<Signature>,
+    session: Option<&str>,
+) -> Verdict {
     let Some(signature) = signature else {
         return Verdict::Valid;
     };
-    match store::by_id_in_epoch(db, signature.account, signature.epoch).await {
+    match store::by_id_in_epoch(db, signature.account, signature.epoch, session).await {
         Ok(Some(_)) => Verdict::Valid,
         Ok(None) => Verdict::Revoked,
         Err(e) => {

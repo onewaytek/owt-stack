@@ -195,6 +195,55 @@ pub async fn anchor<A: Anchor>(pool: &PgPool, to: &A) -> anyhow::Result<Anchored
     })
 }
 
+/// Every manifest recorded in the database, oldest first, checked as a chain: each
+/// row's manifest matches its recorded digest and format, the first names no
+/// previous manifest, and each later one names the digest of the one before it.
+/// Unlike [`latest`], a row that fails is an error, not skipped: verification
+/// reports a damaged or inserted anchor instead of falling back past it.
+///
+/// This checks the database's copies against each other only; a role that may
+/// rewrite `owt_audit_anchors` can rewrite them consistently. The independent check
+/// is a manifest fetched from the store (`verify_anchor`, `audit verify --manifest`).
+pub async fn history(pool: &PgPool) -> Result<Vec<Manifest>, crate::VerifyError> {
+    use crate::VerifyError;
+    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT id, manifest, digest FROM owt_audit_anchors ORDER BY id")
+            .fetch_all(pool)
+            .await?;
+    let mut out: Vec<Manifest> = Vec::with_capacity(rows.len());
+    let mut prev: Option<String> = None;
+    for (id, bytes, digest) in rows {
+        let m = Manifest::from_bytes(&bytes)
+            .map_err(|e| VerifyError::Manifest(format!("anchor {id} does not parse: {e}")))?;
+        let stored: Option<Hash> = digest.as_slice().try_into().ok();
+        if m.format != FORMAT || Some(m.digest()) != stored {
+            return Err(VerifyError::Manifest(format!(
+                "anchor {id}'s manifest does not match its recorded digest"
+            )));
+        }
+        if m.prev != prev {
+            return Err(VerifyError::Manifest(format!(
+                "anchor {id} names {:?} as the previous manifest, not {prev:?}",
+                m.prev
+            )));
+        }
+        prev = Some(crate::hex(&m.digest()));
+        out.push(m);
+    }
+    Ok(out)
+}
+
+/// How long ago the latest valid manifest in the database was made; `None` when
+/// nothing is anchored. Events recorded since are not yet anchored, so an app
+/// alerts when this exceeds its anchoring interval by a margin (a store credential
+/// that stopped working, a job that stopped running).
+pub async fn age(pool: &PgPool) -> anyhow::Result<Option<std::time::Duration>> {
+    Ok(latest(pool).await?.map(|m| {
+        let now = micros(SystemTime::now());
+        std::time::Duration::from_micros(u64::try_from(now - m.at_us).unwrap_or(0))
+    }))
+}
+
 /// The latest manifest recorded in the database whose recorded digest and format
 /// match it (a row that does not is skipped, with a warning). The database's copy is only as trustworthy as the roles that
 /// may insert into `owt_audit_anchors`: for a check the database's owner cannot

@@ -203,7 +203,9 @@ objects:
                   valueFrom:
                     fieldRef: {fieldPath: metadata.namespace}
                 # CNPG-minted; points at <name>-db-rw, so it follows a switchover and
-                # the password rotates without an edit here.
+                # the password rotates without an edit here. This role owns the
+                # schema (migrations run under it), so it can disable the audit
+                # tables' triggers: owt_audit::privileges reports it.
                 - name: DATABASE_URL
                   valueFrom:
                     secretKeyRef: {name: "${NAME}-${DB_SUFFIX}-app", key: uri}

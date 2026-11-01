@@ -211,6 +211,51 @@ async fn a_forged_anchor_record_is_caught() {
     let latest = anchor::latest(&db.pool).await.unwrap().unwrap();
     assert_eq!(latest.heads.len(), 1);
     anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
+    // Verification, though, reports it rather than falling back past it.
+    let e = anchor::history(&db.pool).await.unwrap_err();
+    assert!(matches!(e, VerifyError::Manifest(_)), "{e}");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn the_anchors_form_a_chain_and_have_an_age() {
+    let Some(db) = Db::new().await else { return };
+    assert_eq!(
+        anchor::history(&db.pool).await.unwrap(),
+        Vec::<anchor::Manifest>::new()
+    );
+    assert_eq!(anchor::age(&db.pool).await.unwrap(), None);
+    let audit = Audit::new(db.pool.clone());
+    audit.record(&view("t", "p")).await.unwrap();
+    let first = anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
+    audit.record(&view("t", "p")).await.unwrap();
+    anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
+    let history = anchor::history(&db.pool).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0], first.manifest);
+    assert!(anchor::age(&db.pool).await.unwrap().unwrap() < std::time::Duration::from_mins(1));
+
+    // A self-consistent manifest inserted out of the chain: its digest is its own,
+    // but it names no previous manifest.
+    let orphan = anchor::Manifest {
+        prev: None,
+        ..first.manifest.clone()
+    };
+    let orphan = anchor::Manifest {
+        at_us: orphan.at_us + 1,
+        ..orphan
+    };
+    sqlx::query(
+        "INSERT INTO owt_audit_anchors (manifest, digest, provider, receipt)
+         VALUES ($1, $2, 'none', '')",
+    )
+    .bind(orphan.to_bytes())
+    .bind(&orphan.digest()[..])
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let e = anchor::history(&db.pool).await.unwrap_err();
+    assert!(e.to_string().contains("previous manifest"), "{e}");
     db.drop().await;
 }
 
@@ -376,5 +421,49 @@ async fn tampering_breaks_the_chain_or_the_anchor() {
         verify(&db.pool, "t").await,
         Err(VerifyError::Broken(Broken::Link { seq: 3, .. }))
     ));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn privileges_tell_the_owner_from_an_append_only_role() {
+    let Some(db) = Db::new().await else { return };
+    let owner = owt_audit::privileges(&db.pool).await.unwrap();
+    assert!(!owner.least(), "{owner}");
+    assert!(owner.superuser || owner.owns.len() == 2, "{owner:?}");
+
+    let role = format!("{}_ro", db.schema);
+    for sql in [
+        format!("CREATE ROLE {role} NOLOGIN"),
+        format!("GRANT USAGE ON SCHEMA {} TO {role}", db.schema),
+        format!("GRANT SELECT, INSERT ON owt_audit_events TO {role}"),
+        format!("GRANT SELECT ON owt_audit_anchors TO {role}"),
+    ] {
+        db.pool.execute(sqlx::AssertSqlSafe(sql)).await.unwrap();
+    }
+    let app = pool_in(&db.url, &db.schema, Some(&role)).await;
+    let least = owt_audit::privileges(&app).await.unwrap();
+    assert!(least.least(), "{least:?}");
+
+    db.pool
+        .execute(sqlx::AssertSqlSafe(format!(
+            "GRANT UPDATE, TRUNCATE ON owt_audit_events TO {role}"
+        )))
+        .await
+        .unwrap();
+    let more = owt_audit::privileges(&app).await.unwrap();
+    assert!(!more.least());
+    assert_eq!(
+        more.excess,
+        ["owt_audit_events: UPDATE", "owt_audit_events: TRUNCATE"],
+        "{more}"
+    );
+    app.close().await;
+    db.pool
+        .execute(sqlx::AssertSqlSafe(format!(
+            "REVOKE ALL ON ALL TABLES IN SCHEMA {0} FROM {role}; REVOKE ALL ON SCHEMA {0} FROM {role}; DROP ROLE {role}",
+            db.schema
+        )))
+        .await
+        .unwrap();
     db.drop().await;
 }

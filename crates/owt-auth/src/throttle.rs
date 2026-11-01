@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! if !throttle.sign_in(ip, &form.account) { return too_many(); }
-//! let ok = password::verify_or_decoy(&form.password, hash.as_deref()).await;
+//! let ok = password::verify_or_decoy(&form.password, hash.as_deref()).await?; // `Busy`: 503
 //! ```
 //!
 //! A successful sign-in spends from the budgets too; at five a minute per account,
@@ -19,8 +19,12 @@
 //! off for as long as they keep spending it, from addresses of their own: that is
 //! the price of bounding guesses at it, and it lasts only while they keep at it.
 //!
+//! An account's budget is keyed on the login as the account store matches it (NFKC,
+//! lower case), so `admin` and fullwidth `ａｄｍｉｎ` spend one budget.
+//!
 //! The counts live in this process: with N replicas an attacker gets N times each
-//! budget, which is still a bound. Where it must be exactly the budget, the
+//! budget, which is still a bound, and the first sign-in warns when `POD_NAMESPACE`
+//! is set. Where it must be exactly the budget, the
 //! `redis` feature adds [`shared::SharedThrottle`]: the same three budgets counted in
 //! Redis, so every replica spends from one. The address must be the client's, not the
 //! proxy's: see `owt_web::client_ip`. An IPv6 address is counted by its /64, the
@@ -122,23 +126,42 @@ pub(crate) fn client_key(address: IpAddr) -> IpAddr {
 /// text passed off as one must not be stored whole.
 const MAX_ACCOUNT_KEY_BYTES: usize = 256;
 
-/// The key `account` is counted under: trimmed and lower case, so that variants of
-/// one name share its budget, and cut to [`MAX_ACCOUNT_KEY_BYTES`].
+/// The key `account` is counted under: the account store's form of a login (NFKC,
+/// lower case, trimmed, as `owt_accounts::store::normalize` matches it), so every
+/// spelling that signs in to one account spends one budget, cut to
+/// [`MAX_ACCOUNT_KEY_BYTES`]. A username and its account's email are two logins,
+/// and two budgets.
 pub(crate) fn account_key(account: &str) -> String {
-    let account = account.trim();
-    // Cut before lower-casing, so a megabyte of text is not copied to be discarded.
-    let mut end = account.len().min(MAX_ACCOUNT_KEY_BYTES);
-    while !account.is_char_boundary(end) {
+    use unicode_normalization::UnicodeNormalization;
+    // Cut before normalizing, so a megabyte of text is not copied to be discarded.
+    let compatible: String = cut(account.trim()).nfkc().collect();
+    let lowered: String = compatible.to_lowercase().nfkc().collect();
+    // Trimmed again: NFKC turns some characters into a space and a mark. And cut
+    // again, since normalizing and lower-casing can lengthen it.
+    cut(lowered.trim()).to_owned()
+}
+
+/// `s` cut to at most [`MAX_ACCOUNT_KEY_BYTES`], on a character.
+fn cut(s: &str) -> &str {
+    let mut end = s.len().min(MAX_ACCOUNT_KEY_BYTES);
+    while !s.is_char_boundary(end) {
         end -= 1;
     }
-    let mut key = account[..end].to_lowercase();
-    // Lower-casing can lengthen it.
-    let mut end = key.len().min(MAX_ACCOUNT_KEY_BYTES);
-    while !key.is_char_boundary(end) {
-        end -= 1;
-    }
-    key.truncate(end);
-    key
+    &s[..end]
+}
+
+/// Warn once, on a pod, that the in-process budgets are per replica.
+fn warn_if_replicated() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if std::env::var_os("POD_NAMESPACE").is_some() {
+            tracing::warn!(
+                "the sign-in throttle counts in this process: with N replicas each \
+                 budget is N times larger; with several, use the redis feature's \
+                 SharedThrottle"
+            );
+        }
+    });
 }
 
 impl Throttle {
@@ -176,6 +199,7 @@ impl Throttle {
     /// Count a sign-in to `account` from `address`, before its password is checked;
     /// `false` once any budget is spent, and then the password must not be checked.
     pub fn sign_in(&self, address: IpAddr, account: &str) -> bool {
+        warn_if_replicated();
         // In this order, each only if the one before allowed it: a sign-in an
         // address's budget refuses is not checked, so it costs the account nothing.
         self.attempt(address)
@@ -379,6 +403,21 @@ mod tests {
             "the mark that did not fit is dropped whole"
         );
         assert_eq!(account_key("  Ann\t"), "ann");
+    }
+
+    #[test]
+    fn spellings_of_one_login_share_a_budget() {
+        // Fullwidth letters, a ligature, and a decomposed accent are the login the
+        // store matches.
+        assert_eq!(
+            account_key("\u{ff21}\u{ff44}\u{ff4d}\u{ff49}\u{ff4e}"),
+            "admin"
+        );
+        assert_eq!(account_key("\u{fb01}ona"), "fiona");
+        assert_eq!(account_key("Jose\u{301}"), "jos\u{e9}");
+        let t = Throttle::new(budgets(1));
+        assert!(t.sign_in(ip(1), "admin"));
+        assert!(!t.sign_in(ip(2), "\u{ff41}\u{ff44}\u{ff4d}\u{ff49}\u{ff4e}"));
         assert!(format!("{:?}", Throttle::default()).contains("Throttle"));
     }
 }

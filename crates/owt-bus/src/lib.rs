@@ -35,7 +35,10 @@
 //!   client's current state as a reconnecting client would, and the notice hook is
 //!   told changes may have been missed.
 //! * A subscriber whose queue is full loses the message rather than stalling the
-//!   publisher (counted, if metrics are configured).
+//!   publisher (counted, if metrics are configured). The first loss marks it lagged
+//!   and logs one warning; it is handed [`Message::resync`] as soon as its queue has
+//!   room again, whether [`Subscription::recv`] finds the queue empty or the next
+//!   message for it arrives, after which a later loss warns again.
 //!
 //! **Notices** ([`Bus::on_notice`]) are a side channel for cache invalidation: a short
 //! key, delivered to the hook on every replica before any message published after it.
@@ -43,7 +46,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -62,8 +65,9 @@ pub trait Message: Send + Sync + Sized + 'static {
     fn decode(text: String) -> Option<Self>;
     /// The text that travels.
     fn text(&self) -> &str;
-    /// What subscribers are handed after the subscription was re-established, when
-    /// broadcasts may have been lost. `None`: nothing is.
+    /// What subscribers are handed when broadcasts may have been lost: after the
+    /// Redis subscription was re-established, and to a subscriber whose full queue
+    /// lost messages, once it has room. `None`: nothing is.
     #[must_use]
     fn resync() -> Option<Self> {
         None
@@ -144,29 +148,82 @@ impl MetricNames {
     }
 }
 
+/// One subscription's end of its queue, as the registry holds it.
+struct Sink<M> {
+    tx: mpsc::Sender<Delivered<M>>,
+    /// Set when a message was lost at a full queue, cleared when the subscriber is
+    /// handed [`Message::resync`].
+    lagged: Arc<AtomicBool>,
+}
+
+impl<M> Clone for Sink<M> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            lagged: self.lagged.clone(),
+        }
+    }
+}
+
+impl<M: Message> Sink<M> {
+    /// Queue `msg`, first handing a lagged subscriber [`Message::resync`] if there is
+    /// room for both.
+    fn send(&self, msg: &Delivered<M>, dropped: Option<&str>) {
+        if self.lagged.load(Ordering::Acquire) {
+            self.catch_up(dropped, false);
+        }
+        if self.tx.try_send(msg.clone()).is_err() {
+            self.lost(dropped);
+        }
+    }
+
+    /// Hand the subscriber [`Message::resync`] if its queue has room, which ends a lag.
+    /// `count`: a full queue loses the resync itself (a broadcast resync), rather than
+    /// leaving a lag pending (a catch-up before a message).
+    fn catch_up(&self, dropped: Option<&str>, count: bool) {
+        let Some(msg) = M::resync() else {
+            self.lagged.store(false, Ordering::Release);
+            return;
+        };
+        match self.tx.try_reserve() {
+            Ok(permit) => {
+                self.lagged.store(false, Ordering::Release);
+                permit.send(Arc::new(msg));
+            }
+            Err(_) if count => self.lost(dropped),
+            Err(_) => {}
+        }
+    }
+
+    /// A message was lost: counted every time, logged when it starts a lag.
+    fn lost(&self, dropped: Option<&str>) {
+        count_drop(dropped);
+        if !self.tx.is_closed() && !self.lagged.swap(true, Ordering::AcqRel) {
+            tracing::warn!("subscriber queue full; dropping its messages until it drains");
+        }
+    }
+}
+
 struct Registry<T, M> {
-    topics: HashMap<T, HashMap<u64, mpsc::Sender<Delivered<M>>>>,
+    topics: HashMap<T, HashMap<u64, Sink<M>>>,
 }
 
 impl<T: Topic, M: Message> Registry<T, M> {
     fn deliver(&self, topic: T, msg: &Delivered<M>, dropped: Option<&str>) {
         if let Some(subs) = self.topics.get(&topic) {
-            for tx in subs.values() {
-                if tx.try_send(msg.clone()).is_err() {
-                    count_drop(dropped);
-                    tracing::warn!(%topic, "subscriber queue full or closed; dropping message");
-                }
+            for sink in subs.values() {
+                sink.send(msg, dropped);
             }
         }
     }
 
-    /// Hand `msg` to every subscriber once, whatever topics it is in.
-    fn deliver_all(&self, msg: &Delivered<M>, dropped: Option<&str>) {
+    /// Hand every subscriber [`Message::resync`] once, whatever topics it is in.
+    fn resync_all(&self, dropped: Option<&str>) {
         let mut seen = HashSet::new();
         for subs in self.topics.values() {
-            for (id, tx) in subs {
-                if seen.insert(*id) && tx.try_send(msg.clone()).is_err() {
-                    count_drop(dropped);
+            for (id, sink) in subs {
+                if seen.insert(*id) {
+                    sink.catch_up(dropped, true);
                 }
             }
         }
@@ -204,8 +261,8 @@ impl<T: Topic, M: Message> Shared<T, M> {
     }
 
     fn resync(&self) {
-        if let Some(msg) = M::resync() {
-            self.registry().deliver_all(&Arc::new(msg), self.dropped());
+        if M::resync().is_some() {
+            self.registry().resync_all(self.dropped());
         }
     }
 }
@@ -352,7 +409,10 @@ impl<T: Topic, M: Message> Bus<T, M> {
         let (tx, rx) = mpsc::channel(self.shared.options.capacity);
         Subscription {
             id: self.shared.next_id.fetch_add(1, Ordering::Relaxed),
-            tx,
+            sink: Sink {
+                tx,
+                lagged: Arc::new(AtomicBool::new(false)),
+            },
             rx,
             topics: HashSet::new(),
             shared: self.shared.clone(),
@@ -472,8 +532,11 @@ async fn subscribe<T: Topic, M: Message>(
 /// leaves them all.
 pub struct Subscription<T: Topic, M: Message> {
     id: u64,
-    tx: mpsc::Sender<Delivered<M>>,
-    /// The queue, for `select!` loops that need the receiver itself.
+    sink: Sink<M>,
+    /// The queue, for `select!` loops that need the receiver itself. Reading it
+    /// directly skips the resync [`Subscription::recv`] hands a lagged subscription
+    /// whose queue it finds empty; the subscription still gets it ahead of its next
+    /// message.
     pub rx: mpsc::Receiver<Delivered<M>>,
     topics: HashSet<T>,
     shared: Arc<Shared<T, M>>,
@@ -488,7 +551,7 @@ impl<T: Topic, M: Message> Subscription<T, M> {
                 .topics
                 .entry(topic)
                 .or_default()
-                .insert(self.id, self.tx.clone());
+                .insert(self.id, self.sink.clone());
         }
     }
 
@@ -511,9 +574,27 @@ impl<T: Topic, M: Message> Subscription<T, M> {
         &self.topics
     }
 
-    /// The next message.
+    /// The next message. A subscription that lost messages at a full queue is handed
+    /// [`Message::resync`] once it has read what was queued.
     pub async fn recv(&mut self) -> Option<Delivered<M>> {
+        match self.rx.try_recv() {
+            Ok(msg) => return Some(msg),
+            Err(mpsc::error::TryRecvError::Disconnected) => return None,
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+        if self.sink.lagged.swap(false, Ordering::AcqRel)
+            && let Some(msg) = M::resync()
+        {
+            return Some(Arc::new(msg));
+        }
         self.rx.recv().await
+    }
+
+    /// Whether this subscription lost messages at a full queue and has not yet been
+    /// handed [`Message::resync`] for it.
+    #[must_use]
+    pub fn is_lagged(&self) -> bool {
+        self.sink.lagged.load(Ordering::Acquire)
     }
 }
 
@@ -653,6 +734,48 @@ mod tests {
         bus.publish(Room::A, msg("1")).await;
         bus.publish(Room::A, msg("2")).await;
         assert_eq!(a.recv().await.unwrap().0, "1");
+        assert!(a.rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_that_lost_messages_is_resynced_once_it_drains() {
+        let bus: Bus<Room, Text> = Bus::local(Options {
+            capacity: 1,
+            ..Options::default()
+        });
+        let mut a = bus.subscribe();
+        a.join(Room::A);
+        bus.publish(Room::A, msg("1")).await;
+        assert!(!a.is_lagged());
+        bus.publish(Room::A, msg("2")).await;
+        bus.publish(Room::A, msg("3")).await;
+        assert!(a.is_lagged());
+        assert_eq!(a.recv().await.unwrap().0, "1");
+        assert_eq!(a.recv().await.unwrap().0, "~resync");
+        assert!(!a.is_lagged());
+        assert!(a.rx.try_recv().is_err(), "one resync for the whole lag");
+        bus.publish(Room::A, msg("4")).await;
+        assert_eq!(a.recv().await.unwrap().0, "4");
+    }
+
+    #[tokio::test]
+    async fn a_lagged_subscriber_read_directly_gets_the_resync_before_its_next_message() {
+        let bus: Bus<Room, Text> = Bus::local(Options {
+            capacity: 2,
+            ..Options::default()
+        });
+        let mut a = bus.subscribe();
+        a.join(Room::A);
+        for m in ["1", "2", "3"] {
+            bus.publish(Room::A, msg(m)).await;
+        }
+        assert_eq!(a.rx.try_recv().unwrap().0, "1");
+        assert_eq!(a.rx.try_recv().unwrap().0, "2");
+        assert!(a.is_lagged(), "reading rx directly does not end the lag");
+        bus.publish(Room::A, msg("4")).await;
+        assert!(!a.is_lagged());
+        assert_eq!(a.rx.try_recv().unwrap().0, "~resync");
+        assert_eq!(a.rx.try_recv().unwrap().0, "4");
         assert!(a.rx.try_recv().is_err());
     }
 

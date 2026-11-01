@@ -127,15 +127,32 @@ pub enum Error {
     /// Hashing a password failed (it does not, short of exhaustion).
     #[error(transparent)]
     Hash(anyhow::Error),
+    /// Every permit of the password hasher stayed taken for its timeout
+    /// ([`owt_auth::password::Busy`]): nothing was checked or hashed. A 503.
+    #[error(transparent)]
+    Busy(#[from] owt_auth::password::Busy),
+}
+
+impl Error {
+    /// A failure of [`owt_auth::password::hash`]: [`Error::Busy`] when it found no
+    /// permit, [`Error::Hash`] otherwise.
+    pub(crate) fn hash(e: anyhow::Error) -> Self {
+        match e.downcast::<owt_auth::password::Busy>() {
+            Ok(busy) => Self::Busy(busy),
+            Err(e) => Self::Hash(e),
+        }
+    }
 }
 
 impl From<Error> for owt_web::Error {
-    /// A refusal is a 422 with its message; the faults keep their own mapping.
+    /// A refusal is a 422 with its message, a busy hasher a 503 with `Retry-After`;
+    /// the faults keep their own mapping.
     fn from(e: Error) -> Self {
         match e {
             Error::Refused(r) => Self::Unprocessable(r.to_string().into()),
             Error::Db(e) => Self::Db(e),
             Error::Hash(e) => Self::Internal(e),
+            Error::Busy(b) => Self::unavailable(b.to_string()),
         }
     }
 }
