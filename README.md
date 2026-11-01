@@ -3559,7 +3559,8 @@ struct Msg(String);
 impl owt_bus::Message for Msg {
     fn decode(text: String) -> Option<Self> { Some(Msg(text)) }
     fn text(&self) -> &str { &self.0 }
-    // What every subscriber gets after a resubscribe, when broadcasts may be lost.
+    // What a subscriber gets when broadcasts may have been lost: after a resubscribe,
+    // and after its own full queue dropped messages, once it has room again.
     fn resync() -> Option<Self> { Some(Msg(r#"{"type":"resync"}"#.into())) }
 }
 
@@ -3574,6 +3575,12 @@ bus.publish(Topic::Room(7), Arc::new(Msg("hello".into()))).await;
 let _first = socket.recv().await;
 # Ok(()) }
 ```
+
+A subscriber that falls behind loses messages rather than stalling the publisher.
+The first loss marks it lagged (`Subscription::is_lagged`) and logs one warning, not
+one per message; the drop counter counts each. It gets `resync()` once it has room:
+from `recv` when it has read what was queued, or ahead of its next message when the
+loop reads `rx` directly. So a slow tab replays its state instead of staying stale.
 
 `Bus::local` is the same API in one process, for tests. Channel names are a wire
 format between replicas: change them only with every replica. The prefix is ASCII
