@@ -3440,9 +3440,11 @@ records it in `owt_audit_anchors`; runs are serialized by an advisory lock. `ver
 holds an anchored head. `NoAnchor` records manifests in the database only, for
 development and tests; production uses `S3ObjectLock` (feature `s3`, below),
 or implements `Anchor` over another write-once store. The database's copy of a manifest is checked against its recorded
-digest, but it is only as trustworthy as the roles that may insert anchors; an
-independent check verifies against the copy in the store
-(`myapp audit verify --manifest m.json`).
+digest, but it is only as trustworthy as the roles that may insert anchors; the
+independent check is the store's copy (`anchor::verify_store`, which `myapp audit
+verify` runs; "Verifying", below). An `Anchor` reads manifests back as well as storing
+them: `get(Stored::Version { key, receipt })` for the one `put` stored,
+`get(Stored::Latest)` for the newest it holds.
 
 ```rust,no_run
 use std::time::Duration;
@@ -3516,6 +3518,11 @@ Set the bucket up once:
    cluster's own network only. Redirects are not followed; a 3xx is an error that
    usually means the wrong region or endpoint. The endpoint is an origin: no path,
    userinfo or query.
+4. Give `audit verify` a read-only credential of its own for the bucket:
+   `s3:ListBucket` (to find the newest manifest), `s3:GetObject`,
+   `s3:GetObjectVersion` and `s3:GetObjectRetention`, and nothing that writes. On B2:
+   `listFiles`, `readFiles` and `readFileRetentions`. The `retention` it is
+   configured with is not used for reading.
 
 `If-None-Match: *` keeps a second `put` of a key from replacing the first, where the
 store honors it: AWS and MinIO do, B2's S3 API does not document it. Do not rely on
@@ -3525,8 +3532,8 @@ anchored; `anchor` mints a new key on each run, so only a caller that retries `p
 itself sees this. Keys must be non-empty, not start with `/`, and have no empty, `.`
 or `..` segment.
 
-`fetch(key, version_id)` reads a manifest back (at most 16 MiB), to save as the file
-`audit verify --manifest` takes. Pass the receipt: without a version id the latest
+`fetch(key, version_id)` reads a manifest back (at most 16 MiB); `get` is built on it,
+and it saves the file `audit verify --manifest` takes. Pass the receipt: without a version id the latest
 version is read, which a credential that can write the key again could have replaced.
 With a version id, `fetch` fails unless the response is a 200 whose
 `x-amz-version-id` equals it and the version's retention reads back as COMPLIANCE
@@ -3534,6 +3541,12 @@ with a valid retain-until date, checked before the body is read, so only a versi
 that was locked is trusted. An expired date is accepted: a version id names immutable
 content and a COMPLIANCE date cannot be shortened. Once it passes, though, nothing
 prevents deleting the version, so set the retention beyond your audit horizon.
+
+`get(Stored::Version { key, receipt })` is `fetch(key, Some(receipt))`.
+`get(Stored::Latest)` lists the bucket (`ListObjectsV2` under `owt-audit/`, every
+page) for the greatest manifest key, which is the newest since keys start with the
+manifest's time, and reads that key's latest version, failing unless it is the
+manifest the key names (the key holds its digest).
 
 Requests go straight to the endpoint: the HTTP client ignores `HTTPS_PROXY`,
 `HTTP_PROXY` and `ALL_PROXY`, so the environment cannot route signed requests
@@ -3568,15 +3581,43 @@ event that was edited (`Broken::Hash`), removed (`Broken::Gap`) or swapped
 `anchor::history(&pool)` reads every manifest the database records and fails, rather
 than skipping, on one that does not match its digest or does not name the one before
 it; `anchor::age(&pool)` is how old the latest is, for an alert when anchoring stops
-(a store credential rotated, a job not running). With the `cli` feature the app gets
-these as operator commands: `myapp audit verify` checks every chain, that the
-database's anchors chain, and the latest one's heads; `myapp audit verify --manifest
-m.json`, for a manifest fetched from the store, also fails unless the database
-records it; `--max-age 2h` fails when the latest anchor is older (schedule it a
-margin above the anchoring interval); and `myapp audit heads`:
+(a store credential rotated, a job not running).
+
+`anchor::verify_store(&pool, &store)` is the check the database's owner cannot
+defeat. The database's anchors must chain (`history`), and the latest must have been
+recorded by this store (its provider is the store's `name()`), be the store's copy
+read by its receipt, and be the newest manifest the store holds; then its heads must
+still be in their chains. Each manifest names the digest of the one before it, so the
+store's copy of the latest vouches for every earlier row too. An owner who rewrites
+events and the anchors after them consistently, or removes the newest anchors,
+passes `history` but fails here: the store does not hold the forged manifest, or
+holds a newer one. A store that cannot be read, a missing copy and a copy that
+differs are failures (`VerifyError::Store`), not warnings. If an anchoring run's
+store write succeeds and its database insert fails, the store is a manifest ahead
+and this fails until the next run anchors again.
+
+With the `cli` feature the app gets these as operator commands, and passes
+`cli::run` the store the anchoring job writes to, built from the read-only
+credential (step 4 above):
+
+- `myapp audit verify` walks every chain (`--tenant t` for one) and runs
+  `verify_store` against the store.
+- With no store (`None::<&NoAnchor>`), or with `--db-only` for offline or development
+  use, it checks the database's own anchors (`history`, and the latest one's heads)
+  and prints `cli::UNANCHORED`, a warning that the result is not tamper-evident
+  against the database's owner.
+- `--manifest m.json`, a manifest fetched from the store, is checked as well and must
+  be one the database records.
+- `--max-age 2h` fails when the latest anchor is older (schedule it a margin above the
+  anchoring interval), or when nothing is anchored.
+- `myapp audit heads` prints every chain's head.
+
+`cli::run_to` is `run` writing to a given `Write` instead of stdout.
 
 ```rust,no_run
+use std::time::Duration;
 use clap::{Parser, Subcommand};
+use owt_audit::anchor::{NoAnchor, S3Config, S3ObjectLock};
 use owt_audit::cli::AuditCommand;
 
 #[derive(Parser)]
@@ -3591,10 +3632,41 @@ enum Command {
 
 # async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
 match Cli::parse().command {
-    Command::Audit(cmd) => owt_audit::cli::run(&pool, cmd).await?,
+    Command::Audit(cmd) => match owt_runtime::env::var("MYAPP_ANCHOR_READ_KEY_ID") {
+        Some(access_key) => {
+            let store = S3ObjectLock::new(S3Config {
+                endpoint: "https://s3.us-west-004.backblazeb2.com".into(),
+                bucket: "myapp-audit-anchors".into(),
+                region: "us-west-004".into(),
+                access_key,
+                secret_key: owt_runtime::env::required("MYAPP_ANCHOR_READ_KEY")?.into(),
+                allow_insecure_http: false,
+                retention: Duration::from_hours(7 * 365 * 24),
+            })?;
+            owt_audit::cli::run(&pool, Some(&store), cmd).await?;
+        }
+        // A development database with no store: verified unanchored, with a warning.
+        None => owt_audit::cli::run(&pool, None::<&NoAnchor>, cmd).await?,
+    },
 }
 # Ok(()) }
 ```
+
+**Upgrading to the store-backed `audit verify`** (breaking):
+
+- `cli::run(&pool, cmd)` is `cli::run(&pool, store, cmd)`: pass `Some(&store)` with
+  the anchor store, or `None::<&NoAnchor>` where there is none (the command then
+  warns that it is unanchored).
+- Give the command the read-only credential in step 4; the anchoring job's
+  credential lacks `s3:ListBucket`, and the verifier should not hold write access.
+- An `Anchor` implemented outside owt-audit adds `get(&self, which: Stored<'_>)`:
+  the version `put` returned for a key, or the newest manifest stored (`None` when it
+  holds none).
+- `VerifyError` has a `Store` variant; a `match` on it adds an arm.
+- A deployment whose anchors were recorded with `NoAnchor` fails the default verify
+  (the provider is not the store's); verify with `--db-only` until the job anchors
+  with the store.
+- `--manifest` now adds to the latest anchor's check rather than replacing it.
 
 ### Change requests
 

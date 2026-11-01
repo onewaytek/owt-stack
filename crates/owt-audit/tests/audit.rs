@@ -1,7 +1,11 @@
 //! owt-audit against a real Postgres (`DATABASE_URL`); skipped when it is unset. Each
 //! test takes a schema of its own and drops it.
 
-use owt_audit::anchor::{self, NoAnchor};
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::Mutex;
+
+use owt_audit::anchor::{self, Anchor, NoAnchor, Stored};
 use owt_audit::{ActorKind, Audit, Broken, Event, Outcome, VerifyError, verify, verify_anchor};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{Executor, PgPool};
@@ -56,6 +60,29 @@ impl Db {
         tx.execute("ALTER TABLE owt_audit_events ENABLE TRIGGER USER")
             .await
             .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// Run `sql` with the append-only triggers of both tables off.
+    async fn as_owner_of_events_and_anchors(&self, sql: &str) {
+        let mut tx = self.pool.begin().await.unwrap();
+        for t in ["owt_audit_events", "owt_audit_anchors"] {
+            tx.execute(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {t} DISABLE TRIGGER USER"
+            )))
+            .await
+            .unwrap();
+        }
+        tx.execute(sqlx::AssertSqlSafe(sql.to_owned()))
+            .await
+            .unwrap();
+        for t in ["owt_audit_events", "owt_audit_anchors"] {
+            tx.execute(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {t} ENABLE TRIGGER USER"
+            )))
+            .await
+            .unwrap();
+        }
         tx.commit().await.unwrap();
     }
 }
@@ -571,4 +598,197 @@ async fn privileges_tell_the_owner_from_an_append_only_role() {
         .await
         .unwrap();
     db.drop().await;
+}
+
+/// An anchor store in memory, versioned and write-once like an Object Lock bucket:
+/// key to (version id, bytes).
+#[derive(Default)]
+struct Memory {
+    objects: Mutex<BTreeMap<String, (String, Vec<u8>)>>,
+}
+
+impl Memory {
+    /// What a store whose copy was changed out of band would serve.
+    fn replace(&self, key: &str, bytes: &[u8]) {
+        let mut objects = self.objects.lock().unwrap();
+        let entry = objects.get_mut(key).unwrap();
+        entry.1 = bytes.to_vec();
+    }
+}
+
+impl Anchor for Memory {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> impl Future<Output = anyhow::Result<String>> + Send {
+        let mut objects = self.objects.lock().unwrap();
+        let put = if objects.contains_key(key) {
+            Err(anyhow::anyhow!("{key:?} exists"))
+        } else {
+            let version = format!("v{}", objects.len() + 1);
+            objects.insert(key.into(), (version.clone(), bytes.to_vec()));
+            Ok(version)
+        };
+        std::future::ready(put)
+    }
+
+    fn get(
+        &self,
+        which: Stored<'_>,
+    ) -> impl Future<Output = anyhow::Result<Option<Vec<u8>>>> + Send {
+        let objects = self.objects.lock().unwrap();
+        let got = match which {
+            Stored::Version { key, receipt } => match objects.get(key) {
+                Some((version, bytes)) if version == receipt => Ok(Some(bytes.clone())),
+                _ => Err(anyhow::anyhow!(
+                    "the store does not hold {key:?} at {receipt:?}"
+                )),
+            },
+            Stored::Latest => Ok(objects.last_key_value().map(|(_, (_, b))| b.clone())),
+        };
+        std::future::ready(got)
+    }
+}
+
+#[tokio::test]
+async fn the_store_vouches_for_the_database_anchors() {
+    let Some(db) = Db::new().await else { return };
+    let store = Memory::default();
+    assert_eq!(anchor::verify_store(&db.pool, &store).await.unwrap(), None);
+    let audit = Audit::new(db.pool.clone());
+    audit.record(&view("t", "p0")).await.unwrap();
+    anchor::anchor(&db.pool, &store).await.unwrap();
+    audit.record(&view("t", "p1")).await.unwrap();
+    let latest = anchor::anchor(&db.pool, &store).await.unwrap();
+    assert_eq!(
+        anchor::verify_store(&db.pool, &store).await.unwrap(),
+        Some(latest.manifest.clone())
+    );
+
+    // Anchors recorded by another provider are not this store's.
+    let other = Memory::default();
+    let e = anchor::verify_store(&db.pool, &NoAnchor).await.unwrap_err();
+    assert!(matches!(e, VerifyError::Store(_)), "{e}");
+    // A store that lists no manifest, or misses the latest, fails.
+    let e = anchor::verify_store(&db.pool, &other).await.unwrap_err();
+    assert!(e.to_string().contains("does not hold"), "{e}");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_store_copy_that_differs_fails() {
+    let Some(db) = Db::new().await else { return };
+    let store = Memory::default();
+    let audit = Audit::new(db.pool.clone());
+    audit.record(&view("t", "p0")).await.unwrap();
+    let first = anchor::anchor(&db.pool, &store).await.unwrap();
+    audit.record(&view("t", "p1")).await.unwrap();
+    let second = anchor::anchor(&db.pool, &store).await.unwrap();
+    anchor::verify_store(&db.pool, &store).await.unwrap();
+
+    // The store's copy of the latest is another manifest.
+    store.replace(&second.manifest.key(), &first.manifest.to_bytes());
+    let e = anchor::verify_store(&db.pool, &store).await.unwrap_err();
+    assert!(matches!(e, VerifyError::Store(_)), "{e}");
+    assert!(
+        e.to_string()
+            .contains("is not the manifest the database records"),
+        "{e}"
+    );
+    store.replace(&second.manifest.key(), &second.manifest.to_bytes());
+    anchor::verify_store(&db.pool, &store).await.unwrap();
+
+    // The store holds a manifest newer than the database's latest.
+    store
+        .put(
+            "owt-audit/99999999999999999999-x.json",
+            &first.manifest.to_bytes(),
+        )
+        .await
+        .unwrap();
+    let e = anchor::verify_store(&db.pool, &store).await.unwrap_err();
+    assert!(e.to_string().contains("newest manifest"), "{e}");
+
+    // The store holds manifests, the database none.
+    db.as_owner_of_events_and_anchors("DELETE FROM owt_audit_anchors")
+        .await;
+    let e = anchor::verify_store(&db.pool, &store).await.unwrap_err();
+    assert!(e.to_string().contains("records no anchor"), "{e}");
+    db.drop().await;
+}
+
+#[cfg(feature = "cli")]
+mod cli {
+    use super::*;
+    use owt_audit::cli::{AuditCommand, UNANCHORED, run_to};
+
+    fn verify(db_only: bool) -> AuditCommand {
+        AuditCommand::Verify {
+            tenant: None,
+            manifest: None,
+            max_age: None,
+            db_only,
+        }
+    }
+
+    async fn run<A: Anchor>(
+        pool: &PgPool,
+        store: Option<&A>,
+        db_only: bool,
+    ) -> anyhow::Result<String> {
+        let mut out = Vec::new();
+        run_to(pool, store, verify(db_only), &mut out).await?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_consistent_rewrite_passes_db_only_but_not_the_store() {
+        let Some(db) = Db::new().await else { return };
+        let store = Memory::default();
+        let audit = Audit::new(db.pool.clone());
+        for i in 0..4 {
+            audit.record(&view("t", &format!("p{i}"))).await.unwrap();
+        }
+        anchor::anchor(&db.pool, &store).await.unwrap();
+        audit.record(&view("t", "p4")).await.unwrap();
+        anchor::anchor(&db.pool, &store).await.unwrap();
+        let out = run(&db.pool, Some(&store), false).await.unwrap();
+        assert!(!out.contains(UNANCHORED), "{out}");
+        assert!(out.contains("the latest is the store's newest"), "{out}");
+
+        // The owner rewrites the events since the first anchor and the anchor of
+        // them, and anchors the forgery under the same provider name, but cannot
+        // write to the store.
+        db.as_owner_of_events_and_anchors(
+            "DELETE FROM owt_audit_events WHERE seq >= 5;
+             DELETE FROM owt_audit_anchors WHERE id = (SELECT max(id) FROM owt_audit_anchors)",
+        )
+        .await;
+        audit.record(&view("t", "forged")).await.unwrap();
+        anchor::anchor(&db.pool, &Memory::default()).await.unwrap();
+
+        let out = run(&db.pool, Some(&store), true).await.unwrap();
+        assert!(out.starts_with(UNANCHORED), "{out}");
+        assert!(out.contains("5 events verified"), "{out}");
+        let e = run(&db.pool, Some(&store), false).await.unwrap_err();
+        assert!(e.to_string().contains("anchor store"), "{e:#}");
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn without_a_store_verify_warns_and_checks_the_database() {
+        let Some(db) = Db::new().await else { return };
+        let audit = Audit::new(db.pool.clone());
+        audit.record(&view("t", "p0")).await.unwrap();
+        anchor::anchor(&db.pool, &NoAnchor).await.unwrap();
+        let out = run(&db.pool, None::<&NoAnchor>, false).await.unwrap();
+        assert!(out.starts_with(UNANCHORED), "{out}");
+        assert!(out.contains("1 events verified"), "{out}");
+        // The database's own check still fails on a broken anchored head.
+        db.as_owner_without_triggers("DELETE FROM owt_audit_events WHERE seq = 1")
+            .await;
+        assert!(run(&db.pool, None::<&NoAnchor>, false).await.is_err());
+        db.drop().await;
+    }
 }

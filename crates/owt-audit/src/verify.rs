@@ -77,6 +77,10 @@ pub enum VerifyError {
     /// A manifest that is not one, or whose recorded digest does not match it.
     #[error("audit manifest: {0}")]
     Manifest(String),
+    /// The anchor store could not be read, or its copy of the anchors is not the
+    /// database's (see [`crate::anchor::verify_store`]).
+    #[error("audit anchor store: {0}")]
+    Store(String),
 }
 
 type Row = (
