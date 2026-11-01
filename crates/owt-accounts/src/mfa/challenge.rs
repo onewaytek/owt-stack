@@ -257,7 +257,7 @@ impl Mfa {
         .await?;
         let hashes: Vec<&str> = unused.iter().map(|(_, h)| h.as_str()).collect();
         let found = recovery::find_match(typed, &hashes)
-            .await
+            .await?
             .ok_or(MfaError::Invalid)?;
         let used = sqlx::query(
             "UPDATE account_recovery_codes SET used_at = now()

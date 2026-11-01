@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! if !throttle.sign_in(ip, &form.account) { return too_many(); }
-//! let ok = password::verify_or_decoy(&form.password, hash.as_deref()).await;
+//! let ok = password::verify_or_decoy(&form.password, hash.as_deref()).await?; // `Busy`: 503
 //! ```
 //!
 //! A successful sign-in spends from the budgets too; at five a minute per account,

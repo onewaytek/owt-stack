@@ -440,7 +440,9 @@ pub enum MfaError {
     /// A budget of the throttle is spent: nothing was checked.
     #[error("Too many attempts. Wait a minute and try again.")]
     Throttled,
-    /// The shared throttle could not be reached and fails closed. Answer 503.
+    /// The shared throttle could not be reached and fails closed, or the password
+    /// hasher stayed saturated for its permit timeout ([`owt_auth::password::Busy`]).
+    /// Answer 503.
     #[error("Signing in is unavailable for a moment. Please try again shortly.")]
     Unavailable,
     /// The authenticator is locked for [`LOCK_FOR`] after too many wrong codes in a row.
@@ -485,7 +487,23 @@ pub enum MfaError {
     /// A fault: the database, the random source or the sealer. Its source may name
     /// tables; log it and never show it.
     #[error("The check could not be made. Try again in a moment.")]
-    Fault(#[from] crate::Error),
+    Fault(crate::Error),
+}
+
+impl From<crate::Error> for MfaError {
+    /// A busy hasher is [`MfaError::Unavailable`]; anything else a fault.
+    fn from(e: crate::Error) -> Self {
+        match e {
+            crate::Error::Busy(_) => Self::Unavailable,
+            e => Self::Fault(e),
+        }
+    }
+}
+
+impl From<owt_auth::password::Busy> for MfaError {
+    fn from(_: owt_auth::password::Busy) -> Self {
+        Self::Unavailable
+    }
 }
 
 impl From<sqlx::Error> for MfaError {
@@ -531,7 +549,7 @@ impl MfaError {
     }
 
     fn fault(e: anyhow::Error) -> Self {
-        Self::Fault(crate::Error::Hash(e))
+        crate::Error::hash(e).into()
     }
 }
 
@@ -1276,6 +1294,7 @@ impl Mfa {
             .await
             .map_err(|e| match e {
                 MfaError::Fault(e) => SignInRefused::Fault(e),
+                MfaError::Unavailable => SignInRefused::Unavailable,
                 other => SignInRefused::Fault(crate::Error::Hash(anyhow::anyhow!(other))),
             })
     }

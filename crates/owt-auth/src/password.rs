@@ -11,6 +11,12 @@
 //! it. The permit moves into the blocking task, so a caller that gives up (a request
 //! timeout, a closed connection) does not free it while the hash is still running.
 //!
+//! A check waits for a permit at most [`DEFAULT_PERMIT_TIMEOUT`] (five seconds;
+//! [`set_permit_timeout`] changes it), then fails with [`Busy`] rather than queueing
+//! for as long as the burst lasts. `owt_accounts` answers it with a 503 and
+//! `Retry-After` (`owt_web::Error::Unavailable`); an app calling these functions
+//! itself maps it the same way.
+//!
 //! What a new password must satisfy is [`Policy`]: NIST SP 800-63B's rules, with a
 //! breached-password check against a corpus the app supplies ([`SortedHashes`],
 //! [`Bloom`]).
@@ -22,6 +28,7 @@ use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -35,7 +42,22 @@ use tokio::task::spawn_blocking;
 /// Argon2 memory at the worst.
 pub const MAX_DEFAULT_CONCURRENCY: usize = 8;
 
+/// How long a check waits for a permit unless [`set_permit_timeout`] says otherwise.
+/// Long enough to ride out an ordinary burst of sign-ins (a permit is held for tens of
+/// milliseconds, a recovery code's for a few hundred), short enough that a saturated
+/// pod answers 503 well inside a request's deadline instead of letting the queue grow.
+pub const DEFAULT_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 static PERMITS: OnceLock<Semaphore> = OnceLock::new();
+static PERMIT_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
+/// Every permit stayed taken for the whole [`DEFAULT_PERMIT_TIMEOUT`] (or what
+/// [`set_permit_timeout`] set): the pod is saturated with password checks, and this
+/// one was not run. Not a mismatch: answer 503 with `Retry-After`
+/// (`owt_web::Error::unavailable`), and do not charge it as a failed sign-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("too many passwords are being checked at once: try again shortly")]
+pub struct Busy;
 
 /// Run at most `n` hashes at once (at least one). Call at startup: it returns `false`,
 /// changing nothing, once a hash has run or a bound has been set.
@@ -43,15 +65,32 @@ pub fn set_concurrency(n: usize) -> bool {
     PERMITS.set(Semaphore::new(n.max(1))).is_ok()
 }
 
-async fn permit() -> SemaphorePermit<'static> {
-    PERMITS
-        .get_or_init(|| {
-            let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-            Semaphore::new(cpus.min(MAX_DEFAULT_CONCURRENCY))
-        })
-        .acquire()
+/// Wait at most `wait` for a permit (at least a millisecond), then fail with [`Busy`].
+/// Call at startup: it returns `false`, changing nothing, once a check has waited for a
+/// permit or a timeout has been set.
+pub fn set_permit_timeout(wait: Duration) -> bool {
+    PERMIT_TIMEOUT
+        .set(wait.max(Duration::from_millis(1)))
+        .is_ok()
+}
+
+async fn permit() -> Result<SemaphorePermit<'static>, Busy> {
+    let semaphore = PERMITS.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        Semaphore::new(cpus.min(MAX_DEFAULT_CONCURRENCY))
+    });
+    acquire(
+        semaphore,
+        *PERMIT_TIMEOUT.get_or_init(|| DEFAULT_PERMIT_TIMEOUT),
+    )
+    .await
+}
+
+async fn acquire(semaphore: &Semaphore, wait: Duration) -> Result<SemaphorePermit<'_>, Busy> {
+    tokio::time::timeout(wait, semaphore.acquire())
         .await
-        .expect("the semaphore is never closed")
+        .map(|permit| permit.expect("the semaphore is never closed"))
+        .map_err(|_| Busy)
 }
 
 /// `password` as it is hashed and checked: NFKC-normalized, so a password typed from a
@@ -63,9 +102,15 @@ fn normalized(password: &str) -> String {
 }
 
 /// An Argon2id PHC string for `password`, hashed in its NFKC-normalized form.
+///
+/// # Errors
+///
+/// [`Busy`] (downcast the `anyhow::Error` to find it) when no permit came free in
+/// time; otherwise a failure of the hasher itself, which does not happen short of
+/// exhaustion.
 pub async fn hash(password: &str) -> anyhow::Result<String> {
     let password = normalized(password);
-    let permit = permit().await;
+    let permit = permit().await?;
     spawn_blocking(move || {
         let _permit = permit;
         Argon2::default()
@@ -104,20 +149,28 @@ impl Check {
 /// only yes or no: a caller that stores hashes and rehashes after a match uses [`check`],
 /// which says when the match was only of the password as typed ([`Check::MatchRaw`]),
 /// so that hash is replaced by one of the normalized form.
-pub async fn verify(password: &str, stored: &str) -> bool {
-    check(password, stored).await.matched()
+///
+/// # Errors
+///
+/// [`Busy`]: no permit came free in time, and nothing was checked.
+pub async fn verify(password: &str, stored: &str) -> Result<bool, Busy> {
+    Ok(check(password, stored).await?.matched())
 }
 
 /// [`verify`], saying whether a match needs the hash replaced ([`Check::MatchRaw`]).
-pub async fn check(password: &str, stored: &str) -> Check {
+///
+/// # Errors
+///
+/// [`Busy`]: no permit came free in time, and nothing was checked.
+pub async fn check(password: &str, stored: &str) -> Result<Check, Busy> {
     let (password, stored) = (password.to_owned(), stored.to_owned());
-    let permit = permit().await;
-    spawn_blocking(move || {
+    let permit = permit().await?;
+    Ok(spawn_blocking(move || {
         let _permit = permit;
         check_blocking(&password, &stored)
     })
     .await
-    .unwrap_or(Check::Mismatch)
+    .unwrap_or(Check::Mismatch))
 }
 
 fn check_blocking(password: &str, stored: &str) -> Check {
@@ -140,14 +193,18 @@ fn verify_blocking(password: &str, stored: &str) -> bool {
 }
 
 /// A hash nothing matches, made once with today's parameters, so a check against it
-/// costs what a real one costs.
-async fn decoy() -> Option<&'static str> {
+/// costs what a real one costs. `None` if the hasher failed; [`Busy`] if making it
+/// found no permit.
+async fn decoy() -> Result<Option<&'static str>, Busy> {
     static DECOY: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-    DECOY
+    match DECOY
         .get_or_try_init(|| async { hash(&crate::random_token(32)).await })
         .await
-        .ok()
-        .map(String::as_str)
+    {
+        Ok(decoy) => Ok(Some(decoy.as_str())),
+        Err(e) if e.is::<Busy>() => Err(Busy),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Check `password` for an account that may not exist: `stored` is its hash, or `None`
@@ -156,32 +213,47 @@ async fn decoy() -> Option<&'static str> {
 /// against a hash nothing matches, so the time a sign-in takes says neither whether
 /// the account exists nor what its hash looks like. A yes or no: a caller that rehashes uses
 /// [`check_or_decoy`], to learn of a [`Check::MatchRaw`].
-pub async fn verify_or_decoy(password: &str, stored: Option<&str>) -> bool {
-    check_or_decoy(password, stored).await.matched()
+///
+/// # Errors
+///
+/// [`Busy`]: no permit came free in time, and nothing was checked.
+pub async fn verify_or_decoy(password: &str, stored: Option<&str>) -> Result<bool, Busy> {
+    Ok(check_or_decoy(password, stored).await?.matched())
 }
 
 /// [`verify_or_decoy`], saying whether a match needs the hash replaced.
-pub async fn check_or_decoy(password: &str, stored: Option<&str>) -> Check {
+///
+/// # Errors
+///
+/// [`Busy`]: no permit came free in time, and nothing was checked.
+pub async fn check_or_decoy(password: &str, stored: Option<&str>) -> Result<Check, Busy> {
     if let Some(stored) = stored.filter(|s| usable(s)) {
         return check(password, stored).await;
     }
-    if let Some(decoy) = decoy().await {
-        check(password, decoy).await;
+    if let Some(decoy) = decoy().await? {
+        check(password, decoy).await?;
     }
-    Check::Mismatch
+    Ok(Check::Mismatch)
 }
 
 /// The index of the hash in `hashes` that `secret` (ASCII, used as it is) matches, or
 /// `None`. Always checks `max(hashes.len(), pad)` hashes, one after another on one
 /// permit, the missing ones against a decoy, so the time taken does not say how many
 /// hashes there were or which matched. For secrets that are not passwords
-/// (recovery codes).
-pub(crate) async fn find_matching(secret: &str, hashes: &[&str], pad: usize) -> Option<usize> {
-    let decoy = decoy().await?.to_owned();
+/// (recovery codes). [`Busy`] when no permit came free in time.
+pub(crate) async fn find_matching(
+    secret: &str,
+    hashes: &[&str],
+    pad: usize,
+) -> Result<Option<usize>, Busy> {
+    let Some(decoy) = decoy().await? else {
+        return Ok(None);
+    };
+    let decoy = decoy.to_owned();
     let hashes: Vec<String> = hashes.iter().map(|h| (*h).to_owned()).collect();
     let secret = secret.to_owned();
-    let permit = permit().await;
-    spawn_blocking(move || {
+    let permit = permit().await?;
+    Ok(spawn_blocking(move || {
         let _permit = permit;
         let mut found = None;
         for i in 0..hashes.len().max(pad) {
@@ -194,7 +266,7 @@ pub(crate) async fn find_matching(secret: &str, hashes: &[&str], pad: usize) -> 
     })
     .await
     .ok()
-    .flatten()
+    .flatten())
 }
 
 /// Whether `stored` is a hash [`verify`] can check: an Argon2 PHC string with an
@@ -237,27 +309,30 @@ mod tests {
         let composed = "caf\u{e9} au lait";
         let decomposed = "cafe\u{301} au lait";
         let h = hash(composed).await.unwrap();
-        assert!(verify(decomposed, &h).await && verify(composed, &h).await);
-        assert_eq!(check(decomposed, &h).await, Check::Match);
+        assert!(verify(decomposed, &h).await.unwrap() && verify(composed, &h).await.unwrap());
+        assert_eq!(check(decomposed, &h).await.unwrap(), Check::Match);
         let h = hash(decomposed).await.unwrap();
-        assert!(verify(composed, &h).await);
+        assert!(verify(composed, &h).await.unwrap());
         // `ﬁ` is `fi` under NFKC.
         let h = hash("\u{fb01}sh and chips").await.unwrap();
-        assert!(verify("fish and chips", &h).await);
-        assert!(!verify("fish and chip", &h).await);
+        assert!(verify("fish and chips", &h).await.unwrap());
+        assert!(!verify("fish and chip", &h).await.unwrap());
 
         // A hash of the raw decomposed bytes, as an older build wrote it.
         let legacy = Argon2::default()
             .hash_password(decomposed.as_bytes())
             .unwrap()
             .to_string();
-        assert_eq!(check(decomposed, &legacy).await, Check::MatchRaw);
-        assert_eq!(check("other", &legacy).await, Check::Mismatch);
+        assert_eq!(check(decomposed, &legacy).await.unwrap(), Check::MatchRaw);
+        assert_eq!(check("other", &legacy).await.unwrap(), Check::Mismatch);
         assert_eq!(
-            check_or_decoy(decomposed, Some(&legacy)).await,
+            check_or_decoy(decomposed, Some(&legacy)).await.unwrap(),
             Check::MatchRaw
         );
-        assert_eq!(check_or_decoy(decomposed, None).await, Check::Mismatch);
+        assert_eq!(
+            check_or_decoy(decomposed, None).await.unwrap(),
+            Check::Mismatch
+        );
     }
 
     #[tokio::test]
@@ -267,17 +342,20 @@ mod tests {
             hash("BBBBBBBBBB").await.unwrap(),
         ];
         let refs: Vec<&str> = hashes.iter().map(String::as_str).collect();
-        assert_eq!(find_matching("BBBBBBBBBB", &refs, 4).await, Some(1));
-        assert_eq!(find_matching("CCCCCCCCCC", &refs, 4).await, None);
-        assert_eq!(find_matching("AAAAAAAAAA", &[], 3).await, None);
+        assert_eq!(
+            find_matching("BBBBBBBBBB", &refs, 4).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(find_matching("CCCCCCCCCC", &refs, 4).await.unwrap(), None);
+        assert_eq!(find_matching("AAAAAAAAAA", &[], 3).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn argon2_round_trip() {
         let h = hash("correct horse").await.unwrap();
-        assert!(verify("correct horse", &h).await);
-        assert!(!verify("wrong", &h).await);
-        assert!(!verify("x", "not-a-hash").await);
+        assert!(verify("correct horse", &h).await.unwrap());
+        assert!(!verify("wrong", &h).await.unwrap());
+        assert!(!verify("x", "not-a-hash").await.unwrap());
         assert!(!needs_rehash(&h));
         // Argon2 version 0x10 (an old library's) is rehashed even at today's costs.
         let v10 = h.replacen("$v=19$", "$v=16$", 1);
@@ -291,7 +369,7 @@ mod tests {
         let real = hash("correct horse").await.unwrap();
         let time = |stored: Option<String>| async move {
             let began = std::time::Instant::now();
-            assert!(!verify_or_decoy("guess", stored.as_deref()).await);
+            assert!(!verify_or_decoy("guess", stored.as_deref()).await.unwrap());
             began.elapsed()
         };
         time(None).await; // the decoy is made once
@@ -317,7 +395,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         });
-        assert!(verify("correct horse", &stored).await);
+        assert!(verify("correct horse", &stored).await.unwrap());
         ticker.abort();
         assert!(
             ticks.load(Relaxed) > 0,
@@ -333,7 +411,7 @@ mod tests {
         let checks: Vec<_> = (0..MAX_DEFAULT_CONCURRENCY * 3)
             .map(|_| {
                 let stored = stored.clone();
-                tokio::spawn(async move { verify("correct horse", &stored).await })
+                tokio::spawn(async move { verify("correct horse", &stored).await.unwrap() })
             })
             .collect();
         for c in checks {
@@ -358,15 +436,19 @@ mod tests {
     #[tokio::test]
     async fn a_missing_account_costs_a_check_and_never_matches() {
         let stored = hash("correct horse").await.unwrap();
-        assert!(verify_or_decoy("correct horse", Some(&stored)).await);
-        assert!(!verify_or_decoy("wrong", Some(&stored)).await);
+        assert!(
+            verify_or_decoy("correct horse", Some(&stored))
+                .await
+                .unwrap()
+        );
+        assert!(!verify_or_decoy("wrong", Some(&stored)).await.unwrap());
         let started = std::time::Instant::now();
-        assert!(verify("correct horse", &stored).await);
+        assert!(verify("correct horse", &stored).await.unwrap());
         let real = started.elapsed();
         // The first decoy also hashes it; time the second.
-        assert!(!verify_or_decoy("correct horse", None).await);
+        assert!(!verify_or_decoy("correct horse", None).await.unwrap());
         let started = std::time::Instant::now();
-        assert!(!verify_or_decoy("correct horse", None).await);
+        assert!(!verify_or_decoy("correct horse", None).await.unwrap());
         assert!(
             started.elapsed() > real / 4,
             "the decoy took {:?}, a real check {real:?}",
@@ -398,9 +480,12 @@ mod tests {
                 PasswordHash::new(&stored).is_err(),
                 "{stored:?} parsed as a PHC string"
             );
-            assert!(!verify("anything", &stored).await, "{stored:?} matched");
             assert!(
-                !verify("", &stored).await,
+                !verify("anything", &stored).await.unwrap(),
+                "{stored:?} matched"
+            );
+            assert!(
+                !verify("", &stored).await.unwrap(),
                 "{stored:?} matched the empty password"
             );
             assert!(
@@ -416,7 +501,7 @@ mod tests {
     async fn a_cancelled_check_keeps_its_permit_until_the_hash_ends() {
         let stored = hash("correct horse").await.unwrap();
         let semaphore = PERMITS.get().unwrap();
-        let task = tokio::spawn(async move { verify("correct horse", &stored).await });
+        let task = tokio::spawn(async move { verify("correct horse", &stored).await.unwrap() });
         // Wait until some check holds a permit (other tests share the semaphore, and
         // any of them holding one only makes the bound below easier to see).
         let total = std::thread::available_parallelism()
@@ -438,6 +523,26 @@ mod tests {
             semaphore.available_permits() < total,
             "the permit was freed while the hash ran on"
         );
+    }
+
+    /// With every permit taken, a check waits its timeout and fails with `Busy` rather
+    /// than queueing; once a permit is free it is granted at once.
+    #[tokio::test]
+    async fn a_saturated_pool_answers_busy_after_the_timeout() {
+        let semaphore = Semaphore::new(1);
+        let held = acquire(&semaphore, Duration::from_secs(1)).await.unwrap();
+        let began = std::time::Instant::now();
+        assert_eq!(
+            acquire(&semaphore, Duration::from_millis(50)).await.err(),
+            Some(Busy)
+        );
+        let waited = began.elapsed();
+        assert!(
+            waited >= Duration::from_millis(50),
+            "gave up after {waited:?}"
+        );
+        drop(held);
+        assert!(acquire(&semaphore, Duration::from_millis(50)).await.is_ok());
     }
 
     #[test]

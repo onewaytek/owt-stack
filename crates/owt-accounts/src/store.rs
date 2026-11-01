@@ -255,7 +255,7 @@ pub async fn create_in(conn: &mut sqlx::PgConnection, new: New<'_>) -> Result<Ac
             }
             owt_auth::password::hash(password)
                 .await
-                .map_err(Error::Hash)?
+                .map_err(Error::hash)?
         }
     };
     let key = skeleton(&username);
@@ -335,7 +335,7 @@ async fn authenticate_as(
         .as_ref()
         .map(|(_, hash)| hash.as_str())
         .filter(|hash| !hash.is_empty());
-    let checked = owt_auth::password::check_or_decoy(password, stored).await;
+    let checked = owt_auth::password::check_or_decoy(password, stored).await?;
     if !checked.matched() {
         return Ok(None);
     }
@@ -606,7 +606,7 @@ pub async fn change_password(
             .bind(account.id)
             .fetch_optional(pool)
             .await?;
-    if !owt_auth::password::verify_or_decoy(current, stored.as_deref()).await {
+    if !owt_auth::password::verify_or_decoy(current, stored.as_deref()).await? {
         return Err(Refused::CurrentPassword.into());
     }
     // Only over the hash just checked: a reset by staff while this ran (answering a
@@ -645,7 +645,7 @@ async fn replace_password(
     }
     let hash = owt_auth::password::hash(password)
         .await
-        .map_err(Error::Hash)?;
+        .map_err(Error::hash)?;
     // The row's flag, read under its lock: whether it took the password.
     let allowed = sqlx::query_scalar::<_, bool>(
         "WITH target AS (
