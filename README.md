@@ -1641,7 +1641,9 @@ use owt_auth::throttle::Throttle;
 
 // Once per request, inside the session layer (`Sessions::layer`, above): load the
 // signed-in account if its epoch still matches. The extractors read it from the
-// request, so a handler and a page-chrome helper cost one query between them.
+// request, so a handler and a page-chrome helper cost one query between them. That
+// query also reads whether the account holds a second factor and which policy
+// versions it accepted, so `require_mfa` and `Policies::gate` add no query of their own.
 let accounts = Accounts::new(pool.clone(), "/login");
 // `?next=` is the URL the client asked for, prefix included under `Router::nest`. An
 // app whose pages sit under prefixes with a sign-in page each (`/en/login`,
@@ -1865,7 +1867,8 @@ handler names `SignedWith<Viewer>` (walled as `Signed`) or `MaybeWith<Viewer>`;
 `Maybe`, `Signed`, `Staff` and `roles::Holds` work unchanged beside them. `QUERY` is SQL pasted
 as it is, so it is a constant in the app's code, never built from a request; it binds
 no parameters. Its columns are named apart from the account's (`id`, `username`,
-`email`, `is_staff`, `is_active`, `session_epoch`, `roles`): a row with a name twice
+`email`, `is_staff`, `is_active`, `session_epoch`, `roles`) and the layer's own
+(`owt_has_factor`, `owt_accepted`): a row with a name twice
 (`SELECT p.*` of a table with an `id`, an extra `roles`) is refused, never read in
 place of the account's. That refusal, and a column that fails to decode, fail the
 load as a database outage would, on every walled page, so an app sees it at once. A
@@ -1927,7 +1930,8 @@ then enforce it, with no second layer to remember (installing `load` with anothe
 logs an error and answers 503 to anyone signed in, rather than run single-factor). A
 signature for an account that has a confirmed factor, or that the policy requires to have
 one, then counts as signed in only when the session shows a second factor passed for that
-account and epoch; until then the request is anonymous and the session becomes the pending
+account and epoch (whether the account holds a factor is read in the query that loads it,
+so the gate costs no round trip); until then the request is anonymous and the session becomes the pending
 sign-in above, so a challenge or enrollment page can continue it
 (`Mfa::pending_account`). A provider sign-in (`social`), a sign-in link, `password_gate` and
 an old `/login` route left in place are all held; none can skip the second factor. Without
@@ -2494,7 +2498,8 @@ let policies = Policies::new(pool, chrome, &[policies::TERMS, policies::PRIVACY,
     .client_ip(owt_web::client_ip::Source::ForwardedFor { proxies: 1 }); // the address recorded
 let _app: axum::Router = axum::Router::new()
     .merge(policies.routes())
-    // Inside the accounts layer, which loads the account the gate reads.
+    // Inside the accounts layer, which loads the account the gate reads, and what the
+    // account accepted in the same query: the gate adds no query per request.
     .layer(from_fn_with_state(policies, Policies::gate))
     .layer(from_fn_with_state(accounts, owt_accounts::Accounts::load::<owt_accounts::session::Data>));
 # }

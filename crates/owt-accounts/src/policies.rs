@@ -42,6 +42,7 @@ use serde::Deserialize;
 use sqlx::{PgExecutor, PgPool};
 
 use crate::admin::{Body, Level, Notice};
+use crate::layer::AcceptedVersions;
 use crate::{Maybe, Signed, Staff};
 
 /// A document an app asks people to agree to.
@@ -1296,6 +1297,10 @@ impl Policies {
     /// image, a stylesheet, a script, a fetch, a socket, a stream or a fragment is
     /// never interrupted. When the database cannot say, the request goes through.
     ///
+    /// What the account accepted comes from the accounts layer, which reads it in the
+    /// query that loads the account; the current versions come from this replica's
+    /// copy ([`refresh`](Self::refresh)). So the gate adds no query of its own.
+    ///
     /// Install it inside the accounts layer, which it reads the account from:
     /// `.layer(from_fn_with_state(policies.clone(), Policies::gate))` before
     /// `.layer(from_fn_with_state(accounts, Accounts::load::<…>))`.
@@ -1310,7 +1315,12 @@ impl Policies {
         let Some(account) = Maybe::of(req.extensions()).0 else {
             return next.run(req).await;
         };
-        let asked = match this.asked(account.id).await {
+        let held = req.extensions().get::<AcceptedVersions>().cloned();
+        let asked = match held {
+            Some(held) => this.asked_of(&held.0).await,
+            None => this.asked(account.id).await,
+        };
+        let asked = match asked {
             Ok(asked) => asked,
             Err(e) => {
                 tracing::error!(error = %e, "could not read the site policies an account accepted");
@@ -1359,13 +1369,29 @@ impl Policies {
         if current.is_empty() {
             return Ok(Vec::new());
         }
-        let accepted = accepted(&self.0.pool, account_id).await?;
-        let mut asked: Vec<Version> = outstanding(&current, &accepted)
+        let held: Vec<i64> = accepted(&self.0.pool, account_id)
+            .await?
             .into_iter()
+            .map(|a| a.version_id)
+            .collect();
+        Ok(self.unheld(&current, &held))
+    }
+
+    /// The current versions not among `held` (the version ids an account accepted), in
+    /// the declared order.
+    async fn asked_of(&self, held: &[i64]) -> sqlx::Result<Vec<Version>> {
+        let current = self.current().await?;
+        Ok(self.unheld(&current, held))
+    }
+
+    fn unheld(&self, current: &[Version], held: &[i64]) -> Vec<Version> {
+        let mut asked: Vec<Version> = current
+            .iter()
+            .filter(|v| !held.contains(&v.id))
             .cloned()
             .collect();
         asked.sort_by_key(|v| self.0.documents.iter().position(|d| d.slug == v.kind));
-        Ok(asked)
+        asked
     }
 
     /// Never sent to the page that asks: it, the documents, the staff pages and the

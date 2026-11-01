@@ -4,6 +4,10 @@
 //! signature, loads the account if the epoch still matches, and puts the result in
 //! the request's extensions. The extractors read it from there, so a handler naming
 //! [`Signed`] and a template helper naming [`Maybe`] cost one query between them.
+//! That query also reads what the gates ask about the account (whether it holds a
+//! second factor, for [`Accounts::require_mfa`], and which policy versions it
+//! accepted, for [`Policies::gate`](crate::policies::Policies::gate)), so a signed-in
+//! request costs one query for all of them.
 //!
 //! A signature whose epoch no longer matches (signed out everywhere, password
 //! changed, deactivated) is dropped from the session, so the cookie stops carrying
@@ -34,7 +38,7 @@ use std::sync::Arc;
 
 use crate::mfa::{Mfa, MfaSession};
 use crate::session::Signed as SignedData;
-use crate::store::{self, Account, Extra};
+use crate::store::{self, Account, Extra, Standing};
 
 /// The layer's state: the pool and where the sign-in page is.
 #[derive(Clone, Debug)]
@@ -46,8 +50,9 @@ pub struct Accounts {
     mfa: Option<MfaGate>,
 }
 
-/// The second-factor gate [`Accounts::require_mfa`] fixes for one session data type.
-type GateFn<T> = dyn Fn(PgPool, Session<T>, Account) -> GateFuture + Send + Sync;
+/// The second-factor gate [`Accounts::require_mfa`] fixes for one session data type:
+/// it reads the session, the account and whether the account holds a factor.
+type GateFn<T> = dyn Fn(&Session<T>, &Account, bool) -> Gate + Send + Sync;
 
 #[derive(Clone, Debug)]
 struct MfaGate {
@@ -56,9 +61,6 @@ struct MfaGate {
     /// An `Arc<GateFn<T>>` of that type.
     gate: Arc<dyn std::any::Any + Send + Sync>,
 }
-
-/// The second-factor gate's answer, in flight.
-type GateFuture = std::pin::Pin<Box<dyn Future<Output = sqlx::Result<Gate>> + Send>>;
 
 /// What the second-factor gate decided about a signature.
 enum Gate {
@@ -95,15 +97,13 @@ impl Accounts {
     /// 503 to anyone signed in, rather than run single-factor.
     #[must_use]
     pub fn require_mfa<T: MfaSession>(mut self, mfa: Mfa) -> Self {
-        let gate: Arc<GateFn<T>> = Arc::new(move |pool, session, account| {
-            let mfa = mfa.clone();
-            Box::pin(async move {
-                Ok(match mfa.gate(&pool, &session, &account).await? {
+        let gate: Arc<GateFn<T>> =
+            Arc::new(move |session: &Session<T>, account: &Account, has: bool| {
+                match mfa.gate(session, account, has) {
                     Some(has) => Gate::Open(Some(has)),
                     None => Gate::Held,
-                })
-            })
-        });
+                }
+            });
         self.mfa = Some(MfaGate {
             data: std::any::TypeId::of::<T>(),
             gate: Arc::new(gate),
@@ -137,8 +137,8 @@ impl Accounts {
         next: Next,
     ) -> Response {
         this.load_by::<T, _, _, _>(req, next, |pool, id, epoch, session| async move {
-            let account = store::by_id_in_epoch(&pool, id, epoch, session.as_deref()).await?;
-            Ok(account.map(|account| (account, ())))
+            let account = store::standing_in_epoch(&pool, id, epoch, session.as_deref()).await?;
+            Ok(account.map(|(account, standing)| (account, (), standing)))
         })
         .await
     }
@@ -153,16 +153,18 @@ impl Accounts {
         next: Next,
     ) -> Response {
         this.load_by::<T, _, _, _>(req, next, |pool, id, epoch, session| async move {
-            store::by_id_in_epoch_with::<X>(&pool, id, epoch, session.as_deref()).await
+            store::standing_in_epoch_with::<X>(&pool, id, epoch, session.as_deref()).await
         })
         .await
     }
 
-    /// What the second-factor gate, if one is required, makes of this signature.
-    async fn hold<T: SignedData>(
+    /// What the second-factor gate, if one is required, makes of this signature for
+    /// `account`, which holds a factor if `has_factor`.
+    fn hold<T: SignedData>(
         &self,
         session: Option<&Session<T>>,
         account: &Account,
+        has_factor: bool,
     ) -> sqlx::Result<Gate> {
         let (Some(required), Some(session)) = (&self.mfa, session) else {
             return Ok(Gate::Open(None));
@@ -180,16 +182,16 @@ impl Accounts {
                 "require_mfa and load name different session data types".into(),
             ));
         };
-        gate(self.pool.clone(), session.clone(), account.clone()).await
+        Ok(gate(session, account, has_factor))
     }
 
     /// The middleware, with `read` asking for the session's account (by id, in its
-    /// epoch) and what comes with it.
+    /// epoch), what comes with it and its standing, in one query.
     async fn load_by<T, X, F, R>(self, mut req: Request, next: Next, read: R) -> Response
     where
         T: SignedData,
         X: Clone + Send + Sync + 'static,
-        F: Future<Output = sqlx::Result<Option<(Account, X)>>>,
+        F: Future<Output = sqlx::Result<Option<(Account, X, Standing)>>>,
         R: FnOnce(PgPool, i64, i32, Option<String>) -> F,
     {
         let session = req.extensions().get::<Session<T>>().cloned();
@@ -198,11 +200,13 @@ impl Accounts {
             Some(signature) => {
                 let id = session.as_ref().and_then(Session::id);
                 match read(self.pool.clone(), signature.account, signature.epoch, id).await {
-                    Ok(Some((account, extra))) => {
-                        let held = self.hold::<T>(session.as_ref(), &account).await;
+                    Ok(Some((account, extra, standing))) => {
+                        let held = self.hold::<T>(session.as_ref(), &account, standing.has_factor);
                         match held {
                             Ok(Gate::Open(has_factor)) => {
                                 req.extensions_mut().insert(LoadedExtra(extra));
+                                req.extensions_mut()
+                                    .insert(AcceptedVersions(standing.accepted.into()));
                                 if let Some(has) = has_factor {
                                     req.extensions_mut().insert(HasFactor(has));
                                 }
@@ -210,7 +214,7 @@ impl Accounts {
                             }
                             Ok(Gate::Held) => Loaded::Anonymous,
                             Err(e) => {
-                                tracing::warn!(error = %e, "the session's second factor could not be read");
+                                tracing::warn!(error = %e, "the session's second factor could not be checked");
                                 Loaded::Unknown
                             }
                         }
@@ -336,6 +340,12 @@ pub(crate) struct EnrollAt(pub(crate) String);
 /// ([`Accounts::require_mfa`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct HasFactor(pub(crate) bool);
+
+/// The policy versions the signed-in account accepted (`policy_acceptances` ids), read
+/// with the account, for [`Policies::gate`](crate::policies::Policies::gate). Present
+/// whenever [`Loaded::Account`] is.
+#[derive(Clone, Debug)]
+pub(crate) struct AcceptedVersions(pub(crate) Arc<[i64]>);
 
 /// The signed-in account, if any. Available to anything with the request's
 /// extensions (a page-context extractor, say), not only as a handler argument.
