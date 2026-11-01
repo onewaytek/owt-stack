@@ -51,7 +51,6 @@ run() {
 }
 fail() { echo "FAIL: $*" >&2; echo "--- out"; cat "$work/out"; echo "--- err"; cat "$work/err"; echo "--- log"; cat "$log"; exit 1; }
 held() { grep -E "^$1=" "$FAKE_SECRET" | cut -d= -f2- | base64 -d; }
-stored() { grep -E "^$1=" "$FAKE_SECRET" | cut -d= -f2-; }
 
 printf 'NAME=myapp\nNAMESPACE=myapp-staging\nPORT=8000\n' >"$work/deploy/params.env"
 cat >"$work/deploy/env.env" <<'ENV'
@@ -73,8 +72,8 @@ grep -qx "created PROVIDER_TOKEN" "$work/out" || fail "reports PROVIDER_TOKEN"
 PROVIDER_TOKEN=tok-1 run --apply || fail "apply"
 [ "$(held PUBLIC_BASE_URL)" = "https://myapp.example" ] || fail "a literal is written as given"
 [ "$(held PROVIDER_TOKEN)" = "tok-1" ] || fail "@env takes the caller's variable"
-generated=$(stored SESSION_SECRET)
-[ "${#generated}" -eq 88 ] || fail "a generated key is 64 bytes (88 base64 characters)"
+generated=$(held SESSION_SECRET)
+[ "${#generated}" -eq 88 ] && [ "$(printf %s "$generated" | base64 -d | wc -c)" -eq 64 ] || fail "the app reads a generated key as base64 text of 64 bytes"
 for v in "https://myapp.example" tok-1 "$generated"; do
   grep -qF -- "$v" "$work/out" "$work/err" "$log" && fail "a value was printed or passed as an argument"
 done
@@ -85,7 +84,7 @@ grep -qx "no change" "$work/out" || fail "says no change"
 grep -qx "kept SESSION_SECRET" "$work/out" || fail "keeps the generated key"
 grep -qx "kept PROVIDER_TOKEN" "$work/out" || fail "@env unset keeps the held value"
 grep -qx "unchanged PUBLIC_BASE_URL" "$work/out" || fail "reports an unchanged literal"
-[ "$(stored SESSION_SECRET)" = "$generated" ] || fail "a generated key was regenerated"
+[ "$(held SESSION_SECRET)" = "$generated" ] || fail "a generated key was regenerated"
 
 # 4. A changed literal and a new @env value are set; a key set by hand is left alone;
 #    the generated key still survives. An apply patches an existing Secret.
@@ -100,7 +99,7 @@ grep -q "patch secret/myapp-env" "$log" || fail "an existing Secret is patched"
 [ "$(held PUBLIC_BASE_URL)" = "https://myapp.example/v2" ] || fail "the literal was patched"
 [ "$(held PROVIDER_TOKEN)" = "tok-2" ] || fail "the @env value was patched"
 [ "$(held EXTRA)" = "hand" ] || fail "a key not in the file was touched"
-[ "$(stored SESSION_SECRET)" = "$generated" ] || fail "the generated key changed on a patch"
+[ "$(held SESSION_SECRET)" = "$generated" ] || fail "the generated key changed on a patch"
 
 # 5. Refusals: a value with a newline, an @env key neither set nor held, an unknown
 #    @word, a missing file, a missing NAME, an unknown flag. None writes anything.
