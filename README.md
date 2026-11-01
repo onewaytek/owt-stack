@@ -1295,9 +1295,10 @@ let codes = recovery::generate(recovery::DEFAULT_COUNT).await?;
 let _show_once: Vec<&str> = codes.iter().map(|c| c.code.as_str()).collect();
 let _store: Vec<&str> = codes.iter().map(|c| c.hash.as_str()).collect();
 
-// Sign-in: which unused code, if any, was typed.
+// Sign-in: which unused code, if any, was typed. `password::Busy` (no hashing
+// permit in time) is a 503, not a wrong code.
 let hashes: Vec<&str> = unused.iter().map(|(_, hash)| hash.as_str()).collect();
-if let Some(i) = recovery::find_match(typed, &hashes).await {
+if let Some(i) = recovery::find_match(typed, &hashes).await? {
     let _row_to_mark_used = unused[i].0;
 }
 # Ok(())
