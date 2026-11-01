@@ -796,7 +796,7 @@ async fn a_signed_in_page_reads_the_account_factor_and_policies_in_one_query() {
     let policies = Policies::new(
         db.pool.clone(),
         |page: Page<'_>| -> owt_web::Result<axum::response::Response> {
-            Ok(axum::response::Html(format!("{}", page.body)).into_response())
+            Ok(axum::response::Html(page.body.to_string()).into_response())
         },
         &[TERMS, PRIVACY],
     );

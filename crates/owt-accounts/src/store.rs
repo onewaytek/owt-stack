@@ -508,7 +508,7 @@ pub(crate) struct Standing {
     pub(crate) accepted: Vec<i64>,
 }
 
-/// The columns [`signed_in`] reads for [`Standing`]. Both lookups are on a primary
+/// The columns [`standing_in_epoch`] reads for [`Standing`]. Both lookups are on a primary
 /// key: `account_totp (account_id)` and the `(account_id, kind)` prefix of
 /// `policy_acceptances`.
 const STANDING: &str = "SELECT
@@ -520,7 +520,7 @@ const STANDING: &str = "SELECT
 
 /// The layer's one query for a signed-in request under [`Accounts::load`](crate::Accounts::load):
 /// [`by_id_in_epoch`] and the account's [`Standing`], in a single statement.
-pub(crate) async fn signed_in(
+pub(crate) async fn standing_in_epoch(
     db: impl PgExecutor<'_>,
     id: i64,
     epoch: i32,
@@ -533,9 +533,9 @@ pub(crate) async fn signed_in(
     Ok(Some((Account::from_row(&row)?, Standing::from_row(&row)?)))
 }
 
-/// [`signed_in`] under [`Accounts::load_with`](crate::Accounts::load_with): also what
+/// [`standing_in_epoch`] under [`Accounts::load_with`](crate::Accounts::load_with): also what
 /// `X` reads, as [`by_id_in_epoch_with`] does.
-pub(crate) async fn signed_in_with<X: Extra>(
+pub(crate) async fn standing_in_epoch_with<X: Extra>(
     db: impl PgExecutor<'_>,
     id: i64,
     epoch: i32,

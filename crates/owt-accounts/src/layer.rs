@@ -137,7 +137,7 @@ impl Accounts {
         next: Next,
     ) -> Response {
         this.load_by::<T, _, _, _>(req, next, |pool, id, epoch, session| async move {
-            let account = store::signed_in(&pool, id, epoch, session.as_deref()).await?;
+            let account = store::standing_in_epoch(&pool, id, epoch, session.as_deref()).await?;
             Ok(account.map(|(account, standing)| (account, (), standing)))
         })
         .await
@@ -153,7 +153,7 @@ impl Accounts {
         next: Next,
     ) -> Response {
         this.load_by::<T, _, _, _>(req, next, |pool, id, epoch, session| async move {
-            store::signed_in_with::<X>(&pool, id, epoch, session.as_deref()).await
+            store::standing_in_epoch_with::<X>(&pool, id, epoch, session.as_deref()).await
         })
         .await
     }
