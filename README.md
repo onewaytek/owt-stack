@@ -197,10 +197,22 @@ feature is on.
 (`db::STARTUP_PATIENCE`), with a warning each time, so a pod that starts while the
 database is fenced for a nightly offline snapshot, or switching over, waits rather
 than crash-restarting; a refused password, a missing database or a certificate that
-does not verify fails at once. Each attempt also waits out `acquire_timeout` (30 s)
-for a refused connection, so the worst case is about two minutes, inside the
+does not verify fails at once. Each attempt also waits out `acquire_timeout` (5 s)
+for a refused connection, so the worst case is a little over a minute, inside the
 template's five-minute startup probe. `connect_within(url, patience)` sets another
-bound (`Duration::ZERO` tries once). It also warns at start when the database is not
+bound (`Duration::ZERO` tries once).
+
+`PoolConfig` also bounds what one request can hold. `acquire_timeout` is 5 s, so a
+saturated pool fails a request in seconds instead of holding it to the request
+deadline. Every connection carries Postgres's `statement_timeout` (30 s, the `Limits`
+request deadline: a query whose request timed out stops on the server too) and
+`idle_in_transaction_session_timeout` (60 s: a transaction left open while its task
+awaits something else ends, with its locks), as startup parameters that win over the
+URL's `options`. `migrate_locked` runs without the statement timeout; other long work
+uses `SET LOCAL statement_timeout` in its transaction, or a pool with
+`statement_timeout: None` (`reserve_beside` builds one beside the main pool). `None`
+leaves either to the server. A connection pooler in transaction mode that refuses
+startup parameters needs both `None`, and the timeouts set on the database role. It also warns at start when the database is not
 on this machine and its TLS is not verified (`db::unverified_tls(&options)` asks the
 same of any `PgConnectOptions`): give the pod `PGSSLMODE=verify-full` and
 `PGSSLROOTCERT` (the OpenShift template does), since sqlx's default (`prefer`)
@@ -357,15 +369,16 @@ its click counts as activity. Cross-origin protection needs no token here (see
 **The same stack as a builder.** `owt_web::stack::Stack` applies these layers, and the
 rest of the order the prose above implies, in the one correct order, so an app does not
 re-derive it (axum runs the layers in the reverse of the order they are written, and a
-mistake is silent). Innermost first: `Limits`; the metrics timer, outside the limits so
-a timed-out request is recorded as the 503 it is; a marked `NotFound` fallback; the
-error pages; the account loader; the session layer, which seals nothing for a 5xx;
+mistake is silent). Innermost first: a marked `NotFound` fallback; the account loader,
+inside `Limits` so its database read counts against the deadline; `Limits`; the metrics
+timer, outside the limits so a timed-out request is recorded as the 503 it is; the
+error pages; the session layer, which seals nothing for a 5xx;
 `CrossOrigin`; then, around the routes and `/static` together, `Csp` (so error pages
 and refusals carry the nonce and the policy), the default cache policy, the security
 headers and, when asked, `noindex`. `/static` sits beside the routes, outside the
 session and the error pages, and so outside `Limits` and the timer: a static request
 has no deadline of its own and is absent from the duration metric. The session
-validator and the account loader also run outside the `Limits` deadline. Only the
+validator also runs outside the `Limits` deadline. Only the
 sessions are required. The account loader and
 the timer are closures over the router because `owt-accounts` depends on `owt-web`
 (and the timer lives in `owt-runtime`); `with_state` goes before `apply`.

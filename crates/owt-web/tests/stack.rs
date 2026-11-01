@@ -246,6 +246,26 @@ async fn the_account_loader_runs_inside_the_session_and_after_the_cross_origin_c
     assert_eq!(ran.load(Ordering::SeqCst), 1, "refused before the loader");
 }
 
+/// A loader waiting on a saturated pool is cut by the request's deadline, as a 503
+/// the error pages draw, rather than holding the request until the pool gives up.
+#[tokio::test]
+async fn the_account_loader_runs_inside_the_limits() {
+    let app = stack()
+        .accounts(|r| {
+            r.layer(axum::middleware::from_fn(
+                |req: Request, next: Next| async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    next.run(req).await
+                },
+            ))
+        })
+        .apply(routes());
+    let started = std::time::Instant::now();
+    let got = send(&app, "GET", "/", &[]).await;
+    assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
 #[tokio::test]
 async fn the_timer_sits_outside_the_limits() {
     let seen: Arc<Mutex<Vec<u16>>> = Arc::default();

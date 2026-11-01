@@ -107,6 +107,7 @@ async fn connect_waits_for_a_database_that_comes_up() {
         max: 1,
         min: 0,
         acquire_timeout: Duration::from_millis(200),
+        ..owt_runtime::db::PoolConfig::default()
     };
     let moved = opts.clone().host("127.0.0.1").port(port);
     let via = format!(

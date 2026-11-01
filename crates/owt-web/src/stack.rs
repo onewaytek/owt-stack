@@ -5,11 +5,12 @@
 //! app's routes in this order, innermost first:
 //!
 //! 1. the `NotFound` fallback, so an unmatched path is a marked 404;
-//! 2. the [`Limits`] timeout and body cap, so a timed-out request is a 503 the
+//! 2. the account loader ([`Stack::accounts`]), inside the limits so its database
+//!    read counts against the request's deadline;
+//! 3. the [`Limits`] timeout and body cap, so a timed-out request is a 503 the
 //!    layers outside see;
-//! 3. the metrics timer ([`Stack::timer`]), outside the limits so it records the 503;
-//! 4. the error pages ([`Stack::error_pages`]), which draw the marked 404, 500 and 503;
-//! 5. the account loader ([`Stack::accounts`]);
+//! 4. the metrics timer ([`Stack::timer`]), outside the limits so it records the 503;
+//! 5. the error pages ([`Stack::error_pages`]), which draw the marked 404, 500 and 503;
 //! 6. the session layer, which opens the cookie before the loader reads it, and keeps
 //!    the request's session through a 5xx (a sign-out aside);
 //! 7. [`CrossOrigin`], which refuses a foreign request before a session is opened.
@@ -88,8 +89,8 @@ impl<T: SessionData> Stack<T> {
         }
     }
 
-    /// The timeout and body cap, on the routes and their handlers. The session
-    /// validator and the account loader run outside the deadline, as does `/static`.
+    /// The timeout and body cap, on the routes, their handlers and the account
+    /// loader. The session validator runs outside the deadline, as does `/static`.
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
@@ -120,8 +121,10 @@ impl<T: SessionData> Stack<T> {
         self
     }
 
-    /// The account loader, given the router with everything up to the error pages
-    /// applied; the stack puts the session layer around the result:
+    /// The account loader, given the router with the `NotFound` fallback applied; the
+    /// stack puts the limits, the timer, the error pages and the session layer around
+    /// the result, so the loader's database read counts against the request's deadline
+    /// and its 503 is drawn as an error page:
     ///
     /// ```ignore
     /// .accounts(|r| r.layer(from_fn_with_state(accounts, Accounts::load::<session::Data>)))
@@ -182,6 +185,9 @@ impl<T: SessionData> Stack<T> {
         if !self.own_fallback {
             pages = pages.fallback(|| async { Error::NotFound });
         }
+        if let Some(wrap) = self.accounts {
+            pages = wrap(pages);
+        }
         pages = self.limits.apply(pages);
         if let Some(wrap) = self.timer {
             pages = wrap(pages);
@@ -191,9 +197,6 @@ impl<T: SessionData> Stack<T> {
                 let page = page.clone();
                 async move { error::error_pages(req, next, move |status| page(status)).await }
             }));
-        }
-        if let Some(wrap) = self.accounts {
-            pages = wrap(pages);
         }
         let pages = pages
             .layer(from_fn_with_state(self.sessions, Sessions::<T>::layer))

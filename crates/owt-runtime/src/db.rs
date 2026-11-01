@@ -6,16 +6,30 @@ use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-/// Pool sizing. The defaults suit a small app on one replica; size a busy one from
-/// measurement (connections are the scarcest resource a replica holds).
+/// Pool sizing and the server-side limits each connection carries. The defaults suit
+/// a small app on one replica; size a busy one from measurement (connections are the
+/// scarcest resource a replica holds).
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
     /// Most connections open at once.
     pub max: u32,
     /// Connections kept open when idle.
     pub min: u32,
-    /// How long a caller waits for a connection before failing.
+    /// How long a caller waits for a connection before failing (5 s by default). A
+    /// saturated pool then fails a request in seconds, as a 503, instead of holding
+    /// it for the whole request deadline.
     pub acquire_timeout: Duration,
+    /// Postgres's `statement_timeout` for every connection (30 s by default, the
+    /// `owt_web::Limits` request deadline): a query whose request has timed out stops
+    /// on the server too, instead of running on, holding its locks. `None` leaves the
+    /// server's setting. Migrations through [`migrate_locked`] run without it; other
+    /// long work sets its own with `SET LOCAL statement_timeout` in its transaction, or
+    /// runs on a pool built with `None`.
+    pub statement_timeout: Option<Duration>,
+    /// Postgres's `idle_in_transaction_session_timeout` for every connection (60 s by
+    /// default): a transaction left open while its task awaits something else ends,
+    /// and so do its locks and its connection. `None` leaves the server's setting.
+    pub idle_in_transaction_timeout: Option<Duration>,
 }
 
 impl Default for PoolConfig {
@@ -23,7 +37,9 @@ impl Default for PoolConfig {
         Self {
             max: 10,
             min: 1,
-            acquire_timeout: Duration::from_secs(30),
+            acquire_timeout: Duration::from_secs(5),
+            statement_timeout: Some(Duration::from_secs(30)),
+            idle_in_transaction_timeout: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -34,6 +50,24 @@ impl PoolConfig {
             .max_connections(self.max)
             .min_connections(self.min)
             .acquire_timeout(self.acquire_timeout)
+    }
+
+    /// `opts` with this config's server-side limits as startup parameters, which win
+    /// over the same ones in the URL's `options`.
+    fn limits(&self, opts: PgConnectOptions) -> PgConnectOptions {
+        let ms = |d: Duration| d.as_millis().to_string();
+        let mut params = Vec::new();
+        if let Some(t) = self.statement_timeout {
+            params.push(("statement_timeout", ms(t)));
+        }
+        if let Some(t) = self.idle_in_transaction_timeout {
+            params.push(("idle_in_transaction_session_timeout", ms(t)));
+        }
+        if params.is_empty() {
+            opts
+        } else {
+            opts.options(params)
+        }
     }
 
     /// Connect to `url` now, as [`connect_within`](Self::connect_within) does with
@@ -53,7 +87,7 @@ impl PoolConfig {
     /// `acquire_timeout`, so the last can end that long after `patience`. Warns when
     /// the connection's TLS is not verified (see [`unverified_tls`]).
     pub async fn connect_within(&self, url: &str, patience: Duration) -> sqlx::Result<PgPool> {
-        let opts: PgConnectOptions = url.parse()?;
+        let opts = self.limits(url.parse()?);
         warn_if_unverified(&opts);
         let deadline = tokio::time::Instant::now() + patience;
         let mut wait = Duration::from_millis(500);
@@ -75,17 +109,17 @@ impl PoolConfig {
     /// A pool that connects on first use: startup survives a slow database. Warns
     /// as [`PoolConfig::connect`] does.
     pub fn connect_lazy(&self, url: &str) -> sqlx::Result<PgPool> {
-        let opts: PgConnectOptions = url.parse()?;
+        let opts = self.limits(url.parse()?);
         warn_if_unverified(&opts);
         Ok(self.options().connect_lazy_with(opts))
     }
 
     /// A second pool on the same database and settings as `pool`, with its own
-    /// connections and this sizing, connecting on first use. For work that must never
-    /// queue behind the general traffic.
+    /// connections and this sizing and limits, connecting on first use. For work that
+    /// must never queue behind the general traffic.
     #[must_use]
     pub fn reserve_beside(&self, pool: &PgPool) -> PgPool {
-        let opts: PgConnectOptions = (*pool.connect_options()).clone();
+        let opts = self.limits((*pool.connect_options()).clone());
         self.options().connect_lazy_with(opts)
     }
 }
@@ -182,6 +216,12 @@ async fn locked(
     lock_id: i64,
 ) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
+    // Waiting on another replica's migration and building an index both outlast any
+    // request's `statement_timeout`; the connection's own setting comes back with
+    // `RESET` below, or the connection is closed.
+    sqlx::query("SET statement_timeout = 0")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(lock_id)
         .execute(&mut *conn)
@@ -193,7 +233,10 @@ async fn locked(
         .bind(lock_id)
         .execute(&mut *conn)
         .await;
-    if result.is_err() || unlocked.is_err() {
+    let reset = sqlx::query("RESET statement_timeout")
+        .execute(&mut *conn)
+        .await;
+    if result.is_err() || unlocked.is_err() || reset.is_err() {
         // A failed run returns before sqlx releases its own advisory lock (one per
         // database), and a failed unlock leaves this one: back in the pool, the
         // connection would hold them, and every later migration would wait on it. So
@@ -202,6 +245,7 @@ async fn locked(
     }
     result?;
     unlocked?;
+    reset?;
     tracing::info!("migrations applied");
     Ok(())
 }
@@ -282,6 +326,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_server_side_limits_are_startup_parameters() {
+        let opts: PgConnectOptions = "postgres://u@localhost/db".parse().unwrap();
+        let set = PoolConfig::default().limits(opts.clone());
+        assert_eq!(
+            set.get_options(),
+            Some("-c statement_timeout=30000 -c idle_in_transaction_session_timeout=60000")
+        );
+        let none = PoolConfig {
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            ..PoolConfig::default()
+        }
+        .limits(opts);
+        assert_eq!(none.get_options(), None);
+    }
 
     #[test]
     fn a_certificate_that_does_not_verify_is_not_unreachable() {
