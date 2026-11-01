@@ -3260,6 +3260,23 @@ GRANT SELECT, INSERT ON owt_audit_anchors TO myapp_anchor;
 -- Nothing else: no UPDATE, DELETE, TRUNCATE, TRIGGER or ownership.
 ```
 
+`owt_audit::privileges(&pool)` reports what the role a pool connects as may do to
+the audit tables: whether it owns them (or is a member of their owner), is a
+superuser, or holds `UPDATE`, `DELETE`, `TRUNCATE` or `TRIGGER` on them. Check it at
+startup, on the pool that serves requests. `templates/openshift/app.yaml`
+connects the app as the database's owner (the role its migrations run under), so a
+deployment from it fails this check until the app runs as a role granted as above.
+
+```rust,no_run
+# async fn demo(pool: sqlx::PgPool) -> anyhow::Result<()> {
+let p = owt_audit::privileges(&pool).await?;
+if !p.least() {
+    // Refuse instead where the log must hold: `anyhow::bail!("{p}")`.
+    tracing::warn!(%p, "the audit log is not append-only for this role");
+}
+# Ok(()) }
+```
+
 **Anchoring.** The schema's owner can still drop the triggers and rewrite a chain
 from some event on, recomputing every hash after it; the chain still verifies on its
 own. So, on a schedule, write every chain's head to storage the database's owner

@@ -378,3 +378,47 @@ async fn tampering_breaks_the_chain_or_the_anchor() {
     ));
     db.drop().await;
 }
+
+#[tokio::test]
+async fn privileges_tell_the_owner_from_an_append_only_role() {
+    let Some(db) = Db::new().await else { return };
+    let owner = owt_audit::privileges(&db.pool).await.unwrap();
+    assert!(!owner.least(), "{owner}");
+    assert!(owner.superuser || owner.owns.len() == 2, "{owner:?}");
+
+    let role = format!("{}_ro", db.schema);
+    for sql in [
+        format!("CREATE ROLE {role} NOLOGIN"),
+        format!("GRANT USAGE ON SCHEMA {} TO {role}", db.schema),
+        format!("GRANT SELECT, INSERT ON owt_audit_events TO {role}"),
+        format!("GRANT SELECT ON owt_audit_anchors TO {role}"),
+    ] {
+        db.pool.execute(sqlx::AssertSqlSafe(sql)).await.unwrap();
+    }
+    let app = pool_in(&db.url, &db.schema, Some(&role)).await;
+    let least = owt_audit::privileges(&app).await.unwrap();
+    assert!(least.least(), "{least:?}");
+
+    db.pool
+        .execute(sqlx::AssertSqlSafe(format!(
+            "GRANT UPDATE, TRUNCATE ON owt_audit_events TO {role}"
+        )))
+        .await
+        .unwrap();
+    let more = owt_audit::privileges(&app).await.unwrap();
+    assert!(!more.least());
+    assert_eq!(
+        more.excess,
+        ["owt_audit_events: UPDATE", "owt_audit_events: TRUNCATE"],
+        "{more}"
+    );
+    app.close().await;
+    db.pool
+        .execute(sqlx::AssertSqlSafe(format!(
+            "REVOKE ALL ON ALL TABLES IN SCHEMA {0} FROM {role}; REVOKE ALL ON SCHEMA {0} FROM {role}; DROP ROLE {role}",
+            db.schema
+        )))
+        .await
+        .unwrap();
+    db.drop().await;
+}
