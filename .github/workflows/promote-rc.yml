@@ -76,6 +76,10 @@ name: Promote to rc
 #       uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # vX.Y.Z
 #       with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
 #
+# When `check` is rust-ci.yml in the run that already checked the PR (the app's
+# `ci` job, which `candidate` needs), a candidate with the PR's tree is not checked
+# twice: rust-ci.yml skips its jobs on a tree it passed earlier in the run attempt.
+#
 # Runs on the arc-openshift-k8s ARC scale set, as rust-ci.yml does (override with the
 # RUNS_ON repository or organization variable, a JSON string such as
 # '"ubuntu-latest"'); it needs only git and the runner's own Node, which runs the

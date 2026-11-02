@@ -19,3 +19,26 @@ jobs:
       database: owt
       redis: true
       css-script: ""
+
+  # rust-ci.yml's reuse of a passed tree (its header): a second check of the same
+  # commit in this run skips its jobs, as an app's rc-candidate check does when the
+  # candidate has the PR's tree.
+  again:
+    needs: ci
+    uses: ./.github/workflows/rust-ci.yml
+    with:
+      ref: ${{ github.sha }}
+      check-command: just check
+      database: owt
+      redis: true
+      css-script: ""
+  reused:
+    needs: again
+    # A fork's pull request runs no checks here (rust-ci.yml), so nothing to reuse.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    steps:
+      - env:
+          REUSED: ${{ needs.again.outputs.reused }}
+        run: |
+          [ "$REUSED" = true ] || { echo "::error::the second check of one tree ran again"; exit 1; }

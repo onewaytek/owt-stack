@@ -23,6 +23,21 @@ name: Rust CI
 # set it runs on belongs to the onewaytek organization, so a caller elsewhere sets
 # RUNS_ON to runners of its own.
 #
+# A tree checked twice in one workflow run is built once. A checked promotion runs the
+# app's checks on the PR's merge commit and then, in the same run, on its rc-candidate
+# merge (promote-rc.yml); when rc held nothing beyond main, the two commits have one
+# tree. The `tested` job reads the tree of the commit to check and looks for a record,
+# left by `record` in this run attempt, that this tree passed `rust` and `css` with the
+# same inputs; on a match both are skipped. The called workflow still concludes in
+# success (`tested` succeeded), so the caller's `needs:` hold, and the skipped check
+# runs count as passing for a required check. The record is a cache entry keyed by the
+# run, its attempt, the tree, the runner selector and every input but `ref`, so nothing
+# outside the run can satisfy it, and a re-run attempt checks again. A failed lookup
+# counts as no record: the checks run. `reuse-passed: false` turns it off. The skip
+# trusts tree identity: within one run that differs only in time-dependent checks such
+# as `cargo audit`'s advisory database. `ref` is read twice (here and by the checks),
+# so pass a commit, not a branch that can move between them.
+#
 # The runners are inside the cluster's network, so a pull request from a fork runs
 # nothing here: its code is not ours to run there. Actions are pinned to commits (a
 # tag can be moved); the comment beside each names the release.
@@ -105,6 +120,13 @@ on:
           that passed.
         type: string
         default: ""
+      reuse-passed:
+        description: >-
+          Skip the checks when this run attempt already passed them on the same tree
+          with the same inputs (a checked promotion whose rc-candidate merge has the
+          PR's tree); see the header.
+        type: boolean
+        default: true
       sccache-redis:
         description: >-
           The Redis that sccache reads and writes compiled objects through
@@ -112,6 +134,13 @@ on:
           It is used only when the SCCACHE_REDIS_PASSWORD secret is given too.
         type: string
         default: redis://sccache-redis.sccache.svc:6379
+    outputs:
+      reused:
+        description: >-
+          "true" when the checks were skipped because this run attempt passed them on
+          the same tree with the same inputs (see the header); "false", or empty when
+          the lookup didn't run (a fork's pull request), otherwise.
+        value: ${{ jobs.tested.outputs.passed }}
     secrets:
       # Named as the organization secret, so an app passes it on under one name.
       SCCACHE_REDIS_PASSWORD:
@@ -133,8 +162,54 @@ env:
   SQLX_CLI_VERSION: "0.9.0"
 
 jobs:
-  rust:
+  # Whether this run attempt already passed these checks on this tree (see the header).
+  # The lookup's steps may fail without failing the job; `passed` is "true" only on a
+  # record.
+  tested:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+      passed: ${{ steps.lookup.outputs.cache-hit == 'true' && 'true' || 'false' }}
+    steps:
+      - if: ${{ inputs.reuse-passed }}
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          sparse-checkout: .github
+          persist-credentials: false
+      - id: key
+        if: ${{ inputs.reuse-passed }}
+        continue-on-error: true
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+          RUNS_ON: ${{ vars.RUNS_ON }}
+          RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          # toJSON puts one input on each line; `ref` names the commit, not the checks.
+          inputs=$(printf '%s\n%s\n' "$INPUTS" "$RUNS_ON" | grep -v '^  "ref": ' | sha256sum | cut -c1-16)
+          echo "key=owt-rust-ci-passed-${RUN}-${tree}-${inputs}" >> "$GITHUB_OUTPUT"
+          echo "tree ${tree}, inputs ${inputs}"
+      - id: lookup
+        if: ${{ steps.key.outputs.key != '' }}
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .owt-rust-ci-passed
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      - if: ${{ steps.lookup.outputs.cache-hit == 'true' }}
+        run: echo "::notice::This tree passed these checks earlier in this run; rust and css are skipped."
+
+  rust:
+    needs: tested
+    # Not `success()`: a `tested` that didn't finish leaves the checks to run.
+    if: ${{ !cancelled() && needs.tested.outputs.passed != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     # ARC in Kubernetes container mode needs a job container whenever `services:` is
     # used. Job and service containers share one pod, so services are on localhost,
@@ -454,7 +529,8 @@ jobs:
           echo "$stats" | grep -E 'Cache (hits|misses|errors)|Compile requests executed' || true
 
   css:
-    if: ${{ inputs.css-script != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: tested
+    if: ${{ !cancelled() && needs.tested.outputs.passed != 'true' && inputs.css-script != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -471,3 +547,18 @@ jobs:
         env:
           CSS_SCRIPT: ${{ inputs.css-script }}
         run: npm run "$CSS_SCRIPT"
+
+  # Notes that this tree passed, for a later check of it in this run attempt.
+  record:
+    needs: [tested, rust, css]
+    if: ${{ !cancelled() && needs.tested.outputs.key != '' && needs.rust.result == 'success' && (needs.css.result == 'success' || inputs.css-script == '') }}
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    steps:
+      # Same path and runner as the lookup: the path and the compression are part of
+      # a cache entry's version.
+      - run: echo "$GITHUB_SHA" > .owt-rust-ci-passed
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        with:
+          path: .owt-rust-ci-passed
+          key: ${{ needs.tested.outputs.key }}
