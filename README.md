@@ -2276,7 +2276,16 @@ there removes the password and signs the account out everywhere, as
   minutes) for every change (any `POST`): a member of staff without one is sent to
   the re-authentication page (`Accounts::reauth_at`), or to enrollment when the
   account has no factor under `require_mfa`, with `?next=` the account's page. Pages
-  that only show still open on `Staff` alone. Each change re-checks inside its
+  that only show still open on `Staff` alone. `Admin::step_up_within(window)` sets
+  another window (whole seconds, at least one): shorter where the admin reaches money
+  or clinical records, longer where staff work long sessions and a prompt every 15
+  minutes costs more than it protects. `Admin::without_step_up()` turns the check
+  off, so a staff session alone makes changes: for an app whose staff cannot enrol a
+  factor yet, or that puts its own re-authentication in front of the admin. The
+  risk is that anyone holding a staff session (a stolen cookie, an unlocked laptop)
+  can reset passwords, issue sign-in links and grant staff access with nothing more
+  asked, so `Admin::routes` warns once at startup. Either works with
+  `Admin::session::<T>()` in any order, and the last of the two wins. Each change re-checks inside its
   transaction that its
   author is still active staff (locking both rows, so two staff removing each other at
   once cannot leave none). It refuses your own staff access, deactivating yourself,
@@ -2400,6 +2409,9 @@ let admin = Admin::new(pool, "/staff/accounts", chrome)
         format!("https://myapp.example/login/link/{token}") // the app's `links::redeem` route
     })
     .more("Profile", |a| format!("/staff/profiles/{}", a.id))
+    // A second factor within 5 minutes for each change (default 15); or
+    // `.without_step_up()`, which warns at startup.
+    .step_up_within(std::time::Duration::from_secs(300))
     .search("nickname", move |term| {
         let pool = profiles.clone();
         async move {

@@ -3472,6 +3472,77 @@ async fn the_admin_asks_for_a_recent_second_factor_and_records_each_change() {
     db.drop().await;
 }
 
+/// An app may ask for a second factor within its own window, or not at all; either
+/// works with `Admin::session::<T>()` on either side.
+#[tokio::test]
+async fn the_admin_honours_its_step_up_window_and_the_opt_out() {
+    let db = db!();
+    let sessions = sessions();
+    let boss = store::create(&db.pool, new("boss", "", None))
+        .await
+        .unwrap();
+    store::set_staff(&db.pool, boss.id, true).await.unwrap();
+    let boss = store::by_id(&db.pool, boss.id).await.unwrap().unwrap();
+    let ada = store::create(&db.pool, new("ada", "", None)).await.unwrap();
+    let at = format!("/staff/accounts/{}", ada.id);
+    let done = format!("{at}?notice=signed-out");
+    let back = format!("/reauth?next=%2Fstaff%2Faccounts%2F{}", ada.id);
+    let sign_out = |client: owt_test::Client, proof: Option<Duration>| {
+        let (sessions, boss, at) = (sessions.clone(), boss.clone(), at.clone());
+        async move {
+            client.set_cookie("s", &cookie_proved(&sessions, &boss, proof));
+            let r = client.post_form(&format!("{at}/sign-out"), &[]).await;
+            assert_eq!(r.status, 303);
+            r.location().map(str::to_owned)
+        }
+    };
+
+    // A 5-minute window, set before and after the session type.
+    for a in [
+        admin(&db)
+            .step_up_within(Duration::from_mins(5))
+            .session::<Data>(),
+        admin(&db)
+            .session::<Data>()
+            .step_up_within(Duration::from_mins(5)),
+    ] {
+        let client = owt_test::Client::new(app(&db, &sessions, a.routes()));
+        let inside = sign_out(client.clone(), Some(Duration::from_mins(4))).await;
+        assert_eq!(inside.as_deref(), Some(done.as_str()));
+        for outside in [Some(Duration::from_mins(6)), None] {
+            let r = sign_out(client.clone(), outside).await;
+            assert_eq!(r.as_deref(), Some(back.as_str()), "{outside:?}");
+        }
+    }
+
+    // A two-hour window lets through a factor the default would refuse.
+    let a = admin(&db).step_up_within(Duration::from_hours(2));
+    let client = owt_test::Client::new(app(&db, &sessions, a.routes()));
+    let r = sign_out(client.clone(), Some(Duration::from_mins(90))).await;
+    assert_eq!(r.as_deref(), Some(done.as_str()));
+    let r = sign_out(client, Some(Duration::from_mins(150))).await;
+    assert_eq!(r.as_deref(), Some(back.as_str()));
+
+    // Turned off, in either order with the session type: no factor needed.
+    for a in [
+        admin(&db).without_step_up().session::<Data>(),
+        admin(&db).session::<Data>().without_step_up(),
+    ] {
+        let client = owt_test::Client::new(app(&db, &sessions, a.routes()));
+        let r = sign_out(client, None).await;
+        assert_eq!(r.as_deref(), Some(done.as_str()));
+    }
+
+    // Turned back on by a window.
+    let a = admin(&db)
+        .without_step_up()
+        .step_up_within(Duration::from_mins(5));
+    let client = owt_test::Client::new(app(&db, &sessions, a.routes()));
+    let r = sign_out(client, None).await;
+    assert_eq!(r.as_deref(), Some(back.as_str()));
+    db.drop().await;
+}
+
 /// Only staff, from this origin, reach the admin's actions: a signed-in user gets a
 /// 403 from every one, and so does staff's own browser posting from another site
 /// (a sibling subdomain is same-site, so `SameSite=Lax` would have sent the cookie).
