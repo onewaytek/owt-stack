@@ -28,11 +28,15 @@ name: Rust CI
 # merge (promote-rc.yml); when rc held nothing beyond main, the two commits have one
 # tree. The `tested` job reads the tree of the commit to check and looks for a record,
 # left by `record` in this run attempt, that this tree passed `rust` and `css` with the
-# same inputs; on a match both are skipped, which GitHub reports as success, so the
-# caller's `needs:` and the check names hold. The record is a cache entry keyed by the
+# same inputs; on a match both are skipped. The called workflow still concludes in
+# success (`tested` succeeded), so the caller's `needs:` hold, and the skipped check
+# runs count as passing for a required check. The record is a cache entry keyed by the
 # run, its attempt, the tree, the runner selector and every input but `ref`, so nothing
 # outside the run can satisfy it, and a re-run attempt checks again. A failed lookup
-# counts as no record: the checks run. `reuse-passed: false` turns it off.
+# counts as no record: the checks run. `reuse-passed: false` turns it off. The skip
+# trusts tree identity: within one run that differs only in time-dependent checks such
+# as `cargo audit`'s advisory database. `ref` is read twice (here and by the checks),
+# so pass a commit, not a branch that can move between them.
 #
 # The runners are inside the cluster's network, so a pull request from a fork runs
 # nothing here: its code is not ours to run there. Actions are pinned to commits (a
@@ -134,7 +138,8 @@ on:
       reused:
         description: >-
           "true" when the checks were skipped because this run attempt passed them on
-          the same tree with the same inputs (see the header), "false" otherwise.
+          the same tree with the same inputs (see the header); "false", or empty when
+          the lookup didn't run (a fork's pull request), otherwise.
         value: ${{ jobs.tested.outputs.passed }}
     secrets:
       # Named as the organization secret, so an app passes it on under one name.
@@ -158,7 +163,8 @@ env:
 
 jobs:
   # Whether this run attempt already passed these checks on this tree (see the header).
-  # Every step may fail without failing the job; `passed` is "true" only on a record.
+  # The lookup's steps may fail without failing the job; `passed` is "true" only on a
+  # record.
   tested:
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}

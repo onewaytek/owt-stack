@@ -4741,9 +4741,11 @@ jobs:
   run. `rust-ci.yml`'s `tested` job reads the tree of the commit it is asked to check
   and looks for a record, which its `record` job leaves after `rust` and `css` pass,
   of that tree passing in this run attempt with the same inputs (all but `ref`) and
-  runner selector. On a match `rust` and `css` are skipped; GitHub reports a skipped
-  job as success, so `promote`'s `needs:` and a required check on the names still
-  pass. A different tree, a failed lookup or a re-run attempt runs the checks. It
+  runner selector. On a match `rust` and `css` are skipped; the called workflow still
+  concludes in success (`tested` passed), so `promote`'s `needs:` holds, and a
+  required check on the skipped names counts as passing. A different tree, a failed
+  lookup or a re-run attempt runs the checks. `check-rc` must pass the same inputs as
+  `ci` (only `ref` may differ), or nothing matches. It
   needs `candidate` to need `ci` in one workflow, as above; an app that checks the
   candidate in a workflow of its own gets no skip. Nothing to adopt beyond the pin;
   `reuse-passed: false` on the call turns it off.
