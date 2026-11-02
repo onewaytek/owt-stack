@@ -833,7 +833,18 @@ async fn challenge<T: MfaSession>(
                     p.record(&parts, &events).await;
                     return see_other(&next);
                 }
-                Err(MfaError::NoChallenge) => return to_sign_in(&parts, &next),
+                Err(MfaError::NoChallenge) => {
+                    // A sign-in held to enrollment has no code to answer: it enrolls.
+                    let enrolling = matches!(
+                        p.mfa.pending_account(&p.pool, &session).await,
+                        Ok(Some((_, Kind::Enroll)))
+                    );
+                    return if enrolling {
+                        see_other(&with_next(&p.enroll_url(), &next))
+                    } else {
+                        to_sign_in(&parts, &next)
+                    };
+                }
                 Err(e) => {
                     if let Some(event) = pending.and_then(|a| e.locked_event(a)) {
                         p.record(&parts, &[event]).await;
@@ -953,6 +964,8 @@ async fn reauth_post<T: MfaSession>(
             p.record(&parts, &events).await;
             see_other(&next)
         }
+        // The session is no longer signed in as the account: the form cannot help.
+        Err(MfaError::NoChallenge) => to_sign_in(&parts, &next),
         Err(e) => {
             if let Some(event) = e.locked_event(account.id) {
                 p.record(&parts, &[event]).await;
@@ -1025,7 +1038,14 @@ async fn enroll_form<T: MfaSession>(
         Ok(proof) => proof,
         Err(e) => return step_up_or_sign_in(&p, &parts, e, &this),
     };
-    match p.mfa.begin_totp(&p.pool, &account, &proof).await {
+    // A refresh, a prefetch or a second tab shows the secret already begun, which the
+    // person may have scanned; a fresh one only when none is waiting.
+    let begun = match p.mfa.resume_totp(&p.pool, &account).await {
+        Ok(Some(enrollment)) => Ok(enrollment),
+        Ok(None) => p.mfa.begin_totp(&p.pool, &account, &proof).await,
+        Err(e) => Err(e),
+    };
+    match begun {
         Ok(enrollment) => enroll_page(&p, &parts, &account, pending, &enrollment, next, None).await,
         Err(MfaError::AlreadyEnrolled) => see_other(&format!("{}?notice=already", p.base)),
         Err(e) => owt_web::Error::from(e).into_response(),
@@ -1090,6 +1110,8 @@ async fn enroll<T: MfaSession>(
                     .await;
             }
             Err(MfaError::NotEnrolling) => return see_other(&again),
+            // No lock event here: an unconfirmed authenticator counts no wrong codes, so
+            // `confirm_totp` never answers `Locked`.
             Err(e) => e,
         }
     };

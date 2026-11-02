@@ -250,6 +250,11 @@ async fn enroll(app: &App) -> (Secret, Vec<String>) {
         "{html}"
     );
     let secret = Secret::from_base32(&secrets(&html)[0]).unwrap();
+    // A refresh shows the same secret: the one scanned stays good.
+    assert_eq!(
+        secrets(&app.client.get("/mfa/enroll").await.text()),
+        secrets(&html)
+    );
 
     // A wrong code shows the same secret again, with the reason.
     let r = app
