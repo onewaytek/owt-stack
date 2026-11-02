@@ -1,0 +1,8 @@
+<section class="owt-section">
+<h1>Your recovery codes</h1>
+<div class="owt-alert owt-alert-warning" role="alert">Each code signs you in once if you lose your authenticator. Keep them somewhere safe: they are shown only now, and any older codes no longer work.</div>
+<ul class="owt-secret">
+{% for c in v.codes %}<li><code class="owt-secret-value">{{ c }}</code></li>
+{% endfor %}</ul>
+<div class="owt-actions"><a class="owt-button" href="{{ v.next }}">I have saved them</a></div>
+</section>

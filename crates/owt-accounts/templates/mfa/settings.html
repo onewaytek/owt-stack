@@ -1,0 +1,18 @@
+<section class="owt-section">
+<h1>Second factor</h1>
+{% if let Some(n) = v.notice %}{% if n.error %}<div class="owt-alert owt-alert-error" role="alert">{{ n.text }}</div>
+{% else %}<div class="owt-alert owt-alert-success" role="status">{{ n.text }}</div>
+{% endif %}{% endif %}<dl class="owt-facts">
+<dt>Authenticator app</dt>
+<dd>{% if v.totp %}Set up{% if v.locked %} <span class="owt-badge">Locked</span> <span class="owt-hint">after too many wrong codes: a recovery code unlocks it</span>{% endif %}{% else %}Not set up{% endif %}</dd>
+<dt>Recovery codes left</dt>
+<dd>{{ v.codes_left }}</dd>
+</dl>
+{% if v.totp %}<p class="owt-hint">Each of these asks you to confirm it is you first, and signs out your other sessions.</p>
+<div class="owt-toolbar">
+<form method="post" action="{{ v.recovery_codes }}"><button class="owt-button owt-button-secondary" type="submit">Make new recovery codes</button></form>
+<form method="post" action="{{ v.reenroll }}"><button class="owt-button owt-button-secondary" type="submit">Set up again on a new phone</button></form>
+<form method="post" action="{{ v.remove }}"><button class="owt-button owt-button-danger" type="submit">Remove</button></form>
+</div>
+{% else %}<div class="owt-actions"><a class="owt-button" href="{{ v.enroll }}">Set up an authenticator</a></div>
+{% endif %}</section>

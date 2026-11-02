@@ -1,0 +1,13 @@
+<section class="owt-section">
+<h1>Confirm it is you</h1>
+<p class="owt-hint">Enter the six-digit code from your authenticator app. Without your phone, a recovery code works once.</p>
+{% if let Some(e) = v.error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endif %}<form class="owt-form" method="post" action="{{ v.action }}">
+<div class="owt-field"><label class="owt-label" for="mfa-code">Code from your authenticator app</label>
+<input class="owt-input" id="mfa-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" autofocus></div>
+<div class="owt-field"><label class="owt-label" for="mfa-recovery">Or a recovery code</label>
+<input class="owt-input" id="mfa-recovery" name="recovery_code" autocomplete="off" spellcheck="false"></div>
+<input type="hidden" name="next" value="{{ v.next }}">
+<div class="owt-actions"><button class="owt-button" type="submit">Continue</button></div>
+</form>
+</section>
