@@ -27,7 +27,8 @@
 # DB_SUFFIX, RUST_LOG); a job's own MEMORY_LIMIT or RUST_LOG goes in its
 # jobs/<JOB>.env:
 #
-#   app.yaml         always
+#   app.yaml         always; DB_ROLE_PREFIX defaults to NAME with each hyphen as
+#                    an underscore (my-app serves as my_app_runtime)
 #   redis.yaml       when present
 #   egress.yaml      when present: for the app's pods (POD=NAME), and each task's
 #   tunnel.yaml      when params.env sets TUNNEL_HOST and TUNNEL_ID (one without the
@@ -170,6 +171,13 @@ if [ -e "$hook" ] || [ -L "$hook" ]; then
     exit 2
   fi
 fi
+# The runtime role's name before _runtime (app.yaml's DB_ROLE_PREFIX): NAME with each
+# hyphen as an underscore unless params.env (or the hook) names another, so my-app
+# serves as my_app_runtime, the username its runtime Secret holds. Postgres would
+# take a hyphen only quoted, and CNPG's managed role and the Secret would disagree.
+[ -n "${given[DB_ROLE_PREFIX]:-}" ] || given[DB_ROLE_PREFIX]=${given[NAME]//-/_}
+[[ ${given[DB_ROLE_PREFIX]} =~ ^[a-z_][a-z0-9_]*$ ]] ||
+  { echo "$params: DB_ROLE_PREFIX=${given[DB_ROLE_PREFIX]} is not a role name (a-z, 0-9 and _, not starting with a digit)" >&2; exit 2; }
 # The router reads ROUTE_TIMEOUT as an haproxy duration: a bare number is
 # milliseconds (300 would fail nearly every request), and a value it cannot parse
 # is ignored without a word. So a value without a unit is refused here.

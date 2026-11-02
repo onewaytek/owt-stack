@@ -21,13 +21,14 @@
 #   only this task needs). Both Secrets are optional, and a key in the task's wins.
 # - The same image, kept current by the trigger annotation on the CronJob.
 #
-# The database role. A task connects as the app's runtime role (<NAME>_runtime, from
-# app.yaml's <NAME>-<DB_SUFFIX>-runtime Secret), with the grants the Deployment's
-# `migrate` init container gives it. No task needs the owner: the init container
-# migrates. A task that needs a privilege the runtime role lacks gets a role of its
-# own, never the owner's: the audit anchoring job inserts into owt_audit_anchors,
-# which the runtime role may only read, so it runs as <NAME>_anchor, a managed role
-# added to app.yaml's Cluster beside <NAME>_runtime, its Secret made the same way
+# The database role. A task connects as the app's runtime role
+# (<DB_ROLE_PREFIX>_runtime, from app.yaml's <NAME>-<DB_SUFFIX>-runtime Secret), with
+# the grants the Deployment's `migrate` init container gives it. No task needs the
+# owner: the init container migrates. A task that needs a privilege the runtime role
+# lacks gets a role of its own, never the owner's: the audit anchoring job inserts
+# into owt_audit_anchors, which the runtime role may only read, so it runs as
+# <DB_ROLE_PREFIX>_anchor, a managed role added to app.yaml's Cluster beside
+# <DB_ROLE_PREFIX>_runtime, its Secret made the same way
 # (username, and a hex password, which the URL needs unescaped), and granted once by
 # the owner:
 #

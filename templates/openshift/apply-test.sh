@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # apply.sh against a stand-in `oc` that records what it is asked: which templates
 # are rendered with which parameters, diff against apply, the jobs' files, the
-# egress policies per set of pods, the tunnel and its config checksum, and the
-# refusals. It proves the script's own
+# egress policies per set of pods, the tunnel and its config checksum, the runtime
+# role's prefix, and the refusals. It proves the script's own
 # logic; the templates' output is `oc process`'s to render, on a real run.
 #
 #   templates/openshift/apply-test.sh       (`just templates` runs it)
@@ -313,5 +313,29 @@ grep -q "^oc process" "$log" && fail "rendered without tunnel.yaml"
 cp "$work/good.env" "$work/deploy/params.env"
 rc=0; run || rc=$?
 grep -q "tunnel.yaml" "$work/err" && fail "a note about a tunnel.yaml that is not here"
+
+# 12. The runtime role: DB_ROLE_PREFIX is NAME with each hyphen as an underscore,
+#     so my-app's managed role and its Secret's username agree (my_app_runtime);
+#     params.env may name another, and one that is no role name exits 2. The stand-in
+#     renders nothing, so the template's source stands in for its output.
+grep -qF 'name: ${DB_ROLE_PREFIX}_runtime' "$here/app.yaml" || fail "app.yaml names the role by DB_ROLE_PREFIX"
+grep -nF '${NAME}_' "$here"/*.yaml && fail "a role named from NAME, which may hold a hyphen"
+rc=0; run || rc=$?
+logged "rendered app.yaml NAME=myapp " || fail "app.yaml renders"
+grep "^rendered app.yaml" "$log" | grep -q " DB_ROLE_PREFIX=myapp$" || fail "a name without a hyphen is its own prefix"
+sed 's/^NAME=.*/NAME=scriptured-prayer/' "$work/good.env" >"$work/deploy/params.env"
+rc=0; run || rc=$?; [ "$rc" -eq 1 ] || fail "a hyphenated NAME renders (got $rc)"
+grep "^rendered app.yaml" "$log" | grep -q " DB_ROLE_PREFIX=scriptured_prayer$" || fail "scriptured-prayer's prefix is scriptured_prayer"
+{ cat "$work/deploy/params.env"; echo "DB_ROLE_PREFIX=legacy_role"; } >"$work/params.tmp"
+mv "$work/params.tmp" "$work/deploy/params.env"
+rc=0; run || rc=$?
+grep "^rendered app.yaml" "$log" | grep -q " DB_ROLE_PREFIX=legacy_role$" || fail "params.env names another prefix"
+for bad in scriptured-prayer My_app 9lives 'a b'; do
+  { cat "$work/good.env"; echo "DB_ROLE_PREFIX=$bad"; } >"$work/deploy/params.env"
+  rc=0; run || rc=$?; [ "$rc" -eq 2 ] || fail "DB_ROLE_PREFIX=$bad exits 2 (got $rc)"
+  grep -qF "DB_ROLE_PREFIX=$bad is not a role name" "$work/err" || fail "names DB_ROLE_PREFIX=$bad"
+  grep -q "^oc process" "$log" && fail "DB_ROLE_PREFIX=$bad rendered something"
+done
+cp "$work/good.env" "$work/deploy/params.env"
 
 echo "apply.sh: ok"
