@@ -3,7 +3,7 @@
 # See README "Working on owt-stack".
 [package]
 name = "owt-fuzz"
-version = "0.12.1"
+version = "0.12.2"
 publish = false
 edition = "2024"
 
