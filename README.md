@@ -4735,6 +4735,18 @@ jobs:
   goes to `rc-candidate`, the app's checks run on it, and `rc` fast-forwards to it
   only if they pass and `rc` hasn't moved since. `rust-ci.yml` also fails on two
   migrations with one version.
+- **The candidate check is skipped when it would repeat the PR's.** When `rc` holds
+  nothing beyond `main` (no other PR in flight, `main` unmoved), the candidate merge
+  has the same tree as the PR's merge commit, which `ci` checked earlier in the same
+  run. `rust-ci.yml`'s `tested` job reads the tree of the commit it is asked to check
+  and looks for a record, which its `record` job leaves after `rust` and `css` pass,
+  of that tree passing in this run attempt with the same inputs (all but `ref`) and
+  runner selector. On a match `rust` and `css` are skipped; GitHub reports a skipped
+  job as success, so `promote`'s `needs:` and a required check on the names still
+  pass. A different tree, a failed lookup or a re-run attempt runs the checks. It
+  needs `candidate` to need `ci` in one workflow, as above; an app that checks the
+  candidate in a workflow of its own gets no skip. Nothing to adopt beyond the pin;
+  `reuse-passed: false` on the call turns it off.
 - **A promotion can be lost** in the candidate flow, two ways. GitHub keeps one
   *pending* run per concurrency group, so a third PR updated while one promotion runs
   and another waits cancels the waiting one, not queues it. And `publish-rc.yml`
