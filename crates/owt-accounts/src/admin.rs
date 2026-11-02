@@ -25,7 +25,9 @@
 //!
 //! Every change asks for a second factor used within [`STEP_UP`] (15 minutes), as
 //! [`RecentMfa`](crate::mfa::RecentMfa) does: a member of staff without one is sent to
-//! re-authenticate (or to enrol a factor) and back to the account's page. A sign-in
+//! re-authenticate (or to enrol a factor) and back to the account's page. An app sets
+//! another window with [`Admin::step_up_within`], or turns the check off with
+//! [`Admin::without_step_up`]. A sign-in
 //! link staff issue lives at most [`MAX_LINK_TTL`] (24 hours).
 //!
 //! A password or link is shown once, in the answer to the `POST` that made it; every
@@ -79,7 +81,8 @@ pub use words::Words;
 pub const PER_PAGE: usize = 50;
 
 /// How recently the member of staff must have used a second factor to change
-/// anything: 15 minutes.
+/// anything, unless the app sets another window ([`Admin::step_up_within`]): 15
+/// minutes.
 pub const STEP_UP: Duration = Duration::from_mins(15);
 
 /// The longest a sign-in link issued here lives: 24 hours. A longer
@@ -221,11 +224,16 @@ pub trait Recorder: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 }
 
-type StepUpCheck = fn(&Parts, &str) -> owt_web::Result<()>;
+type StepUpCheck = fn(&Parts, Duration, &str) -> owt_web::Result<()>;
 
-/// The step-up check for session data `T`, sending the visitor back to `next`.
-fn step_up_for<T: crate::mfa::MfaSession>(parts: &Parts, next: &str) -> owt_web::Result<()> {
-    crate::mfa::guard_to::<T>(parts, STEP_UP.as_secs(), true, next)
+/// The step-up check for session data `T`: a second factor used within `window`,
+/// sending the visitor back to `next` without one.
+fn step_up_for<T: crate::mfa::MfaSession>(
+    parts: &Parts,
+    window: Duration,
+    next: &str,
+) -> owt_web::Result<()> {
+    crate::mfa::guard_to::<T>(parts, window.as_secs(), true, next)
 }
 
 /// The rendered body of an admin page, for the app's layout to embed as
@@ -902,6 +910,9 @@ pub struct Admin {
     words: Words,
     recorder: Option<Box<dyn Recorder>>,
     step_up: StepUpCheck,
+    /// How recently a change's author must have used a second factor; `None` when
+    /// the app turned the check off.
+    step_up_window: Option<Duration>,
 }
 
 impl fmt::Debug for Admin {
@@ -938,6 +949,7 @@ impl Admin {
             words: Words::ENGLISH,
             recorder: None,
             step_up: step_up_for::<crate::session::Data>,
+            step_up_window: Some(STEP_UP),
         }
     }
 
@@ -955,6 +967,37 @@ impl Admin {
     #[must_use]
     pub fn session<T: crate::mfa::MfaSession>(mut self) -> Self {
         self.step_up = step_up_for::<T>;
+        self
+    }
+
+    /// Ask every change for a second factor used within `window` rather than
+    /// [`STEP_UP`]: a shorter one for an admin that touches money or health records,
+    /// a longer one where staff work in long sessions and a 15-minute prompt costs
+    /// more than it protects. Whole seconds count. It turns the check back on after
+    /// [`Admin::without_step_up`].
+    ///
+    /// # Panics
+    ///
+    /// When `window` is under a second: no change could ever pass.
+    #[must_use]
+    pub fn step_up_within(mut self, window: Duration) -> Self {
+        assert!(
+            window.as_secs() > 0,
+            "the admin's step-up window is at least a second"
+        );
+        self.step_up_window = Some(window);
+        self
+    }
+
+    /// Let staff change accounts without a recent second factor: being signed in as
+    /// staff is enough. For an app whose staff cannot enrol a factor yet, or one
+    /// behind its own re-authentication. The risk: anyone holding a staff session (a
+    /// stolen cookie, an unlocked laptop) can reset passwords, issue sign-in links and
+    /// grant staff access with nothing more asked, so [`Admin::routes`] warns once
+    /// when it builds the routes. [`Admin::step_up_within`] turns the check back on.
+    #[must_use]
+    pub fn without_step_up(mut self) -> Self {
+        self.step_up_window = None;
         self
     }
 
@@ -1029,12 +1072,21 @@ impl Admin {
     /// The routes, at the `base` given to [`Admin::new`]: merge them into the app's
     /// router, inside the accounts layer ([`crate::Accounts::load`]). They refuse a
     /// cross-origin `POST` on their own, and a change without a second factor used
-    /// within [`STEP_UP`].
+    /// within [`STEP_UP`] (or the app's [`Admin::step_up_within`] window), unless
+    /// the app chose [`Admin::without_step_up`].
     pub fn routes<S: Clone + Send + Sync + 'static>(self) -> Router<S> {
         if self.recorder.is_none() {
             tracing::warn!(
                 base = %self.base,
                 "the accounts admin records no audit events: give it a Recorder with Admin::audit"
+            );
+        }
+        if self.step_up_window.is_none() {
+            tracing::warn!(
+                base = %self.base,
+                "the accounts admin asks no recent second factor for changes \
+                 (Admin::without_step_up): anyone holding a staff session can reset \
+                 passwords, issue sign-in links and grant staff access"
             );
         }
         let base = self.base.clone();
@@ -1133,8 +1185,9 @@ impl Admin {
 type Shared = State<Arc<Admin>>;
 
 /// Every change (any method but `GET` and `HEAD`) is for staff who used a second
-/// factor within [`STEP_UP`]; the rest are sent to re-authenticate and back to the
-/// form's page.
+/// factor within the admin's window ([`STEP_UP`] by default); the rest are sent to
+/// re-authenticate and back to the form's page. Without the check
+/// ([`Admin::without_step_up`]), staff alone suffices.
 async fn step_up(State(admin): Shared, request: Request, next: Next) -> Response {
     if request.method().is_safe() {
         return next.run(request).await;
@@ -1144,9 +1197,11 @@ async fn step_up(State(admin): Shared, request: Request, next: Next) -> Response
     if let Err(e) = Staff::from_request_parts(&mut parts, &()).await {
         return e.into_response();
     }
-    let back = admin.form_page(parts.uri.path());
-    if let Err(e) = (admin.step_up)(&parts, &back) {
-        return e.into_response();
+    if let Some(window) = admin.step_up_window {
+        let back = admin.form_page(parts.uri.path());
+        if let Err(e) = (admin.step_up)(&parts, window, &back) {
+            return e.into_response();
+        }
     }
     next.run(Request::from_parts(parts, body)).await
 }
