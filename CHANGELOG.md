@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/onewaytek/owt-stack/compare/v0.12.1...v0.12.2) (2026-11-02)
+
+
+### Features
+
+* **ci:** skip a check of a tree that already passed in the run ([#303](https://github.com/onewaytek/owt-stack/issues/303)) ([c17c932](https://github.com/onewaytek/owt-stack/commit/c17c932431810a0c307d7cc1c44436c72b3c36e2))
+
 ## [0.12.1](https://github.com/onewaytek/owt-stack/compare/v0.12.0...v0.12.1) (2026-11-02)
 
 
