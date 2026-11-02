@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.1](https://github.com/onewaytek/owt-stack/compare/v0.12.0...v0.12.1) (2026-11-02)
+
+
+### Features
+
+* **accounts:** configurable admin step-up window and an opt-out ([#302](https://github.com/onewaytek/owt-stack/issues/302)) ([331dd25](https://github.com/onewaytek/owt-stack/commit/331dd258b5a17f71d6e5d32ff26fa45e21235fea))
+* **accounts:** mountable second-factor pages (mfa::pages) ([#299](https://github.com/onewaytek/owt-stack/issues/299)) ([244d353](https://github.com/onewaytek/owt-stack/commit/244d353c902639572e339fe5f6306e6918b45762))
+
+
+### Bug Fixes
+
+* **templates:** name the runtime role from NAME with hyphens as underscores ([#301](https://github.com/onewaytek/owt-stack/issues/301)) ([a489173](https://github.com/onewaytek/owt-stack/commit/a489173345ba3cd9b25eb9842bd29d0ebf3f54db))
+
 ## [0.12.0](https://github.com/onewaytek/owt-stack/compare/v0.11.0...v0.12.0) (2026-11-01)
 
 
