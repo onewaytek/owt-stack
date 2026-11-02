@@ -3540,6 +3540,7 @@ async fn the_admin_honours_its_step_up_window_and_the_opt_out() {
     let client = owt_test::Client::new(app(&db, &sessions, a.routes()));
     let r = sign_out(client, None).await;
     assert_eq!(r.as_deref(), Some(back.as_str()));
+    db.drop().await;
 }
 
 /// Only staff, from this origin, reach the admin's actions: a signed-in user gets a
