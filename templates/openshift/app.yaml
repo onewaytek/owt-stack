@@ -3,8 +3,10 @@
 # the app's name has to reach places Kustomize's name transformers don't (the image
 # trigger annotation, the ImageStreamTag, the CNPG-minted Secret's name):
 #
-#   oc process -f app.yaml -p NAME=myapp -p NAMESPACE=myapp \
+#   oc process -f app.yaml -p NAME=myapp -p NAMESPACE=myapp -p DB_ROLE_PREFIX=myapp \
 #     -p IMAGE=ghcr.io/onewaytek/myapp -p CHANNEL=rc -p PORT=8000 | oc apply -f -
+#
+# apply.sh passes DB_ROLE_PREFIX for you: NAME with each hyphen as an underscore.
 #
 # Re-applying it to an app that is already running: pass -p POSTGRES_MAJOR=<the
 # major its database runs>, and read `oc diff -f -` of the same output first.
@@ -17,9 +19,10 @@
 # Two database roles. The owner (<NAME>, CNPG's <NAME>-<DB_SUFFIX>-app Secret) runs
 # the migrations in each pod's `migrate` init container (`<binary> migrate`, under an
 # advisory lock, so replicas serialize) and grants the runtime role what serving
-# needs; the app serves as the runtime role (<NAME>_runtime), which owns nothing, so
-# it cannot drop the audit tables' triggers or rewrite their chain. CNPG manages the
-# runtime role from a Secret made once, by hand, before the first apply:
+# needs; the app serves as the runtime role (<DB_ROLE_PREFIX>_runtime: my_app_runtime
+# for an app named my-app), which owns nothing, so it cannot drop the audit tables'
+# triggers or rewrite their chain. CNPG manages the runtime role from a Secret made
+# once, by hand, before the first apply, whose username is that role:
 #
 #   pw=$(openssl rand -hex 32)
 #   oc create secret generic myapp-db-runtime -n myapp --type=kubernetes.io/basic-auth \
@@ -146,6 +149,13 @@ parameters:
       installed from OperatorHub for all namespaces), the only one that may call the
       database instances' status port.
     value: openshift-operators
+  - name: DB_ROLE_PREFIX
+    description: >-
+      The runtime role's name before _runtime: NAME with each hyphen as an
+      underscore (my_app for my-app), which apply.sh passes unless params.env sets
+      another. The role is <DB_ROLE_PREFIX>_runtime, and the runtime Secret's
+      username must be the same.
+    required: true
 objects:
   - apiVersion: image.openshift.io/v1
     kind: ImageStream
@@ -367,7 +377,7 @@ objects:
       # grants are all it may do. Its password is the Secret made by hand (top).
       managed:
         roles:
-          - name: ${NAME}_runtime
+          - name: ${DB_ROLE_PREFIX}_runtime
             ensure: present
             login: true
             inherit: true

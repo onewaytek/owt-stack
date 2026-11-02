@@ -5135,6 +5135,7 @@ Deployment's trigger rolls out each new digest. By hand, the same is one
 
 ```sh
 oc process -f templates/openshift/app.yaml -p NAME=myapp -p NAMESPACE=myapp \
+  -p DB_ROLE_PREFIX=myapp \
   -p IMAGE=ghcr.io/onewaytek/myapp -p CHANNEL=rc -p PORT=8000 | oc apply -f -
 ```
 
@@ -5152,6 +5153,17 @@ oc create secret generic myapp-db-runtime -n myapp --type=kubernetes.io/basic-au
   --from-literal=username=myapp_runtime --from-literal=password="$pw"
 oc label secret myapp-db-runtime -n myapp cnpg.io/reload=true
 ```
+
+The role's name is `<DB_ROLE_PREFIX>_runtime`, and the Secret's `username` must be
+the same. `apply.sh` sets `DB_ROLE_PREFIX` to `NAME` with each hyphen as an
+underscore, so an app named `my-app` serves as `my_app_runtime` (its Secret is still
+`my-app-db-runtime`: object names take hyphens, unquoted role names do not). Set
+`DB_ROLE_PREFIX` in `params.env` to keep another name; `apply.sh` refuses one that is
+not `a-z`, `0-9` and `_`. A hyphenated app deployed from an earlier template had a
+managed role `my-app_runtime` that its Secret's `my_app_runtime` never matched: copy
+the templates again, check the Secret's `username` is `my_app_runtime`, and apply;
+CNPG creates that role, the next pod's init container grants it, and the owner may
+`DROP ROLE "my-app_runtime"`.
 
 The init container sets `DATABASE_URL` to the owner's and `DB_RUNTIME_ROLE` to the
 runtime role's name. The `migrate` subcommand runs the migration sequence (see
