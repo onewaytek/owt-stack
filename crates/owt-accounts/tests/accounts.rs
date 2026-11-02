@@ -3472,9 +3472,6 @@ async fn the_admin_asks_for_a_recent_second_factor_and_records_each_change() {
     db.drop().await;
 }
 
-/// Only staff, from this origin, reach the admin's actions: a signed-in user gets a
-/// 403 from every one, and so does staff's own browser posting from another site
-/// (a sibling subdomain is same-site, so `SameSite=Lax` would have sent the cookie).
 /// An app may ask for a second factor within its own window, or not at all; either
 /// works with `Admin::session::<T>()` on either side.
 #[tokio::test]
@@ -3545,6 +3542,9 @@ async fn the_admin_honours_its_step_up_window_and_the_opt_out() {
     assert_eq!(r.as_deref(), Some(back.as_str()));
 }
 
+/// Only staff, from this origin, reach the admin's actions: a signed-in user gets a
+/// 403 from every one, and so does staff's own browser posting from another site
+/// (a sibling subdomain is same-site, so `SameSite=Lax` would have sent the cookie).
 #[tokio::test]
 async fn the_admin_refuses_everyone_but_staff_and_every_other_origin() {
     let db = db!();
