@@ -4693,6 +4693,9 @@ jobs:
   ruleset refusing new `v*` branches. A credential that can change
   `.github/workflows` can bypass all of this (a branch's push runs its own workflow
   files): keep that permission to people, never to automation.
+- **Commit messages may use `#N` freely.** The release leaves no comment or label on
+  the issues and PRs its commits mention, so a number that names something other
+  than a GitHub issue (an app's own register) never fails a release.
 - **Images** are tagged `X.Y.Z`, plus `X.Y` and `latest` (and `X` from 1.0) for a
   stable release, or `rc` for a prerelease. Rebuild an existing tag (a base image
   rebuilt for a fix, a registry that lost it) from a `workflow_dispatch` of the app's

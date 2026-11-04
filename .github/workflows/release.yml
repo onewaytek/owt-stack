@@ -198,7 +198,11 @@ jobs:
             assets,
             message: "chore(release): v${nextRelease.version} [skip ci]\n\n${nextRelease.notes}",
           }]);
-          plugins.push("@semantic-release/github");
+          // No comments or labels on the issues and PRs the commits mention: a `#N`
+          // in a message may name something else (an app's own register numbers),
+          // and one that resolves to nothing fails the run after the tag and the
+          // GitHub release exist, so the image job never runs.
+          plugins.push(["@semantic-release/github", { successComment: false, releasedLabels: false }]);
           // A branch that does not exist (an app without rc) is ignored.
           console.log(JSON.stringify({
             branches: ["main", { name: "rc", prerelease: true }],
