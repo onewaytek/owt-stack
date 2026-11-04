@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.3](https://github.com/onewaytek/owt-stack/compare/v0.12.2...v0.12.3) (2026-11-04)
+
+
+### Bug Fixes
+
+* **ci:** release leaves no comments or labels on issues its commits mention ([#311](https://github.com/onewaytek/owt-stack/issues/311)) ([5fd40a7](https://github.com/onewaytek/owt-stack/commit/5fd40a775a4e3e4b7359e5b1e69a7a08a8502ab8))
+* **deps:** bump astral-sh/setup-uv from 10.3.2 to 10.3.3 ([#306](https://github.com/onewaytek/owt-stack/issues/306)) ([071a30b](https://github.com/onewaytek/owt-stack/commit/071a30b4c7ec2654fd07489348e0b5c53348d19a))
+* **deps:** bump log from 0.4.34 to 0.4.35 in the patch-and-minor group ([#307](https://github.com/onewaytek/owt-stack/issues/307)) ([61c8cc4](https://github.com/onewaytek/owt-stack/commit/61c8cc4f145751647427a0e6bbeb28baa94ef509))
+* **deps:** bump taiki-e/install-action from 2.87.31 to 2.88.1 ([#305](https://github.com/onewaytek/owt-stack/issues/305)) ([4bd2c5a](https://github.com/onewaytek/owt-stack/commit/4bd2c5a5690888269df2524cb054a6a8392771e6))
+
 ## [0.12.2](https://github.com/onewaytek/owt-stack/compare/v0.12.1...v0.12.2) (2026-11-02)
 
 
