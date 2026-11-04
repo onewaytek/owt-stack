@@ -200,7 +200,10 @@ mod tests {
             *b = i;
         }
         let mut reader = Chunks::new(&key, &header);
-        assert_eq!(&reader.open(&unhex(FIRST), false).unwrap()[..], b"first chunk");
+        assert_eq!(
+            &reader.open(&unhex(FIRST), false).unwrap()[..],
+            b"first chunk"
+        );
         assert_eq!(&reader.open(&unhex(LAST), true).unwrap()[..], b"last");
         let mut writer = Chunks::new(&key, &header);
         assert_eq!(writer.seal(b"first chunk", false).unwrap(), unhex(FIRST));
