@@ -9,6 +9,9 @@
 //! A link may name where to land after signing in (`next`, a path on the app's own
 //! site): [`mint_with`] stores it and [`redeem_with`] returns it, for the handler to
 //! redirect to.
+//!
+//! A link emailed to an address records it ([`mint_emailed`]): redeeming it proves
+//! the account holds that address, which [`crate::confirmed_emails`] reports.
 
 use std::time::Duration;
 
@@ -69,7 +72,7 @@ pub async fn mint(
     ttl: Duration,
     reason: &str,
 ) -> sqlx::Result<Minted> {
-    insert(db, account_id, ttl, reason, None).await
+    insert(db, account_id, ttl, reason, None, None).await
 }
 
 /// [`mint`] with a page to land on after signing in: `next`, a path on the app's own
@@ -88,7 +91,34 @@ pub async fn mint_with(
     if next.is_some_and(|n| !valid_next(n)) {
         return Err(Refused::Next.into());
     }
-    Ok(insert(db, account_id, ttl, reason, next).await?)
+    Ok(insert(db, account_id, ttl, reason, next, None).await?)
+}
+
+/// [`mint_with`] for a link the app emails to `to`: the address is stored, normalized
+/// as `accounts.email` is ([`store::normalize`]), and redeeming the link proves the
+/// account holds it ([`crate::confirmed_emails`], [`Redeemed::sent_to`]). Mint it only
+/// for the address the message goes to, and send it nowhere else.
+///
+/// # Errors
+///
+/// [`Refused::Email`] when `to` is not one address, [`Refused::Next`] when `next` is
+/// not a local path, or the database.
+pub async fn mint_emailed(
+    db: impl PgExecutor<'_>,
+    account_id: i64,
+    to: &str,
+    ttl: Duration,
+    reason: &str,
+    next: Option<&str>,
+) -> Result<Minted> {
+    let to = store::normalize(to);
+    if !store::valid_email(&to) {
+        return Err(Refused::Email.into());
+    }
+    if next.is_some_and(|n| !valid_next(n)) {
+        return Err(Refused::Next.into());
+    }
+    Ok(insert(db, account_id, ttl, reason, next, Some(&to)).await?)
 }
 
 async fn insert(
@@ -97,13 +127,14 @@ async fn insert(
     ttl: Duration,
     reason: &str,
     next: Option<&str>,
+    sent_to: Option<&str>,
 ) -> sqlx::Result<Minted> {
     let mut bytes = [0u8; 32];
     rand::fill(&mut bytes);
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     sqlx::query(
-        "INSERT INTO sign_in_links (token_sha256, account_id, expires_at, reason, next)
-         VALUES ($1, $2, now() + $3 * interval '1 second', $4, $5)",
+        "INSERT INTO sign_in_links (token_sha256, account_id, expires_at, reason, next, sent_to)
+         VALUES ($1, $2, now() + $3 * interval '1 second', $4, $5, $6)",
     )
     .bind(digest(&token))
     .bind(account_id)
@@ -111,6 +142,7 @@ async fn insert(
     .bind(ttl.min(MAX_TTL).as_secs().cast_signed())
     .bind(reason)
     .bind(next)
+    .bind(sent_to)
     .execute(db)
     .await?;
     Ok(Minted { token })
@@ -133,6 +165,9 @@ pub struct Redeemed {
     /// The path the link named to land on ([`mint_with`]), a [`valid_next`] one:
     /// redirect there after [`crate::session::sign_in`]. None when it named none.
     pub next: Option<String>,
+    /// The address the link was emailed to ([`mint_emailed`]), normalized: the
+    /// account holds it now. None for a link handed over any other way.
+    pub sent_to: Option<String>,
 }
 
 /// [`redeem`], also returning where the link said to land.
@@ -148,12 +183,13 @@ pub async fn redeem_with(pool: &sqlx::PgPool, token: &str, from: &str) -> Result
     // so the two cannot deadlock.
     let mut tx = pool.begin().await?;
     let digest = digest(token);
-    let Some((account_id, next)) = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT account_id, next FROM sign_in_links WHERE token_sha256 = $1",
-    )
-    .bind(&digest)
-    .fetch_optional(&mut *tx)
-    .await?
+    let Some((account_id, next, sent_to)) =
+        sqlx::query_as::<_, (i64, Option<String>, Option<String>)>(
+            "SELECT account_id, next, sent_to FROM sign_in_links WHERE token_sha256 = $1",
+        )
+        .bind(&digest)
+        .fetch_optional(&mut *tx)
+        .await?
     else {
         return Err(Refused::Link.into());
     };
@@ -182,7 +218,11 @@ pub async fn redeem_with(pool: &sqlx::PgPool, token: &str, from: &str) -> Result
     tx.commit().await?;
     // Checked again on the way out: the column is the database's, not this crate's.
     let next = next.filter(|n| valid_next(n));
-    Ok(Redeemed { account, next })
+    Ok(Redeemed {
+        account,
+        next,
+        sent_to,
+    })
 }
 
 /// Void every unused link of an account (its password was reset another way, say).

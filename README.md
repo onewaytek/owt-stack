@@ -8,7 +8,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
-| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
+| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links, and the addresses an account has proven by one (`confirmed_emails`); roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-crypt` | envelope field encryption: XChaCha20-Poly1305 field seals under data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
 | `owt-storage` | objects in an S3-compatible bucket (B2, R2, MinIO): client-side encryption through `owt-crypt` in bounded memory, streaming multipart uploads, presigned URLs, verified deletion |
 | `owt-audit` | an append-only, hash-chained audit log: one chain per tenant, SHA-256 over a canonical encoding, triggers that refuse changes, a verifier (and its clap subcommand, feature `cli`), and anchoring of the chain heads to external write-once storage |
@@ -1471,6 +1471,9 @@ anything else.
 | `owt_accounts_local` | `account_local_identities` | `account_local_identities_pkey`, `account_local_identities_account` | | `accounts.password_sign_in`; constraint `accounts_password_sign_in_hash` on `accounts` |
 | `owt_accounts_link_next` | | | | `sign_in_links.next` |
 | `owt_accounts_mfa` | `account_totp`, `account_recovery_codes` | `account_totp_pkey`, `account_recovery_codes_pkey`, `account_recovery_codes_id_seq`, `account_recovery_codes_account` | | |
+| `owt_accounts_recovery_codes_index` | | `account_recovery_codes_account_all` | | |
+| `owt_accounts_revoked_sessions` | `revoked_sessions` | `revoked_sessions_pkey`, `revoked_sessions_expires_at` | | |
+| `owt_accounts_confirmed_emails` | | | | `sign_in_links.sent_to`, `account_identities.verified_email` |
 
 Each table is also a type of its name, and its triggers and constraints are its own.
 An app that already has any of these names (a table, view, index, sequence, type or
@@ -1755,6 +1758,20 @@ let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Ref
 let minted = links::mint_with(&pool, ada.id, std::time::Duration::from_secs(900), "outage", Some("/admin/")).await?;
 let opened = links::redeem_with(&pool, &minted.token, &ip.to_string()).await?;
 let _land_on = opened.next.as_deref().unwrap_or("/"); // opened.account signs in
+// A link the app emails records the address (`mint_emailed`, normalized as
+// `accounts.email` is; `Refused::Email` when it is not one address). Redeeming it
+// proves the account holds that address: `owt_accounts::confirmed_emails` lists every
+// address proven so, with the email of each linked identity whose provider checked it
+// (Google's `email_verified`, Discord's `verified`), normalized and sorted. The
+// account's own email is not assumed: a staff change of it proves nothing until a
+// link emailed there is redeemed, and a link minted with `mint`/`mint_with` (or before
+// the address was recorded) proves no address. Compare an invitation's address with
+// it inside the transaction that accepts, the account's row held `FOR SHARE`.
+let minted = links::mint_emailed(&pool, ada.id, "ada@example.com", std::time::Duration::from_secs(1800), "emailed sign-in", Some("/invites")).await?;
+let opened = links::redeem_with(&pool, &minted.token, &ip.to_string()).await?;
+assert_eq!(opened.sent_to.as_deref(), Some("ada@example.com"));
+let proven: Vec<String> = owt_accounts::confirmed_emails(&pool, ada.id).await?;
+let _may_accept = proven.contains(&owt_accounts::normalize("Ada@Example.com"));
 # let _ = app; Ok(()) }
 ```
 

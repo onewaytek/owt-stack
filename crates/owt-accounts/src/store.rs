@@ -104,7 +104,7 @@ pub fn username_problem(username: &str) -> Option<Refused> {
 
 /// One address: something before one `@`, something after, no whitespace. The
 /// mail that proves it is the app's business.
-fn valid_email(email: &str) -> bool {
+pub(crate) fn valid_email(email: &str) -> bool {
     let Some((local, domain)) = email.split_once('@') else {
         return false;
     };
@@ -659,6 +659,60 @@ pub async fn by_username(db: impl PgExecutor<'_>, username: &str) -> sqlx::Resul
     .bind(normalize(username))
     .fetch_optional(db)
     .await
+}
+
+/// The addresses `account_id` has proven it holds, normalized ([`normalize`]),
+/// sorted and without repeats: what an app compares an invitation's address with
+/// before it seats the account.
+///
+/// An address is proven by either of:
+///
+/// - a sign-in link emailed to it ([`links::mint_emailed`](crate::links::mint_emailed))
+///   that the account redeemed. A link voided unused proves nothing, and neither does
+///   one minted without an address ([`links::mint`](crate::links::mint),
+///   [`links::mint_with`](crate::links::mint_with), the staff page, the CLI, and every
+///   link minted before the address was recorded): which address such a link reached
+///   is unknown. One emailed sign-in proves the address again.
+/// - a linked provider identity whose provider says it checked the email
+///   ([`owt_auth::oauth::Identity::email_verified`], as the provider's `identity`
+///   reads it: Google's and `OpenID` Connect's `email_verified`, Discord's `verified`,
+///   Twitch's email), as of the identity's last sign-in. Unlinking the identity
+///   takes the address away.
+///
+/// The account's own `email` counts only when proven the same way: a change of it
+/// (the staff admin's, [`set_email`]) proves nothing until a link emailed to the new
+/// address is redeemed. A proof does not
+/// expire, and it holds for the account that made it even if another account holds
+/// the address later; an app that wants a recent proof mints a link and asks for it.
+///
+/// Read inside the transaction that acts on the answer, with the account's row held
+/// (`SELECT … FOR SHARE`), so an identity unlinked meanwhile cannot slip between the
+/// check and the write.
+pub async fn confirmed_emails(
+    db: impl PgExecutor<'_>,
+    account_id: i64,
+) -> sqlx::Result<Vec<String>> {
+    // `voided` is the `used_from` the library writes when it voids an unused link;
+    // a redeemed link holds the client's address there.
+    let found: Vec<String> = sqlx::query_scalar(
+        "SELECT sent_to FROM sign_in_links
+         WHERE account_id = $1 AND sent_to IS NOT NULL
+           AND used_at IS NOT NULL AND used_from IS DISTINCT FROM 'voided'
+         UNION
+         SELECT verified_email FROM account_identities
+         WHERE account_id = $1 AND verified_email IS NOT NULL",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await?;
+    let mut emails: Vec<String> = found
+        .iter()
+        .map(|e| normalize(e))
+        .filter(|e| !e.is_empty())
+        .collect();
+    emails.sort();
+    emails.dedup();
+    Ok(emails)
 }
 
 /// The active account with this email, if the email is set and is a sign-in name: an
