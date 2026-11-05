@@ -85,6 +85,10 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_revoked_sessions",
         sql: include_str!("../migrations/0009_revoked_sessions.sql"),
     },
+    Migration {
+        name: "owt_accounts_confirmed_emails",
+        sql: include_str!("../migrations/0010_confirmed_emails.sql"),
+    },
 ];
 
 /// The table [`run`] records the library's migrations in, in the schema they run in
@@ -754,6 +758,7 @@ const SHIPPED_SHA256: &[&str] = &[
     "936dcc0d4c1736b7631055589072d42e8bf966aeab73b2bc070d842a73850a17",
     "50d4c3618cbbe298ad4ade48bdb68015b7f947e4c25d78a24b7a3692072e34ac",
     "aa6faf71cfa9f5136beed2899744ab0ac1e964b7e92da7e4c9509eaa1bc8ffae",
+    "d5d2953c0621db0256279180f9da1e5f16dfcc32fe43a23dfc309ff9584b0803",
 ];
 
 /// The names each of [`ALL`] gives a relation (table, index, sequence) in the schema
@@ -848,6 +853,10 @@ const COLUMNS: &[(&str, &[&str])] = &[
     ("owt_accounts_constraints", &["accounts.username_skeleton"]),
     ("owt_accounts_local", &["accounts.password_sign_in"]),
     ("owt_accounts_link_next", &["sign_in_links.next"]),
+    (
+        "owt_accounts_confirmed_emails",
+        &["sign_in_links.sent_to", "account_identities.verified_email"],
+    ),
 ];
 
 /// The constraints each of [`ALL`] adds to a table an earlier one created, as

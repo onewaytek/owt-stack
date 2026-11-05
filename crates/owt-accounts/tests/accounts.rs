@@ -6059,3 +6059,105 @@ async fn an_arrival_waiting_on_a_retirement_reaches_nothing() {
     assert_eq!(arriving.await.unwrap(), identities::Arrival::Unknown);
     db.drop().await;
 }
+
+/// An address is confirmed by a redeemed link emailed to it, or a provider that
+/// checked it; never by being the account's email.
+async fn proven(pool: &PgPool, id: i64) -> Vec<String> {
+    owt_accounts::confirmed_emails(pool, id).await.unwrap()
+}
+
+#[tokio::test]
+async fn confirmed_emails_are_the_addresses_an_account_proved() {
+    let db = db!();
+    let ada = store::create(&db.pool, new("ada", "ada@example.com", None))
+        .await
+        .unwrap();
+    let ttl = Duration::from_mins(15);
+    // A link minted without an address, redeemed: proves nothing.
+    let plain = links::mint(&db.pool, ada.id, ttl, "emailed sign-in")
+        .await
+        .unwrap();
+    let opened = links::redeem_with(&db.pool, &plain.token, "203.0.113.9")
+        .await
+        .unwrap();
+    assert_eq!(opened.sent_to, None);
+    assert_eq!(proven(&db.pool, ada.id).await, Vec::<String>::new());
+
+    // Not one address: refused.
+    let err = links::mint_emailed(&db.pool, ada.id, "nobody", ttl, "emailed sign-in", None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.refused(), Some(&owt_accounts::Refused::Email));
+
+    // Emailed and unredeemed, or voided: nothing yet.
+    let emailed = links::mint_emailed(
+        &db.pool,
+        ada.id,
+        " ＡＤＡ@Example.com ",
+        ttl,
+        "emailed sign-in",
+        Some("/invites"),
+    )
+    .await
+    .unwrap();
+    let voided = links::mint_emailed(&db.pool, ada.id, "void@example.com", ttl, "x", None)
+        .await
+        .unwrap();
+    assert_eq!(proven(&db.pool, ada.id).await, Vec::<String>::new());
+    let opened = links::redeem_with(&db.pool, &emailed.token, "203.0.113.9")
+        .await
+        .unwrap();
+    assert_eq!(opened.sent_to.as_deref(), Some("ada@example.com"));
+    assert_eq!(opened.next.as_deref(), Some("/invites"));
+    links::void_all(&db.pool, ada.id).await.unwrap();
+    assert!(links::redeem(&db.pool, &voided.token, "x").await.is_err());
+    assert_eq!(proven(&db.pool, ada.id).await, ["ada@example.com"]);
+
+    // Staff change the email: the new address is not confirmed, the old one stays.
+    store::set_email(&db.pool, ada.id, "new@example.com")
+        .await
+        .unwrap();
+    assert_eq!(proven(&db.pool, ada.id).await, ["ada@example.com"]);
+    let to_new = links::mint_emailed(&db.pool, ada.id, "new@example.com", ttl, "x", None)
+        .await
+        .unwrap();
+    links::redeem(&db.pool, &to_new.token, "203.0.113.9")
+        .await
+        .unwrap();
+
+    // Providers: a verified email counts, an unverified one does not, and a later
+    // sign-in that no longer vouches for it takes it away.
+    let verified = identity("g1", Some("Ada.L@Example.com"), true);
+    identities::link(&db.pool, ada.id, &oauth::google(), &verified)
+        .await
+        .unwrap();
+    identities::link(
+        &db.pool,
+        ada.id,
+        &oauth::discord(),
+        &identity("d1", Some("unchecked@example.com"), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        proven(&db.pool, ada.id).await,
+        ["ada.l@example.com", "ada@example.com", "new@example.com"]
+    );
+    identities::link(
+        &db.pool,
+        ada.id,
+        &oauth::google(),
+        &identity("g1", Some("ada.l@example.com"), false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        proven(&db.pool, ada.id).await,
+        ["ada@example.com", "new@example.com"]
+    );
+
+    // Another account's proofs are its own.
+    let bob = store::create(&db.pool, new("bob", "", None)).await.unwrap();
+    assert_eq!(proven(&db.pool, bob.id).await, Vec::<String>::new());
+    db.drop().await;
+}

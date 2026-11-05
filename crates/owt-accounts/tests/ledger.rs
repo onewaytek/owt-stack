@@ -219,7 +219,7 @@ async fn an_apps_applied_copies_are_adopted_never_run_again() {
     // Once no binary carries the copies, their rows can go, and the app's migrator
     // no longer needs to ignore them.
     let forgotten = migrations::forget_copies(&db.pool).await.unwrap();
-    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     let left: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
         .fetch_all(&db.pool)
         .await
@@ -252,14 +252,7 @@ async fn a_partly_applied_set_of_copies_is_adopted_and_the_rest_applied() {
     assert_eq!(done.adopted, [ALL[0].name, ALL[1].name, ALL[2].name]);
     assert_eq!(
         done.applied,
-        [
-            ALL[3].name,
-            ALL[4].name,
-            ALL[5].name,
-            ALL[6].name,
-            ALL[7].name,
-            ALL[8].name
-        ]
+        ALL[3..].iter().map(|m| m.name).collect::<Vec<_>>()
     );
     assert_eq!(tables(&db.pool).await.len(), LIBRARY_TABLES.len() + 1);
     assert!(migrations::complete(&db.pool).await.unwrap().validated);
@@ -566,14 +559,7 @@ async fn an_adoption_cut_short_resumes() {
     let done = migrations::run(&db.pool).await.unwrap();
     assert_eq!(
         done.adopted,
-        [
-            ALL[3].name,
-            ALL[4].name,
-            ALL[5].name,
-            ALL[6].name,
-            ALL[7].name,
-            ALL[8].name
-        ]
+        ALL[3..].iter().map(|m| m.name).collect::<Vec<_>>()
     );
     assert_eq!(done.applied, Vec::<&str>::new());
     assert_eq!(db.ledger().await.len(), ALL.len());
@@ -605,5 +591,75 @@ async fn replicas_running_the_whole_start_at_once_all_succeed() {
             .unwrap();
     }
     assert_eq!(db.ledger().await.len(), ALL.len());
+    db.drop().await;
+}
+
+/// 0010 fills `verified_email` for identities linked before it, reading their claims
+/// as owt-auth's providers read them, and gives no old link an address.
+#[tokio::test]
+async fn identities_linked_before_0010_keep_their_verified_emails() {
+    let Some(db) = Db::new().await else { return };
+    let before = ALL.len() - 1;
+    for (i, m) in ALL.iter().enumerate().take(before) {
+        db.write(&copy_file(i), m.sql);
+    }
+    db.app().await.run(&db.pool).await.unwrap();
+    let ada = owt_accounts::store::create(
+        &db.pool,
+        owt_accounts::New {
+            username: "ada",
+            email: "ada@example.com",
+            password: None,
+            is_staff: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ada.id, 1);
+    sqlx::raw_sql(
+        "INSERT INTO account_identities (account_id, provider, subject, claims) VALUES
+           (1, 'google', 'g1', '{\"email\": \"Ada@Example.com\", \"email_verified\": true}'),
+           (1, 'google', 'g2', '{\"email\": \"g2@example.com\", \"email_verified\": \"true\"}'),
+           (1, 'https://sso.example', 's1', '{\"email\": \"sso@example.com\", \"email_verified\": false}'),
+           (1, 'discord', 'd1', '{\"email\": \"d1@example.com\", \"verified\": true}'),
+           (1, 'discord', 'd2', '{\"email\": \"d2@example.com\", \"email_verified\": true}'),
+           (1, 'twitch', 't1', '{\"email\": \"t1@example.com\"}'),
+           (1, 'twitch', 't2', '{\"email\": null}'),
+           (1, 'google', 'g3', '{\"email\": \"\", \"email_verified\": true}');
+         INSERT INTO sign_in_links (token_sha256, account_id, expires_at, reason, used_at, used_from)
+         VALUES (sha256('t'), 1, now() + interval '1 day', 'emailed sign-in', now(), '203.0.113.9');",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let done = migrations::run(&db.pool).await.unwrap();
+    assert_eq!(done.applied, [ALL[before].name]);
+    let verified: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT subject, verified_email FROM account_identities ORDER BY subject")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    let verified: Vec<(&str, Option<&str>)> = verified
+        .iter()
+        .map(|(s, e)| (s.as_str(), e.as_deref()))
+        .collect();
+    assert_eq!(
+        verified,
+        [
+            ("d1", Some("d1@example.com")),
+            ("d2", None),
+            ("g1", Some("Ada@Example.com")),
+            ("g2", None),
+            ("g3", None),
+            ("s1", None),
+            ("t1", Some("t1@example.com")),
+            ("t2", None),
+        ]
+    );
+    // The old link proves nothing; the account's own email is not assumed.
+    assert_eq!(
+        owt_accounts::confirmed_emails(&db.pool, 1).await.unwrap(),
+        ["ada@example.com", "d1@example.com", "t1@example.com"]
+    );
     db.drop().await;
 }

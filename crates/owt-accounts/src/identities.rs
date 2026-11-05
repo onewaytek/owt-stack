@@ -62,6 +62,15 @@ impl Linked {
     }
 }
 
+/// What `account_identities.verified_email` records for `identity`: its email when
+/// the provider says it checked it, else nothing.
+fn verified_email(identity: &Identity) -> Option<&str> {
+    identity
+        .email
+        .as_deref()
+        .filter(|e| identity.email_verified && !e.trim().is_empty())
+}
+
 /// The identity `provider` knows as `subject`, if it is linked.
 pub async fn find(
     db: impl PgExecutor<'_>,
@@ -101,10 +110,11 @@ pub async fn link(
         return Err(Refused::NoSubject.into());
     }
     let linked = sqlx::query_as::<_, Linked>(
-        "INSERT INTO account_identities (account_id, provider, subject, claims)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO account_identities (account_id, provider, subject, claims, verified_email)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (provider, subject) DO UPDATE
-            SET claims = EXCLUDED.claims, last_sign_in = now()
+            SET claims = EXCLUDED.claims, verified_email = EXCLUDED.verified_email,
+                last_sign_in = now()
             WHERE account_identities.account_id = EXCLUDED.account_id
          RETURNING id, account_id, provider, subject, claims",
     )
@@ -112,6 +122,7 @@ pub async fn link(
     .bind(provider.key())
     .bind(&identity.uid)
     .bind(&identity.extra)
+    .bind(verified_email(identity))
     .fetch_optional(db)
     .await?;
     // No row back: the conflict's WHERE excluded it, so another account holds it.
@@ -356,13 +367,14 @@ pub async fn arrive_in(
         // nothing: the identity reaches nothing, and is not linked again.
         lock_account(&mut tx, linked.account_id).await?;
         let refreshed = sqlx::query(
-            "UPDATE account_identities SET claims = $4, last_sign_in = now()
+            "UPDATE account_identities SET claims = $4, verified_email = $5, last_sign_in = now()
              WHERE provider = $1 AND subject = $2 AND account_id = $3",
         )
         .bind(provider.key())
         .bind(&identity.uid)
         .bind(linked.account_id)
         .bind(&identity.extra)
+        .bind(verified_email(identity))
         .execute(&mut *tx)
         .await?
         .rows_affected()
