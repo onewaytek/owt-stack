@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.4](https://github.com/onewaytek/owt-stack/compare/v0.12.3...v0.12.4) (2026-11-05)
+
+
+### Features
+
+* **accounts:** record the address each sign-in link went to; confirmed_emails ([#314](https://github.com/onewaytek/owt-stack/issues/314)) ([4c8904f](https://github.com/onewaytek/owt-stack/commit/4c8904f44f8b9db4fdb18ec82b91a8cbb47ead7b))
+
 ## [0.12.3](https://github.com/onewaytek/owt-stack/compare/v0.12.2...v0.12.3) (2026-11-04)
 
 
