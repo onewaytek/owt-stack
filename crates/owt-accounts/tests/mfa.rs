@@ -11,7 +11,7 @@ use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 use owt_accounts::mfa::{
     Answer, EventKind, Factor, Mfa, MfaError, MfaPolicy, Next, Recent, RecentMfa, SecretSealer,
-    StepUp, require_recent, require_recent_mfa,
+    StepUp, StepUpGate, require_recent, require_recent_mfa,
 };
 use owt_accounts::session::{Data, SignInRefused, Signed as _};
 use owt_accounts::{Accounts, Signed, store};
@@ -1395,5 +1395,186 @@ async fn a_plain_row_is_refused_once_plaintext_is_turned_off() {
             .await
             .unwrap();
     assert_eq!(plain, 1, "the query in the README counts it");
+    db.drop().await;
+}
+
+fn gated_app(db: &Db, sessions: &Sessions<Data>, mfa: Mfa, gate: StepUpGate) -> Router {
+    let st = AppState {
+        pool: db.pool.clone(),
+        mfa: mfa.clone(),
+        throttle: Arc::new(throttle()),
+    };
+    let accounts = Accounts::new(db.pool.clone(), "/login")
+        .reauth_at("/reauth")
+        .require_mfa::<Data>(mfa);
+    let gated = Router::new()
+        .route(
+            "/settings",
+            get(|| async { "settings" }).post(|| async { "saved" }),
+        )
+        .layer(from_fn_with_state(gate, StepUpGate::<Data>::guard));
+    Router::new()
+        .route("/login", post(login))
+        .route("/challenge", post(challenge))
+        .merge(gated)
+        .with_state(st)
+        .layer(from_fn_with_state(accounts, Accounts::load::<Data>))
+        .layer(from_fn_with_state(sessions.clone(), Sessions::layer))
+}
+
+fn post_with(uri: &str, headers: &[(&str, &str)]) -> axum::http::Request<axum::body::Body> {
+    let mut req = axum::http::Request::post(uri)
+        .header("host", "app.test")
+        .header("content-type", "application/x-www-form-urlencoded");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    req.body(axum::body::Body::from("a=1")).unwrap()
+}
+
+/// Move the session's proofs `secs` into the past.
+fn age(client: &owt_test::Client, sessions: &Sessions<Data>, secs: u64) {
+    let (id, mut data) = sessions.unseal(&client.cookie("s").unwrap()).unwrap();
+    let auth = data.mfa.auth.as_mut().unwrap();
+    auth.at -= secs;
+    auth.mfa_at = auth.mfa_at.map(|t| t - secs);
+    client.set_cookie("s", &sessions.seal(&id, &data));
+}
+
+#[tokio::test]
+async fn the_step_up_gate_sends_a_stale_change_back_to_the_page_it_came_from() {
+    let db = db!();
+    account(&db, "ada", false).await;
+    let sessions = sessions();
+    let gate = StepUpGate::new(Duration::from_secs(60));
+    let client = owt_test::Client::new(gated_app(&db, &sessions, mfa(), gate));
+
+    // Anonymous: the sign-in wall, not re-authentication.
+    let r = client.send(post_with("/settings", &[])).await;
+    assert_eq!(r.status, 303);
+    assert_eq!(r.location(), Some("/login?next=%2Fsettings"));
+
+    let r = client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(r.text(), "Done", "signed in");
+    assert_eq!(
+        client.send(post_with("/settings", &[])).await.text(),
+        "saved"
+    );
+
+    age(&client, &sessions, 120);
+    // Reads pass; changes go to /reauth and back to the form's page.
+    assert_eq!(client.get("/settings").await.text(), "settings");
+    let r = client
+        .send(post_with(
+            "/settings?x=1",
+            &[("referer", "https://app.test/profile?tab=email")],
+        ))
+        .await;
+    assert_eq!(r.status, 303);
+    assert_eq!(r.location(), Some("/reauth?next=%2Fprofile%3Ftab%3Demail"));
+    // Another site's Referer, or none: the request's path, without the form's query.
+    for headers in [&[("referer", "https://evil.test/profile")][..], &[]] {
+        let r = client.send(post_with("/settings?x=1", headers)).await;
+        assert_eq!(r.location(), Some("/reauth?next=%2Fsettings"));
+    }
+    // htmx: a 204 that loads the page whole, back to the page htmx was on.
+    let r = client
+        .send(post_with(
+            "/settings",
+            &[
+                ("hx-request", "true"),
+                ("hx-current-url", "https://app.test/profile"),
+                ("referer", "https://app.test/elsewhere"),
+            ],
+        ))
+        .await;
+    assert_eq!(r.status, 204);
+    assert_eq!(r.header("hx-redirect"), Some("/reauth?next=%2Fprofile"));
+    assert!(r.header("cache-control").unwrap().contains("no-store"));
+    assert_eq!(r.location(), None);
+    // A boosted request follows the 303 as a page load.
+    let r = client
+        .send(post_with(
+            "/settings",
+            &[("hx-request", "true"), ("hx-boosted", "true")],
+        ))
+        .await;
+    assert_eq!(r.status, 303);
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn the_step_up_gate_checks_who_first_and_can_cover_reads() {
+    let db = db!();
+    account(&db, "ada", false).await;
+    let sessions = sessions();
+    let gate = StepUpGate::new(Duration::from_secs(60)).staff().reads();
+    let client = owt_test::Client::new(gated_app(&db, &sessions, mfa(), gate));
+    client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    // Not staff: a 403, fresh or stale, read or change.
+    assert_eq!(client.get("/settings").await.status, 403);
+    assert_eq!(client.send(post_with("/settings", &[])).await.status, 403);
+
+    let grace = account(&db, "grace", true).await;
+    let client = owt_test::Client::new(gated_app(
+        &db,
+        &sessions,
+        mfa(),
+        StepUpGate::new(Duration::from_secs(60)).staff().reads(),
+    ));
+    client
+        .post_form(
+            "/login",
+            &[("login", &grace.username), ("password", PASSWORD)],
+        )
+        .await;
+    assert_eq!(client.get("/settings?page=2").await.text(), "settings");
+    age(&client, &sessions, 120);
+    let r = client.get("/settings?page=2").await;
+    assert_eq!(r.location(), Some("/reauth?next=%2Fsettings%3Fpage%3D2"));
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn the_step_up_gate_can_ask_for_the_second_factor() {
+    let db = db!();
+    let ada = account(&db, "ada", false).await;
+    let mfa = mfa();
+    let Enrolled { secret, .. } = enroll(&db, &mfa, &ada).await;
+    account(&db, "bob", false).await;
+    let sessions = sessions();
+    let gate = StepUpGate::new(Duration::from_secs(60)).second_factor();
+    let app = gated_app(&db, &sessions, mfa, gate);
+
+    let client = owt_test::Client::new(app.clone());
+    client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    let r = client
+        .post_form(
+            "/challenge",
+            &[("totp", &totp::code(&secret, step_now() + 1))],
+        )
+        .await;
+    assert_eq!(r.text(), "signed in as ada");
+    assert_eq!(
+        client.send(post_with("/settings", &[])).await.text(),
+        "saved"
+    );
+    age(&client, &sessions, 120);
+    let r = client.send(post_with("/settings", &[])).await;
+    assert_eq!(r.location(), Some("/reauth?next=%2Fsettings"));
+
+    // An account without a factor is sent to enrollment.
+    let client = owt_test::Client::new(app);
+    client
+        .post_form("/login", &[("login", "bob"), ("password", PASSWORD)])
+        .await;
+    let r = client.send(post_with("/settings", &[])).await;
+    assert_eq!(r.location(), Some("/mfa/enroll?next=%2Fsettings"));
     db.drop().await;
 }

@@ -2136,6 +2136,33 @@ async fn break_glass(session: Session<Data>) -> Result<&'static str, &'static st
 }
 ```
 
+**Step-up for a group of routes.** `mfa::StepUpGate` is the same check as a middleware, so
+every route under it is covered, including ones added later. It lets reads (`GET`, `HEAD`)
+through and, for a change, checks who first (any signed-in account; `.staff()`; or
+`.role(ROLE)`, a 403 for anyone else) and then the proof within the window (`.second_factor()`
+for `RecentMfa`'s). `.reads()` puts reads behind it too. A redirect cannot repeat a `POST`,
+so `?next=` names the page the change came from: `HX-Current-URL` for htmx, else the
+`Referer`, each only when it is this site's (`owt_web::redirect::htmx_current_page`,
+`redirect::referer_page`), else the request's path. The person re-authenticates, lands back
+on the form and sends it again. An htmx request (not a boosted one) gets a 204 with
+`HX-Redirect` and `Cache-Control: no-store` instead of the 303, so the re-authentication
+page loads whole rather than into a fragment. Add the layer before `Accounts::load` (so it
+runs after it); an app with its own session data names it with `.with_session::<MyData>()`
+and `StepUpGate::<MyData>::guard`.
+
+```rust,no_run
+use std::time::Duration;
+use axum::{Router, middleware::from_fn_with_state, routing::post};
+use owt_accounts::mfa::StepUpGate;
+use owt_accounts::session::Data;
+
+// Every change under /staff: staff who used a second factor in the last 5 minutes.
+let gate = StepUpGate::new(Duration::from_secs(300)).staff().second_factor();
+let staff: Router = Router::new()
+    .route("/staff/refunds", post(|| async { "refunded" }))
+    .layer(from_fn_with_state(gate, StepUpGate::<Data>::guard));
+```
+
 #### The second-factor pages
 
 `owt_accounts::mfa::pages::MfaPages` mounts the pages the functions above need, so an app

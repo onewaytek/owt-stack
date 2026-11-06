@@ -3,13 +3,17 @@
 use std::marker::PhantomData;
 use std::time::{Duration, SystemTime};
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use owt_web::Error;
 use owt_web::session::Session;
 
 use super::state::{self, MfaSession};
 use crate::layer::{self, EnrollAt, HasFactor, Maybe, ReauthAt};
+use crate::roles::Role;
 use crate::session::Data;
 
 /// Why the session must prove who it is again. The app answers it with its
@@ -220,4 +224,210 @@ impl<S: Send + Sync, const SECS: u64, T: MfaSession> FromRequestParts<S> for Rec
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         guard::<T>(parts, SECS, true).map(|()| Self(PhantomData))
     }
+}
+
+/// Who a [`StepUpGate`] lets through to the step-up check.
+#[derive(Clone, Copy, Debug)]
+enum Who {
+    Signed,
+    Staff,
+    Role(Role),
+}
+
+/// Step-up for a whole group of routes, as a middleware: every change (any method but
+/// `GET`, `HEAD`, `OPTIONS` and `TRACE`) needs a proof of who the person is within the
+/// gate's window, and the rest pass. Where [`Recent`] and [`RecentMfa`] guard one
+/// handler each, the gate guards everything under it, so a route added later is
+/// covered without anyone remembering to.
+///
+/// In order, for a request the gate checks:
+/// 1. who: a signed-in account ([`Signed`](crate::Signed)'s wall otherwise), or with
+///    [`StepUpGate::staff`] or [`StepUpGate::role`] the right one (403 otherwise);
+/// 2. the proof: as [`Recent`], or as [`RecentMfa`] with
+///    [`StepUpGate::second_factor`]. Without it the visitor is sent to the
+///    re-authentication page (or enrollment, for an account without a factor), with
+///    `?next=` naming the page to come back to.
+///
+/// A redirect cannot repeat a `POST`, so `?next=` names the page the change was sent
+/// from: `HX-Current-URL` for an htmx request, else the `Referer`, both only when they
+/// are this site's ([`owt_web::redirect::htmx_current_page`],
+/// [`owt_web::redirect::referer_page`]), else the request's own path. The person
+/// re-authenticates, lands back on the form and sends it again.
+///
+/// An htmx request (not a boosted one) would follow a 303 inside its request and swap
+/// the re-authentication page into a fragment, so it gets a 204 with `HX-Redirect`
+/// instead, which loads the page whole. The sign-in wall is left to
+/// [`Accounts::load`](crate::Accounts::load), which does the same for it.
+///
+/// `T` is the session data type ([`Data`] unless the app has its own,
+/// [`StepUpGate::with_session`]); name it at the layer:
+///
+/// ```
+/// # use std::time::Duration;
+/// # use axum::{Router, routing::post, middleware::from_fn_with_state};
+/// use owt_accounts::mfa::StepUpGate;
+/// use owt_accounts::session::Data;
+///
+/// let gate = StepUpGate::new(Duration::from_secs(300)).staff().second_factor();
+/// let staff: Router = Router::new()
+///     .route("/staff/refunds", post(|| async { "refunded" }))
+///     .layer(from_fn_with_state(gate, StepUpGate::<Data>::guard));
+/// ```
+#[derive(Debug)]
+pub struct StepUpGate<T = Data> {
+    window: Duration,
+    who: Who,
+    second_factor: bool,
+    reads: bool,
+    data: PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for StepUpGate<T> {
+    fn clone(&self) -> Self {
+        Self {
+            window: self.window,
+            who: self.who,
+            second_factor: self.second_factor,
+            reads: self.reads,
+            data: PhantomData,
+        }
+    }
+}
+
+impl StepUpGate {
+    /// Changes need a proof (a password, a link, a provider or a second factor) within
+    /// `window`, from any signed-in account.
+    #[must_use]
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            who: Who::Signed,
+            second_factor: false,
+            reads: false,
+            data: PhantomData,
+        }
+    }
+}
+
+impl<T: MfaSession> StepUpGate<T> {
+    /// The same gate for an app whose session data type is `U`.
+    #[must_use]
+    pub fn with_session<U: MfaSession>(self) -> StepUpGate<U> {
+        StepUpGate {
+            window: self.window,
+            who: self.who,
+            second_factor: self.second_factor,
+            reads: self.reads,
+            data: PhantomData,
+        }
+    }
+
+    /// Only staff pass; anyone else signed in gets a 403 before any re-authentication,
+    /// as with [`Staff`](crate::Staff).
+    #[must_use]
+    pub fn staff(mut self) -> Self {
+        self.who = Who::Staff;
+        self
+    }
+
+    /// Only holders of `role` pass (staff too, for a role
+    /// [`held_by_staff`](Role::held_by_staff)); anyone else signed in gets a 403, as
+    /// with [`Holds`](crate::roles::Holds).
+    #[must_use]
+    pub fn role(mut self, role: Role) -> Self {
+        self.who = Who::Role(role);
+        self
+    }
+
+    /// The proof must be a second factor, as [`RecentMfa`]'s.
+    #[must_use]
+    pub fn second_factor(mut self) -> Self {
+        self.second_factor = true;
+        self
+    }
+
+    /// Reads (`GET`, `HEAD`) need the proof too, and the who check: for pages whose
+    /// content is itself sensitive. `?next=` is then the page asked for.
+    #[must_use]
+    pub fn reads(mut self) -> Self {
+        self.reads = true;
+        self
+    }
+
+    /// The middleware: `.layer(from_fn_with_state(gate, StepUpGate::<Data>::guard))`,
+    /// inside [`Accounts::load`](crate::Accounts::load) (added before it, so it runs
+    /// after it).
+    pub async fn guard(State(gate): State<Self>, request: Request, next: Next) -> Response {
+        if request.method().is_safe() && !gate.reads {
+            return next.run(request).await;
+        }
+        let (parts, body) = request.into_parts();
+        if let Err(e) = gate.check(&parts) {
+            return e;
+        }
+        next.run(Request::from_parts(parts, body)).await
+    }
+
+    fn check(&self, parts: &Parts) -> Result<(), Response> {
+        // Who first: anyone else meets the sign-in wall or a 403, not re-authentication.
+        let Some(account) = Maybe::of(&parts.extensions).0 else {
+            return Err(layer::wall(parts).into_response());
+        };
+        let allowed = match self.who {
+            Who::Signed => true,
+            Who::Staff => account.is_staff,
+            Who::Role(role) => account.holds(&role),
+        };
+        if !allowed {
+            let why = match self.who {
+                Who::Role(role) => format!("This needs the {} role.", role.label),
+                _ => "Only staff can do this.".to_owned(),
+            };
+            return Err(Error::Forbidden(why.into()).into_response());
+        }
+        let htmx = flag(&parts.headers, "hx-request");
+        let back = if parts.method.is_safe() {
+            None
+        } else if htmx {
+            owt_web::redirect::htmx_current_page(&parts.headers)
+                .or_else(|| owt_web::redirect::referer_page(&parts.headers))
+        } else {
+            owt_web::redirect::referer_page(&parts.headers)
+        };
+        let next = back.as_deref().unwrap_or_else(|| {
+            let asked = layer::asked_for(&parts.extensions, &parts.uri);
+            // The path alone for a change: its query is the form's, not a page's.
+            if parts.method.is_safe() {
+                asked
+            } else {
+                asked.split_once('?').map_or(asked, |(path, _)| path)
+            }
+        });
+        match guard_to::<T>(parts, self.window.as_secs(), self.second_factor, next) {
+            Ok(()) => Ok(()),
+            Err(Error::Redirect(to)) if htmx && !flag(&parts.headers, "hx-boosted") => {
+                Err(hx_redirect(&to))
+            }
+            Err(e) => Err(e.into_response()),
+        }
+    }
+}
+
+fn flag(headers: &HeaderMap, name: &str) -> bool {
+    headers.get(name).is_some_and(|v| v.as_bytes() == b"true")
+}
+
+/// A 204 that has htmx load `to` as a whole page.
+fn hx_redirect(to: &str) -> Response {
+    let Ok(value) = HeaderValue::from_str(to) else {
+        return Error::Redirect(to.to_owned()).into_response();
+    };
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (HeaderName::from_static("hx-redirect"), value),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+    )
+        .into_response()
 }
