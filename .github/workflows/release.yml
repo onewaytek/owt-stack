@@ -6,7 +6,7 @@ name: App release (reusable)
 #   jobs:
 #     release:
 #       needs: ci
-#       permissions: {contents: write, issues: write, pull-requests: write}
+#       permissions: {contents: write, issues: write, pull-requests: write, actions: write}
 #       uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # vX.Y.Z, the release the app uses
 #     image:
 #       needs: release
@@ -27,6 +27,19 @@ name: App release (reusable)
 # tag: `feat` is minor, `fix` and `perf` are patch, `!` or a BREAKING CHANGE footer
 # is major, and anything else releases nothing. The tag is `vX.Y.Z`, and a GitHub
 # release carries the generated notes.
+#
+# A run behind its branch releases nothing: semantic-release will not release from a
+# commit older than the branch's head ("local branch rc is behind the remote one")
+# and ends without a version, so no image is built. That happens to a run re-run
+# after the branch moved, and to one that waited in the runner queue while it moved.
+# On main the newer head was pushed by someone and started a run of its own, so the
+# stale run only says so. On rc the newer head was usually pushed with a workflow's
+# own token (promote-rc.yml, publish-rc.yml, the main-to-rc sync), which starts no
+# run, so the stale run dispatches the app's release workflow on rc: the fresh run
+# checks and releases the head, the stale run's commits with it. That dispatch is
+# why the calling job grants `actions: write`; the workflow file dispatched is the
+# caller's own (`release-workflow` overrides it), which needs a `workflow_dispatch`
+# trigger, as promote-rc.yml's dispatch already does.
 #
 # An app whose code reads its own version (to report it to its clients, say) sets
 # `version-command` and `version-files`: the command writes the version into those
@@ -71,6 +84,12 @@ on:
         description: Install uv for the version command (Python apps).
         type: boolean
         default: false
+      release-workflow:
+        description: >-
+          The app's release workflow file, dispatched on rc when this run is behind
+          the branch. Empty: the workflow that called this one.
+        type: string
+        default: ""
     outputs:
       version:
         description: The version released, without the v; empty when nothing was.
@@ -101,6 +120,8 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
+      # A run behind rc dispatches a fresh one (see the header).
+      actions: write
     outputs:
       version: ${{ steps.semrel.outputs.version }}
       channel: ${{ steps.semrel.outputs.channel }}
@@ -230,6 +251,32 @@ jobs:
           "$RUNNER_TEMP/semrel/node_modules/.bin/semantic-release" || status=$?
           echo "::${stop}::"
           exit "$status"
+      - name: A run behind its branch hands over to the head
+        # semantic-release ends without a version when the checkout is behind the
+        # branch; that must not pass for "nothing to release" (see the header).
+        if: ${{ steps.semrel.outputs.version == '' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          WORKFLOW: ${{ inputs.release-workflow }}
+          CALLER: ${{ github.workflow_ref }}
+        with:
+          script: |
+            const branch = process.env.GITHUB_REF_NAME;
+            const { owner, repo } = context.repo;
+            const { data } = await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+            const head = data.object.sha;
+            if (head === context.sha) {
+              core.info(`${branch} is still at ${head}: nothing was releasable`);
+              return;
+            }
+            if (branch !== "rc") {
+              core.notice(`${branch} moved from ${context.sha} to ${head} under this run, which released nothing; the push of ${head} started its own run`);
+              return;
+            }
+            // "owner/repo/.github/workflows/release.yml@refs/heads/rc": the caller's file.
+            const workflow = process.env.WORKFLOW || process.env.CALLER.split("@")[0].split("/").pop();
+            await github.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: workflow, ref: "rc" });
+            core.notice(`rc moved from ${context.sha} to ${head} under this run, which released nothing; dispatched ${workflow} on rc to release the head`);
       - name: The version fits the branch
         # rc makes prereleases and main makes releases, whatever a configuration said.
         env:
