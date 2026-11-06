@@ -4778,7 +4778,7 @@ built.
 # .github/workflows/release.yml
 on:
   push: {branches: [main, rc]}
-  workflow_dispatch:          # promote-rc.yml starts rc releases this way
+  workflow_dispatch:          # promote-rc.yml and release.yml start rc releases this way
 # One run at a time per branch, none cancelled. The release job serialises itself;
 # this keeps a second push's ci and image jobs from running beside the first's release.
 concurrency: {group: "release-${{ github.ref_name }}", cancel-in-progress: false}
@@ -4788,7 +4788,7 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    permissions: {contents: write, issues: write, pull-requests: write}
+    permissions: {contents: write, issues: write, pull-requests: write, actions: write}
     uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # v0.12.4
   image:
     needs: release
@@ -4851,18 +4851,21 @@ jobs:
   can pull `rc`'s tree toward `main` where an in-flight feature edits the same lines,
   and an app whose release commits `chore(release)` files back to `main` has a
   changed tree at every sync. Such a release run publishes nothing (no releasable
-  commit, no image) and costs one run. A release run on `rc` that failed and is
-  re-run after `rc` moved publishes nothing either, since semantic-release will not
-  release from a commit behind its branch. The next release run releases everything
-  since the last tag, the failed run's commits included, but a history-only sync
-  starts none, so those commits wait for the next promotion or tree-changing sync.
-  An app that passed `dispatch-release: false` to `sync-rc` drops it to get the
-  rule. A PR's checks run on the PR alone, so two
-  PRs in flight can each pass and break `rc` together: two migrations taking one
-  number merge without a conflict. Checking the merge first closes that. The merge
-  goes to `rc-candidate`, the app's checks run on it, and `rc` fast-forwards to it
-  only if they pass and `rc` hasn't moved since. `rust-ci.yml` also fails on two
-  migrations with one version.
+  commit, no image) and costs one run. Every sync, even one that finds `rc` already
+  holding `main`, also releases `rc` when its tree differs from the newest `rc`
+  prerelease tag it contains: `rc` left unreleased by a release run that failed is
+  released by the next stable release's sync. A release run that is behind its
+  branch when it runs (re-run after the branch moved, or queued while it moved)
+  can't release, since semantic-release will not release from a commit behind its
+  branch; on `rc` it dispatches the release workflow again so a fresh run releases
+  the head (which is why `release` grants `actions: write`), and on `main` it says
+  so in a notice, since the push that moved `main` started its own run. An app that
+  passed `dispatch-release: false` to `sync-rc` drops it to get the rule. A PR's
+  checks run on the PR alone, so two PRs in flight can each pass and break `rc`
+  together: two migrations taking one number merge without a conflict. Checking the
+  merge first closes that. The merge goes to `rc-candidate`, the app's checks run on
+  it, and `rc` fast-forwards to it only if they pass and `rc` hasn't moved since.
+  `rust-ci.yml` also fails on two migrations with one version.
 - **The candidate check is skipped when it would repeat the PR's.** When `rc` holds
   nothing beyond `main` (no other PR in flight, `main` unmoved), the candidate merge
   has the same tree as the PR's merge commit, which `ci` checked earlier in the same
@@ -5974,6 +5977,16 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+
+## Upgrading from 0.12
+
+- **The `release` job grants `actions: write`.** `release.yml` dispatches a fresh run
+  on `rc` when it finds itself behind the branch, so the calling job's permissions
+  become `{contents: write, issues: write, pull-requests: write, actions: write}`.
+  Without it the release workflow fails to start once its pin moves. The caller needs
+  its `workflow_dispatch` trigger, which `promote-rc.yml`'s dispatch already
+  requires. Nothing changes for `sync-rc` beyond the pin: it starts releasing `rc`
+  when `rc` holds code no `rc` prerelease has.
 
 ## Upgrading from 0.9
 
