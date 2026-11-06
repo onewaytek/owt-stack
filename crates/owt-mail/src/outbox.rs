@@ -58,7 +58,7 @@ impl std::fmt::Debug for Outbox {
                     .unwrap_or_else(PoisonError::into_inner)
                     .len(),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -133,7 +133,7 @@ mod tests {
         assert_eq!(first_link(&first.text), Some("https://x.example/l/1"));
         assert_eq!(first_link("none"), None);
         outbox.clear();
-        assert!(mail.sent().is_empty());
+        assert_eq!(mail.sent(), Vec::<Email>::new());
     }
 
     #[tokio::test]

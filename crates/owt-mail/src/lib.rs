@@ -485,7 +485,7 @@ mod tests {
         }
         let header = Email::new("a@example.com", "Hi\r\nBcc: x@evil.example", "b");
         assert!(matches!(mail.send(&header).await, Err(Error::Header)));
-        assert!(outbox.sent().is_empty());
+        assert_eq!(outbox.sent(), Vec::<Email>::new());
     }
 
     #[test]

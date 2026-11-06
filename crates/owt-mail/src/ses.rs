@@ -287,11 +287,11 @@ mod tests {
     fn dates_are_utc_calendar_dates() {
         assert_eq!(amz_date(UNIX_EPOCH), "19700101T000000Z");
         assert_eq!(
-            amz_date(UNIX_EPOCH + Duration::from_secs(1_440_938_160)),
+            amz_date(UNIX_EPOCH + Duration::from_mins(24_015_636)),
             "20150830T123600Z"
         );
         assert_eq!(
-            amz_date(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            amz_date(UNIX_EPOCH + Duration::from_hours(264_384)),
             "20000229T000000Z"
         );
     }
