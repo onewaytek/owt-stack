@@ -43,11 +43,14 @@ name: Promote to rc
 # one run of the release workflow. The rule applies to this direct path only; with
 # `candidate: true`, publish-rc.yml dispatches on every publish.
 #
-# A release run on rc that failed and is re-run after rc moved publishes nothing
-# (semantic-release refuses to release from a commit behind its branch). The next
-# dispatch releases everything since the last tag, the failed run's commits included,
-# but a history-only sync dispatches none, so until the next promotion or tree-changing
-# sync those commits wait.
+# The sync also dispatches the release when rc's head carries code no rc release
+# has: its tree differs from the tree of the newest rc prerelease tag it contains.
+# That is rc left unreleased by a release run that failed, or that was behind rc
+# when it ran (semantic-release refuses to release from a commit behind its branch;
+# release.yml then dispatches a fresh run, but a run that failed outright does not).
+# The test runs on every sync, even one that finds rc already containing main, so
+# each stable release also settles rc. With no rc tag at all it dispatches nothing
+# beyond the tree rule above.
 #
 # A branch's own checks don't check rc: two branches built beside each other can each
 # pass and still break rc together (two migrations taking one number merge without a
@@ -102,7 +105,8 @@ on:
       dispatch-release:
         description: >-
           Start the app's release workflow on rc when the merge changed rc's tree (not
-          when it only joined histories that already held the same code). Unlike
+          when it only joined histories that already held the same code), and, on a
+          sync from main, when rc's tree differs from its newest rc tag's. Unlike
           publish-rc.yml's input of the name, which dispatches whenever it runs.
         type: boolean
         default: true
@@ -165,6 +169,17 @@ jobs:
           if [ -n "$PR" ]; then msg="chore(rc): merge #${PR} (${SRC}) into rc"; else msg="chore(rc): merge ${SRC} into rc"; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # On a sync: whether HEAD carries code no rc release has (see the header),
+          # read by "Release rc". The newest rc tag by version that HEAD contains.
+          unreleased() {
+            git fetch -q --no-tags origin '+refs/tags/v*:refs/tags/v*'
+            local tag
+            tag=$(git tag --merged HEAD --list 'v*-rc.*' --sort=-v:refname | sed -n 1p)
+            if [ -n "$tag" ] && [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse "${tag}^{tree}")" ]; then
+              echo "rc's tree differs from ${tag}'s: releasing rc"
+              echo "unreleased=true" >> "$GITHUB_OUTPUT"
+            fi
+          }
           for attempt in 1 2 3 4 5; do
             git fetch --no-tags origin \
               "+refs/heads/main:refs/remotes/origin/main" \
@@ -184,6 +199,7 @@ jobs:
             fi
             if [ "$(git rev-parse HEAD)" = "$before" ]; then
               echo "changed=false" >> "$GITHUB_OUTPUT"
+              [ "$SRC" = main ] && unreleased
               echo "rc already contains ${SRC}"
               exit 0
             fi
@@ -199,6 +215,7 @@ jobs:
               content=false
               [ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse "${before}^{tree}")" ] && content=true
               printf 'changed=true\ncontent=%s\nsha=%s\nbase=%s\n' "$content" "$(git rev-parse HEAD)" "$base" >> "$GITHUB_OUTPUT"
+              [ "$SRC" = main ] && unreleased
               exit 0
             fi
             echo "push raced another writer (attempt ${attempt}); retrying"
@@ -207,7 +224,10 @@ jobs:
           echo "could not push rc after 5 attempts" >&2
           exit 1
       - name: Release rc
-        if: ${{ inputs.dispatch-release && !inputs.candidate && steps.merge.outputs.changed == 'true' && steps.merge.outputs.content == 'true' }}
+        if: >-
+          ${{ inputs.dispatch-release && !inputs.candidate
+          && ((steps.merge.outputs.changed == 'true' && steps.merge.outputs.content == 'true')
+          || steps.merge.outputs.unreleased == 'true') }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           WORKFLOW: ${{ inputs.release-workflow }}

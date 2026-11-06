@@ -35,9 +35,26 @@ pub fn local_or<'a>(next: Option<&'a str>, fallback: &'a str) -> &'a str {
 /// `host[:port]`), and its path passes [`local`]. Fall back to the request's own URI.
 #[must_use]
 pub fn htmx_current_page(headers: &HeaderMap) -> Option<String> {
+    same_origin_page(headers, "hx-current-url")
+}
+
+/// The page a request was sent from (`Referer`), as a path and query on this site:
+/// where a form's `POST` came from, for a redirect that sends the visitor back to it
+/// with a `GET`.
+///
+/// `None` under the same rules as [`htmx_current_page`]: an `http(s)` URL of the
+/// request's own origin whose path passes [`local`]. A browser that sends no
+/// `Referer` (a `no-referrer` policy) or only the origin gets `None` or `/`.
+#[must_use]
+pub fn referer_page(headers: &HeaderMap) -> Option<String> {
+    same_origin_page(headers, header::REFERER.as_str())
+}
+
+/// The URL in header `name`, as a path and query, when it names this origin.
+fn same_origin_page(headers: &HeaderMap, name: &str) -> Option<String> {
     let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let host = get(header::HOST.as_str()).filter(|h| !h.is_empty())?;
-    let url = url::Url::parse(get("hx-current-url")?).ok()?;
+    let url = url::Url::parse(get(name)?).ok()?;
     let same_origin = matches!(url.scheme(), "http" | "https")
         && url.username().is_empty()
         && url.password().is_none()
@@ -65,6 +82,32 @@ mod tests {
             h.insert(header::HOST, HeaderValue::from_static(host));
         }
         htmx_current_page(&h)
+    }
+
+    #[test]
+    fn the_referer_is_a_path_on_this_origin() {
+        let referer = |url: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::REFERER, HeaderValue::from_static(url));
+            h.insert(header::HOST, HeaderValue::from_static("app.test"));
+            referer_page(&h)
+        };
+        assert_eq!(
+            referer("https://app.test/a/b?c=1").as_deref(),
+            Some("/a/b?c=1")
+        );
+        assert_eq!(referer("https://evil.test/a"), None);
+        assert_eq!(referer("javascript:alert(1)"), None);
+        // A path a browser reads as another host: `//`, and `\` that the URL
+        // parser turns into `/`.
+        assert_eq!(referer("https://app.test//evil.test/a"), None);
+        assert_eq!(referer("https://app.test/\\evil.test/a"), None);
+        // Encoded slashes stay encoded, a path on this site.
+        assert_eq!(
+            referer("https://app.test/%2F%2Fevil.test").as_deref(),
+            Some("/%2F%2Fevil.test")
+        );
+        assert_eq!(referer_page(&HeaderMap::new()), None);
     }
 
     #[test]
