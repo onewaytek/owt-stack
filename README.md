@@ -4670,7 +4670,7 @@ built.
 # .github/workflows/release.yml
 on:
   push: {branches: [main, rc]}
-  workflow_dispatch:          # promote-rc.yml starts rc releases this way
+  workflow_dispatch:          # promote-rc.yml and release.yml start rc releases this way
 # One run at a time per branch, none cancelled. The release job serialises itself;
 # this keeps a second push's ci and image jobs from running beside the first's release.
 concurrency: {group: "release-${{ github.ref_name }}", cancel-in-progress: false}
@@ -4752,12 +4752,12 @@ jobs:
   branch; on `rc` it dispatches the release workflow again so a fresh run releases
   the head (which is why `release` grants `actions: write`), and on `main` it says
   so in a notice, since the push that moved `main` started its own run. An app that
-  passed `dispatch-release: false` to `sync-rc` drops it to get the rule. A PR's checks run on the PR alone, so two
-  PRs in flight can each pass and break `rc` together: two migrations taking one
-  number merge without a conflict. Checking the merge first closes that. The merge
-  goes to `rc-candidate`, the app's checks run on it, and `rc` fast-forwards to it
-  only if they pass and `rc` hasn't moved since. `rust-ci.yml` also fails on two
-  migrations with one version.
+  passed `dispatch-release: false` to `sync-rc` drops it to get the rule. A PR's
+  checks run on the PR alone, so two PRs in flight can each pass and break `rc`
+  together: two migrations taking one number merge without a conflict. Checking the
+  merge first closes that. The merge goes to `rc-candidate`, the app's checks run on
+  it, and `rc` fast-forwards to it only if they pass and `rc` hasn't moved since.
+  `rust-ci.yml` also fails on two migrations with one version.
 - **The candidate check is skipped when it would repeat the PR's.** When `rc` holds
   nothing beyond `main` (no other PR in flight, `main` unmoved), the candidate merge
   has the same tree as the PR's merge commit, which `ci` checked earlier in the same

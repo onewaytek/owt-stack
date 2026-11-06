@@ -105,7 +105,8 @@ on:
       dispatch-release:
         description: >-
           Start the app's release workflow on rc when the merge changed rc's tree (not
-          when it only joined histories that already held the same code). Unlike
+          when it only joined histories that already held the same code), and, on a
+          sync from main, when rc's tree differs from its newest rc tag's. Unlike
           publish-rc.yml's input of the name, which dispatches whenever it runs.
         type: boolean
         default: true
