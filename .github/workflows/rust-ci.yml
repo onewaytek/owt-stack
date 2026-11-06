@@ -96,7 +96,9 @@ on:
           The app's own gate (e.g. `just check`), run instead of the built-in fmt,
           audit, sqlx, clippy and test steps, so CI runs exactly what a developer
           runs. just and cargo-audit are installed for it (sqlx-cli too, for an app
-          with a .sqlx/ or migrations/), and the database is migrated first. With it
+          with a .sqlx/, or with migrations/ and no migrate-command), and the
+          database is migrated first. A gate that calls sqlx otherwise (its own
+          `sqlx migrate run` beside a migrate-command) installs it itself. With it
           set, `audit`, `sqlx-check` and `test-args` are ignored: the app's gate
           decides those.
         type: string
@@ -500,7 +502,7 @@ jobs:
       # Also the migration step without check-command: an app with a migrate-command
       # and no .sqlx/ migrates here without sqlx-cli.
       - name: sqlx metadata is current
-        if: ${{ inputs.check-command == '' && (steps.sqlx-cli.outputs.needed == 'true' || (inputs.migrate-command != '' && inputs.database != '')) }}
+        if: ${{ inputs.check-command == '' && (steps.sqlx-cli.outputs.needed == 'true' || (inputs.sqlx-check && inputs.migrate-command != '' && inputs.database != '')) }}
         env:
           MIGRATE: ${{ inputs.migrate-command }}
         shell: bash

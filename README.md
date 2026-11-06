@@ -146,9 +146,8 @@ of variables for tests, prints its names and never its values.
 
 `serve::serve` is `serve_with` and `ServeOptions::default()`: a request head must arrive
 within 310 s (an idle kept-alive connection closes then too, just after the OpenShift
-router's 300 s), at most 4096 connections
-are open at once, and a stop drains for up to 20 s. `ServeOptions` is built from its
-default and changed field by field:
+router's 300 s), at most 4096 connections are open at once, and a stop drains for up to
+20 s. `ServeOptions` is built from its default and changed field by field:
 
 ```rust,no_run
 # async fn run(app: axum::Router) -> anyhow::Result<()> {
@@ -174,9 +173,8 @@ feature is on.
   on a connection the app has just closed, and answers it with a 502. The OpenShift
   router's HAProxy waits up to 300 s by default (`timeout http-keep-alive`), so the
   default is 310 s; an app with a different proxy in front sets it above that
-  proxy's. The router
-  reads request heads itself, so the longer wait costs an idle socket, not
-  protection from slow clients.
+  proxy's. The router reads request heads itself, so the longer wait costs an idle
+  socket, not protection from slow clients.
 - **Connections.** `max_connections` counts every connection from its accept to its
   close: one idle between kept-alive requests, and one holding a Server-Sent Events
   stream, which is an ordinary HTTP/1.1 response that does not end. A WebSocket
@@ -5341,8 +5339,8 @@ Removing the entries before step 3 starts pods with neither.
 
 **Redis** is a template of its own, for an app that uses the cache, the bus across
 replicas, leases or the shared sign-in throttle. It runs as compose does: nothing on
-disk, `MAXMEMORY` (128mb) with `MAXMEMORY_POLICY` (`allkeys-lru`), one pod replaced rather than surged so the
-replicas never split across two. A password protects it, and a NetworkPolicy admits
+disk, `MAXMEMORY` (128mb) with `MAXMEMORY_POLICY` (`allkeys-lru`), one pod replaced
+rather than surged so the replicas never split across two. A password protects it, and a NetworkPolicy admits
 the app's pods alone. The password is a Secret made once by hand, since a generated
 one would change on every apply. The Deployment reads `REDIS_URL` from that Secret
 when it exists, so the app picks Redis up at its next restart:
@@ -5534,8 +5532,9 @@ the Secret named in `secret:` to the database's owner at once, but never rewrite
 The Route sends traffic through the router (HAProxy), which keeps idle connections to
 the pod for reuse for up to 300 s (`timeout http-keep-alive`). `ServeOptions`' default
 `header_read_timeout` (310 s) is above that; an app that lowers it below the router's
-gets an occasional 502 on a connection the app has just closed. Each rollout also cuts the app's SSE streams after the 20-second
-drain; their clients reconnect to the new pods ("Bounds" under "Wiring an app").
+gets an occasional 502 on a connection the app has just closed. Each rollout also cuts
+the app's SSE streams after the 20-second drain; their clients reconnect to the new pods
+("Bounds" under "Wiring an app").
 The router also cuts a response that sends nothing for `ROUTE_TIMEOUT` (its
 `timeout server`, set by the Route's `haproxy.router.openshift.io/timeout`; default
 `30s`, the router's own), so a quiet SSE stream sends `sse::HEARTBEAT` more often
