@@ -11,6 +11,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links, and the addresses an account has proven by one (`confirmed_emails`); roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-crypt` | envelope field encryption: XChaCha20-Poly1305 field seals under data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
 | `owt-storage` | objects in an S3-compatible bucket (B2, R2, MinIO): client-side encryption through `owt-crypt` in bounded memory, streaming multipart uploads, presigned URLs, verified deletion |
+| `owt-mail` | outgoing email: one `Mailer` over SMTP (lettre), Resend or SES, plain text with an HTML alternative, recipients parsed as mailboxes (no header injection), a timeout, credentials kept out of `Debug`; an in-memory outbox and a failing transport for tests; an allowlist for demo deployments; a not-configured mode callers report instead of failing |
 | `owt-audit` | an append-only, hash-chained audit log: one chain per tenant, SHA-256 over a canonical encoding, triggers that refuse changes, a verifier (and its clap subcommand, feature `cli`), and anchoring of the chain heads to external write-once storage |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
@@ -62,6 +63,7 @@ owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.4" }
 owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.4" }
 owt-storage = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.4" }
 owt-audit = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.4" }
+owt-mail = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.4" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
@@ -3443,6 +3445,85 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
   gone, which proves deletion on an unversioned bucket only (above).
 - `Storage::from_store` takes any `object_store` store: `InMemory` in tests, a
   directory in development (neither presigns).
+
+### Outgoing email
+
+`owt-mail` sends an app's email (sign-in links, invitations, notices) through one
+handle, `Mail`, kept in the app's state. The transport comes from the environment:
+
+| Variables | Transport |
+|---|---|
+| `MAIL_URL=smtp://user:pass@host:587` (STARTTLS) or `smtps://user:pass@host:465` (TLS), and `MAIL_FROM` | any provider's SMTP relay, through lettre |
+| `RESEND_API_KEY` and `MAIL_FROM` | Resend's HTTP API |
+| `SES_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `MAIL_FROM` (`AWS_SESSION_TOKEN`, `SES_ENDPOINT` optional) | SES's v2 `SendEmail`, signed with SigV4 |
+| `MAIL_URL=memory:` | the outbox: kept in memory, delivered to nobody |
+| none of them | what the app passes: `Unconfigured::Off` (nothing is sent; `send` answers `Delivery::NotConfigured`) or `Unconfigured::Outbox` (the outbox, logging each text so a workstation reads its links from the log) |
+
+Two transports configured at once fail start-up, as do a `MAIL_FROM` that is not an
+address and a `MAIL_URL` lettre can't read (the error never quotes the URL, which
+carries the relay's password). Each delivery is bounded by `DEFAULT_TIMEOUT` (10 s).
+Every recipient is parsed as one mailbox and a subject may not hold a line break, so
+no caller's input becomes a header. An `Email`'s `Debug` shows its subject only.
+
+```rust,no_run
+use owt_mail::{Delivery, Email, Mail, MailAllow, Unconfigured};
+
+# async fn demo(link: &str) -> anyhow::Result<()> {
+let mut mail = Mail::from_env(Unconfigured::Off)?;
+// A demo deployment mails only its testers.
+if let Some(list) = owt_runtime::env::var("MYAPP_MAIL_ALLOW") {
+    mail = mail.allow_only(MailAllow::parse(&list)?);
+}
+// A deployment that sends sign-in links refuses to start without delivery.
+anyhow::ensure!(mail.delivers() || !owt_runtime::env::flag("MYAPP_REQUIRE_MAIL", false)?, "set MAIL_URL, RESEND_API_KEY or SES_REGION");
+
+let email = Email::new("Ana <ana@example.com>", "Your sign-in link", format!("Sign in: {link}"))
+    .with_html(format!("<p><a href=\"{link}\">Sign in</a></p>"));
+match mail.send(&email).await? {
+    Delivery::Sent | Delivery::Kept => {}
+    Delivery::NotConfigured => tracing::warn!("no email sent: mail isn't configured"),
+}
+# Ok(()) }
+```
+
+`send` fails with `Error::Address` or `Error::Header` for input it refuses,
+`Error::Refused` for an address off the allowlist, `Error::Rejected` when the
+provider answered no (its own words, clipped to 300 characters, never the key), and
+`Error::Unreachable` when it could not be reached in time. A transport of the app's
+own implements `Mailer`; `Mail::new` takes it.
+
+In tests, `Mail::outbox()` returns the handle and its `Outbox`, and `first_link`
+pulls the link out of a message's text; `Mail::new(Failing)` is a provider that
+refuses everything:
+
+```rust
+use owt_mail::{Delivery, Email, Mail, first_link};
+
+# #[tokio::main(flavor = "current_thread")] async fn main() {
+let (mail, outbox) = Mail::outbox();
+let sent = mail.send(&Email::new("ana@example.com", "Sign in", "Go to https://myapp.example/l/abc")).await.unwrap();
+assert_eq!(sent, Delivery::Kept);
+let last = outbox.last_to("ana@example.com").unwrap();
+assert_eq!(first_link(&last.text), Some("https://myapp.example/l/abc"));
+# }
+```
+
+**Adopting it in an app with a mailer of its own.** Add the dependency, then:
+
+1. Replace the app's mail configuration with `Mail::from_env(...)` at start-up
+   (`Unconfigured::Off` where the app reports "mail isn't configured",
+   `Unconfigured::Outbox` where it printed links offline). The variable names are
+   the ones above; an app whose names differ renames them in its deployment's
+   Secret, or builds `Smtp`, `Resend` or `Ses` itself and passes it to `Mail::new`.
+2. Swap its message type for `Email` (`text`, and `html` where it sent both) and its
+   `Mailer` trait or `send(to, subject, body)` for `Mail::send`. Code that checked
+   `Ok(false)` matches `Delivery::NotConfigured`; code that asked for the outbox
+   calls `Mail::outbox_ref` or `Mail::sent`, and "does mail reach anyone"
+   becomes `Mail::delivers`.
+3. A demo allowlist moves to `MailAllow` and `Mail::allow_only`; the app keeps its
+   own refusal text and maps `Error::Refused` to it.
+4. Tests take `Mail::outbox()` (or `MAIL_URL=memory:`) and `first_link`; a test of a
+   provider's refusal takes `Failing`. Delete the app's mail module.
 
 ### Audit log
 

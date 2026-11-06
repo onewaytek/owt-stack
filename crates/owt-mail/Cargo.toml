@@ -1,0 +1,30 @@
+[package]
+name = "owt-mail"
+description = "Outgoing email for apps on owt-stack: one Mailer over SMTP, Resend or SES, an in-memory outbox for tests, an allowlist for demo deployments, and a not-configured mode."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+hex = "0.4"
+hmac.workspace = true
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "hostname", "tokio1-rustls", "webpki-roots", "aws-lc-rs"] }
+owt-runtime = { workspace = true, default-features = false }
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true, features = ["tokio", "http1", "json"] }
+tokio.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
