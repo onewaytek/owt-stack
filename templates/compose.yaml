@@ -33,8 +33,9 @@ services:
   redis:
     image: docker.io/library/redis:8-alpine
     # As production runs it for a cache and a bus: no persistence, bounded,
-    # LRU-evicted. Eviction can drop a job lease (owt_runtime::jobs::lease): an app
-    # whose leased work must never run twice gives it a `noeviction` Redis.
+    # LRU-evicted. Eviction can drop a job lease (owt_runtime::jobs::lease) or a
+    # shared throttle counter (owt_auth::throttle::SharedThrottle): an app using
+    # either gives it a `noeviction` Redis, as in production (redis.yaml).
     command: ["redis-server", "--save", "", "--appendonly", "no",
               "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
     ports:

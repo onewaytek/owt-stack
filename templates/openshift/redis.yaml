@@ -1,5 +1,6 @@
-# An optional Redis for an app deployed from app.yaml, for the cache, the bus and job
-# leases (owt_runtime::cache, owt_bus, owt_runtime::jobs::lease). Run as compose.yaml
+# An optional Redis for an app deployed from app.yaml, for the cache, the bus, job
+# leases and the shared sign-in throttle (owt_runtime::cache, owt_bus,
+# owt_runtime::jobs::lease, owt_auth::throttle::SharedThrottle). Run as compose.yaml
 # runs it: nothing on disk, bounded by maxmemory, least recently used keys evicted.
 #
 #   pw=$(openssl rand -hex 24)
@@ -13,8 +14,12 @@
 # next rollout (`oc rollout restart deployment/myapp`); until the Secret exists,
 # REDIS_URL is unset.
 #
-# Eviction can drop a job lease: an app whose leased work must never run twice sets
-# MAXMEMORY_POLICY=noeviction, and then a full Redis refuses writes instead.
+# WARNING: eviction is unsafe for leases and for the shared throttle. An evicted lease
+# lets leased work run twice; an evicted throttle counter hands a password guesser a
+# fresh budget. An app using either sets MAXMEMORY_POLICY=noeviction, and then a full
+# Redis refuses writes instead (the throttle then refuses sign-ins). Under noeviction
+# the cache's Expiry::Lru entries, which carry no TTL, never leave: such an app caches
+# only with Expiry::For or Expiry::At, or gives the cache a Redis of its own.
 apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
@@ -40,7 +45,9 @@ parameters:
     description: What Redis holds before it evicts (or, with noeviction, refuses).
     value: 128mb
   - name: MAXMEMORY_POLICY
-    description: allkeys-lru for a cache; noeviction when a lost lease must not happen.
+    description: >-
+      allkeys-lru for a Redis that holds only the cache and the bus; noeviction for
+      leases or the shared sign-in throttle, which eviction defeats.
     value: allkeys-lru
   # Named apart from app.yaml's MEMORY_LIMIT (the app's), as REDIS_IMAGE is.
   - name: REDIS_MEMORY_LIMIT

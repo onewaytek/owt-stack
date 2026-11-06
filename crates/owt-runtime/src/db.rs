@@ -44,7 +44,35 @@ impl Default for PoolConfig {
     }
 }
 
+/// The variable [`PoolConfig::from_env`] reads the pool's size from.
+pub const POOL_MAX_VAR: &str = "DB_POOL_MAX";
+
 impl PoolConfig {
+    /// The defaults, with [`max`](Self::max) from `DB_POOL_MAX` ([`POOL_MAX_VAR`]) when
+    /// it is set: one name for every app, so a deployment sizes any app's pool the
+    /// same way.
+    ///
+    /// # Errors
+    /// `DB_POOL_MAX` is set but is not a whole number above zero.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_vars(&crate::env::Vars::Process)
+    }
+
+    /// [`from_env`](Self::from_env), reading `vars`: for tests.
+    ///
+    /// # Errors
+    /// As [`from_env`](Self::from_env).
+    pub fn from_vars(vars: &crate::env::Vars) -> anyhow::Result<Self> {
+        let defaults = Self::default();
+        let max = vars.parse_or(POOL_MAX_VAR, defaults.max)?;
+        anyhow::ensure!(max > 0, "{POOL_MAX_VAR} must be above zero");
+        Ok(Self {
+            max,
+            min: defaults.min.min(max),
+            ..defaults
+        })
+    }
+
     fn options(&self) -> PgPoolOptions {
         PgPoolOptions::new()
             .max_connections(self.max)
@@ -314,6 +342,19 @@ pub async fn grant_runtime(pool: &PgPool, role: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_pool_size_comes_from_db_pool_max() {
+        use crate::env::Vars;
+        let config = |pairs: &[(&str, &str)]| {
+            super::PoolConfig::from_vars(&pairs.iter().copied().collect::<Vars>())
+        };
+        assert_eq!(config(&[]).unwrap().max, 10);
+        assert_eq!(config(&[("DB_POOL_MAX", "25")]).unwrap().max, 25);
+        assert_eq!(config(&[("DB_POOL_MAX", "1")]).unwrap().min, 1);
+        assert!(config(&[("DB_POOL_MAX", "0")]).is_err());
+        assert!(config(&[("DB_POOL_MAX", "ten")]).is_err());
+    }
+
     #[test]
     fn a_role_name_is_quoted_and_anything_else_refused() {
         assert_eq!(

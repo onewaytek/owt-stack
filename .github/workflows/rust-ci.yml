@@ -406,7 +406,9 @@ jobs:
       # is kept in the GitHub cache (scoped to the repository and branch, like
       # rust-cache's), keyed by its version and features and by the image it was
       # built in, so it is built once per image rather than every run. It is
-      # installed only for an app with a .sqlx/ to check or migrations to apply.
+      # installed only for an app with a .sqlx/ to check, or with migrations/ that
+      # it applies itself: an app with a migrate-command (its binary's `migrate`)
+      # never runs it.
       # Its major must match the apps' sqlx (0.9); move these together, and with
       # templates/justfile's `setup`.
       - name: Does the app need sqlx-cli
@@ -415,10 +417,11 @@ jobs:
         env:
           DATABASE: ${{ inputs.database }}
           CONTAINER: ${{ inputs.container }}
+          MIGRATE: ${{ inputs.migrate-command }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d .sqlx ] || { [ -n "$DATABASE" ] && [ -d migrations ]; }; then
+          if [ -d .sqlx ] || { [ -n "$DATABASE" ] && [ -z "$MIGRATE" ] && [ -d migrations ]; }; then
             image=$( { echo "$CONTAINER"; cat /etc/os-release 2>/dev/null || true; } | sha256sum | cut -c1-12)
             {
               echo "needed=true"
@@ -426,7 +429,7 @@ jobs:
               echo "key=sqlx-cli-$SQLX_CLI_VERSION-postgres-rustls-$RUNNER_OS-$RUNNER_ARCH-$image"
             } >> "$GITHUB_OUTPUT"
           else
-            echo "no .sqlx/ to check and no migrations/ to apply: sqlx-cli is not installed"
+            echo "no .sqlx/ to check and no migrations/ for sqlx-cli to apply: sqlx-cli is not installed"
           fi
       - name: Restore sqlx-cli
         id: sqlx-cli-cache
@@ -494,8 +497,10 @@ jobs:
       - name: cargo audit
         if: ${{ inputs.check-command == '' && inputs.audit }}
         run: cargo audit --deny warnings
+      # Also the migration step without check-command: an app with a migrate-command
+      # and no .sqlx/ migrates here without sqlx-cli.
       - name: sqlx metadata is current
-        if: ${{ inputs.check-command == '' && steps.sqlx-cli.outputs.needed == 'true' }}
+        if: ${{ inputs.check-command == '' && (steps.sqlx-cli.outputs.needed == 'true' || (inputs.migrate-command != '' && inputs.database != '')) }}
         env:
           MIGRATE: ${{ inputs.migrate-command }}
         shell: bash

@@ -128,18 +128,14 @@ async fn main() -> anyhow::Result<()> {
         otel_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT"),
         ..logging::Options::default()
     });
-    let pool = PoolConfig { max: env::parse_or("DB_POOL_MAX", 10)?, ..PoolConfig::default() }
-        .connect(&env::required("DATABASE_URL")?)
-        .await?;
+    // DB_POOL_MAX sizes the pool (10 when unset): the one name every app reads.
+    let pool = PoolConfig::from_env()?.connect(&env::required("DATABASE_URL")?).await?;
     // Replicas starting together migrate once; the rest wait on the lock.
     owt_runtime::db::migrate_locked(&pool, &MIGRATOR, 8_531_207).await?;
     let bind = env::var("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8000".into());
-    // Behind the OpenShift router: an idle kept-alive connection is closed after
-    // `header_read_timeout` (30 s by default), and the router may reuse one for up to
-    // 300 s, so keep the app's wait above the router's (see "Bounds" below).
-    let mut options = serve::ServeOptions::default();
-    options.header_read_timeout = std::time::Duration::from_secs(310);
-    serve::serve_with(&bind, router(pool), serve::shutdown_signal(), options).await
+    // Kept-alive connections idle up to 310 s, above the OpenShift router's 300 s
+    // (see "Bounds" below).
+    serve::serve(&bind, router(pool), serve::shutdown_signal()).await
 }
 ```
 
@@ -148,8 +144,9 @@ A credential is read with `env::secret`, which returns a
 a derived `Debug` of the config that keeps it does not print it. `env::Vars`, a map
 of variables for tests, prints its names and never its values.
 
-`serve::serve` is the same with `ServeOptions::default()`: a request head must arrive
-within 30 s (an idle kept-alive connection closes then too), at most 4096 connections
+`serve::serve` is `serve_with` and `ServeOptions::default()`: a request head must arrive
+within 310 s (an idle kept-alive connection closes then too, just after the OpenShift
+router's 300 s), at most 4096 connections
 are open at once, and a stop drains for up to 20 s. `ServeOptions` is built from its
 default and changed field by field:
 
@@ -175,8 +172,9 @@ feature is on.
   connection may sit idle before the app closes it. A proxy that keeps idle
   connections to the app for reuse longer than that sends, now and then, a request
   on a connection the app has just closed, and answers it with a 502. The OpenShift
-  router's HAProxy waits up to 300 s by default (`timeout http-keep-alive`), so an
-  app behind it sets the timeout above that, as the example above does. The router
+  router's HAProxy waits up to 300 s by default (`timeout http-keep-alive`), so the
+  default is 310 s; an app with a different proxy in front sets it above that
+  proxy's. The router
   reads request heads itself, so the longer wait costs an idle socket, not
   protection from slow clients.
 - **Connections.** `max_connections` counts every connection from its accept to its
@@ -4537,11 +4535,33 @@ opt-level = 3
 ```
 
 It changes nothing about the lockfile, `cargo audit` or sccache (the optimised
-artifacts are cached under their own key).
+artifacts are cached under their own key). Put `opt-level` on these packages only, never
+under `[profile.test]`: that optimises the app crate and every test binary too, so each
+edit recompiles slower.
+
+**Test layout and debug info:** every file in `tests/` is its own binary, and each one
+links the whole app crate, sqlx, the TLS stack and owt-stack. Twenty such files make
+twenty large executables, which is what fills a CI runner's disk: ARC runners have a
+10 GiB work volume, and one app's test executables went from 4.8 GiB to 0.9 GiB by
+merging them into one and trimming debug info. An app has one integration-test binary,
+`tests/it/main.rs`, with a `mod` per area (`tests/it/accounts.rs`, ...) and shared helpers
+in `tests/it/support.rs`; `cargo test --test it accounts::` runs one area. And the dev
+profile (which `cargo test` inherits) keeps line tables only, enough for a backtrace's
+file and line, not a debugger's variables:
+
+```toml
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = "line-tables-only"
+```
+
+This repository does the same in its root `Cargo.toml`.
 
 **CI:** call the reusable check workflow with the app's gate. It runs on ARC, with
 Postgres and Redis as services, installs `just` and `cargo-audit` (and `sqlx-cli`
-for an app with a `.sqlx/` or `migrations/`), migrates, then runs `check-command`.
+for an app with a `.sqlx/`, or with `migrations/` and no `migrate-command`: an app that
+migrates through its binary never needs it), migrates, then runs `check-command`.
 Without `check-command`, it runs its own fmt, audit, sqlx, clippy and test steps. The
 tools are pinned (`templates/justfile`'s `setup` installs the same versions), and
 `sqlx-cli`, which has no prebuilt binary, is built once per job image and kept in the
@@ -5320,8 +5340,8 @@ before step 3 and `oc rollout resume deployment/myapp` after step 4 make them on
 Removing the entries before step 3 starts pods with neither.
 
 **Redis** is a template of its own, for an app that uses the cache, the bus across
-replicas or leases. It runs as compose does: nothing on disk, `MAXMEMORY` (128mb)
-with `MAXMEMORY_POLICY` (`allkeys-lru`), one pod replaced rather than surged so the
+replicas, leases or the shared sign-in throttle. It runs as compose does: nothing on
+disk, `MAXMEMORY` (128mb) with `MAXMEMORY_POLICY` (`allkeys-lru`), one pod replaced rather than surged so the
 replicas never split across two. A password protects it, and a NetworkPolicy admits
 the app's pods alone. The password is a Secret made once by hand, since a generated
 one would change on every apply. The Deployment reads `REDIS_URL` from that Secret
@@ -5335,8 +5355,14 @@ oc process -f templates/openshift/redis.yaml -p NAME=myapp -p NAMESPACE=myapp | 
 oc rollout restart deployment/myapp
 ```
 
-An app whose leased work must never run twice gives it `-p MAXMEMORY_POLICY=noeviction`
-("Background jobs"): a full Redis then refuses writes instead of dropping a lease.
+**Eviction defeats leases and the shared throttle.** An evicted lease lets leased work
+run twice ("Background jobs"), and an evicted `SharedThrottle` counter hands a password
+guesser a fresh budget. An app using either gives its Redis
+`-p MAXMEMORY_POLICY=noeviction`, so a full Redis refuses writes instead (the throttle
+then fails closed). Under `noeviction` the cache's `Expiry::Lru` entries, which carry no
+TTL, never leave and fill it: such an app caches only with `Expiry::For` or `Expiry::At`,
+or gives the cache a Redis of its own. `allkeys-lru`, the default, suits a Redis that
+holds only the cache and the bus.
 
 **Scheduled tasks** run the app's image with other arguments, one `cronjob.yaml` per
 task. The image's entrypoint is the binary, so `ARGS` picks the subcommand:
@@ -5506,10 +5532,9 @@ the Secret named in `secret:` to the database's owner at once, but never rewrite
 `uri`.
 
 The Route sends traffic through the router (HAProxy), which keeps idle connections to
-the pod for reuse longer than the app's default 30-second keep-alive (its
-`timeout http-keep-alive` is 300 s). Serve with a `header_read_timeout` above that, as
-"Wiring an app" does, or requests on a connection the app has just closed fail with
-an occasional 502. Each rollout also cuts the app's SSE streams after the 20-second
+the pod for reuse for up to 300 s (`timeout http-keep-alive`). `ServeOptions`' default
+`header_read_timeout` (310 s) is above that; an app that lowers it below the router's
+gets an occasional 502 on a connection the app has just closed. Each rollout also cuts the app's SSE streams after the 20-second
 drain; their clients reconnect to the new pods ("Bounds" under "Wiring an app").
 The router also cuts a response that sends nothing for `ROUTE_TIMEOUT` (its
 `timeout server`, set by the Route's `haproxy.router.openshift.io/timeout`; default
@@ -5866,6 +5891,21 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+
+## Upgrading from 0.12
+
+- `ServeOptions::default()`'s `header_read_timeout` is 310 s (it was 30 s), above the
+  OpenShift router's 300 s keep-alive. An app that set 310 s itself can drop the line;
+  one served without such a proxy and wanting the short wait sets it back.
+- `PoolConfig::from_env()` reads the pool size from `DB_POOL_MAX`. An app that reads
+  another variable switches to it and renames the variable in its deployment.
+- An app with job leases or `SharedThrottle` on the Redis template's default
+  `allkeys-lru` switches it to `-p MAXMEMORY_POLICY=noeviction` (and its `Expiry::Lru`
+  cache entries to `Expiry::For`, or the cache to a Redis of its own): see "Eviction
+  defeats leases and the shared throttle".
+- Add the dev profile's `debug = "line-tables-only"` and merge `tests/*.rs` into one
+  `tests/it` binary ("Test layout and debug info" under "Commands, CI,
+  releases and deployment").
 
 ## Upgrading from 0.9
 
