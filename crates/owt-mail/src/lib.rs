@@ -159,6 +159,7 @@ pub trait Mailer: Send + Sync + 'static {
 /// What became of a message [`Mail::send`] was given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
+#[non_exhaustive]
 pub enum Delivery {
     /// Handed to a provider.
     Sent,

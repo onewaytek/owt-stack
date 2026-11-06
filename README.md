@@ -3461,7 +3461,8 @@ handle, `Mail`, kept in the app's state. The transport comes from the environmen
 
 Two transports configured at once fail start-up, as do a `MAIL_FROM` that is not an
 address and a `MAIL_URL` lettre can't read (the error never quotes the URL, which
-carries the relay's password). Each delivery is bounded by `DEFAULT_TIMEOUT` (10 s).
+carries the relay's password). Each delivery, over SMTP or HTTP, is bounded by
+`DEFAULT_TIMEOUT` (10 s).
 Every recipient is parsed as one mailbox and a subject may not hold a line break, so
 no caller's input becomes a header. An `Email`'s `Debug` shows its subject only.
 
@@ -3479,9 +3480,8 @@ anyhow::ensure!(mail.delivers() || !owt_runtime::env::flag("MYAPP_REQUIRE_MAIL",
 
 let email = Email::new("Ana <ana@example.com>", "Your sign-in link", format!("Sign in: {link}"))
     .with_html(format!("<p><a href=\"{link}\">Sign in</a></p>"));
-match mail.send(&email).await? {
-    Delivery::Sent | Delivery::Kept => {}
-    Delivery::NotConfigured => tracing::warn!("no email sent: mail isn't configured"),
+if mail.send(&email).await? == Delivery::NotConfigured {
+    tracing::warn!("no email sent: mail isn't configured");
 }
 # Ok(()) }
 ```

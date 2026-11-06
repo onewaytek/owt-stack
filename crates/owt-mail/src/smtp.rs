@@ -14,6 +14,7 @@ use crate::{Email, Error, Mailer};
 pub struct Smtp {
     from: Mailbox,
     transport: AsyncSmtpTransport<Tokio1Executor>,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for Smtp {
@@ -26,8 +27,9 @@ impl std::fmt::Debug for Smtp {
 
 impl Smtp {
     /// The relay `url` names (`smtp://user:pass@host:587` for STARTTLS,
-    /// `smtps://user:pass@host:465` for TLS, as lettre reads it), sending as `from`,
-    /// each exchange bounded by `timeout`.
+    /// `smtps://user:pass@host:465` for TLS, as lettre reads it), sending as `from`.
+    /// `timeout` bounds each exchange with the relay and the whole delivery: a relay
+    /// that answers every command slowly still fails in `timeout`.
     pub fn from_url(
         url: &Sensitive<String>,
         from: Mailbox,
@@ -40,7 +42,11 @@ impl Smtp {
             })?
             .timeout(Some(timeout))
             .build();
-        Ok(Self { from, transport })
+        Ok(Self {
+            from,
+            transport,
+            timeout,
+        })
     }
 
     /// The message as it goes on the wire.
@@ -72,7 +78,13 @@ impl Mailer for Smtp {
     fn send<'a>(&'a self, email: &'a Email) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(async move {
             let message = self.message(email)?;
-            self.transport.send(message).await.map(drop).map_err(|e| {
+            let sent = tokio::time::timeout(self.timeout, self.transport.send(message))
+                .await
+                .map_err(|elapsed| Error::Unreachable {
+                    provider: "smtp",
+                    source: Box::new(elapsed),
+                })?;
+            sent.map(drop).map_err(|e| {
                 if e.is_permanent() || e.is_transient() {
                     Error::Rejected {
                         provider: "smtp",

@@ -284,6 +284,45 @@ mod tests {
     }
 
     #[test]
+    fn signatures_match_the_sigv4_test_suites_posts() {
+        let c = Credentials {
+            access_key: "AKIDEXAMPLE",
+            secret_key: SECRET,
+            region: "us-east-1",
+            service: "service",
+        };
+        let date = "20150830T123600Z";
+        let host = ("host".to_owned(), "example.amazonaws.com".to_owned());
+        let amz = ("x-amz-date".to_owned(), date.to_owned());
+        // post-vanilla: no body.
+        assert!(
+            authorization(&c, "POST", "/", &[host.clone(), amz.clone()], b"", date).ends_with(
+                "SignedHeaders=host;x-amz-date, \
+                 Signature=5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b"
+            )
+        );
+        // post-x-www-form-urlencoded: a body and a content-type, as SES's request has.
+        let content_type = (
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        assert!(
+            authorization(
+                &c,
+                "POST",
+                "/",
+                &[amz, host, content_type],
+                b"Param1=value1",
+                date
+            )
+            .ends_with(
+                "SignedHeaders=content-type;host;x-amz-date, \
+                     Signature=ff11897932ad3f4e8b18135d722051e5ac45fc38421b1da7b9d196a0fe09473a"
+            )
+        );
+    }
+
+    #[test]
     fn dates_are_utc_calendar_dates() {
         assert_eq!(amz_date(UNIX_EPOCH), "19700101T000000Z");
         assert_eq!(
