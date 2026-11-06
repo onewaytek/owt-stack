@@ -362,16 +362,17 @@ impl<T: MfaSession> StepUpGate<T> {
             return next.run(request).await;
         }
         let (parts, body) = request.into_parts();
-        if let Err(e) = gate.check(&parts) {
-            return e;
+        if let Some(refused) = gate.refusal(&parts) {
+            return refused;
         }
         next.run(Request::from_parts(parts, body)).await
     }
 
-    fn check(&self, parts: &Parts) -> Result<(), Response> {
+    /// The response that refuses the request, or `None` to let it through.
+    fn refusal(&self, parts: &Parts) -> Option<Response> {
         // Who first: anyone else meets the sign-in wall or a 403, not re-authentication.
         let Some(account) = Maybe::of(&parts.extensions).0 else {
-            return Err(layer::wall(parts).into_response());
+            return Some(layer::wall(parts).into_response());
         };
         let allowed = match self.who {
             Who::Signed => true,
@@ -383,7 +384,7 @@ impl<T: MfaSession> StepUpGate<T> {
                 Who::Role(role) => format!("This needs the {} role.", role.label),
                 _ => "Only staff can do this.".to_owned(),
             };
-            return Err(Error::Forbidden(why.into()).into_response());
+            return Some(Error::Forbidden(why.into()).into_response());
         }
         let htmx = flag(&parts.headers, "hx-request");
         let back = if parts.method.is_safe() {
@@ -404,11 +405,11 @@ impl<T: MfaSession> StepUpGate<T> {
             }
         });
         match guard_to::<T>(parts, self.window.as_secs(), self.second_factor, next) {
-            Ok(()) => Ok(()),
+            Ok(()) => None,
             Err(Error::Redirect(to)) if htmx && !flag(&parts.headers, "hx-boosted") => {
-                Err(hx_redirect(&to))
+                Some(hx_redirect(&to))
             }
-            Err(e) => Err(e.into_response()),
+            Err(e) => Some(e.into_response()),
         }
     }
 }
