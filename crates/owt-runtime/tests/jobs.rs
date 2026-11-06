@@ -88,10 +88,12 @@ async fn the_period_holds_and_jitter_only_adds() {
         at[0] - start < Duration::from_secs(2),
         "the first run waits only the jitter"
     );
+    // tokio's timer rounds each sleep up to the next millisecond, so a jitter just
+    // under its 2 s bound can land the run exactly on 12 s.
     for pair in at.windows(2) {
         let gap = pair[1] - pair[0];
         assert!(
-            gap >= Duration::from_secs(10) && gap < Duration::from_secs(12),
+            gap >= Duration::from_secs(10) && gap <= Duration::from_millis(12_001),
             "gap {gap:?}"
         );
     }
