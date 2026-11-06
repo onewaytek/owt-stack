@@ -2137,8 +2137,8 @@ async fn break_glass(session: Session<Data>) -> Result<&'static str, &'static st
 ```
 
 **Step-up for a group of routes.** `mfa::StepUpGate` is the same check as a middleware, so
-every route under it is covered, including ones added later. It lets reads (`GET`, `HEAD`)
-through and, for a change, checks who first (any signed-in account; `.staff()`; or
+every route under it is covered, including ones added later. It lets reads (`GET`, `HEAD`,
+`OPTIONS`) through and, for a change, checks who first (any signed-in account; `.staff()`; or
 `.role(ROLE)`, a 403 for anyone else) and then the proof within the window (`.second_factor()`
 for `RecentMfa`'s). `.reads()` puts reads behind it too. A redirect cannot repeat a `POST`,
 so `?next=` names the page the change came from: `HX-Current-URL` for htmx, else the

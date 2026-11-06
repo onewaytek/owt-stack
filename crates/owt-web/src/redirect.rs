@@ -98,6 +98,15 @@ mod tests {
         );
         assert_eq!(referer("https://evil.test/a"), None);
         assert_eq!(referer("javascript:alert(1)"), None);
+        // A path a browser reads as another host: `//`, and `\` that the URL
+        // parser turns into `/`.
+        assert_eq!(referer("https://app.test//evil.test/a"), None);
+        assert_eq!(referer("https://app.test/\\evil.test/a"), None);
+        // Encoded slashes stay encoded, a path on this site.
+        assert_eq!(
+            referer("https://app.test/%2F%2Fevil.test").as_deref(),
+            Some("/%2F%2Fevil.test")
+        );
         assert_eq!(referer_page(&HeaderMap::new()), None);
     }
 
