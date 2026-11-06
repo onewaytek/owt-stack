@@ -83,6 +83,7 @@ owt-change = { path = "crates/owt-change" }
 owt-crypt = { path = "crates/owt-crypt" }
 owt-storage = { path = "crates/owt-storage" }
 owt-audit = { path = "crates/owt-audit" }
+owt-mail = { path = "crates/owt-mail" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
