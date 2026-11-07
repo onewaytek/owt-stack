@@ -130,6 +130,7 @@ impl Smtp {
     }
 
     /// How the connection to the relay is protected.
+    #[must_use]
     pub fn tls(&self) -> SmtpTls {
         self.tls
     }
