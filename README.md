@@ -23,7 +23,7 @@ Outside the crates:
 |---|---|
 | `.github/workflows/rust-ci.yml` | the reusable check workflow on ARC: the app's `just check`, or built-in fmt, audit, sqlx metadata, clippy and tests; the stylesheet build |
 | `.github/workflows/release-please.yml` | this repository's releases: versions and the changelog by release-please |
-| `.github/workflows/conventional-commits.yml` | Conventional Commits checked on every pull request, here and, as a reusable workflow, in an app: the title and every commit, with one commitlint and one configuration |
+| `.github/workflows/conventional-commits.yml` | Conventional Commits checked on every pull request, here and, as a reusable workflow, in an app: the title and every commit but a merge of the base into the branch (a squash merge drops it), with one commitlint and one configuration |
 | `.github/workflows/release.yml` | reusable releases from conventional commits: stable on `main`, prereleases on `rc`, optional version write-back and changelog |
 | `.github/workflows/image.yml` | reusable image build for a released tag, daemonless on ARC (or the Dockerfile, GitHub-hosted), pushed to ghcr with the channel's floating tags |
 | `.github/workflows/image-check.yml` | reusable, opt-in: the same image built and verified on a pull request, pushing nothing, for a caller that grants only `contents: read` |
