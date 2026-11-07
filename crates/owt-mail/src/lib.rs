@@ -10,8 +10,10 @@
 //!
 //! [`Mail::from_env`] picks the transport from the environment:
 //!
-//! - `MAIL_URL=smtp://user:pass@host:587` (STARTTLS) or `smtps://user:pass@host:465`
-//!   (TLS), as lettre reads the URL; `MAIL_URL=memory:` is the outbox.
+//! - `MAIL_URL=smtps://user:pass@host:465` (TLS) or `smtp://user:pass@host:587`
+//!   (STARTTLS, required: credentials never travel in plaintext);
+//!   `smtp://host:1025?tls=none` for a local mail catcher (see [`SmtpTls`]);
+//!   `MAIL_URL=memory:` is the outbox.
 //! - `RESEND_API_KEY`: Resend.
 //! - `SES_REGION`, with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
 //!   (`AWS_SESSION_TOKEN` and `SES_ENDPOINT` optional): SES's v2 `SendEmail`.
@@ -41,7 +43,7 @@ pub use allow::{Allowlisted, MailAllow};
 pub use outbox::{Failing, Outbox, first_link};
 pub use resend::Resend;
 pub use ses::Ses;
-pub use smtp::Smtp;
+pub use smtp::{Smtp, SmtpTls};
 
 /// How long one delivery may take before it fails: a request usually waits on it.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);

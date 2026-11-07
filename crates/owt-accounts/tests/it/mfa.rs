@@ -1540,6 +1540,56 @@ async fn the_step_up_gate_checks_who_first_and_can_cover_reads() {
 }
 
 #[tokio::test]
+async fn the_step_up_gate_checks_who_on_reads_without_asking_for_proof() {
+    let db = db!();
+    account(&db, "ada", false).await;
+    let grace = account(&db, "grace", true).await;
+    let sessions = sessions();
+    let gate = || {
+        StepUpGate::new(Duration::from_secs(60))
+            .staff()
+            .second_factor()
+    };
+
+    // Anonymous: the sign-in wall on a read too, without `.reads()`.
+    let client = owt_test::Client::new(gated_app(&db, &sessions, mfa(), gate()));
+    let r = client.get("/settings").await;
+    assert_eq!(r.status, 303);
+    assert_eq!(r.location(), Some("/login?next=%2Fsettings"));
+    assert_ne!(r.text(), "settings");
+
+    // Signed in but not staff: a 403 on a read.
+    client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(client.get("/settings").await.status, 403);
+
+    // Staff without a second factor: reads pass, changes need the proof.
+    let client = owt_test::Client::new(gated_app(&db, &sessions, mfa(), gate()));
+    client
+        .post_form(
+            "/login",
+            &[("login", &grace.username), ("password", PASSWORD)],
+        )
+        .await;
+    assert_eq!(client.get("/settings").await.text(), "settings");
+    let r = client.send(post_with("/settings", &[])).await;
+    assert_eq!(r.location(), Some("/mfa/enroll?next=%2Fsettings"));
+
+    // With `.reads()` the read needs the second factor too.
+    let client = owt_test::Client::new(gated_app(&db, &sessions, mfa(), gate().reads()));
+    client
+        .post_form(
+            "/login",
+            &[("login", &grace.username), ("password", PASSWORD)],
+        )
+        .await;
+    let r = client.get("/settings").await;
+    assert_eq!(r.location(), Some("/mfa/enroll?next=%2Fsettings"));
+    db.drop().await;
+}
+
+#[tokio::test]
 async fn the_step_up_gate_can_ask_for_the_second_factor() {
     let db = db!();
     let ada = account(&db, "ada", false).await;

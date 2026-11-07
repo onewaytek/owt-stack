@@ -38,11 +38,20 @@ export default {
   },
   // Dependabot's bodies quote release notes, whose lines run past the length limit.
   // Its headers ("fix(deps): bump ...") are generated, and the title check sees them.
-  // A merge of the base into the branch ("Merge origin/main ...") never reaches main:
-  // a squash merge keeps only the title, which the title job checks. commitlint's own
-  // defaults skip only git's wordings ("Merge branch", "Merge remote-tracking branch").
+  // A merge of the base into the branch never reaches main: a squash merge keeps only
+  // the title, which the title job checks. Only a whole first line in git's own merge
+  // wording is skipped ("Merge branch 'main' of github.com:o/r into fix/x", "Merge
+  // remote-tracking branch 'origin/main'", "Merge origin/main", "Merge main into
+  // fix/x"), so a commit cannot skip linting by starting "Merge". commitlint's own
+  // defaults, which skip any "Merge … into …", "Revert …" or "fixup!" line, are off.
+  defaultIgnores: false,
   ignores: [
     (message) => message.includes("Signed-off-by: dependabot[bot]"),
-    (message) => /^Merge (origin\/|main\b|branch\b|remote-tracking\b)/.test(message),
+    (message) =>
+      [
+        /^Merge (branch|remote-tracking branch) '[^']+'( of \S+)?( into \S+)?$/,
+        /^Merge origin\/\S+( into \S+)?$/,
+        /^Merge main( into \S+)?$/,
+      ].some((merge) => merge.test(message.split("\n")[0].trimEnd())),
   ],
 };
