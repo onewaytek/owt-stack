@@ -142,7 +142,13 @@ jobs:
             },
             // Dependabot's bodies quote release notes, whose lines run past the length limit.
             // Its headers ("fix(deps): bump ...") are generated, and the title check sees them.
-            ignores: [(message) => message.includes("Signed-off-by: dependabot[bot]")],
+            // A merge of the base into the branch ("Merge origin/main ...") never reaches main:
+            // a squash merge keeps only the title, which the title job checks. commitlint's own
+            // defaults skip only git's wordings ("Merge branch", "Merge remote-tracking branch").
+            ignores: [
+              (message) => message.includes("Signed-off-by: dependabot[bot]"),
+              (message) => /^Merge (origin\/|main\b|branch\b|remote-tracking\b)/.test(message),
+            ],
           };
           JS
             config=(--config "$RUNNER_TEMP/commitlint.config.mjs")
