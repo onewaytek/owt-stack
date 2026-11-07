@@ -94,6 +94,13 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 
+# Line tables only, in the dev profile `cargo test` inherits: a backtrace still names
+# file and line, and each test binary is a fraction of its full-debug size.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = "line-tables-only"
+
 # Cryptography dominates a debug test run: argon2 hashing, AES-GCM sealing and SHA-2
 # digesting run 20-50x slower unoptimised. These dependencies are built optimised in the
 # dev profile (which `cargo test` inherits); the workspace's own crates stay at
