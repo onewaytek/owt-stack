@@ -6285,7 +6285,11 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `ClientIp`, `Sessions::from_env`, or anything in backticks), so
 `fix(deploy): PUBLIC_URL comes only from the params file` passes and
 `fix(web): Drop the cache` does not; an app without a commitlint configuration of
-its own is checked by the same rules (`commitlint.config.mjs`). Scopes
+its own is checked by the same rules (`commitlint.config.mjs`). Every commit is
+linted but a merge of the base whose first line is exactly git's wording (`Merge
+branch 'main' of …`, `Merge remote-tracking branch 'origin/main' into …`, `Merge
+origin/main`, `Merge main into …`); commitlint's broader defaults (any `Merge … into
+…`, `Revert …`, `fixup!`) are off, so a revert is written `revert: …`. Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
 `accounts`, `audit`, `change`, `crypt`, `storage`, `tailwind`, `deps`, `release` (release-please and its configuration).
 
