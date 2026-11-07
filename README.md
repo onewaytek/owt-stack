@@ -3476,11 +3476,19 @@ handle, `Mail`, kept in the app's state. The transport comes from the environmen
 
 | Variables | Transport |
 |---|---|
-| `MAIL_URL=smtp://user:pass@host:587` (STARTTLS) or `smtps://user:pass@host:465` (TLS), and `MAIL_FROM` | any provider's SMTP relay, through lettre |
+| `MAIL_URL=smtps://user:pass@host:465` (TLS) or `smtp://user:pass@host:587` (STARTTLS, required), and `MAIL_FROM` | any provider's SMTP relay, through lettre |
 | `RESEND_API_KEY` and `MAIL_FROM` | Resend's HTTP API |
 | `SES_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `MAIL_FROM` (`AWS_SESSION_TOKEN`, `SES_ENDPOINT` optional) | SES's v2 `SendEmail`, signed with SigV4 |
 | `MAIL_URL=memory:` | the outbox: kept in memory, delivered to nobody |
 | none of them | what the app passes: `Unconfigured::Off` (nothing is sent; `send` answers `Delivery::NotConfigured`) or `Unconfigured::Outbox` (the outbox, logging each text so a workstation reads its links from the log) |
+
+SMTP credentials never travel in plaintext. `smtps://` is TLS from the first byte;
+`smtp://` is STARTTLS, required (lettre itself reads a bare `smtp://` as plaintext,
+so owt-mail adds `?tls=required`), and a relay that doesn't offer STARTTLS fails the
+delivery. A local mail catcher (Mailpit and the like) takes `smtp://host:1025?tls=none`,
+with no credentials or credentials towards `localhost`, `127.0.0.1` or `::1` only.
+`tls=opportunistic`, which falls back to plaintext, and any other `tls` value fail
+start-up; `Smtp::tls` answers which `SmtpTls` mode a transport uses.
 
 Two transports configured at once fail start-up, as do a `MAIL_FROM` that is not an
 address and a `MAIL_URL` lettre can't read (the error never quotes the URL, which
@@ -6024,6 +6032,14 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+
+## Upgrading from 0.13
+
+- **`MAIL_URL=smtp://…` is STARTTLS, required.** owt-mail adds `?tls=required` to a
+  bare `smtp://` (lettre alone reads it as plaintext), so the relay must offer
+  STARTTLS. A local mail catcher without TLS takes `smtp://host:1025?tls=none` (with
+  credentials only towards a loopback host); `?tls=opportunistic` and any other `tls`
+  value fail start-up ("Outgoing email").
 
 ## Upgrading from 0.12
 
