@@ -3314,7 +3314,7 @@ refuses an authentication key that holds `export-wrapped`, `import-wrapped`,
 `put-wrap-key`, `generate-wrap-key` or `delete-wrap-key`. An unwrap is `Refused` only
 when the device reports the message as invalid or unauthentic; connection, session
 and every other device error are `Unavailable`. These checks are unit-tested against
-`MockHsm` and a fake device; `tests/yubihsm.rs` runs them against real hardware when
+`MockHsm` and a fake device; `tests/it/yubihsm.rs` runs them against real hardware when
 `OWT_YUBIHSM_CONNECTOR` is set:
 
 ```rust,no_run
@@ -4653,7 +4653,11 @@ merging them into one and trimming debug info. An app has one integration-test b
 `tests/it/main.rs`, with a `mod` per area (`tests/it/accounts.rs`, ...) and shared helpers
 in `tests/it/support.rs`; `cargo test --test it accounts::` runs one area. And the dev
 profile (which `cargo test` inherits) keeps line tables only, enough for a backtrace's
-file and line, not a debugger's variables:
+file and line, not a debugger's variables. A test that needs process state of its own
+stays a file of its own: a setting that takes only once per process (owt-stack's
+`password::set_concurrency` tests), or a thread-scoped tracing subscriber that a
+concurrent test could race to a callsite (owt-web's `client_ip_log.rs`); its header
+says why.
 
 ```toml
 [profile.dev]
@@ -4662,7 +4666,8 @@ debug = "line-tables-only"
 debug = "line-tables-only"
 ```
 
-This repository does the same in its root `Cargo.toml`.
+This repository does the same in its root `Cargo.toml`, and each crate has one
+`tests/it` binary beside those exceptions.
 
 **CI:** call the reusable check workflow with the app's gate. It runs on ARC, with
 Postgres and Redis as services, installs `just` and `cargo-audit` (and `sqlx-cli`
@@ -6021,7 +6026,7 @@ The router example under "Wiring an app" composes the layers; beyond it:
   cache entries to `Expiry::For`, or the cache to a Redis of its own): see "Eviction
   defeats leases and the shared throttle".
 - Add the dev profile's `debug = "line-tables-only"` and merge `tests/*.rs` into one
-  `tests/it` binary ("Test layout and debug info" under "Commands, CI,
+  `tests/it` binary, all but a test that needs a process of its own ("Test layout and debug info" under "Commands, CI,
   releases and deployment").
 
 ## Upgrading from 0.9
@@ -6229,11 +6234,11 @@ header says how to run such a Redis). Each is skipped otherwise; CI sets the fir
 **Tests come in five kinds**, and a change to anything that reads what a client sent
 adds to the first:
 
-- *Properties* (`crates/*/tests/properties.rs`, `owt-bus/tests/model.rs`): what must
+- *Properties* (`properties.rs` and `owt-bus`'s `model.rs`, under `crates/*/tests/`): what must
   hold for every input, with proptest looking for the one where it does not. A
   failure writes its seed to a `.proptest-regressions` file beside the test; commit
   it, so the case is retried for ever.
-- *The composed app* (`owt-web/tests/hardened_app.rs`): the layers in the README's
+- *The composed app* (`owt-web/tests/it/hardened_app.rs`): the layers in the README's
   order, and the sign-in story end to end (fixation, revocation, an outage, a
   replayed cookie).
 - *Unit tests* beside the code, for what needs its private parts.

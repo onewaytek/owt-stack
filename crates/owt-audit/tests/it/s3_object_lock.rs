@@ -1,7 +1,6 @@
 //! Against a real S3 endpoint with Object Lock; skipped unless configured:
 //! `OWT_ANCHOR_S3_ENDPOINT`, `_BUCKET` (created with Object Lock), `_REGION`
 //! (default `us-east-1`), `_ACCESS_KEY`, `_SECRET_KEY`.
-#![cfg(feature = "s3")]
 
 use std::time::Duration;
 

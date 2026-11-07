@@ -1630,7 +1630,7 @@ async fn an_arrival_can_share_the_apps_transaction() {
 #[tokio::test]
 async fn a_trigger_on_the_epoch_hears_every_revocation() {
     let db = db!();
-    let readme = include_str!("../../../README.md");
+    let readme = include_str!("../../../../README.md");
     let at = readme
         .find("CREATE TABLE provider_tokens")
         .expect("the README's example");
