@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/onewaytek/owt-stack/compare/v0.13.0...v0.13.1) (2026-11-07)
+
+
+### Features
+
+* **runtime:** `Jobs::child` (O6), and one tests/it binary per crate ([#324](https://github.com/onewaytek/owt-stack/issues/324)) ([737b640](https://github.com/onewaytek/owt-stack/commit/737b640e611243b0aef224240735a05dd3938b9b))
+
 ## [0.13.0](https://github.com/onewaytek/owt-stack/compare/v0.12.4...v0.13.0) (2026-11-07)
 
 
