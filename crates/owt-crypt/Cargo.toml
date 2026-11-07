@@ -17,7 +17,7 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 anyhow.workspace = true
 base64.workspace = true
 futures.workspace = true
-getrandom = "0.3"
+getrandom = "0.4"
 hmac = "0.13"
 owt-runtime = { workspace = true, default-features = false }
 rand.workspace = true
