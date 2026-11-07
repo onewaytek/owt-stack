@@ -234,19 +234,21 @@ enum Who {
     Role(Role),
 }
 
-/// Step-up for a whole group of routes, as a middleware: every change (any method but
-/// `GET`, `HEAD`, `OPTIONS` and `TRACE`) needs a proof of who the person is within the
-/// gate's window, and the rest pass. Where [`Recent`] and [`RecentMfa`] guard one
-/// handler each, the gate guards everything under it, so a route added later is
-/// covered without anyone remembering to.
+/// Step-up for a whole group of routes, as a middleware: every request must come from
+/// the right account, and every change (any method but `GET`, `HEAD`, `OPTIONS` and
+/// `TRACE`) also needs a proof of who the person is within the gate's window. Where
+/// [`Recent`] and [`RecentMfa`] guard one handler each, the gate guards everything
+/// under it, so a route added later is covered without anyone remembering to.
 ///
 /// In order, for a request the gate checks:
-/// 1. who: a signed-in account ([`Signed`](crate::Signed)'s wall otherwise), or with
-///    [`StepUpGate::staff`] or [`StepUpGate::role`] the right one (403 otherwise);
-/// 2. the proof: as [`Recent`], or as [`RecentMfa`] with
-///    [`StepUpGate::second_factor`]. Without it the visitor is sent to the
-///    re-authentication page (or enrollment, for an account without a factor), with
-///    `?next=` naming the page to come back to.
+/// 1. who, for every request, reads included: a signed-in account
+///    ([`Signed`](crate::Signed)'s wall otherwise), or with [`StepUpGate::staff`] or
+///    [`StepUpGate::role`] the right one (403 otherwise). The gate authorizes the
+///    whole group, so `.staff()` keeps anyone else off its pages too;
+/// 2. the proof, for a change (and for a read with [`StepUpGate::reads`]): as
+///    [`Recent`], or as [`RecentMfa`] with [`StepUpGate::second_factor`]. Without it
+///    the visitor is sent to the re-authentication page (or enrollment, for an
+///    account without a factor), with `?next=` naming the page to come back to.
 ///
 /// A redirect cannot repeat a `POST`, so `?next=` names the page the change was sent
 /// from: `HX-Current-URL` for an htmx request, else the `Referer`, both only when they
@@ -346,8 +348,9 @@ impl<T: MfaSession> StepUpGate<T> {
         self
     }
 
-    /// Reads (`GET`, `HEAD`) need the proof too, and the who check: for pages whose
-    /// content is itself sensitive. `?next=` is then the page asked for.
+    /// Reads (`GET`, `HEAD`, `OPTIONS`, `TRACE`) need the proof too: for pages whose
+    /// content is itself sensitive. `?next=` is then the page asked for. The who check
+    /// covers reads with or without it.
     #[must_use]
     pub fn reads(mut self) -> Self {
         self.reads = true;
@@ -358,9 +361,6 @@ impl<T: MfaSession> StepUpGate<T> {
     /// inside [`Accounts::load`](crate::Accounts::load) (added before it, so it runs
     /// after it).
     pub async fn guard(State(gate): State<Self>, request: Request, next: Next) -> Response {
-        if request.method().is_safe() && !gate.reads {
-            return next.run(request).await;
-        }
         let (parts, body) = request.into_parts();
         if let Some(refused) = gate.refusal(&parts) {
             return refused;
@@ -370,7 +370,8 @@ impl<T: MfaSession> StepUpGate<T> {
 
     /// The response that refuses the request, or `None` to let it through.
     fn refusal(&self, parts: &Parts) -> Option<Response> {
-        // Who first: anyone else meets the sign-in wall or a 403, not re-authentication.
+        // Who first, for every request, reads included: anyone else meets the sign-in
+        // wall or a 403, not re-authentication.
         let Some(account) = Maybe::of(&parts.extensions).0 else {
             return Some(layer::wall(parts).into_response());
         };
@@ -385,6 +386,10 @@ impl<T: MfaSession> StepUpGate<T> {
                 _ => "Only staff can do this.".to_owned(),
             };
             return Some(Error::Forbidden(why.into()).into_response());
+        }
+        // The proof: for changes, and for reads too with `.reads()`.
+        if parts.method.is_safe() && !self.reads {
+            return None;
         }
         let htmx = flag(&parts.headers, "hx-request");
         let back = if parts.method.is_safe() {

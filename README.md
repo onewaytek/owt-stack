@@ -2135,10 +2135,12 @@ async fn break_glass(session: Session<Data>) -> Result<&'static str, &'static st
 ```
 
 **Step-up for a group of routes.** `mfa::StepUpGate` is the same check as a middleware, so
-every route under it is covered, including ones added later. It lets reads (`GET`, `HEAD`,
-`OPTIONS`) through and, for a change, checks who first (any signed-in account; `.staff()`; or
-`.role(ROLE)`, a 403 for anyone else) and then the proof within the window (`.second_factor()`
-for `RecentMfa`'s). `.reads()` puts reads behind it too. A redirect cannot repeat a `POST`,
+every route under it is covered, including ones added later. For every request, reads
+included, it checks who first (any signed-in account; `.staff()`; or `.role(ROLE)`; the
+sign-in wall for an anonymous visitor and a 403 for anyone else), so the gate authorizes the
+whole group. A change then needs the proof within the window (`.second_factor()` for
+`RecentMfa`'s); reads (`GET`, `HEAD`, `OPTIONS`) need it too only with `.reads()`, for pages
+whose content is itself sensitive. A redirect cannot repeat a `POST`,
 so `?next=` names the page the change came from: `HX-Current-URL` for htmx, else the
 `Referer`, each only when it is this site's (`owt_web::redirect::htmx_current_page`,
 `redirect::referer_page`), else the request's path. The person re-authenticates, lands back
@@ -2150,14 +2152,15 @@ and `StepUpGate::<MyData>::guard`.
 
 ```rust,no_run
 use std::time::Duration;
-use axum::{Router, middleware::from_fn_with_state, routing::post};
+use axum::{Router, middleware::from_fn_with_state, routing::{get, post}};
 use owt_accounts::mfa::StepUpGate;
 use owt_accounts::session::Data;
 
-// Every change under /staff: staff who used a second factor in the last 5 minutes.
+// Everything under /staff is for staff only; every change also needs a second factor
+// used in the last 5 minutes. Add `.reads()` to ask for it on page loads too.
 let gate = StepUpGate::new(Duration::from_secs(300)).staff().second_factor();
 let staff: Router = Router::new()
-    .route("/staff/refunds", post(|| async { "refunded" }))
+    .route("/staff/refunds", get(|| async { "refunds" }).post(|| async { "refunded" }))
     .layer(from_fn_with_state(gate, StepUpGate::<Data>::guard));
 ```
 
@@ -3476,11 +3479,19 @@ handle, `Mail`, kept in the app's state. The transport comes from the environmen
 
 | Variables | Transport |
 |---|---|
-| `MAIL_URL=smtp://user:pass@host:587` (STARTTLS) or `smtps://user:pass@host:465` (TLS), and `MAIL_FROM` | any provider's SMTP relay, through lettre |
+| `MAIL_URL=smtps://user:pass@host:465` (TLS) or `smtp://user:pass@host:587` (STARTTLS, required), and `MAIL_FROM` | any provider's SMTP relay, through lettre |
 | `RESEND_API_KEY` and `MAIL_FROM` | Resend's HTTP API |
 | `SES_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `MAIL_FROM` (`AWS_SESSION_TOKEN`, `SES_ENDPOINT` optional) | SES's v2 `SendEmail`, signed with SigV4 |
 | `MAIL_URL=memory:` | the outbox: kept in memory, delivered to nobody |
 | none of them | what the app passes: `Unconfigured::Off` (nothing is sent; `send` answers `Delivery::NotConfigured`) or `Unconfigured::Outbox` (the outbox, logging each text so a workstation reads its links from the log) |
+
+SMTP credentials never travel in plaintext. `smtps://` is TLS from the first byte;
+`smtp://` is STARTTLS, required (lettre itself reads a bare `smtp://` as plaintext,
+so owt-mail adds `?tls=required`), and a relay that doesn't offer STARTTLS fails the
+delivery. A local mail catcher (Mailpit and the like) takes `smtp://host:1025?tls=none`,
+with no credentials or credentials towards `localhost`, `127.0.0.1` or `::1` only.
+`tls=opportunistic`, which falls back to plaintext, and any other `tls` value fail
+start-up; `Smtp::tls` answers which `SmtpTls` mode a transport uses.
 
 Two transports configured at once fail start-up, as do a `MAIL_FROM` that is not an
 address and a `MAIL_URL` lettre can't read (the error never quotes the URL, which
@@ -6025,6 +6036,21 @@ The router example under "Wiring an app" composes the layers; beyond it:
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
 
+## Upgrading from 0.13
+
+- **`StepUpGate` checks who for every request.** `.staff()`, `.role(ROLE)` and the
+  default signed-in check now cover reads (`GET`, `HEAD`, `OPTIONS`) as well as
+  changes; `.reads()` decides only whether reads also need a fresh proof. Under a
+  `.staff()` gate an anonymous page load meets the sign-in wall and a signed-in
+  non-staff one a 403, where both used to pass through. An app that relied on the gate
+  letting reads through to everyone moves those routes out from under it; one that
+  kept `Staff` or `Holds` on its handlers for reads may keep them or drop them.
+- **`MAIL_URL=smtp://…` is STARTTLS, required.** owt-mail adds `?tls=required` to a
+  bare `smtp://` (lettre alone reads it as plaintext), so the relay must offer
+  STARTTLS. A local mail catcher without TLS takes `smtp://host:1025?tls=none` (with
+  credentials only towards a loopback host); `?tls=opportunistic` and any other `tls`
+  value fail start-up ("Outgoing email").
+
 ## Upgrading from 0.12
 
 - **The `release` job grants `actions: write`.** `release.yml` dispatches a fresh run
@@ -6285,7 +6311,11 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `ClientIp`, `Sessions::from_env`, or anything in backticks), so
 `fix(deploy): PUBLIC_URL comes only from the params file` passes and
 `fix(web): Drop the cache` does not; an app without a commitlint configuration of
-its own is checked by the same rules (`commitlint.config.mjs`). Scopes
+its own is checked by the same rules (`commitlint.config.mjs`). Every commit is
+linted but a merge of the base whose first line is exactly git's wording (`Merge
+branch 'main' of …`, `Merge remote-tracking branch 'origin/main' into …`, `Merge
+origin/main`, `Merge main into …`); commitlint's broader defaults (any `Merge … into
+…`, `Revert …`, `fixup!`) are off, so a revert is written `revert: …`. Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
 `accounts`, `audit`, `change`, `crypt`, `storage`, `tailwind`, `deps`, `release` (release-please and its configuration).
 

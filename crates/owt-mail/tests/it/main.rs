@@ -2,3 +2,4 @@
 //! `cargo test -p owt-mail --test it <area>::`.
 
 mod http;
+mod smtp;
