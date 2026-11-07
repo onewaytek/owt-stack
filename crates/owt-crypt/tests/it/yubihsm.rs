@@ -3,7 +3,6 @@
 //! (object id, default 2), `OWT_YUBIHSM_PASSWORD` and `OWT_YUBIHSM_WRAP_KEY` (object
 //! id, default 100). The authentication key must hold `wrap-data` and `unwrap-data`
 //! only, and the wrap key must be AES-256-CCM with those two capabilities.
-#![cfg(feature = "yubihsm")]
 
 use owt_crypt::kek::KekProvider;
 use owt_crypt::yubihsm::YubiHsmKek;

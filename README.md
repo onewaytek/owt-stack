@@ -3314,7 +3314,7 @@ refuses an authentication key that holds `export-wrapped`, `import-wrapped`,
 `put-wrap-key`, `generate-wrap-key` or `delete-wrap-key`. An unwrap is `Refused` only
 when the device reports the message as invalid or unauthentic; connection, session
 and every other device error are `Unavailable`. These checks are unit-tested against
-`MockHsm` and a fake device; `tests/yubihsm.rs` runs them against real hardware when
+`MockHsm` and a fake device; `tests/it/yubihsm.rs` runs them against real hardware when
 `OWT_YUBIHSM_CONNECTOR` is set:
 
 ```rust,no_run
@@ -4064,6 +4064,15 @@ run, and graceful shutdown:
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
 
+A job registered at run time (a singleton per live channel or tenant) goes on a
+`jobs.child()`: cancelling the child's `shutdown()` token stops its loops and nothing
+else, the parent's shutdown stops it too, and the parent's `stopped()` waits for it.
+Keep the child beside what it serves, and give the family one `&'static str` name, not
+one leaked name per instance: the name is the metrics' `job` label, so a per-instance
+name grows the label set without bound. A run that lasts longer than a tick belongs on
+`singleton_with`, so it never holds a slot of the app's pool; a long task that should
+stop at removal, not at its end, watches the child's `shutdown()` itself.
+
 Choosing: `singleton` for periodic work that one replica at a time does and that
 needs only Postgres; `leased` when the work wants a sticky owner and a fast handover
 at shutdown, or the app sits behind a transaction-mode pooler; the durable queue
@@ -4091,6 +4100,15 @@ jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_
 // A long singleton on a connection of its own, outside the app's pool.
 let opts = pool.connect_options().as_ref().clone();
 jobs.singleton_with("rebuild", Every::new(Duration::from_hours(1)), opts, 7_210_003, || async { Ok(()) });
+
+// A singleton per live channel, removed when the channel ends: its own child of `jobs`.
+// One static name for the family (the metrics' `job` label); the lock id tells them apart.
+let channel_id: i64 = 42;
+let channel = jobs.child();
+channel.singleton_with("channel_run", Every::new(Duration::from_secs(5)), pool.connect_options().as_ref().clone(), 7_220_000 + channel_id, || async { Ok(()) });
+// ...when the channel ends: its loop stops (a run in progress finishes); the rest go on.
+channel.shutdown().cancel();
+channel.stopped().await;
 
 // One replica owns the clock; the TTL outlasts the period so ownership sticks.
 let leases = Leases::new(redis, Leases::new_holder_id(), "myapp")?;
@@ -4653,7 +4671,11 @@ merging them into one and trimming debug info. An app has one integration-test b
 `tests/it/main.rs`, with a `mod` per area (`tests/it/accounts.rs`, ...) and shared helpers
 in `tests/it/support.rs`; `cargo test --test it accounts::` runs one area. And the dev
 profile (which `cargo test` inherits) keeps line tables only, enough for a backtrace's
-file and line, not a debugger's variables:
+file and line, not a debugger's variables. A test that needs process state of its own
+stays a file of its own: a setting that takes only once per process (owt-stack's
+`password::set_concurrency` tests), or a thread-scoped tracing subscriber that a
+concurrent test could race to a callsite (owt-web's `client_ip_log.rs`); its header
+says why.
 
 ```toml
 [profile.dev]
@@ -4662,7 +4684,8 @@ debug = "line-tables-only"
 debug = "line-tables-only"
 ```
 
-This repository does the same in its root `Cargo.toml`.
+This repository does the same in its root `Cargo.toml`, and each crate has one
+`tests/it` binary beside those exceptions.
 
 **CI:** call the reusable check workflow with the app's gate. It runs on ARC, with
 Postgres and Redis as services, installs `just` and `cargo-audit` (and `sqlx-cli`
@@ -6020,8 +6043,11 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `allkeys-lru` switches it to `-p MAXMEMORY_POLICY=noeviction` (and its `Expiry::Lru`
   cache entries to `Expiry::For`, or the cache to a Redis of its own): see "Eviction
   defeats leases and the shared throttle".
+- An app that registers singletons at run time (one per channel or tenant) and leaks a
+  name for each puts each on its own `jobs.child()`, under one static name, and
+  cancels the child when its channel ends ("Background jobs").
 - Add the dev profile's `debug = "line-tables-only"` and merge `tests/*.rs` into one
-  `tests/it` binary ("Test layout and debug info" under "Commands, CI,
+  `tests/it` binary, all but a test that needs a process of its own ("Test layout and debug info" under "Commands, CI,
   releases and deployment").
 
 ## Upgrading from 0.9
@@ -6229,11 +6255,11 @@ header says how to run such a Redis). Each is skipped otherwise; CI sets the fir
 **Tests come in five kinds**, and a change to anything that reads what a client sent
 adds to the first:
 
-- *Properties* (`crates/*/tests/properties.rs`, `owt-bus/tests/model.rs`): what must
+- *Properties* (`properties.rs` and `owt-bus`'s `model.rs`, under `crates/*/tests/`): what must
   hold for every input, with proptest looking for the one where it does not. A
   failure writes its seed to a `.proptest-regressions` file beside the test; commit
   it, so the case is retried for ever.
-- *The composed app* (`owt-web/tests/hardened_app.rs`): the layers in the README's
+- *The composed app* (`owt-web/tests/it/hardened_app.rs`): the layers in the README's
   order, and the sign-in story end to end (fixation, revocation, an outage, a
   replayed cookie).
 - *Unit tests* beside the code, for what needs its private parts.
