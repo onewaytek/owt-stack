@@ -4064,6 +4064,15 @@ run, and graceful shutdown:
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
 
+A job registered at run time (a singleton per live channel or tenant) goes on a
+`jobs.child()`: cancelling the child's `shutdown()` token stops its loops and nothing
+else, the parent's shutdown stops it too, and the parent's `stopped()` waits for it.
+Keep the child beside what it serves, and give the family one `&'static str` name, not
+one leaked name per instance: the name is the metrics' `job` label, so a per-instance
+name grows the label set without bound. A run that lasts longer than a tick belongs on
+`singleton_with`, so it never holds a slot of the app's pool; a long task that should
+stop at removal, not at its end, watches the child's `shutdown()` itself.
+
 Choosing: `singleton` for periodic work that one replica at a time does and that
 needs only Postgres; `leased` when the work wants a sticky owner and a fast handover
 at shutdown, or the app sits behind a transaction-mode pooler; the durable queue
@@ -4091,6 +4100,15 @@ jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_
 // A long singleton on a connection of its own, outside the app's pool.
 let opts = pool.connect_options().as_ref().clone();
 jobs.singleton_with("rebuild", Every::new(Duration::from_hours(1)), opts, 7_210_003, || async { Ok(()) });
+
+// A singleton per live channel, removed when the channel ends: its own child of `jobs`.
+// One static name for the family (the metrics' `job` label); the lock id tells them apart.
+let channel_id: i64 = 42;
+let channel = jobs.child();
+channel.singleton_with("channel_run", Every::new(Duration::from_secs(5)), pool.connect_options().as_ref().clone(), 7_220_000 + channel_id, || async { Ok(()) });
+// ...when the channel ends: its loop stops (a run in progress finishes); the rest go on.
+channel.shutdown().cancel();
+channel.stopped().await;
 
 // One replica owns the clock; the TTL outlasts the period so ownership sticks.
 let leases = Leases::new(redis, Leases::new_holder_id(), "myapp")?;
@@ -6025,6 +6043,9 @@ The router example under "Wiring an app" composes the layers; beyond it:
   `allkeys-lru` switches it to `-p MAXMEMORY_POLICY=noeviction` (and its `Expiry::Lru`
   cache entries to `Expiry::For`, or the cache to a Redis of its own): see "Eviction
   defeats leases and the shared throttle".
+- An app that registers singletons at run time (one per channel or tenant) and leaks a
+  name for each puts each on its own `jobs.child()`, under one static name, and
+  cancels the child when its channel ends ("Background jobs").
 - Add the dev profile's `debug = "line-tables-only"` and merge `tests/*.rs` into one
   `tests/it` binary, all but a test that needs a process of its own ("Test layout and debug info" under "Commands, CI,
   releases and deployment").

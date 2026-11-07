@@ -24,6 +24,8 @@
 //!   wait; a run in progress finishes first. [`Jobs::stopped`] resolves when all have.
 //!   A leased job releases its lease on the way out, so another replica takes over
 //!   at once instead of after the TTL.
+//! * **Removal.** [`Jobs::child`] gives jobs a token of their own, so a job registered
+//!   at run time (a singleton per live channel or tenant) stops without the rest.
 //! * **Metrics** (feature `metrics`): names are the app's ([`JobMetrics::prefixed`]),
 //!   runs counted by `job` and `outcome` (`ran`, `skipped`, `failed`), run time timed
 //!   by `job`.
@@ -32,12 +34,12 @@
 pub mod lease;
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::RngExt;
-use tokio::task::JoinHandle;
 pub use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 /// How often a job runs: once per period from when its loop starts ([`Every::new`]),
 /// or at fixed boundaries by the wall clock ([`Every::aligned`]).
@@ -243,7 +245,7 @@ impl JobMetrics {
 #[derive(Clone)]
 pub struct Jobs {
     shutdown: CancellationToken,
-    handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    tracker: TaskTracker,
     #[cfg(feature = "metrics")]
     metrics: Option<Arc<JobMetrics>>,
 }
@@ -254,7 +256,7 @@ impl Jobs {
     pub fn new(shutdown: CancellationToken) -> Self {
         Self {
             shutdown,
-            handles: Arc::default(),
+            tracker: TaskTracker::new(),
             #[cfg(feature = "metrics")]
             metrics: None,
         }
@@ -274,17 +276,36 @@ impl Jobs {
         &self.shutdown
     }
 
-    /// Resolves when every job's loop has stopped (after cancellation).
+    /// Jobs of their own under these: cancelling the child's [`Jobs::shutdown`] stops
+    /// its loops (a run in progress finishes first) and leaves the rest running. For
+    /// jobs registered at run time and removed again, such as a singleton per live
+    /// channel: keep the child beside the channel and cancel it when the channel ends.
+    /// The parent's shutdown stops the child too, the parent's [`Jobs::stopped`] waits
+    /// for its loops, and the child records into the same metrics. Give such jobs one
+    /// static name for the family (it is the metrics' `job` label) and tell them apart
+    /// by lock id, or by a span the task enters.
+    #[must_use]
+    pub fn child(&self) -> Self {
+        let child = Self {
+            shutdown: self.shutdown.child_token(),
+            tracker: TaskTracker::new(),
+            #[cfg(feature = "metrics")]
+            metrics: self.metrics.clone(),
+        };
+        let (token, tracker) = (child.shutdown.clone(), child.tracker.clone());
+        self.spawn(async move {
+            token.cancelled().await;
+            tracker.close();
+            tracker.wait().await;
+        });
+        child
+    }
+
+    /// Resolves when every job's loop has stopped (after cancellation), a child's
+    /// included.
     pub async fn stopped(&self) {
-        let handles = std::mem::take(
-            &mut *self
-                .handles
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for h in handles {
-            let _ = h.await;
-        }
+        self.tracker.close();
+        self.tracker.wait().await;
     }
 
     #[cfg_attr(
@@ -308,11 +329,9 @@ impl Jobs {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let h = tokio::spawn(fut);
-        self.handles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(h);
+        // The tracker forgets a loop once it ends, so jobs added and removed at run
+        // time leave nothing behind.
+        self.tracker.spawn(fut);
     }
 
     /// Run `task` on every replica, every period. For idempotent work.
@@ -670,6 +689,7 @@ async fn try_lock_dedicated<'a>(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     use super::*;
@@ -932,5 +952,50 @@ mod tests {
         jobs.stopped().await;
         assert!(asked.elapsed() < Duration::from_secs(1));
         assert!(starts.lock().unwrap().is_empty());
+    }
+
+    /// A counter and a task that bumps it.
+    fn counter() -> (
+        Arc<AtomicUsize>,
+        impl Fn() -> std::future::Ready<anyhow::Result<()>> + Send + Sync + 'static,
+    ) {
+        let n = Arc::new(AtomicUsize::new(0));
+        let m = n.clone();
+        (n, move || {
+            m.fetch_add(1, SeqCst);
+            std::future::ready(Ok(()))
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_child_stops_alone_and_with_its_parent() {
+        let jobs = Jobs::new(CancellationToken::new());
+        let minute = Every::new(Duration::from_mins(1)).jitter(Duration::ZERO);
+        let (kept, task) = counter();
+        jobs.every_replica("kept", minute, task);
+        let channel = jobs.child();
+        let (removed, task) = counter();
+        channel.every_replica("removed", minute, task);
+        until(|| removed.load(SeqCst) >= 2).await;
+
+        // Removed: its loop ends and stays ended; the parent's goes on.
+        channel.shutdown().cancel();
+        channel.stopped().await;
+        let (at, kept_at) = (removed.load(SeqCst), kept.load(SeqCst));
+        until(|| kept.load(SeqCst) >= kept_at + 3).await;
+        assert_eq!(removed.load(SeqCst), at);
+        assert!(!jobs.shutdown().is_cancelled());
+
+        // The parent's shutdown reaches a child, and `stopped` waits for its loops.
+        let late = jobs.child();
+        let (n, task) = counter();
+        late.every_replica("late", minute, task);
+        until(|| n.load(SeqCst) >= 1).await;
+        jobs.shutdown().cancel();
+        jobs.stopped().await;
+        assert!(late.shutdown().is_cancelled());
+        let stopped_at = n.load(SeqCst);
+        tokio::time::sleep(Duration::from_mins(5)).await;
+        assert_eq!(n.load(SeqCst), stopped_at);
     }
 }
