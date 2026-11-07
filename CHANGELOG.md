@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/onewaytek/owt-stack/compare/v0.12.4...v0.13.0) (2026-11-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ci:** the job calling release.yml grants actions: write (see "Upgrading from 0.12" in the README).
+
+### Features
+
+* **accounts:** StepUpGate, step-up as a middleware ([#320](https://github.com/onewaytek/owt-stack/issues/320)) ([4308769](https://github.com/onewaytek/owt-stack/commit/4308769d7c1903146b29ddcd2bdb8fd3530a2d67))
+* **ci:** release rc when a stale run or a sync leaves it unreleased ([#318](https://github.com/onewaytek/owt-stack/issues/318)) ([17ad8c2](https://github.com/onewaytek/owt-stack/commit/17ad8c2ed1e60041a18ff5dc517624b81d797d4c))
+* **mail:** add owt-mail, one mailer for apps ([#319](https://github.com/onewaytek/owt-stack/issues/319)) ([81a9aa1](https://github.com/onewaytek/owt-stack/commit/81a9aa1e0c5616332a831b98db09fc06f827ad24))
+* **runtime:** defaults from the architecture review ([#321](https://github.com/onewaytek/owt-stack/issues/321)) ([0396b78](https://github.com/onewaytek/owt-stack/commit/0396b78d93d6c65dfc8b6ea50e265f6ce9a5e52a))
+
 ## [0.12.4](https://github.com/onewaytek/owt-stack/compare/v0.12.3...v0.12.4) (2026-11-05)
 
 
