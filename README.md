@@ -5,8 +5,8 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 
 | Crate | What an app gets |
 |---|---|
-| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
-| `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
+| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects and http(s)-only links people supply; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
+| `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool, migrations under an advisory lock, and the database's clock for outcome-deciding comparisons; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links, and the addresses an account has proven by one (`confirmed_emails`); roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-crypt` | envelope field encryption: XChaCha20-Poly1305 field seals under data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
@@ -232,6 +232,42 @@ on this machine and its TLS is not verified (`db::unverified_tls(&options)` asks
 same of any `PgConnectOptions`): give the pod `PGSSLMODE=verify-full` and
 `PGSSLROOTCERT` (the OpenShift template does), since sqlx's default (`prefer`)
 neither requires TLS nor checks the server.
+
+**Decide by the database's clock.** A comparison that decides an outcome (an answer
+inside its round's window, a vote before the cut-off, a link not yet expired) reads
+`db::now(executor)`, the database's `clock_timestamp()`, rather than
+`OffsetDateTime::now_utc()`. Every replica then reads one clock, so two pods whose
+clocks drift apart cannot decide one case two ways, and the reading agrees with the
+stamps the database wrote (`DEFAULT now()`, `SET closed_at = clock_timestamp()`). Read it
+after taking the row locks the decision depends on: `clock_timestamp()` is the moment of
+the reading, where `now()` is the transaction's start and would read a time before a
+lock wait, when a cut-off that passed during the wait had not yet passed. The app's
+clock stays right for what decides nothing: input validation (a date of birth not in
+the future), display ("closes in 3 minutes"), logging, and timeouts within the process.
+
+```rust
+# async fn answer(pool: &sqlx::PgPool, round: i64, text: &str) -> anyhow::Result<bool> {
+use owt_runtime::db;
+
+let mut tx = pool.begin().await?;
+// The lock first, so a close that holds it has stamped `closes_at` before the reading.
+let closes_at: time::OffsetDateTime =
+    sqlx::query_scalar("SELECT closes_at FROM rounds WHERE id = $1 FOR SHARE")
+        .bind(round)
+        .fetch_one(&mut *tx)
+        .await?;
+if db::now(&mut *tx).await? >= closes_at {
+    return Ok(false); // too late, on every replica alike
+}
+sqlx::query("INSERT INTO answers (round_id, text) VALUES ($1, $2)")
+    .bind(round)
+    .bind(text)
+    .execute(&mut *tx)
+    .await?;
+tx.commit().await?;
+# Ok(true)
+# }
+```
 
 The router composes the layers. Order matters: a layer added later wraps the ones
 before it, so cross-origin refusal runs before the session is opened, and the outer
@@ -850,6 +886,33 @@ like_escape(q.trim())
 ```
 
 Pass the escaped term as a bound parameter, never spliced into the SQL.
+
+**Links people supply** (a profile's website, an event's page) go through
+`owt_web::redirect::web_url` before they become an `href`: it returns the parsed URL
+only when it is absolute `http` or `https`, with a host and no user or password, so a
+`javascript:`, `data:` or relative link never reaches a page. Check at the form, and
+again where the page renders the link, so rows saved before the check are covered;
+render the parsed form, which the template escapes as any text.
+
+```rust
+use askama::Template;
+use owt_web::redirect::web_url;
+
+#[derive(Template)]
+#[template(ext = "html", source = r#"{% if let Some(url) = website %}<a href="{{ url }}" rel="nofollow ugc noopener">website</a>{% endif %}"#)]
+struct Profile { website: Option<String> }
+
+// At the form: refuse what is not a web page.
+assert!(web_url("javascript:alert(1)").is_none());
+assert!(web_url("data:text/html,<script>alert(1)</script>").is_none());
+// At the page: a stored value that would not pass today shows no link.
+let page = |stored: &str| Profile { website: web_url(stored).map(String::from) }.render().unwrap();
+assert_eq!(page("javascript:alert(1)"), "");
+assert_eq!(
+    page(" https://Example.com/me "),
+    r#"<a href="https://example.com/me" rel="nofollow ugc noopener">website</a>"#
+);
+```
 
 ### htmx fragments
 
@@ -6327,8 +6390,11 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `ClientIp`, `Sessions::from_env`, or anything in backticks), so
 `fix(deploy): PUBLIC_URL comes only from the params file` passes and
-`fix(web): Drop the cache` does not; an app without a commitlint configuration of
-its own is checked by the same rules (`commitlint.config.mjs`). Every commit is
+`fix(web): Drop the cache` does not. The first line runs to 120 characters at most;
+the body and the footers have no line-length limit, so a log, a link or quoted output
+goes in as it is. An app without a commitlint configuration of its own is checked by
+the same rules (`commitlint.config.mjs`). The title job checks the title's form (a
+type, an optional scope, a subject), not its length. Every commit is
 linted but a merge of the base whose first line is exactly git's wording (`Merge
 branch 'main' of …`, `Merge remote-tracking branch 'origin/main' into …`, `Merge
 origin/main`, `Merge main into …`); commitlint's broader defaults (any `Merge … into

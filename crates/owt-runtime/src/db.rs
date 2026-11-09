@@ -5,6 +5,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use time::OffsetDateTime;
 
 /// Pool sizing and the server-side limits each connection carries. The defaults suit
 /// a small app on one replica; size a busy one from measurement (connections are the
@@ -150,6 +151,30 @@ impl PoolConfig {
         let opts = self.limits((*pool.connect_options()).clone());
         self.options().connect_lazy_with(opts)
     }
+}
+
+/// The database's clock: `clock_timestamp()`, the moment the query runs, in UTC.
+///
+/// Read it for a comparison that decides an outcome (a window still open, a cut-off
+/// passed, a link expired) where the rows it is compared with were stamped by the
+/// database (`DEFAULT now()`, `SET closed_at = clock_timestamp()`). Every replica then
+/// reads one clock, so two pods whose clocks drift apart cannot decide the same case
+/// two ways, and the app's reading agrees with the stamps.
+///
+/// `clock_timestamp()` rather than `now()`: `now()` is the start of the transaction,
+/// fixed for its length, so inside a transaction that has waited on a lock it reads a
+/// time before the wait, and a cut-off that passed during the wait would not have
+/// passed yet. `clock_timestamp()` is the time of the reading, as
+/// [`OffsetDateTime::now_utc`] is in the app; read it after taking the locks the
+/// decision depends on. On a pool (one statement per transaction) the two agree.
+/// SQL that wants the transaction's own time writes `now()` itself.
+///
+/// # Errors
+/// The query fails (the connection is lost, the transaction has aborted).
+pub async fn now<'e, E: sqlx::PgExecutor<'e>>(executor: E) -> sqlx::Result<OffsetDateTime> {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(executor)
+        .await
 }
 
 /// How long [`PoolConfig::connect`] keeps trying an unreachable database at start: an
