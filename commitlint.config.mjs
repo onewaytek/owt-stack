@@ -35,9 +35,15 @@ export default {
     // decides instead: a capital opens a subject only as part of an identifier.
     "subject-case": [0],
     "subject-first-word": [2, "always"],
+    // A header may run to 120 characters: a scope and an identifier or two leave the
+    // default 100 little room for the subject. The body and the footers are prose,
+    // links, logs and quoted output, so their lines have no limit at all.
+    "header-max-length": [2, "always", 120],
+    "body-max-line-length": [0],
+    "footer-max-line-length": [0],
   },
-  // Dependabot's bodies quote release notes, whose lines run past the length limit.
-  // Its headers ("fix(deps): bump ...") are generated, and the title check sees them.
+  // Dependabot's headers ("fix(deps): bump ...") are generated, and the title check
+  // sees them.
   // A merge of the base into the branch never reaches main: a squash merge keeps only
   // the title, which the title job checks. Only a whole first line in git's own merge
   // wording is skipped ("Merge branch 'main' of github.com:o/r into fix/x", "Merge

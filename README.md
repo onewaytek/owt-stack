@@ -6310,8 +6310,11 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `ClientIp`, `Sessions::from_env`, or anything in backticks), so
 `fix(deploy): PUBLIC_URL comes only from the params file` passes and
-`fix(web): Drop the cache` does not; an app without a commitlint configuration of
-its own is checked by the same rules (`commitlint.config.mjs`). Every commit is
+`fix(web): Drop the cache` does not. The first line runs to 120 characters at most;
+the body and the footers have no line-length limit, so a log, a link or quoted output
+goes in as it is. An app without a commitlint configuration of its own is checked by
+the same rules (`commitlint.config.mjs`). The title job checks the title's form (a
+type, an optional scope, a subject), not its length. Every commit is
 linted but a merge of the base whose first line is exactly git's wording (`Merge
 branch 'main' of …`, `Merge remote-tracking branch 'origin/main' into …`, `Merge
 origin/main`, `Merge main into …`); commitlint's broader defaults (any `Merge … into
