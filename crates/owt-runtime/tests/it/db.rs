@@ -160,3 +160,36 @@ fn url_password(url: &str) -> String {
     let userinfo = rest.split_once('@').map_or("", |(u, _)| u);
     userinfo.split_once(':').map_or("", |(_, p)| p).to_owned()
 }
+
+/// `db::now` reads the database's clock as it runs: it agrees with the server's own
+/// reading, and inside a transaction it moves on while `now()` stays at the start.
+#[tokio::test]
+async fn now_reads_the_database_clock_as_it_runs() {
+    let Some(url) = owt_runtime::env::var("DATABASE_URL") else {
+        return;
+    };
+    let pool = PgPool::connect(&url).await.expect("DATABASE_URL connects");
+    let before: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let read = owt_runtime::db::now(&pool).await.unwrap();
+    assert!(read >= before, "{read} is before {before}");
+    assert_eq!(read.offset(), time::UtcOffset::UTC);
+
+    let mut tx = pool.begin().await.unwrap();
+    let started: time::OffsetDateTime = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_sleep(0.05)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let later = owt_runtime::db::now(&mut *tx).await.unwrap();
+    assert!(
+        later - started >= time::Duration::milliseconds(50),
+        "{later} is not after the transaction's start {started} and the sleep"
+    );
+    tx.rollback().await.unwrap();
+}
