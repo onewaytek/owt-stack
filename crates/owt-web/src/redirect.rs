@@ -3,6 +3,10 @@
 //! A sign-in page is handed `?next=` and redirects there afterwards. Unchecked, that
 //! is an open redirect: a link to this site that lands on another, which is what a
 //! phishing page wants.
+//!
+//! A link someone typed for others to follow (a profile's website, an event's page) is
+//! the other way round: it must leave the site, but only for a web page. [`web_url`]
+//! keeps `javascript:` and `data:` out of an `href`.
 
 use axum::http::{HeaderMap, header};
 
@@ -48,6 +52,29 @@ pub fn htmx_current_page(headers: &HeaderMap) -> Option<String> {
 #[must_use]
 pub fn referer_page(headers: &HeaderMap) -> Option<String> {
     same_origin_page(headers, header::REFERER.as_str())
+}
+
+/// `link` as an absolute `http` or `https` URL with a host, else `None`: for a link
+/// someone supplied that the site shows to others as an `href`.
+///
+/// Any other scheme is refused: `javascript:` and `vbscript:` run in the page's
+/// origin when followed, `data:` opens a document the attacker wrote, and `file:` or
+/// a custom scheme reaches outside the browser. So is a relative link (it would point
+/// into this site), a URL without a host, and one with a user or password
+/// (`https://bank.example@evil.example/` reads as the bank). Check at the form, and
+/// again where the page renders the link, so rows saved before the check are covered.
+///
+/// The `Url` is the parsed form: render `url.as_str()`, escaped by the template as
+/// any text is, rather than the string as typed. The parser has already removed the
+/// tabs and newlines a browser would strip, and leading and trailing spaces.
+#[must_use]
+pub fn web_url(link: &str) -> Option<url::Url> {
+    let url = url::Url::parse(link).ok()?;
+    let ok = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none();
+    ok.then_some(url)
 }
 
 /// The URL in header `name`, as a path and query, when it names this origin.
@@ -132,6 +159,48 @@ mod tests {
             assert_eq!(current(url, host), None, "{url} on {host}");
         }
         assert_eq!(htmx_current_page(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn only_web_links_with_a_host_pass() {
+        for (link, shown) in [
+            ("https://example.com", "https://example.com/"),
+            ("http://example.com/a?b=1#c", "http://example.com/a?b=1#c"),
+            ("HTTPS://Example.COM/Path", "https://example.com/Path"),
+            ("  https://example.com/x  ", "https://example.com/x"),
+            ("https://exa\tmple.com/", "https://example.com/"),
+            ("https://[::1]:8443/", "https://[::1]:8443/"),
+            // Without slashes, a special scheme still names a host, as browsers read it.
+            ("https:example.com", "https://example.com/"),
+            ("https://bücher.example/", "https://xn--bcher-kva.example/"),
+        ] {
+            assert_eq!(
+                web_url(link).map(String::from).as_deref(),
+                Some(shown),
+                "{link:?}"
+            );
+        }
+        for bad in [
+            "",
+            "example.com",
+            "/a/b",
+            "//example.com/a",
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            " javascript:alert(1)",
+            "java\tscript:alert(1)",
+            "javascript://example.com/%0aalert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+            "ftp://example.com/",
+            "mailto:a@example.com",
+            "https://user@example.com/",
+            "https://bank.example:pw@evil.example/",
+            "http://",
+        ] {
+            assert_eq!(web_url(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

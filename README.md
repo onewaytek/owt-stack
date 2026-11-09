@@ -5,7 +5,7 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 
 | Crate | What an app gets |
 |---|---|
-| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
+| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects and http(s)-only links people supply; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
 | `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool, migrations under an advisory lock, and the database's clock for outcome-deciding comparisons; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
 | `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links, and the addresses an account has proven by one (`confirmed_emails`); roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
@@ -869,6 +869,33 @@ like_escape(q.trim())
 ```
 
 Pass the escaped term as a bound parameter, never spliced into the SQL.
+
+**Links people supply** (a profile's website, an event's page) go through
+`owt_web::redirect::web_url` before they become an `href`: it returns the parsed URL
+only when it is absolute `http` or `https`, with a host and no user or password, so a
+`javascript:`, `data:` or relative link never reaches a page. Check at the form, and
+again where the page renders the link, so rows saved before the check are covered;
+render the parsed form, which the template escapes as any text.
+
+```rust
+use askama::Template;
+use owt_web::redirect::web_url;
+
+#[derive(Template)]
+#[template(ext = "html", source = r#"{% if let Some(url) = website %}<a href="{{ url }}" rel="nofollow ugc noopener">website</a>{% endif %}"#)]
+struct Profile { website: Option<String> }
+
+// At the form: refuse what is not a web page.
+assert!(web_url("javascript:alert(1)").is_none());
+assert!(web_url("data:text/html,<script>alert(1)</script>").is_none());
+// At the page: a stored value that would not pass today shows no link.
+let page = |stored: &str| Profile { website: web_url(stored).map(String::from) }.render().unwrap();
+assert_eq!(page("javascript:alert(1)"), "");
+assert_eq!(
+    page(" https://Example.com/me "),
+    r#"<a href="https://example.com/me" rel="nofollow ugc noopener">website</a>"#
+);
+```
 
 ### htmx fragments
 
