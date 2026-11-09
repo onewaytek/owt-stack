@@ -22,4 +22,13 @@ ignore = [
     # built artifact and it never sees runtime or untrusted input. Lifts when an
     # askama release drops the dependency.
     "RUSTSEC-2026-0374",
+
+    # libsqlite3-sys 0.37: the bundled C SQLite carries CVE-2026-119375; fixed in
+    # 0.39. Cargo resolves the lockfile with every optional dependency of the graph,
+    # so sqlx's and sqlx-macros-core's optional `sqlx-sqlite` (and its
+    # libsqlite3-sys) sit in Cargo.lock although no crate here turns on a SQLite
+    # feature: `cargo tree -i libsqlite3-sys --target all` prints nothing, and
+    # nothing compiles or links it. sqlx-sqlite 0.9.0 caps it at <0.38, so no
+    # lockfile update can move it. Lifts when an sqlx release accepts 0.39.
+    "RUSTSEC-2026-0459",
 ]

@@ -95,6 +95,23 @@ as the process's provider if none is set, and an app that connects to a `rediss:
 Redis before or without the bus (a lease's `ConnectionManager`, say) calls
 `owt_bus::ensure_crypto_provider()` first.
 
+Cargo.lock lists `sqlx-sqlite` and `libsqlite3-sys` even in a Postgres-only app: Cargo
+resolves the lockfile with every optional dependency, and `sqlx` and `sqlx-macros-core`
+both name `sqlx-sqlite` as one. Nothing compiles it unless a crate turns on an sqlx
+SQLite feature (`cargo tree -i libsqlite3-sys --target all` prints nothing), but
+`cargo audit` reads the lockfile, so RUSTSEC-2026-0459 (SQLite CVE-2026-119375,
+libsqlite3-sys 0.37, which sqlx-sqlite 0.9.0 caps below 0.38) fails it. An app checks
+that the tree is empty and ignores the advisory in its `.cargo/audit.toml`:
+
+```toml
+[advisories]
+ignore = [
+    # libsqlite3-sys 0.37 (SQLite CVE-2026-119375): in Cargo.lock only, as sqlx's
+    # optional sqlx-sqlite; no SQLite feature is on, so nothing compiles or links it.
+    "RUSTSEC-2026-0459",
+]
+```
+
 **Developing against a local checkout:** patch the git source in the app's
 `.cargo/config.toml` (not committed) instead of editing `Cargo.toml`:
 
