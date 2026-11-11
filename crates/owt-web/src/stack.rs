@@ -20,8 +20,8 @@
 //! has no deadline of its own and is absent from the duration metric. Then everything
 //! is wrapped in:
 //!
-//! 8. [`Csp`], which mints the nonce the pages read, and sends the policy with every
-//!    response, the error pages and refusals included;
+//! 8. [`Csp`], which mints the nonce the pages read (none under [`Csp::static_policy`]),
+//!    and sends the policy with every response, the error pages and refusals included;
 //! 9. the default cache policy ([`headers::private_by_default`], or
 //!    [`headers::no_store_by_default`]);
 //! 10. [`headers::security`];
