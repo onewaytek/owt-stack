@@ -200,17 +200,32 @@ impl Throttle {
     /// `false` once any budget is spent, and then the password must not be checked.
     pub fn sign_in(&self, address: IpAddr, account: &str) -> bool {
         warn_if_replicated();
+        self.refused_sign_in(address, account).is_none()
+    }
+
+    /// Count a sign-in as [`sign_in`](Self::sign_in) does; the budget that refused it
+    /// (1, attempts from the address; 2, sign-ins from the address; 3, sign-ins to the
+    /// account), or `None`.
+    pub(crate) fn refused_sign_in(&self, address: IpAddr, account: &str) -> Option<usize> {
         // In this order, each only if the one before allowed it: a sign-in an
         // address's budget refuses is not checked, so it costs the account nothing.
-        self.attempt(address)
-            && self
-                .sign_ins_by_address
-                .check_key(&client_key(address))
-                .is_ok()
-            && self
-                .sign_ins_by_account
-                .check_key(&account_key(account))
-                .is_ok()
+        if !self.attempt(address) {
+            Some(1)
+        } else if self
+            .sign_ins_by_address
+            .check_key(&client_key(address))
+            .is_err()
+        {
+            Some(2)
+        } else if self
+            .sign_ins_by_account
+            .check_key(&account_key(account))
+            .is_err()
+        {
+            Some(3)
+        } else {
+            None
+        }
     }
 }
 
