@@ -383,6 +383,25 @@ mod tests {
         );
     }
 
+    /// A data key wrapped by an independent AES-256-GCM implementation (Python
+    /// `cryptography`): KEK `20 21 .. 3f`, nonce `a0 a1 .. ab`, data key `00 01 .. 1f`,
+    /// context `ctx-1`. A key wrapped before any upgrade of the cipher crates unwraps.
+    #[tokio::test]
+    async fn a_known_wrapped_key_unwraps() {
+        const WRAPPED: &str = "a0a1a2a3a4a5a6a7a8a9aaab7e3da637c0d286ada921a7b12a5078a9816ed\
+            31428a13035178bd1e2cf7bb1e7f11252929f83e2c0c8d8ac8ddcd43183";
+        let wrapped: Vec<u8> = WRAPPED
+            .as_bytes()
+            .chunks(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect();
+        let kek = LocalKek::parse("k:ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=").unwrap();
+        let key = kek.unwrap("local:k", &wrapped, b"ctx-1").await.unwrap();
+        let expected: Vec<u8> = (0..32).collect();
+        assert_eq!(&key[..], &expected[..]);
+        assert!(kek.unwrap("local:k", &wrapped, b"ctx-2").await.is_err());
+    }
+
     #[test]
     fn keyrings_are_checked() {
         for bad in [

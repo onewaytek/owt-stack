@@ -179,6 +179,41 @@ impl Chunks {
 mod tests {
     use super::*;
 
+    fn unhex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks(2)
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    /// Two chunks sealed by an independent AES-256-GCM implementation (Python
+    /// `cryptography`) under content key `40 41 .. 5f`, for the header of a sealed key
+    /// of 65 `07` bytes and nonce prefix `01 .. 01`. An object stored before any
+    /// upgrade of the cipher crates opens, and the chunk cipher writes the same bytes.
+    #[test]
+    fn known_chunks_open_and_seal_the_same() {
+        const FIRST: &str = "024cfebb99c550cd48262a5fadccb1b5ab77f13e3d6af9b99c5bc8";
+        const LAST: &str = "3be61ef1f5f87b78831e1492f6e260494afe9d29";
+        let header = Header::new(vec![7; 65], [1; PREFIX]);
+        let mut key = Zeroizing::new([0_u8; 32]);
+        for (b, i) in key.iter_mut().zip(0x40_u8..) {
+            *b = i;
+        }
+        let mut reader = Chunks::new(&key, &header);
+        assert_eq!(
+            &reader.open(&unhex(FIRST), false).unwrap()[..],
+            b"first chunk"
+        );
+        assert_eq!(&reader.open(&unhex(LAST), true).unwrap()[..], b"last");
+        let mut writer = Chunks::new(&key, &header);
+        assert_eq!(writer.seal(b"first chunk", false).unwrap(), unhex(FIRST));
+        assert_eq!(writer.seal(b"last", true).unwrap(), unhex(LAST));
+        // The last chunk read as a middle one is refused.
+        let mut early = Chunks::new(&key, &header);
+        early.open(&unhex(FIRST), false).unwrap();
+        assert!(early.open(&unhex(LAST), false).is_err());
+    }
+
     #[test]
     fn only_the_writers_chunk_size_parses() {
         let header = Header::new(vec![7; 65], [1; PREFIX]);
