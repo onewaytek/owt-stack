@@ -36,7 +36,7 @@
 //! the data (at sign-out). An app may use the id as a guest's identity.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRequestParts, Request, State};
@@ -222,7 +222,37 @@ struct Config {
     idle: Option<Duration>,
     /// The least time between two reseals of the last-active time.
     idle_refresh: Option<Duration>,
+    /// What set [`Self::idle`].
+    idle_source: IdleSource,
+    /// Logs the idle timeout once, on the first request through [`Sessions::layer`].
+    idle_logged: Arc<Once>,
     secure: bool,
+}
+
+/// What set a [`Sessions`]'s idle timeout, for the line logged at the first request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleSource {
+    /// Nothing did: [`IDLE_TIMEOUT`].
+    Default,
+    /// `SESSION_IDLE_TIMEOUT`, through [`Sessions::from_vars`].
+    Variable,
+    /// [`Sessions::idle_timeout`] or [`Sessions::without_idle_timeout`], called in code.
+    Builder,
+}
+
+impl IdleSource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Variable => IDLE_TIMEOUT_VAR,
+            Self::Builder => "builder",
+        }
+    }
+}
+
+/// `idle` as the startup line writes it: whole seconds, or `off`.
+fn idle_text(idle: Option<Duration>) -> String {
+    idle.map_or_else(|| "off".to_owned(), |d| format!("{}s", d.as_secs()))
 }
 
 /// A request header that, set to `1`, marks the request as passive: not the person's
@@ -336,6 +366,8 @@ impl<T: SessionData> Sessions<T> {
                 absolute: ABSOLUTE_LIFETIME.max(max_age),
                 idle: Some(IDLE_TIMEOUT),
                 idle_refresh: None,
+                idle_source: IdleSource::Default,
+                idle_logged: Arc::new(Once::new()),
                 secure,
             }),
             validator: None,
@@ -350,7 +382,10 @@ impl<T: SessionData> Sessions<T> {
     /// is set: a duration (`90s`, `30m`, `8h`, `14d`) for
     /// [`idle_timeout`](Self::idle_timeout), or `off` for
     /// [`without_idle_timeout`](Self::without_idle_timeout). A blank value is unset. A
-    /// builder call after `from_env` wins over the variable.
+    /// builder call after `from_env` wins over the variable. The first request through
+    /// [`layer`](Self::layer) logs the idle timeout in force and what set it (`default`,
+    /// `SESSION_IDLE_TIMEOUT` or `builder`) at `info`, so a manifest's setting that code
+    /// overrode shows.
     ///
     /// # Errors
     ///
@@ -408,16 +443,15 @@ impl<T: SessionData> Sessions<T> {
         let key = key_for(&secret, &purpose)
             .map_err(|e| anyhow::anyhow!("the session key from SESSION_SECRET: {e}"))?;
         let sessions = Self::new(key, cookie, max_age, secure);
-        Ok(
-            match set(IDLE_TIMEOUT_VAR)
-                .map(|v| parse_idle_timeout(&v))
-                .transpose()?
-            {
-                None => sessions,
-                Some(Some(timeout)) => sessions.idle_timeout(timeout),
-                Some(None) => sessions.without_idle_timeout(),
-            },
-        )
+        let from_variable = match set(IDLE_TIMEOUT_VAR)
+            .map(|v| parse_idle_timeout(&v))
+            .transpose()?
+        {
+            None => return Ok(sessions),
+            Some(Some(timeout)) => sessions.idle_timeout(timeout),
+            Some(None) => sessions.without_idle_timeout(),
+        };
+        Ok(from_variable.idle_from(IdleSource::Variable))
     }
 
     /// End every session this long after it began, however recently it was re-sealed.
@@ -437,7 +471,7 @@ impl<T: SessionData> Sessions<T> {
     #[must_use]
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         Arc::make_mut(&mut self.inner).idle = Some(timeout.max(Duration::from_secs(1)));
-        self
+        self.idle_from(IdleSource::Builder)
     }
 
     /// Never end a session for inactivity, only at its absolute lifetime: for an app
@@ -446,7 +480,26 @@ impl<T: SessionData> Sessions<T> {
     #[must_use]
     pub fn without_idle_timeout(mut self) -> Self {
         Arc::make_mut(&mut self.inner).idle = None;
+        self.idle_from(IdleSource::Builder)
+    }
+
+    /// Record what set the idle timeout.
+    fn idle_from(mut self, source: IdleSource) -> Self {
+        Arc::make_mut(&mut self.inner).idle_source = source;
         self
+    }
+
+    /// Log the idle timeout in force and its source, once per `Sessions` however many
+    /// requests or clones.
+    fn log_idle_once(&self) {
+        let config = &self.inner;
+        config.idle_logged.call_once(|| {
+            tracing::info!(
+                idle_timeout = %idle_text(config.idle),
+                source = config.idle_source.name(),
+                "session idle timeout"
+            );
+        });
     }
 
     /// Reseal the last-active time at most this often (see
@@ -712,6 +765,7 @@ impl<T: SessionData> Sessions<T> {
     /// ([`Session::flush`]) stands whatever the response: a server error after one
     /// seals an empty session, dropping anything the handler did after it.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
+        this.log_idle_once();
         let session = Session::<T>::default();
         {
             let mut inner = session.inner();
@@ -1174,6 +1228,35 @@ mod env_tests {
         assert!(moved.opens(&new));
         assert!(!moved.opens(&old), "a new purpose alone signs everyone out");
         assert!(moved.also_open_with(old.clone()).opens(&old));
+    }
+
+    #[test]
+    fn the_idle_timeout_remembers_what_set_it() {
+        let s = secret();
+        let age = Duration::from_secs(60);
+        let source = |value: Option<&str>| {
+            let mut pairs = vec![("SESSION_SECRET", s.as_str())];
+            pairs.extend(value.map(|v| (IDLE_TIMEOUT_VAR, v)));
+            Sessions::<D>::from_vars("myapp", "s", age, true, vars(&pairs)).unwrap()
+        };
+        assert_eq!(source(None).inner.idle_source.name(), "default");
+        assert_eq!(source(Some(" ")).inner.idle_source.name(), "default");
+        assert_eq!(
+            source(Some("8h")).inner.idle_source.name(),
+            "SESSION_IDLE_TIMEOUT"
+        );
+        assert_eq!(
+            source(Some("off")).inner.idle_source.name(),
+            "SESSION_IDLE_TIMEOUT"
+        );
+        let overridden = source(Some("8h")).idle_timeout(Duration::from_mins(15));
+        assert_eq!(overridden.inner.idle_source.name(), "builder");
+        assert_eq!(
+            source(None).without_idle_timeout().inner.idle_source.name(),
+            "builder"
+        );
+        assert_eq!(idle_text(Some(Duration::from_mins(30))), "1800s");
+        assert_eq!(idle_text(None), "off");
     }
 
     #[test]
