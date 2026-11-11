@@ -57,6 +57,54 @@ pub async fn no_store_by_default(req: Request, next: Next) -> Response {
     resp
 }
 
+/// A route layer that makes a route's pages cacheable by everyone, browsers and shared
+/// caches alike, for `max_age`: `Cache-Control: public, max-age=N` on a `200` response
+/// that sets no cookie and says nothing about caching itself. Default absent: put it
+/// only on routes whose pages are the same for every viewer.
+///
+/// It runs inside the session layer, which still marks a response that carries a
+/// cookie or a signed-in person's idle time [`NEVER_CACHE`]; any other status, and a
+/// handler's own `Cache-Control`, are left to [`private_by_default`].
+///
+/// ```
+/// # use std::time::Duration;
+/// # use axum::{Router, routing::get};
+/// let public = Router::<()>::new()
+///     .route("/about", get(|| async { axum::response::Html("<h1>About</h1>") }))
+///     .route_layer(owt_web::headers::public(Duration::from_mins(5)));
+/// ```
+#[must_use]
+pub fn public(
+    max_age: std::time::Duration,
+) -> tower_http::set_header::SetResponseHeaderLayer<PublicCache> {
+    public_with(crate::cache::CachePolicy::public(max_age))
+}
+
+/// [`public`] with a whole policy: an edge lifetime longer than the browser's, or
+/// stale-while-revalidate. A policy that is not public
+/// ([`CachePolicy::no_store`](crate::cache::CachePolicy::no_store)) sets that instead.
+#[must_use]
+pub fn public_with(
+    policy: crate::cache::CachePolicy,
+) -> tower_http::set_header::SetResponseHeaderLayer<PublicCache> {
+    tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+        header::CACHE_CONTROL,
+        PublicCache(policy.header_value()),
+    )
+}
+
+/// The `Cache-Control` value [`public`] sets, and when.
+#[derive(Clone, Debug)]
+pub struct PublicCache(HeaderValue);
+
+impl<B> tower_http::set_header::MakeHeaderValue<axum::http::Response<B>> for PublicCache {
+    fn make_header_value(&mut self, resp: &axum::http::Response<B>) -> Option<HeaderValue> {
+        (resp.status() == axum::http::StatusCode::OK
+            && !resp.headers().contains_key(header::SET_COOKIE))
+        .then(|| self.0.clone())
+    }
+}
+
 /// HTTPS only, referrer policy, opener isolation, MIME sniffing, framing and device
 /// features. The content security policy is [`Csp`], which needs configuring.
 pub async fn security(req: Request, next: Next) -> Response {
@@ -372,5 +420,52 @@ mod tests {
     #[should_panic(expected = "CSP directive value")]
     fn a_directive_that_would_inject_another_is_refused() {
         let _ = Csp::new().directive("img-src", "'self'; script-src *");
+    }
+
+    #[tokio::test]
+    async fn public_marks_only_plain_ok_pages() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/page", get(|| async { axum::response::Html("x") }))
+            .route(
+                "/cookie",
+                get(|| async { ([(header::SET_COOKIE, "a=b")], axum::response::Html("x")) }),
+            )
+            .route(
+                "/own",
+                get(|| async { ([(header::CACHE_CONTROL, "public, max-age=9")], "x") }),
+            )
+            .route("/gone", get(|| async { StatusCode::NOT_FOUND }))
+            .route_layer(public(std::time::Duration::from_secs(300)))
+            .layer(axum::middleware::from_fn(private_by_default));
+        let get = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let res = app
+                    .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                res.headers()
+                    .get(header::CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap().to_owned())
+            }
+        };
+        assert_eq!(get("/page").await.as_deref(), Some("public, max-age=300"));
+        assert_eq!(
+            get("/cookie").await.as_deref(),
+            Some(NEVER_CACHE),
+            "a cookie stays private"
+        );
+        assert_eq!(
+            get("/own").await.as_deref(),
+            Some("public, max-age=9"),
+            "the handler wins"
+        );
+        assert_eq!(get("/gone").await, None, "only a 200");
     }
 }
