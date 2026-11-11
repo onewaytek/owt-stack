@@ -31,6 +31,12 @@ pub struct PoolConfig {
     /// default): a transaction left open while its task awaits something else ends,
     /// and so do its locks and its connection. `None` leaves the server's setting.
     pub idle_in_transaction_timeout: Option<Duration>,
+    /// Whether the pool pings a connection before handing it out (`false` by default).
+    /// The ping is a round trip on every acquire, doubling the cost of a request's
+    /// single query; without it a connection that died while idle fails its query
+    /// instead, which a request answers as a 503 and the pool replaces. `true` trades
+    /// that round trip for fewer such errors after a database restart.
+    pub test_before_acquire: bool,
 }
 
 impl Default for PoolConfig {
@@ -41,6 +47,7 @@ impl Default for PoolConfig {
             acquire_timeout: Duration::from_secs(5),
             statement_timeout: Some(Duration::from_secs(30)),
             idle_in_transaction_timeout: Some(Duration::from_secs(60)),
+            test_before_acquire: false,
         }
     }
 }
@@ -79,6 +86,7 @@ impl PoolConfig {
             .max_connections(self.max)
             .min_connections(self.min)
             .acquire_timeout(self.acquire_timeout)
+            .test_before_acquire(self.test_before_acquire)
     }
 
     /// `opts` with this config's server-side limits as startup parameters, which win
@@ -408,6 +416,16 @@ mod tests {
         }
         .limits(opts);
         assert_eq!(none.get_options(), None);
+    }
+
+    #[test]
+    fn the_pool_does_not_ping_before_acquire_unless_told_to() {
+        assert!(!PoolConfig::default().options().get_test_before_acquire());
+        let pinging = PoolConfig {
+            test_before_acquire: true,
+            ..PoolConfig::default()
+        };
+        assert!(pinging.options().get_test_before_acquire());
     }
 
     #[test]
