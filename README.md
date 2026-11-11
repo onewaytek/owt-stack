@@ -2107,7 +2107,21 @@ on a used recovery code, and on any event with `while_pending` set (a factor enr
 pending sign-in, on a password alone). Ten wrong authenticator codes in a row lock it for 15 minutes
 (`MfaError::Locked { until, just_locked }`, counted in the database; the answer that locked it
 has an event, `err.locked_event(account_id)`, to email the owner about); a recovery code or
-`Mfa::unlock_totp` (for staff) unlocks it at once. A `SharedThrottle`'s `on_lockout` hook gets the throttle key of a
+`Mfa::unlock_totp` (for staff) unlocks it at once. `Mfa::lockout(after, for_)` tunes both
+(a practice that wants five codes and an hour, say), but cannot turn the lockout off: `after`
+is clamped to 3..=100 (NIST SP 800-63B-4 caps consecutive failures at 100) and `for_` to
+at least a minute.
+
+```rust
+use std::time::Duration;
+use owt_accounts::mfa::Mfa;
+
+let mfa = Mfa::new("Acme Health").lockout(5, Duration::from_hours(1));
+assert_eq!(mfa.lockout_policy(), (5, Duration::from_hours(1)));
+// Zero is not "off": the floor holds.
+assert_eq!(Mfa::new("Acme").lockout(0, Duration::ZERO).lockout_policy(), (3, Duration::from_mins(1)));
+```
+ A `SharedThrottle`'s `on_lockout` hook gets the throttle key of a
 second-factor lockout; `mfa::lockout_account(&lockout.account)` is the account id to email.
 
 **The policy and the secret.** `MfaPolicy::Optional` challenges only accounts that
@@ -6029,7 +6043,8 @@ this command, run when the app adopts a release, is the only thing that moves it
   account and epoch, and sensitive actions ask for a recent proof (`Recent`, `RecentMfa`);
   a sign-in that records nothing counts as stale. Factor changes need a `ChangeProof` from
   `Mfa::authorize_change`, move the account's session epoch on and reseal the current
-  session. Ten wrong codes lock the authenticator (persisted). The TOTP secret is stored
+  session. Ten wrong codes lock the authenticator (persisted; `Mfa::lockout` tunes it
+  within 3 to 100, never off). The TOTP secret is stored
   with a format and key id by an app-supplied `SecretSealer`. Enrolling from a pending
   sign-in is allowed under `Required` and flagged (`while_pending`) so the owner is told;
   the library does not require an emailed link.

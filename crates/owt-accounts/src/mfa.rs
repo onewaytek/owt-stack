@@ -31,7 +31,8 @@
 //! A pending sign-in expires ([`Mfa::pending_ttl`], ten minutes). Every wrong answer is
 //! charged to the throttle under a key of the account's ([`Key`]), so six digits cannot be
 //! guessed; and [`LOCK_AFTER`] wrong authenticator codes in a row (counted in the
-//! database, so across replicas and over days) lock it, until a recovery code or staff
+//! database, so across replicas and over days; [`Mfa::lockout`] tunes the count and
+//! the lock's length, never off) lock it, until a recovery code or staff
 //! ([`Mfa::unlock_totp`]) unlock it ([`MfaError::Locked`]: tell the owner).
 //!
 //! # Every door
@@ -457,7 +458,8 @@ pub enum MfaError {
     /// Answer 503.
     #[error("Signing in is unavailable for a moment. Please try again shortly.")]
     Unavailable,
-    /// The authenticator is locked for [`LOCK_FOR`] after too many wrong codes in a row.
+    /// The authenticator is locked for [`LOCK_FOR`] (or [`Mfa::lockout`]'s length) after
+    /// too many wrong codes in a row.
     /// A recovery code unlocks it at once, or staff do ([`Mfa::unlock_totp`]).
     #[error(
         "Too many wrong codes. Use a recovery code to unlock the authenticator, or try again in a few minutes."
@@ -632,11 +634,20 @@ impl Factors {
     }
 }
 
-/// Wrong authenticator codes in a row after which the factor is locked.
+/// Wrong authenticator codes in a row after which the factor is locked, unless
+/// [`Mfa::lockout`] says otherwise.
 pub const LOCK_AFTER: i32 = 10;
 
-/// How long a lock lasts if no recovery code or staff lifts it sooner.
+/// How long a lock lasts if no recovery code or staff lifts it sooner, unless
+/// [`Mfa::lockout`] says otherwise.
 pub const LOCK_FOR: Duration = Duration::from_mins(15);
+
+/// The fewest and most wrong codes in a row [`Mfa::lockout`] takes. NIST SP
+/// 800-63B-4 caps consecutive failed attempts at 100.
+pub const LOCK_AFTER_RANGE: std::ops::RangeInclusive<u32> = 3..=100;
+
+/// The shortest lock [`Mfa::lockout`] takes.
+pub const LOCK_FOR_MIN: Duration = Duration::from_mins(1);
 
 /// Proof that the person may change their factors now: made by [`Mfa::authorize_change`]
 /// and nothing else, and asked for by every function that changes them
@@ -659,6 +670,8 @@ pub struct Mfa {
     pending_ttl: Duration,
     recovery_codes: usize,
     accept_plaintext: bool,
+    lock_after: i32,
+    lock_for: Duration,
 }
 
 impl std::fmt::Debug for Mfa {
@@ -667,6 +680,8 @@ impl std::fmt::Debug for Mfa {
             .field("issuer", &self.issuer)
             .field("policy", &self.policy)
             .field("pending_ttl", &self.pending_ttl)
+            .field("lock_after", &self.lock_after)
+            .field("lock_for", &self.lock_for)
             .finish_non_exhaustive()
     }
 }
@@ -688,6 +703,8 @@ impl Mfa {
             pending_ttl: Duration::from_secs(600),
             recovery_codes: recovery::DEFAULT_COUNT,
             accept_plaintext: true,
+            lock_after: LOCK_AFTER,
+            lock_for: LOCK_FOR,
         }
     }
 
@@ -723,6 +740,25 @@ impl Mfa {
     pub fn pending_ttl(mut self, ttl: Duration) -> Self {
         self.pending_ttl = ttl;
         self
+    }
+
+    /// Lock the authenticator after `after` wrong codes in a row, for `for_` (by default
+    /// [`LOCK_AFTER`], 10, and [`LOCK_FOR`], 15 minutes). The lockout cannot be turned
+    /// off: `after` is clamped to [`LOCK_AFTER_RANGE`] (3 to 100) and `for_` to at least
+    /// [`LOCK_FOR_MIN`] (a minute). A recovery code or [`unlock_totp`](Self::unlock_totp)
+    /// still lifts a lock at once.
+    #[must_use]
+    pub fn lockout(mut self, after: u32, for_: Duration) -> Self {
+        let after = after.clamp(*LOCK_AFTER_RANGE.start(), *LOCK_AFTER_RANGE.end());
+        self.lock_after = i32::try_from(after).unwrap_or(LOCK_AFTER);
+        self.lock_for = for_.max(LOCK_FOR_MIN);
+        self
+    }
+
+    /// The lockout in force: wrong codes in a row, and how long the lock lasts.
+    #[must_use]
+    pub fn lockout_policy(&self) -> (u32, Duration) {
+        (self.lock_after.unsigned_abs(), self.lock_for)
     }
 
     /// How many recovery codes to issue (ten by default; at least one).
@@ -1186,7 +1222,7 @@ impl Mfa {
         Ok(Event::new(account.id, EventKind::Removed(Factor::Totp)))
     }
 
-    /// Unlock the authenticator after too many wrong codes ([`LOCK_AFTER`]): for staff
+    /// Unlock the authenticator after too many wrong codes ([`lockout`](Self::lockout)): for staff
     /// answering the owner. (A recovery code unlocks it by itself.)
     ///
     /// # Errors

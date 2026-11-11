@@ -1133,6 +1133,64 @@ async fn ten_wrong_codes_lock_the_authenticator_until_a_recovery_code_or_staff_u
     db.drop().await;
 }
 
+#[test]
+fn the_lockout_is_tunable_but_never_off() {
+    use owt_accounts::mfa::{LOCK_AFTER, LOCK_FOR};
+    let default = mfa().lockout_policy();
+    assert_eq!(default, (LOCK_AFTER.unsigned_abs(), LOCK_FOR));
+    assert_eq!(
+        mfa().lockout(5, Duration::from_mins(30)).lockout_policy(),
+        (5, Duration::from_mins(30))
+    );
+    assert_eq!(
+        mfa().lockout(0, Duration::ZERO).lockout_policy(),
+        (3, Duration::from_mins(1)),
+        "neither zero turns it off"
+    );
+    assert_eq!(mfa().lockout(u32::MAX, LOCK_FOR).lockout_policy().0, 100);
+}
+
+#[tokio::test]
+async fn a_tuned_lockout_locks_after_its_own_count_for_its_own_length() {
+    let db = db!();
+    let ada = account(&db, "ada", false).await;
+    let mfa = mfa().lockout(3, Duration::from_mins(5));
+    enroll(&db, &mfa, &ada).await;
+    let t = throttle();
+    let s = Session::<Data>::default();
+    mfa.password_sign_in(&db.pool, &t, &s, IP, "ada", PASSWORD)
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        let r = mfa
+            .challenge(&db.pool, &t, &s, IP, Answer::Totp("000000"))
+            .await;
+        if i < 3 {
+            assert!(matches!(r, Err(MfaError::Invalid)), "{i}: {r:?}");
+        } else {
+            assert!(
+                matches!(
+                    r,
+                    Err(MfaError::Locked {
+                        just_locked: true,
+                        ..
+                    })
+                ),
+                "{i}: {r:?}"
+            );
+        }
+    }
+    let (minutes,): (f64,) = sqlx::query_as(
+        "SELECT (EXTRACT(EPOCH FROM locked_until - now()) / 60)::float8 FROM account_totp WHERE account_id = $1",
+    )
+    .bind(ada.id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!((4.0..=5.0).contains(&minutes), "{minutes}");
+    db.drop().await;
+}
+
 #[tokio::test]
 async fn the_layer_holds_a_signature_from_any_door_to_the_second_factor() {
     let db = db!();
