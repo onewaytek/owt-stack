@@ -10,7 +10,7 @@ use owt_web::session::Session;
 use sqlx::PgPool;
 
 use super::state::{self, Kind, MfaSession, State};
-use super::{Event, EventKind, Factor, Key, LOCK_AFTER, LOCK_FOR, Limiter, Mfa, MfaError, Next};
+use super::{Event, EventKind, Factor, Key, Limiter, Mfa, MfaError, Next};
 use crate::session::{self, Signed};
 use crate::store::{self, Account};
 
@@ -141,7 +141,7 @@ impl Mfa {
     }
 
     /// A TOTP code against the account's confirmed authenticator, once. A wrong code is
-    /// counted; [`LOCK_AFTER`] in a row lock the authenticator.
+    /// counted; [`lockout`](Mfa::lockout)'s count in a row lock the authenticator.
     async fn check_totp(
         &self,
         pool: &PgPool,
@@ -176,7 +176,7 @@ impl Mfa {
         let (secret, reseal) = self.open(&stored, account.id)?;
         let last = last.and_then(|s| u64::try_from(s).ok());
         let Some(step) = totp::verify(&secret, code, now, last) else {
-            return Err(Self::count_failure(pool, account.id).await?);
+            return Err(self.count_failure(pool, account.id).await?);
         };
         let step = i64::try_from(step).map_err(|e| MfaError::fault(e.into()))?;
         // The check and the write are one statement: two requests with one code both
@@ -191,7 +191,7 @@ impl Mfa {
         .execute(pool)
         .await?;
         if moved.rows_affected() != 1 {
-            return Err(Self::count_failure(pool, account.id).await?);
+            return Err(self.count_failure(pool, account.id).await?);
         }
         if reseal {
             self.reseal(pool, account.id, &stored, &secret).await;
@@ -200,8 +200,8 @@ impl Mfa {
     }
 
     /// Count a wrong code; the error to answer with ([`MfaError::Locked`] when this one
-    /// locked the factor, for [`LOCK_FOR`]).
-    async fn count_failure(pool: &PgPool, account: i64) -> Result<MfaError, MfaError> {
+    /// locked the factor, for [`lockout`](Mfa::lockout)'s length).
+    async fn count_failure(&self, pool: &PgPool, account: i64) -> Result<MfaError, MfaError> {
         let (until, just): (Option<i64>, bool) = sqlx::query_as(
             "UPDATE account_totp SET failed_attempts = failed_attempts + 1,
                     locked_until = CASE WHEN failed_attempts + 1 >= $2 AND locked_until IS NULL
@@ -212,8 +212,8 @@ impl Mfa {
                        failed_attempts = $2 AND locked_until IS NOT NULL",
         )
         .bind(account)
-        .bind(LOCK_AFTER)
-        .bind(LOCK_FOR.as_secs_f64())
+        .bind(self.lock_after)
+        .bind(self.lock_for.as_secs_f64())
         .fetch_one(pool)
         .await?;
         Ok(match until {
