@@ -376,7 +376,11 @@ The OpenShift template passes it as a parameter (default `30m`), so an app sets
 `SESSION_IDLE_TIMEOUT=14d` or `off` in `params.env`. A builder call after `from_env`
 (`idle_timeout(d)`, `without_idle_timeout()`) wins over the variable, so an app that
 must keep a short timeout (staff-only, health data) calls it in code and the setting
-cannot loosen it. A mixed app keeps the app-wide session long and puts
+cannot loosen it. The first request through `Sessions::layer` logs the idle timeout
+in force and what set it at `info` (`session idle timeout idle_timeout=1800s
+source=default`; the source is `default`, `SESSION_IDLE_TIMEOUT` or `builder`; the
+timeout is `off` when none), so a manifest's value that the app's code overrode shows
+in the log. A mixed app keeps the app-wide session long and puts
 `StepUpGate::new(window)` on its staff router instead.
 
 ```rust
