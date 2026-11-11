@@ -227,7 +227,24 @@ URL's `options`. `migrate_locked` runs without the statement timeout; other long
 uses `SET LOCAL statement_timeout` in its transaction, or a pool with
 `statement_timeout: None` (`reserve_beside` builds one beside the main pool). `None`
 leaves either to the server. A connection pooler in transaction mode that refuses
-startup parameters needs both `None`, and the timeouts set on the database role. It also warns at start when the database is not
+startup parameters needs both `None`, and the timeouts set on the database role.
+The pool does not ping a connection before handing it out (`test_before_acquire:
+false`, unlike sqlx's default): the ping is a round trip on every acquire, doubling a
+signed-in request's account load. A connection that died while idle (a database
+restart, a switchover) then fails its one query, which the request answers as a 503,
+and the pool replaces it; `test_before_acquire: true` brings the ping back for an app
+that would rather pay the round trip.
+
+```rust,no_run
+# async fn demo(url: &str) -> anyhow::Result<()> {
+use owt_runtime::db::PoolConfig;
+let pool = PoolConfig { test_before_acquire: true, ..PoolConfig::from_env()? }
+    .connect(url)
+    .await?;
+# let _ = pool; Ok(()) }
+```
+
+`connect` also warns at start when the database is not
 on this machine and its TLS is not verified (`db::unverified_tls(&options)` asks the
 same of any `PgConnectOptions`): give the pod `PGSSLMODE=verify-full` and
 `PGSSLROOTCERT` (the OpenShift template does), since sqlx's default (`prefer`)
