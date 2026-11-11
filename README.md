@@ -1091,6 +1091,32 @@ let cache = match owt_runtime::env::var("REDIS_URL") {
 # let _ = cache; Ok(()) }
 ```
 
+**A route of public pages.** HTML that sets no `Cache-Control` stays `private` /
+`no-store` (`headers::private_by_default`, and `Stack` installs it): a shared cache must
+never keep a signed-in page. A route whose pages are the same for everyone (an about
+page, a public article, a map that changes on a tick) opts in with the route layer
+`headers::public(max_age)`, rather than each handler writing the header. It sets
+`public, max-age=N` on a `200` that sets no cookie and has no `Cache-Control` of its own;
+`headers::public_with(policy)` takes a whole `CachePolicy` (an edge lifetime, say). The
+session layer runs outside it, so a response that carries a cookie or a signed-in
+person's idle time is still marked private.
+
+```rust
+use std::time::Duration;
+use axum::{Router, response::Html, routing::get};
+use owt_web::{cache::CachePolicy, headers};
+
+let public = Router::<()>::new()
+    .route("/about", get(|| async { Html("<h1>About</h1>") }))
+    .route_layer(headers::public(Duration::from_mins(5)));
+let articles = Router::<()>::new()
+    .route("/articles/{slug}", get(|| async { Html("<article>…</article>") }))
+    .route_layer(headers::public_with(
+        CachePolicy::public(Duration::from_secs(60)).edge(Duration::from_hours(1)),
+    ));
+let _app: Router = public.merge(articles);
+```
+
 - **Policies:** `immutable()` for fingerprinted bytes, `public(d)` with `.edge(s_maxage)`
   and `.stale_while_revalidate(w)`, `public_until(remaining, browser_cap)`, and
   `no_store()`. A policy is a response part, and `Fragment::new` takes one through
