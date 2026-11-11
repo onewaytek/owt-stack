@@ -6206,6 +6206,23 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+- A CSP is always sent (`Stack` installs one; `report_only(true)` is the escape hatch
+  while a page is fixed). Its nonce is not: `Csp::static_policy()` drops every
+  `{nonce}` source (the default `'nonce-{nonce}'` in `script-src` and `style-src`),
+  mints no `Nonce`, and sends one precomputed header on every response. Use it for an
+  app whose templates have no inline `<script>` or `<style>` (scripts and styles come
+  from files) and whose pages are cached for everyone, where a per-request nonce would
+  be replayed to every viewer anyway. Every other directive stays, and a `directive()`
+  naming `{nonce}` after it panics at startup. The default keeps the nonce, and either
+  way the header is rendered once when the policy is built, not per request.
+
+  ```rust
+  use owt_web::headers::Csp;
+  // Pages cached at the edge, scripts and styles from /static only.
+  let _csp = Csp::new()
+      .directive("img-src", "'self' data: https://cdn.example")
+      .static_policy();
+  ```
 
 ## Upgrading from 0.13
 

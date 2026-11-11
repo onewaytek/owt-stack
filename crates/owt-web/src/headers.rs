@@ -148,7 +148,11 @@ pub async fn security(req: Request, next: Next) -> Response {
 /// default policy blocks every one, including those a page writes on purpose (a
 /// progress bar's width, a colour swatch); [`Csp::allow_style_attributes`] allows
 /// them. A page cached for many viewers replays one nonce; give such a page no inline
-/// scripts.
+/// scripts, or use [`Csp::static_policy`], which has no nonce at all.
+///
+/// The header is rendered once, when the policy is built: a request costs one join of
+/// the precomputed text around its nonce, or nothing beyond a clone under
+/// [`Csp::static_policy`].
 #[derive(Clone, Debug)]
 pub struct Csp(Arc<CspInner>);
 
@@ -156,6 +160,40 @@ pub struct Csp(Arc<CspInner>);
 struct CspInner {
     directives: Vec<(String, String)>,
     report_only: bool,
+    static_policy: bool,
+    rendered: Rendered,
+}
+
+/// The policy's header, rendered from the directives whenever they change.
+#[derive(Clone, Debug)]
+enum Rendered {
+    /// The text between `{nonce}`s: the header is these joined by the request's nonce.
+    Segments(Vec<String>),
+    /// No nonce: the whole header, ready to send.
+    Static(HeaderValue),
+}
+
+impl CspInner {
+    fn text(&self) -> String {
+        self.directives
+            .iter()
+            .map(|(k, v)| format!("{k} {v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn rerender(&mut self) {
+        let text = self.text();
+        self.rendered = if self.static_policy {
+            // Values are checked printable ASCII, so this never falls back.
+            Rendered::Static(
+                HeaderValue::from_str(&text)
+                    .unwrap_or(HeaderValue::from_static("default-src 'self'")),
+            )
+        } else {
+            Rendered::Segments(text.split("{nonce}").map(str::to_owned).collect())
+        };
+    }
 }
 
 impl Default for Csp {
@@ -178,13 +216,17 @@ impl Csp {
             ("form-action", "'self'"),
             ("frame-ancestors", "'none'"),
         ];
-        Self(Arc::new(CspInner {
+        let mut inner = CspInner {
             directives: directives
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect(),
             report_only: false,
-        }))
+            static_policy: false,
+            rendered: Rendered::Segments(Vec::new()),
+        };
+        inner.rerender();
+        Self(Arc::new(inner))
     }
 
     /// Set (or replace) the directive `name`; an empty `value` removes it.
@@ -192,7 +234,8 @@ impl Csp {
     /// # Panics
     /// If `name` is not a directive name (letters and `-`) or `value` holds a `;`, a
     /// `,` or anything a header cannot carry: a policy that could not be sent would
-    /// otherwise leave every page with none.
+    /// otherwise leave every page with none. Under [`static_policy`](Self::static_policy),
+    /// also if `value` holds `{nonce}`: there is no nonce to put there.
     #[must_use]
     pub fn directive(mut self, name: &str, value: &str) -> Self {
         assert!(
@@ -206,10 +249,38 @@ impl Csp {
             "CSP directive value for {name}: {value:?}"
         );
         let inner = Arc::make_mut(&mut self.0);
+        assert!(
+            !(inner.static_policy && value.contains("{nonce}")),
+            "CSP directive value for {name} uses {{nonce}}, and a static policy has none: {value:?}"
+        );
         inner.directives.retain(|(k, _)| k != name);
         if !value.is_empty() {
             inner.directives.push((name.to_owned(), value.to_owned()));
         }
+        inner.rerender();
+        self
+    }
+
+    /// A policy with no nonce: every source naming `{nonce}` (the default
+    /// `'nonce-{nonce}'` in `script-src` and `style-src`) is dropped, a directive left
+    /// empty goes with it, and the layer mints no [`Nonce`]. The header is the same on
+    /// every response, so a page cached for everyone carries a policy that is true for
+    /// every viewer. Inline `<script>` and `<style>` elements are then blocked, nonce or
+    /// not: scripts and styles come from files. The policy is still sent, enforced
+    /// unless [`report_only`](Self::report_only) says otherwise.
+    #[must_use]
+    pub fn static_policy(mut self) -> Self {
+        let inner = Arc::make_mut(&mut self.0);
+        inner.static_policy = true;
+        for (_, value) in &mut inner.directives {
+            *value = value
+                .split(' ')
+                .filter(|source| !source.is_empty() && !source.contains("{nonce}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        inner.directives.retain(|(_, v)| !v.is_empty());
+        inner.rerender();
         self
     }
 
@@ -230,20 +301,33 @@ impl Csp {
         self
     }
 
+    #[cfg(test)]
     fn render(&self, nonce: &str) -> String {
-        self.0
-            .directives
-            .iter()
-            .map(|(k, v)| format!("{k} {}", v.replace("{nonce}", nonce)))
-            .collect::<Vec<_>>()
-            .join("; ")
+        match &self.0.rendered {
+            Rendered::Segments(parts) => parts.join(nonce),
+            Rendered::Static(v) => v.to_str().unwrap_or_default().to_owned(),
+        }
+    }
+
+    /// The header for a request with `nonce` (none under a static policy).
+    fn header(&self, nonce: Option<&Nonce>) -> Option<HeaderValue> {
+        match (&self.0.rendered, nonce) {
+            (Rendered::Static(v), _) => Some(v.clone()),
+            (Rendered::Segments(parts), Some(nonce)) => {
+                HeaderValue::try_from(parts.join(nonce.as_str())).ok()
+            }
+            (Rendered::Segments(_), None) => None,
+        }
     }
 
     /// Middleware body, for `from_fn_with_state(csp, Csp::layer)`: mint the request's
-    /// [`Nonce`] and send the policy with any response that carries none.
+    /// [`Nonce`] (none under [`static_policy`](Self::static_policy)) and send the policy
+    /// with any response that carries none.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
-        let nonce = Nonce::new();
-        req.extensions_mut().insert(nonce.clone());
+        let nonce = (!this.0.static_policy).then(Nonce::new);
+        if let Some(nonce) = &nonce {
+            req.extensions_mut().insert(nonce.clone());
+        }
         let mut resp = next.run(req).await;
         let name = if this.0.report_only {
             header::CONTENT_SECURITY_POLICY_REPORT_ONLY
@@ -251,7 +335,7 @@ impl Csp {
             header::CONTENT_SECURITY_POLICY
         };
         if !resp.headers().contains_key(&name)
-            && let Ok(v) = HeaderValue::from_str(&this.render(&nonce.0))
+            && let Some(v) = this.header(nonce.as_ref())
         {
             resp.headers_mut().insert(name, v);
         }
@@ -467,5 +551,75 @@ mod tests {
             "the handler wins"
         );
         assert_eq!(get("/gone").await, None, "only a 200");
+    }
+
+    #[test]
+    fn the_precomputed_header_matches_a_fresh_render() {
+        let csp = Csp::new().directive("img-src", "'self' data: https://cdn.test");
+        assert_eq!(
+            csp.render("abc"),
+            "default-src 'self'; script-src 'self' 'nonce-abc'; style-src 'self' 'nonce-abc'; \
+             object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; \
+             img-src 'self' data: https://cdn.test"
+        );
+    }
+
+    #[test]
+    fn a_static_policy_has_no_nonce_and_keeps_every_other_source() {
+        let csp = Csp::new()
+            .directive("script-src", "'self' 'nonce-{nonce}' https://cdn.test")
+            .directive("style-src", "'nonce-{nonce}'")
+            .static_policy()
+            .allow_style_attributes();
+        let policy = csp.render("unused");
+        assert!(!policy.contains("nonce"), "{policy}");
+        assert!(
+            policy.contains("script-src 'self' https://cdn.test"),
+            "{policy}"
+        );
+        assert!(
+            !policy.contains("style-src "),
+            "an emptied directive goes: {policy}"
+        );
+        assert!(
+            policy.contains("style-src-attr 'unsafe-inline'"),
+            "{policy}"
+        );
+        assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
+    }
+
+    #[tokio::test]
+    async fn a_static_policy_is_sent_and_mints_no_nonce() {
+        let app = Router::new()
+            .route(
+                "/",
+                get(|req: Request| async move {
+                    assert!(req.extensions().get::<Nonce>().is_none());
+                    Html("x")
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Csp::new().static_policy(),
+                Csp::layer,
+            ));
+        let res = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let policy = res.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap();
+        assert!(
+            policy.starts_with("default-src 'self'; script-src 'self';"),
+            "{policy}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "static policy")]
+    fn a_static_policy_refuses_a_nonce() {
+        let _ = Csp::new()
+            .static_policy()
+            .directive("script-src", "'nonce-{nonce}'");
     }
 }
