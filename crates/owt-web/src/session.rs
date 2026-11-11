@@ -249,11 +249,47 @@ fn oversized(encoded_len: usize) -> bool {
 /// a day at most.
 pub const ABSOLUTE_LIFETIME: Duration = Duration::from_hours(24);
 
-/// How long a session lasts without activity, unless [`Sessions::idle_timeout`] says
-/// otherwise or [`Sessions::without_idle_timeout`] turns it off: 30 minutes, NIST SP
-/// 800-63B-4's inactivity bound at AAL2. A workforce app handling health data sets
-/// less (15 minutes, AAL3's).
+/// How long a session lasts without activity, unless `SESSION_IDLE_TIMEOUT` (read by
+/// [`Sessions::from_env`]), [`Sessions::idle_timeout`] or
+/// [`Sessions::without_idle_timeout`] says otherwise: 30 minutes. That is inside
+/// NIST SP 800-63B-4's inactivity bound at AAL2 (1 hour) and OWASP's 15 to 30 minutes
+/// for low-risk applications; at AAL1 NIST requires none. A workforce app handling
+/// health data sets less (15 minutes, AAL3's).
 pub const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// The variable [`Sessions::from_env`] reads the idle timeout from.
+pub const IDLE_TIMEOUT_VAR: &str = "SESSION_IDLE_TIMEOUT";
+
+/// An idle timeout as `SESSION_IDLE_TIMEOUT` writes it: whole seconds, minutes, hours
+/// or days (`90s`, `30m`, `8h`, `14d`), or `off` for none. `None` is `off`.
+fn parse_idle_timeout(value: &str) -> anyhow::Result<Option<Duration>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let unit = value.chars().last().unwrap_or(' ');
+    let per = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => anyhow::bail!(
+            "{IDLE_TIMEOUT_VAR} is `{value}`, not a duration (`30m`, `8h`, `14d`) or `off`"
+        ),
+    };
+    let n: u64 = value[..value.len() - 1].trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "{IDLE_TIMEOUT_VAR} is `{value}`, not a duration (`30m`, `8h`, `14d`) or `off`"
+        )
+    })?;
+    anyhow::ensure!(
+        n > 0,
+        "{IDLE_TIMEOUT_VAR} is zero: write `off` for no idle timeout"
+    );
+    n.checked_mul(per)
+        .map(|secs| Some(Duration::from_secs(secs)))
+        .ok_or_else(|| anyhow::anyhow!("{IDLE_TIMEOUT_VAR} is `{value}`, too long"))
+}
 
 /// What the cookie holds, before sealing. Field names are short: they ride on every
 /// request.
@@ -310,8 +346,15 @@ impl<T: SessionData> Sessions<T> {
     /// secret `SESSION_SECRET` (required), derived with [`key_for`] for the purpose
     /// [`purpose_from`] reads (`myapp/production`, `myapp/local`).
     ///
+    /// The idle timeout is [`IDLE_TIMEOUT`], 30 minutes, unless `SESSION_IDLE_TIMEOUT`
+    /// is set: a duration (`90s`, `30m`, `8h`, `14d`) for
+    /// [`idle_timeout`](Self::idle_timeout), or `off` for
+    /// [`without_idle_timeout`](Self::without_idle_timeout). A blank value is unset. A
+    /// builder call after `from_env` wins over the variable.
+    ///
     /// # Errors
     ///
+    /// `SESSION_IDLE_TIMEOUT` is set and is neither a duration above zero nor `off`.
     /// `SESSION_SECRET` is unset or not a secret [`key_for`] takes, the purpose is not
     /// one it takes, or the app runs in a pod (`KUBERNETES_SERVICE_HOST` is set) and
     /// none of `SESSION_KEY_PURPOSE`, `SESSION_PURPOSE` and `POD_NAMESPACE` is: `local`
@@ -364,7 +407,17 @@ impl<T: SessionData> Sessions<T> {
         })?;
         let key = key_for(&secret, &purpose)
             .map_err(|e| anyhow::anyhow!("the session key from SESSION_SECRET: {e}"))?;
-        Ok(Self::new(key, cookie, max_age, secure))
+        let sessions = Self::new(key, cookie, max_age, secure);
+        Ok(
+            match set(IDLE_TIMEOUT_VAR)
+                .map(|v| parse_idle_timeout(&v))
+                .transpose()?
+            {
+                None => sessions,
+                Some(Some(timeout)) => sessions.idle_timeout(timeout),
+                Some(None) => sessions.without_idle_timeout(),
+            },
+        )
     }
 
     /// End every session this long after it began, however recently it was re-sealed.
@@ -1121,6 +1174,65 @@ mod env_tests {
         assert!(moved.opens(&new));
         assert!(!moved.opens(&old), "a new purpose alone signs everyone out");
         assert!(moved.also_open_with(old.clone()).opens(&old));
+    }
+
+    #[test]
+    fn the_idle_timeout_comes_from_the_environment_or_stays_thirty_minutes() {
+        let s = secret();
+        let age = Duration::from_secs(60);
+        let idle = |value: Option<&str>| {
+            let mut pairs = vec![("SESSION_SECRET", s.as_str())];
+            pairs.extend(value.map(|v| (IDLE_TIMEOUT_VAR, v)));
+            Sessions::<D>::from_vars("myapp", "s", age, true, vars(&pairs)).map(|s| s.idle())
+        };
+        assert_eq!(
+            idle(None).unwrap(),
+            Some(IDLE_TIMEOUT),
+            "unset keeps the default"
+        );
+        assert_eq!(
+            idle(Some(" ")).unwrap(),
+            Some(IDLE_TIMEOUT),
+            "blank is unset"
+        );
+        assert_eq!(idle(Some("30m")).unwrap(), Some(Duration::from_mins(30)));
+        assert_eq!(idle(Some("90s")).unwrap(), Some(Duration::from_secs(90)));
+        assert_eq!(idle(Some("8h")).unwrap(), Some(Duration::from_hours(8)));
+        assert_eq!(
+            idle(Some("14d")).unwrap(),
+            Some(Duration::from_hours(14 * 24))
+        );
+        assert_eq!(idle(Some("off")).unwrap(), None);
+        assert_eq!(idle(Some("OFF")).unwrap(), None);
+        for bad in [
+            "0m",
+            "30",
+            "m",
+            "-5m",
+            "30 minutes",
+            "1.5h",
+            "false",
+            "99999999999999999d",
+        ] {
+            let e = idle(Some(bad))
+                .err()
+                .unwrap_or_else(|| panic!("{bad} refused"));
+            assert!(e.to_string().contains(IDLE_TIMEOUT_VAR), "{bad}: {e}");
+        }
+        let built = Sessions::<D>::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[("SESSION_SECRET", &s), (IDLE_TIMEOUT_VAR, "off")]),
+        )
+        .unwrap()
+        .idle_timeout(Duration::from_mins(15));
+        assert_eq!(
+            built.idle(),
+            Some(Duration::from_mins(15)),
+            "the builder wins"
+        );
     }
 
     #[test]
