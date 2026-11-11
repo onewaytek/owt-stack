@@ -41,6 +41,14 @@
 //! for a public site with no sensitive data) sets [`FailMode::Open`], and every error is
 //! then logged and allowed.
 //!
+//! Between the two, [`FailMode::Local`] keeps counting during an outage, in this
+//! process, against the same budgets (an in-process [`Throttle`](super::Throttle)):
+//! sign-ins go on, and guessing stays bounded, at N times each budget with N replicas.
+//! It suits a budget that guards a mailbox or a form rather than a password (an
+//! emailed sign-in link, a sign-up); for passwords on sensitive data keep `Closed`.
+//! Refusals while counting locally never report `just_locked` and do not call the
+//! lockout hook, since a replica's local count is not the account's.
+//!
 //! # Telling the owner
 //!
 //! The first sign-in refused in a window because an account's budget ran out returns
@@ -56,7 +64,14 @@ use std::time::Duration;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use sha2::{Digest, Sha256};
 
-use super::{Budgets, account_key, client_key};
+use super::{Budgets, Throttle, account_key, client_key};
+
+/// What a count came to: Redis's answer (the refusing key's index, 1-based, and whether
+/// it was the first, or `None`), or "count locally" under [`FailMode::Local`].
+enum Counted {
+    Shared(Option<(usize, bool)>),
+    Local,
+}
 
 /// What the throttle does when Redis cannot answer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,6 +81,9 @@ pub enum FailMode {
     Closed,
     /// Allow, and log the error.
     Open,
+    /// Count in this process instead, against the same budgets, and log the error:
+    /// see the module documentation.
+    Local,
 }
 
 /// Why a sign-in or attempt was refused.
@@ -111,6 +129,7 @@ pub struct SharedThrottle {
     prefix: Arc<str>,
     budgets: Budgets,
     fail: FailMode,
+    local: Arc<Throttle>,
     hook: Option<Hook>,
     script: Arc<redis::Script>,
     call_budget: Duration,
@@ -194,6 +213,7 @@ impl SharedThrottle {
             prefix: prefix.into(),
             budgets,
             fail: FailMode::default(),
+            local: Arc::new(Throttle::new(budgets)),
             hook: None,
             script: Arc::new(redis::Script::new(COUNT)),
             call_budget: Duration::from_secs(2),
@@ -205,7 +225,8 @@ impl SharedThrottle {
         self
     }
 
-    /// What to do when Redis fails (closed by default).
+    /// What to do when Redis fails: refuse ([`FailMode::Closed`], the default), allow
+    /// ([`FailMode::Open`]) or count in this process ([`FailMode::Local`]).
     #[must_use]
     pub fn fail_mode(mut self, mode: FailMode) -> Self {
         self.fail = mode;
@@ -235,11 +256,7 @@ impl SharedThrottle {
 
     /// Run the counting script over `keys` with `limits` (budget, window) each; the
     /// refusing key's index (1-based) and whether it was the first, or `None`.
-    async fn count(
-        &self,
-        keys: &[String],
-        limits: &[(u32, Duration)],
-    ) -> Result<Option<(usize, bool)>, Refusal> {
+    async fn count(&self, keys: &[String], limits: &[(u32, Duration)]) -> Result<Counted, Refusal> {
         let mut invocation = self.script.prepare_invoke();
         for key in keys {
             invocation.key(key);
@@ -260,14 +277,17 @@ impl SharedThrottle {
         )
         .await;
         match answer {
-            Ok(Ok((0, _))) => Ok(None),
-            Ok(Ok((i, first))) => Ok(Some((usize::try_from(i).unwrap_or(1), first == 1))),
+            Ok(Ok((0, _))) => Ok(Counted::Shared(None)),
+            Ok(Ok((i, first))) => Ok(Counted::Shared(Some((
+                usize::try_from(i).unwrap_or(1),
+                first == 1,
+            )))),
             Ok(Err(e)) => self.failed(&e.to_string()),
             Err(_) => self.failed("timed out"),
         }
     }
 
-    fn failed(&self, why: &str) -> Result<Option<(usize, bool)>, Refusal> {
+    fn failed(&self, why: &str) -> Result<Counted, Refusal> {
         match self.fail {
             FailMode::Closed => {
                 tracing::error!(error = why, "the shared throttle failed, refusing (closed)");
@@ -275,7 +295,14 @@ impl SharedThrottle {
             }
             FailMode::Open => {
                 tracing::error!(error = why, "the shared throttle failed, allowing (open)");
-                Ok(None)
+                Ok(Counted::Shared(None))
+            }
+            FailMode::Local => {
+                tracing::error!(
+                    error = why,
+                    "the shared throttle failed, counting in this process (local)"
+                );
+                Ok(Counted::Local)
             }
         }
     }
@@ -298,8 +325,9 @@ impl SharedThrottle {
             .count(&[self.key("att", &addr)], &[self.attempt_limit()])
             .await?
         {
-            None => Ok(()),
-            Some(_) => Err(Refusal::Attempts),
+            Counted::Shared(None) => Ok(()),
+            Counted::Local if self.local.attempt(address) => Ok(()),
+            Counted::Shared(Some(_)) | Counted::Local => Err(Refusal::Attempts),
         }
     }
 
@@ -323,7 +351,14 @@ impl SharedThrottle {
             (self.budgets.sign_ins_per_address, minute),
             (self.budgets.sign_ins_per_account, minute),
         ];
-        match self.count(&keys, &limits).await? {
+        let refused = match self.count(&keys, &limits).await? {
+            Counted::Shared(refused) => refused,
+            Counted::Local => self
+                .local
+                .refused_sign_in(address, &account)
+                .map(|i| (i, false)),
+        };
+        match refused {
             None => Ok(()),
             Some((1, _)) => Err(Refusal::Attempts),
             Some((2, _)) => Err(Refusal::Address),
@@ -540,5 +575,15 @@ mod tests {
         );
         let open = t.clone().fail_mode(FailMode::Open);
         assert_eq!(open.sign_in(ip(2), "ann").await, Ok(()));
+        // Local counts in this process against the same budget (5 to an account),
+        // and never reports a first lockout.
+        let local = t.clone().fail_mode(FailMode::Local);
+        for _ in 0..5 {
+            assert_eq!(local.sign_in(ip(3), "ann").await, Ok(()));
+        }
+        assert_eq!(
+            local.sign_in(ip(4), "ann").await,
+            Err(Refusal::Account { just_locked: false })
+        );
     }
 }

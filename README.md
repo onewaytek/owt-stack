@@ -1435,8 +1435,20 @@ its own), as the leases do. **When Redis
 fails, sign-in fails closed** (`Refusal::Unavailable`: answer 503, not "too many
 attempts"): the throttle is all that bounds online guessing, and an outage that locks
 people out is a better failure for health records than one that lets an attacker guess;
-`FailMode::Open` reverses it. `on_lockout` is called once per window when an account
-crosses its limit, the moment to email its owner.
+`FailMode::Open` reverses it. `FailMode::Local` is the posture between: during an
+outage it counts in the process, against the same budgets, as `Throttle` does, so
+sign-ins go on and guessing stays bounded (at N times each budget with N replicas). Use
+it for a budget guarding a mailbox or a form rather than a password (an emailed sign-in
+link, a sign-up), where an outage should neither stop sign-ins nor stop counting; keep
+`Closed` for passwords on sensitive data. A refusal counted locally never has
+`just_locked` set and does not call the hook. `on_lockout` is called once per window
+when an account crosses its limit, the moment to email its owner.
+
+| `FailMode` | Redis down |
+|---|---|
+| `Closed` (default) | Every sign-in and attempt refused, `Refusal::Unavailable` (503) |
+| `Local` | Counted in this process against the same budgets; refused as usual when spent |
+| `Open` | Every sign-in and attempt allowed, uncounted; each error logged |
 
 ```rust,no_run
 # async fn demo(url: &str, ip: std::net::IpAddr, account: &str) -> anyhow::Result<()> {
@@ -1456,6 +1468,12 @@ match throttle.sign_in(ip, account).await {
     Err(Refusal::Unavailable) => { /* 503, and page whoever runs Redis */ }
     Err(_) => { /* 429 */ }
 }
+
+// An emailed sign-in link's budget: keep counting, per replica, through an outage.
+let links = SharedThrottle::connect(url, "myapp-links", Budgets::default())
+    .await?
+    .fail_mode(FailMode::Local);
+if links.attempt(ip).await.is_err() { /* 429 */ }
 # Ok(())
 # }
 ```
@@ -6035,7 +6053,8 @@ this command, run when the app adopts a release, is the only thing that moves it
   the library does not require an emailed link.
 - **The shared throttle fails closed.** If Redis is unreachable, sign-in is refused
   (`Refusal::Unavailable`) rather than allowed unthrottled: the throttle is the only
-  bound on online guessing. `FailMode::Open` is the app's choice to make.
+  bound on online guessing. `FailMode::Local` (count per replica during the outage) and
+  `FailMode::Open` are the app's choice to make.
 - **Library code holds no `query!` macros**, so it needs no `.sqlx/` metadata and builds
   offline anywhere.
 - **Metric names belong to the app.** The library takes them as arguments, so an app's
