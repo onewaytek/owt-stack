@@ -336,13 +336,59 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
 cookie lives without being resealed), `absolute_lifetime` (from sign-in, however
 active: `session::ABSOLUTE_LIFETIME`, 24 hours, unless set, or `max_age` if longer),
 and `idle_timeout` (since the person's last activity: `session::IDLE_TIMEOUT`, 30
-minutes, unless set). These are NIST SP 800-63B-4's AAL2 bounds; an app handling
-health data sets AAL3's (12 hours, 15 minutes). An app whose sessions guard nothing
-a copied cookie could misuse (a game's guest identity) may call
-`without_idle_timeout()`. Revocation is the epoch above:
+minutes, unless set). The 24 hours is NIST SP 800-63B-4's reauthentication bound at
+AAL2; the 30 minutes is inside its AAL2 inactivity bound (1 hour) and OWASP's 15 to
+30 minutes for low-risk applications. An app handling health data sets AAL3's (12
+hours, 15 minutes). Revocation is the epoch above:
 `sign_out_everywhere`, a password change or a deactivation moves the account's
 `session_epoch`, and the validator refuses every session sealed under the old one on
 its next request, on every replica.
+
+**The idle timeout is on by default, at 30 minutes.** A person who leaves a tab for
+half an hour is signed out, whatever `max_age` says, and each refresh of the
+last-active time sends a `Set-Cookie`, which makes that response private to shared
+caches. That suits staff areas and health data; a public or low-risk app (a game, a
+reading site) usually wants days or none. `Sessions::from_env` and `from_vars` read
+it from the environment:
+
+| Variable | Value | Unset |
+|---|---|---|
+| `SESSION_IDLE_TIMEOUT` | Whole seconds, minutes, hours or days (`90s`, `30m`, `8h`, `14d`), or `off` for none. Zero, a bare number or another unit is an error at startup. | 30 minutes (`session::IDLE_TIMEOUT`); blank is unset |
+
+The OpenShift template passes it as a parameter (default `30m`), so an app sets
+`SESSION_IDLE_TIMEOUT=14d` or `off` in `params.env`. A builder call after `from_env`
+(`idle_timeout(d)`, `without_idle_timeout()`) wins over the variable, so an app that
+must keep a short timeout (staff-only, health data) calls it in code and the setting
+cannot loosen it. A mixed app keeps the app-wide session long and puts
+`StepUpGate::new(window)` on its staff router instead.
+
+```rust
+# fn main() -> anyhow::Result<()> {
+use std::time::Duration;
+use owt_web::session::{IDLE_TIMEOUT, Sessions};
+# #[derive(Clone, Default, serde::Serialize, serde::Deserialize)] struct SessionData;
+# let secret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==".to_owned();
+let env = |idle: &'static str| {
+    let secret = secret.clone();
+    move |name: &str| match name {
+        "SESSION_SECRET" => Some(secret.clone()),
+        "SESSION_IDLE_TIMEOUT" => Some(idle.to_owned()),
+        _ => None,
+    }
+};
+let max_age = Duration::from_secs(14 * 86_400);
+let reading = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("14d"))?;
+assert_eq!(reading.idle(), Some(Duration::from_secs(14 * 86_400)));
+let game = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("off"))?;
+assert_eq!(game.idle(), None);
+let unset = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env(""))?;
+assert_eq!(unset.idle(), Some(IDLE_TIMEOUT), "30 minutes");
+// Code wins: a staff app pins its own window whatever the environment says.
+let staff = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("off"))?
+    .idle_timeout(Duration::from_mins(15));
+assert_eq!(staff.idle(), Some(Duration::from_mins(15)));
+# Ok(()) }
+```
 
 With an idle timeout, the cookie also carries the last-active time. Activity (a
 request that carries the session, is not passive and does not fail) refreshes it at
@@ -492,7 +538,9 @@ the handler and write `<script nonce="{{ nonce }}">`.
   (the whole purpose, taken exactly), else `myapp/` plus `SESSION_PURPOSE`, else
   `POD_NAMESPACE`, else `local` (`session::purpose_from`); `local` is for
   development, and in a pod (`KUBERNETES_SERVICE_HOST` set) without any of the three
-  variables it is an error. `Sessions::from_vars` reads a map instead, for tests.
+  variables it is an error. It also reads `SESSION_IDLE_TIMEOUT` (30 minutes when
+  unset; see "Idle timeout and lifetimes"). `Sessions::from_vars` reads a map
+  instead, for tests.
 
   **Moving onto `from_env` without signing anyone out.** The key must stay the one
   the app derives today, so first read the purpose actually in effect, from the live
@@ -5493,7 +5541,9 @@ optional: until it exists, the app starts without it. A variable the template se
 (`DATABASE_URL`, `PGSSLMODE`, `BIND_ADDR`, `RUST_LOG`, …) wins over the Secret's;
 `RUST_LOG` is the template's `RUST_LOG` parameter (default `info`), so a narrower
 filter goes in `params.env` (`RUST_LOG=info,myapp=debug`), or in a task's
-`jobs/<JOB>.env` for that task alone. A
+`jobs/<JOB>.env` for that task alone. `SESSION_IDLE_TIMEOUT` is a parameter too
+(default `30m`): a low-risk app sets `SESSION_IDLE_TIMEOUT=14d` or `off` in
+`params.env`. A
 Secret's change reaches pods only when they start, so restart after one.
 
 `env.sh`, beside `apply.sh`, makes the Secret idempotently from `env.env`, one

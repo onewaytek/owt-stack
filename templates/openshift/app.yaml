@@ -103,6 +103,13 @@ parameters:
   - name: RUST_LOG
     description: The log filter (info, or info,myapp=debug); never empty.
     value: info
+  # How long a session lasts without activity, read by `Sessions::from_env`: 30m is
+  # owt-web's default. A public or low-risk app sets days (14d) or `off` in params.env;
+  # a staff or health-data app keeps 30m or less. A builder call in the app's code
+  # (`idle_timeout`, `without_idle_timeout`) wins over it.
+  - name: SESSION_IDLE_TIMEOUT
+    description: The session idle timeout (90s, 30m, 8h, 14d) or off.
+    value: 30m
   - name: METRICS_NAMESPACE
     description: The namespace whose Prometheus scrapes the metrics port.
     value: openshift-user-workload-monitoring
@@ -281,6 +288,7 @@ objects:
                   valueFrom:
                     secretKeyRef: {name: "${NAME}-redis", key: url, optional: true}
                 - {name: RUST_LOG, value: "${RUST_LOG}"}
+                - {name: SESSION_IDLE_TIMEOUT, value: "${SESSION_IDLE_TIMEOUT}"}
               volumeMounts:
                 - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
                 - {name: tmp, mountPath: /tmp}
