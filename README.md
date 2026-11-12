@@ -4674,6 +4674,16 @@ the element wins.
 }
 ```
 
+**Buttons** come in four weights. `owt-button` is the primary (accent fill);
+`owt-button owt-button-secondary` is outlined; `owt-button owt-button-danger` is a
+filled red for the one destructive action a form exists for; and
+`owt-button owt-button-quiet` is a low-emphasis, underlined button in the ink colour
+for harmless actions (Pin, Hide, Cancel, Sign out). A quiet button that destroys
+something adds `owt-button-quiet-danger`, which turns it red, so red always means
+danger: `<button class="owt-button owt-button-quiet owt-button-quiet-danger">Remove</button>`.
+Every weight shows a 2 px ink outline, offset 2 px, on keyboard focus
+(`:focus-visible`); a mouse click draws none.
+
 Two forms on one page with a field of the same name give each its own `id`
 (`Field::text("email", "Email").id("invite-email")`), so labels and
 `aria-describedby` stay attached to the right input. Page links drop `?page=1`, so
