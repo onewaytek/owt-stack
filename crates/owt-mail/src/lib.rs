@@ -314,7 +314,7 @@ impl Mail {
     /// What the outbox holds, oldest first; empty for any other transport.
     #[must_use]
     pub fn sent(&self) -> Vec<Email> {
-        self.outbox_ref().map(Outbox::sent).unwrap_or_default()
+        self.outbox_ref().map_or_default(Outbox::sent)
     }
 
     /// Send `email`.

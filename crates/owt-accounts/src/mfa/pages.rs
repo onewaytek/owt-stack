@@ -1077,7 +1077,7 @@ async fn enroll<T: MfaSession>(
         Ok(proof) => proof,
         Err(e) => return step_up_or_sign_in(&p, &parts, e, &again),
     };
-    let code = form.code.as_deref().map(str::trim).unwrap_or_default();
+    let code = form.code.as_deref().map_or_default(str::trim);
     let refused = if code.is_empty() {
         MfaError::Invalid
     } else if let Err(t) = p.limiter.charge(ip, Key::SecondFactor(account.id)).await {
