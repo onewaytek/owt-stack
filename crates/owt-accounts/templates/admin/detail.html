@@ -46,7 +46,7 @@
 {% else %}<table class="owt-table">
 <thead><tr><th scope="col">{{ v.words.provider }}</th><th scope="col">{{ v.words.shown_as }}</th><th scope="col"><span class="owt-sr">{{ v.words.actions }}</span></th></tr></thead>
 <tbody>
-{% for i in v.connections %}<tr><td>{{ i.provider }}</td><td>{{ i.label }}</td><td><form method="post" action="{{ i.unlink }}"><button class="owt-button owt-button-quiet" type="submit">{{ v.words.remove }}</button></form></td></tr>
+{% for i in v.connections %}<tr><td>{{ i.provider }}</td><td>{{ i.label }}</td><td><form method="post" action="{{ i.unlink }}"><button class="owt-button owt-button-quiet owt-button-quiet-danger" type="submit">{{ v.words.remove }}</button></form></td></tr>
 {% endfor %}</tbody>
 </table>
 {% endif %}{% if !v.local_identities.is_empty() %}<h3>{{ v.words.local_identities }}</h3>
@@ -54,7 +54,7 @@
 <table class="owt-table">
 <thead><tr><th scope="col">{{ v.words.key }}</th><th scope="col">{{ v.words.subject }}</th><th scope="col">{{ v.words.added }}</th><th scope="col">{{ v.words.last_sign_in }}</th><th scope="col"><span class="owt-sr">{{ v.words.actions }}</span></th></tr></thead>
 <tbody>
-{% for l in v.local_identities %}<tr><td>{{ l.key }}</td><td>{{ l.subject }}</td><td>{{ l.created }}</td><td>{{ l.last_sign_in }}</td><td>{% if !v.myself %}<form method="post" action="{{ l.forget }}"><input type="hidden" name="key" value="{{ l.key }}"><input type="hidden" name="subject" value="{{ l.subject }}"><button class="owt-button owt-button-quiet" type="submit">{{ v.words.retire }}</button></form>{% endif %}</td></tr>
+{% for l in v.local_identities %}<tr><td>{{ l.key }}</td><td>{{ l.subject }}</td><td>{{ l.created }}</td><td>{{ l.last_sign_in }}</td><td>{% if !v.myself %}<form method="post" action="{{ l.forget }}"><input type="hidden" name="key" value="{{ l.key }}"><input type="hidden" name="subject" value="{{ l.subject }}"><button class="owt-button owt-button-quiet owt-button-quiet-danger" type="submit">{{ v.words.retire }}</button></form>{% endif %}</td></tr>
 {% endfor %}</tbody>
 </table>
 {% endif %}</section>

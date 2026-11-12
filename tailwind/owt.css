@@ -196,7 +196,7 @@
      (owt_accounts::admin), and any page that wants them. */
   .owt-button {
     @apply inline-flex items-center justify-center rounded-(--radius-owt) bg-owt-accent px-3 py-2 text-sm font-medium text-owt-on-accent;
-    @apply focus:ring-2 focus:ring-owt-accent/30 focus:outline-none disabled:opacity-50;
+    @apply focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-owt-ink disabled:opacity-50;
   }
   .owt-button-secondary {
     @apply border border-owt-line bg-owt-surface text-owt-ink hover:bg-owt-line/40;
@@ -204,8 +204,13 @@
   .owt-button-danger {
     @apply bg-owt-danger text-owt-on-accent;
   }
+  /* Quiet is the low-emphasis button for harmless actions; quiet danger is the
+     same weight for an action that destroys something. */
   .owt-button-quiet {
-    @apply bg-transparent px-2 py-1 text-owt-danger underline;
+    @apply bg-transparent px-2 py-1 text-owt-ink underline hover:bg-owt-line/40;
+  }
+  .owt-button-quiet-danger {
+    @apply text-owt-danger;
   }
   .owt-block {
     @apply block;
