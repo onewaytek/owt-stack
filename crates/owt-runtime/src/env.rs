@@ -110,15 +110,13 @@ impl Vars {
     /// A comma-separated list, blanks dropped; empty if unset.
     #[must_use]
     pub fn list(&self, name: &str) -> Vec<String> {
-        self.var(name)
-            .map(|v| {
-                v.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.var(name).map_or_default(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
     }
 
     /// Whole seconds (`30`, `30s`) or milliseconds (`250ms`); `default` if unset.

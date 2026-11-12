@@ -548,9 +548,7 @@ impl<T: SessionData> Sessions<T> {
         let mut jar = cookie::CookieJar::new();
         jar.private_mut(&self.inner.key)
             .add(Cookie::new(name.clone(), plain));
-        jar.get(&name)
-            .map(|c| c.value().to_owned())
-            .unwrap_or_default()
+        jar.get(&name).map_or_default(|c| c.value().to_owned())
     }
 
     /// The last-active time a last-active cookie records for session `id`.
@@ -646,8 +644,7 @@ impl<T: SessionData> Sessions<T> {
         jar.private_mut(&self.inner.key)
             .add(Cookie::new(self.inner.cookie.clone(), plain));
         jar.get(&self.inner.cookie)
-            .map(|c| c.value().to_owned())
-            .unwrap_or_default()
+            .map_or_default(|c| c.value().to_owned())
     }
 
     /// The id and data `value` seals, if it was sealed with this key and hasn't lapsed.
