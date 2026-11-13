@@ -1,0 +1,9 @@
+name: myapp
+namespace: myapp
+image: {repository: ghcr.io/onewaytek/myapp, digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+port: 8000
+memoryLimit: 256Mi
+database: {size: 1Gi}
+postgresMajor: "18"
+cnpgNamespace: openshift-operators
+monitoring: {enabled: true}

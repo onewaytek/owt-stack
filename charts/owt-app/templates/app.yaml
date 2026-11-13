@@ -1,0 +1,189 @@
+{{- /*
+The app: its Deployment, Service and Route (templates/openshift/app.yaml's). The
+image is pinned by digest, which deploy-pin writes into the deployments repository;
+a new digest there is the rollout. The migrate init container runs the migrations as
+the schema's owner, the app serves as the runtime role, and both read the app's
+environment from <name>-env.
+*/ -}}
+{{- $name := include "owt.name" . -}}
+{{- $ns := include "owt.namespace" . -}}
+{{- $db := include "owt.db" . -}}
+{{- $image := include "owt.image" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  replicas: {{ .Values.replicas }}
+  # Surge before terminate: with one replica, this is what keeps a rollout (or a
+  # bad image) from taking the site down.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  # The selector is immutable, and the pod label is what the Service, the
+  # NetworkPolicies and adoption of a running Deployment depend on: exactly app=<name>.
+  selector:
+    matchLabels: {app: "{{ $name }}"}
+  template:
+    metadata:
+      labels: {app: "{{ $name }}"}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      # The app never calls the cluster API, so it holds no token for it.
+      automountServiceAccountToken: false
+      initContainers:
+        - name: migrate
+          image: {{ $image }}
+          args: [migrate]
+          envFrom:
+            - secretRef: {name: "{{ $name }}-env", optional: true}
+            {{- include "owt.settingsRef" . | nindent 12 }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            # The owner: CNPG-minted, at <name>-db-rw.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: "{{ $db }}-app", key: uri}
+            - name: DB_RUNTIME_ROLE
+              valueFrom:
+                secretKeyRef: {name: "{{ $db }}-runtime", key: username}
+            - {name: PGSSLMODE, value: verify-full}
+            - {name: PGSSLROOTCERT, value: /etc/db-ca/ca.crt}
+            - {name: RUST_LOG, value: {{ .Values.rustLog | quote }}}
+          volumeMounts:
+            - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {memory: {{ .Values.memoryLimit | quote }}}
+          securityContext:
+            {{- include "owt.securityContext" . | nindent 12 }}
+      containers:
+        - name: app
+          image: {{ $image }}
+          ports:
+            - {name: http, containerPort: {{ .Values.port }}}
+            - {name: metrics, containerPort: 9464}
+          # The app's own variables, from a Secret (optional: until it exists, the
+          # app runs without them), then the settings ConfigMap when it is on.
+          envFrom:
+            - secretRef: {name: "{{ $name }}-env", optional: true}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- include "owt.settingsRef" . | nindent 12 }}
+          env:
+            - {name: BIND_ADDR, value: "0.0.0.0:{{ .Values.port }}"}
+            # The namespace, for `session::key_for`'s purpose: a secret copied to
+            # another environment is then another key there.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            # The runtime role, at <name>-db-rw, so it follows a switchover. Its
+            # password is hex, so it needs no escaping in the URL.
+            - name: DB_RUNTIME_USER
+              valueFrom:
+                secretKeyRef: {name: "{{ $db }}-runtime", key: username}
+            - name: DB_RUNTIME_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: "{{ $db }}-runtime", key: password}
+            - name: DATABASE_URL
+              value: "postgres://$(DB_RUNTIME_USER):$(DB_RUNTIME_PASSWORD)@{{ $db }}-rw:5432/{{ $name }}"
+            - {name: PGSSLMODE, value: verify-full}
+            - {name: PGSSLROOTCERT, value: /etc/db-ca/ca.crt}
+            # The Redis, once its Secret exists, and unset until then.
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef: {name: "{{ $name }}-redis", key: url, optional: true}
+            - {name: RUST_LOG, value: {{ .Values.rustLog | quote }}}
+            - {name: SESSION_IDLE_TIMEOUT, value: {{ .Values.sessionIdleTimeout | quote }}}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            {{- range .Values.persistence }}
+            {{- if .mountPath }}
+            - {name: {{ .name | quote }}, mountPath: {{ .mountPath | quote }}}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # Startup includes connecting; until Postgres is up the process exits and
+          # restarts, which this tolerates without flapping.
+          startupProbe:
+            httpGet: {path: {{ .Values.probes.startupPath }}, port: http}
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: {{ .Values.probes.readinessPath }}, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: {{ .Values.probes.livenessPath }}, port: http}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits:
+              memory: {{ .Values.memoryLimit | quote }}
+              {{- with .Values.cpuLimit }}
+              cpu: {{ . | quote }}
+              {{- end }}
+          # restricted-v2 compatible; the SCC assigns the UID.
+          securityContext:
+            {{- include "owt.securityContext" . | nindent 12 }}
+      volumes:
+        - name: db-ca
+          secret:
+            secretName: {{ $db }}-ca
+            items: [{key: ca.crt, path: ca.crt}]
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 64Mi}
+        {{- range .Values.persistence }}
+        {{- if .mountPath }}
+        - name: {{ .name | quote }}
+          persistentVolumeClaim: {claimName: "{{ $name }}-{{ .name }}"}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  selector: {app: "{{ $name }}"}
+  ports:
+    - {name: http, port: 80, targetPort: http}
+    # Scraped in-cluster only; no Route points here.
+    - {name: metrics, port: 9464, targetPort: metrics}
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+  annotations:
+    # The router's own HSTS, so responses the app never sees carry it too.
+    haproxy.router.openshift.io/hsts_header: max-age=31536000
+    haproxy.router.openshift.io/timeout: {{ .Values.routeTimeout | quote }}
+spec:
+  # No host: the router assigns <name>-<namespace>.<apps domain>.
+  to: {kind: Service, name: "{{ $name }}"}
+  port: {targetPort: http}
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

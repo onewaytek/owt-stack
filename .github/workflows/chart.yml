@@ -1,0 +1,54 @@
+name: Chart
+
+# charts/owt-app against templates/openshift: `just chart` (charts/owt-app/tests/
+# render-equivalence.sh) renders every fixture both ways and fails on any difference
+# the chart does not make on purpose. GitHub-hosted, which is free for this public
+# repository, with oc, helm and yq pinned by version and checked against their
+# publishers' SHA-256 sums.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  render-equivalence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Helm 3, as Argo CD renders the chart with.
+      HELM_VERSION: v3.19.0
+      HELM_SHA256: a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+      YQ_VERSION: v4.47.2
+      YQ_SHA256: 1bb99e1019e23de33c7e6afc23e93dad72aad6cf2cb03c797f068ea79814ddb0
+      OC_VERSION: 4.22.0
+      OC_SHA256: b6e027b304678d55e89ea1e8fe5c89e832f9c1a73518a1846e8cf9601c647aef
+      JUST_VERSION: 1.58.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install helm, yq and oc
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "$HELM_SHA256  helm.tgz" | sha256sum -c -
+          tar -xzf helm.tgz --strip-components=1 -C "$bin" linux-amd64/helm
+          curl -fsSL -o "$bin/yq" "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          echo "$YQ_SHA256  $bin/yq" | sha256sum -c -
+          chmod +x "$bin/yq"
+          curl -fsSL -o oc.tgz "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/${OC_VERSION}/openshift-client-linux-${OC_VERSION}.tar.gz"
+          echo "$OC_SHA256  oc.tgz" | sha256sum -c -
+          tar -xzf oc.tgz -C "$bin" oc
+          echo "$bin" >> "$GITHUB_PATH"
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: just@${{ env.JUST_VERSION }}
+      - run: helm version && yq --version && oc version --client && jq --version
+      - run: just chart

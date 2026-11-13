@@ -1,0 +1,111 @@
+{{- /*
+cronjob.yaml's scheduled tasks, one per `jobs` entry: the app's image with other
+arguments, the app's database (as the runtime role unless dbRole names another),
+TLS and environment, then <name>-<job>-env, whose keys win over the app's. Each
+task's pods are labelled app=<name>-<job>, never app=<name>, and their own
+NetworkPolicies admit them to Postgres and Redis.
+*/ -}}
+{{- $name := include "owt.name" . -}}
+{{- $ns := include "owt.namespace" . -}}
+{{- $db := include "owt.db" . -}}
+{{- range .Values.jobs }}
+{{- $job := printf "%s-%s" $name (required "each job needs a name" .name) }}
+{{- $role := .dbRole | default "runtime" }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $job }}
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  schedule: {{ required (printf "job %s needs a schedule" .name) .schedule | quote }}
+  # A run still going when the next is due keeps going, alone.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # A failed run waits for the next schedule rather than repeating at once.
+      backoffLimit: 0
+      template:
+        metadata:
+          labels: {app: "{{ $job }}"}
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: {{ include "owt.image" $ }}
+              args: {{ required (printf "job %s needs args" .name) .args | toJson }}
+              envFrom:
+                - secretRef: {name: "{{ $name }}-env", optional: true}
+                - secretRef: {name: "{{ $job }}-env", optional: true}
+                {{- include "owt.settingsRef" $ | nindent 16 }}
+              env:
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef: {fieldPath: metadata.namespace}
+                - name: DB_USER
+                  valueFrom:
+                    secretKeyRef: {name: "{{ $db }}-{{ $role }}", key: username}
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef: {name: "{{ $db }}-{{ $role }}", key: password}
+                - name: DATABASE_URL
+                  value: "postgres://$(DB_USER):$(DB_PASSWORD)@{{ $db }}-rw:5432/{{ $name }}"
+                - {name: PGSSLMODE, value: verify-full}
+                - {name: PGSSLROOTCERT, value: /etc/db-ca/ca.crt}
+                - name: REDIS_URL
+                  valueFrom:
+                    secretKeyRef: {name: "{{ $name }}-redis", key: url, optional: true}
+                - {name: RUST_LOG, value: {{ .rustLog | default $.Values.rustLog | quote }}}
+              volumeMounts:
+                - {name: db-ca, mountPath: /etc/db-ca, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {memory: {{ .memoryLimit | default "256Mi" | quote }}}
+              securityContext:
+                {{- include "owt.securityContext" $ | nindent 16 }}
+          volumes:
+            - name: db-ca
+              secret:
+                secretName: {{ $db }}-ca
+                items: [{key: ca.crt, path: ca.crt}]
+            - name: tmp
+              emptyDir: {medium: Memory, sizeLimit: 64Mi}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $job }}-db
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  podSelector:
+    matchLabels: {cnpg.io/cluster: "{{ $db }}"}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: "{{ $job }}"}
+      ports: [{port: 5432}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $job }}-redis
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  podSelector:
+    matchLabels: {app: "{{ $name }}-redis"}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: "{{ $job }}"}
+      ports: [{port: 6379}]
+{{- end }}

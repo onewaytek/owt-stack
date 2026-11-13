@@ -1,0 +1,18 @@
+name: my-app
+namespace: myapp-demo
+image: {repository: ghcr.io/onewaytek/my-app, digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+replicas: 1
+postgresMajor: "18"
+memoryLimit: 512Mi
+rustLog: my_app=info,owt_accounts=info,tower_http=info
+tunnel: {host: demo.example.com, id: 64a3821c-0000-4590-97cb-c4322630b68b}
+egress: {enabled: true}
+jobs:
+  - name: anchor
+    schedule: "5 * * * *"
+    args: [audit, anchor]
+    dbRole: anchor
+    memoryLimit: 128Mi
+    rustLog: info
+    internetCIDR: 0.0.0.0/32
+monitoring: {enabled: true}

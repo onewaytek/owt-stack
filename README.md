@@ -34,7 +34,8 @@ Outside the crates:
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its action and workflow pins, its crates and its npm packages, minors and patches grouped |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
-| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, a `migrate` init container as the schema's owner and the app serving as a runtime role that owns nothing, the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
+| `charts/owt-app` | the app's deploy as a Helm chart for Argo CD ("Deploying with GitOps"): the templates below with the image pinned by digest, stateful objects never pruned, and Secrets from OpenBao through External Secrets; `just chart` proves its renders match the templates' |
+| `templates/openshift/app.yaml` | deprecated for `charts/owt-app`, supported until its removal: an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, a `migrate` init container as the schema's owner and the app serving as a runtime role that owns nothing, the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone, connecting to nothing |
 | `templates/openshift/egress.yaml` | where the app's pods (or a task's) may connect: its database, its Redis, the cluster's DNS and port 443 of the internet, and nothing else |
 | `templates/openshift/tunnel.yaml` | the public address on a private cluster: a locally managed Cloudflare named tunnel of the app's own, two `cloudflared` connectors forwarding its host to the app's Service, and their NetworkPolicies |
@@ -5506,7 +5507,9 @@ theirs under tag refs, so none is read (a cold BuildKit build of a Rust app take
 ten minutes or more). Keep the `paths:` list to the files the image reads, and leave
 the check out of an app whose Dockerfile rarely changes.
 
-**OpenShift:** the app keeps its copies of the templates in `deploy/openshift/`, with
+**OpenShift:** the templates are deprecated: a new deploy uses `charts/owt-app` through
+Argo CD ("Deploying with GitOps"), and an existing one moves to it. Until it does,
+the app keeps its copies of the templates in `deploy/openshift/`, with
 `apply.sh` beside them and its parameters in `params.env`, one `KEY=VALUE` a line
 (`NAME`, `NAMESPACE`, `IMAGE`, `CHANNEL`, `PORT`, `POSTGRES_MAJOR`, and whatever else
 it sets). The script renders each template present with the parameters it declares,
@@ -6133,6 +6136,152 @@ one, otherwise the only line).
 Dependabot leaves this dependency alone (`templates/dependabot.yml` ignores it), so
 this command, run when the app adopts a release, is the only thing that moves it.
 
+## Deploying with GitOps
+
+`charts/owt-app` is the app's deploy as a Helm chart, for Argo CD to render and sync
+from a deployments repository. It renders what `templates/openshift` renders, with
+three differences on purpose:
+
+- **The image is pinned by digest.** The app container, the `migrate` init container
+  and every job run `image.repository@image.digest`. There is no ImageStream and no
+  `image.openshift.io/triggers` annotation: a release reaches the cluster when CI
+  writes its digest into the deployments repository, and Argo syncs the commit.
+- **Stateful objects are never pruned or deleted by Argo.** The CNPG `Cluster`, the
+  app's PersistentVolumeClaims, the ExternalSecrets and the Secrets they write carry
+  `argocd.argoproj.io/sync-options: Prune=false,Delete=false`.
+- **Secrets can come from OpenBao** through External Secrets' `vault` provider, in
+  place of `env.sh`, `set-secret.sh` and Secrets made by hand.
+
+Argo renders the chart with `helm template`, so there is no Helm release state in the
+cluster, and nothing installs it with `helm install`. An Application names the chart
+at an owt-stack tag and takes its values from the deployments repository:
+
+```yaml
+sources:
+  - repoURL: https://github.com/onewaytek/owt-stack.git
+    targetRevision: vX.Y.Z
+    path: charts/owt-app
+    helm:
+      releaseName: myapp
+      valueFiles:
+        - $values/apps/myapp/common.yaml
+        - $values/apps/myapp/rc/values.yaml
+        - $values/apps/myapp/rc/image.yaml   # written by CI: repository, digest, version
+  - repoURL: git@github.com:onewaytek/deployments.git
+    targetRevision: main
+    ref: values
+```
+
+`values.schema.json` checks every key, and a render without `name`,
+`image.repository`, `image.digest` (`sha256:` and 64 hex digits, never a tag) or
+`postgresMajor` fails, as does a tunnel host without its id, a route timeout without
+a unit or a role prefix Postgres would need quoted. The chart has no default for
+`postgresMajor`: a wrong one changes the Cluster's `imageName`, which CNPG carries out
+as an in-place major upgrade, so each environment states the major it runs.
+
+**Values.** Each key replaces the `params.env` parameter in the comment beside it in
+`charts/owt-app/values.yaml`:
+
+| Value | Default | params.env |
+|---|---|---|
+| `name` | required | `NAME` |
+| `namespace` | the Application's destination | `NAMESPACE` |
+| `image.repository`, `image.digest` | required | `IMAGE` (with `CHANNEL`, which the chart no longer needs) |
+| `image.version` | (not rendered) | the release the digest names |
+| `port`, `replicas` | `8000`, `1` | `PORT`, `REPLICAS` |
+| `routeTimeout` | `30s` | `ROUTE_TIMEOUT` |
+| `memoryLimit`, `cpuLimit` | `512Mi`, none | `MEMORY_LIMIT` |
+| `rustLog`, `sessionIdleTimeout` | `info`, `30m` | `RUST_LOG`, `SESSION_IDLE_TIMEOUT` |
+| `metricsNamespace`, `cnpgNamespace` | `openshift-user-workload-monitoring`, `openshift-operators` | `METRICS_NAMESPACE`, `CNPG_NAMESPACE` |
+| `postgresMajor` | required | `POSTGRES_MAJOR` |
+| `database.suffix`, `.instances`, `.size`, `.storageClass` | `db`, `1`, `2Gi`, `lvms-vg1` | `DB_SUFFIX`, `DB_INSTANCES`, `DB_SIZE`, `STORAGE_CLASS` |
+| `database.rolePrefix` | `name` with `-` as `_` | `DB_ROLE_PREFIX` |
+| `backup.snapshotClass`, `.schedule`, `.keepDays`, `.keepAtLeast`, `.pruneSchedule`, `.online`, `.pruneImage` | as app.yaml's | `SNAPSHOT_CLASS`, `BACKUP_SCHEDULE`, `BACKUP_KEEP_DAYS`, `BACKUP_KEEP_AT_LEAST`, `PRUNE_SCHEDULE`, `BACKUP_ONLINE`, `PRUNE_IMAGE` |
+| `redis.enabled`, `.image`, `.maxmemory`, `.maxmemoryPolicy`, `.memoryLimit` | off | `redis.yaml` present; `REDIS_IMAGE`, `MAXMEMORY`, `MAXMEMORY_POLICY`, `REDIS_MEMORY_LIMIT` |
+| `tunnel.host`, `.id`, `.credentialsSecret`, `.image`, `.memoryLimit` | no tunnel | `TUNNEL_HOST`, `TUNNEL_ID`, `CREDENTIALS_SECRET`, `CLOUDFLARED_IMAGE`, `TUNNEL_MEMORY_LIMIT` |
+| `egress.enabled`, `.internetCIDR` | off, `0.0.0.0/0` | `egress.yaml` present; `INTERNET_CIDR` |
+| `dns.namespace`, `dns.port` | `openshift-dns`, `5353` | `DNS_NAMESPACE`, `DNS_PORT` |
+| `jobs[]`: `name`, `schedule`, `args`, `dbRole`, `memoryLimit`, `rustLog`, `internetCIDR` | none | one `jobs/<JOB>.env` each: `JOB`, `SCHEDULE`, `ARGS` (a list here, not JSON text), `DB_ROLE`, `MEMORY_LIMIT`, `RUST_LOG`, `INTERNET_CIDR` |
+| `monitoring.enabled`, `.interval` | off, `30s` | `--monitoring`; `INTERVAL` |
+
+A job's `memoryLimit` defaults to `256Mi` and its `rustLog` to the app's. Under
+`apply.sh`, params.env's `MEMORY_LIMIT` reached the jobs too, so an app that set it
+there and kept no `MEMORY_LIMIT` in a job's file sets the job's `memoryLimit` to the
+same value. A `pre-render` hook's computed parameters become plain values (a checksum
+the chart computes itself, as the tunnel's, needs nothing).
+
+What only the chart has:
+
+- `extraEnv`, `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts` and
+  `probes.{startupPath,readinessPath,livenessPath}`: the app container's additions,
+  for an app whose copy of app.yaml added variables, a mounted CA or other health
+  paths. Variables come after the template's own; Secrets and ConfigMaps read whole
+  come after `<name>-env`.
+- `persistence[]` (`name`, `size`, `storageClass`, `accessModes`, `mountPath`): a
+  PersistentVolumeClaim `<name>-<entry>`, mounted in the app container at
+  `mountPath` when one is given.
+- `podAnnotations`: annotations on the app's pod template. Bump
+  `podAnnotations.rotation` in git to roll the pods after rotating a secret, since a
+  Secret's change reaches pods only when they start.
+- `settings.configMap` and `settings.values`: plain settings in a ConfigMap
+  `<name>-settings`, read last (after `<name>-env`) by the app, the `migrate` init
+  container and every job, so git wins over the Secret. Off by default; turning it on
+  changes the pod template and rolls the pods once.
+- `externalSecrets`: below.
+
+Anything else the app deploys (a second Deployment, an extra Route, an
+EgressFirewall) stays plain manifests in a second source of the Application.
+
+**Secrets from OpenBao.** With `externalSecrets.enabled`, the chart adds a
+ServiceAccount `eso-openbao`, a namespaced SecretStore `openbao` (the `vault`
+provider, KV v2 at `externalSecrets.store.mount`, Kubernetes auth as `eso-openbao`
+with the role `externalSecrets.store.role`, by default the namespace's name, and
+OpenBao's certificate trusted through the namespace's `openshift-service-ca.crt`),
+and one ExternalSecret per Secret, each read whole from `<path>/<key>`:
+
+| Secret | From (`externalSecrets.path` = `apps/<app>/<env>`) | When |
+|---|---|---|
+| `<name>-env` | `<path>/env` | `externalSecrets.env` (on) |
+| `<name>-<suffix>-runtime` | `<path>/db-runtime`, typed `kubernetes.io/basic-auth`, labelled `cnpg.io/reload: "true"` | `externalSecrets.dbRuntime` (on) |
+| `<name>-redis` | `<path>/redis` (`password`, `url`) | `redis.enabled` |
+| the tunnel's credentials Secret | `<path>/tunnel` (`credentials.json`) | a tunnel |
+| `externalSecrets.extra[].secret` | `<path>/<extra[].key>`, with an optional `type` and `labels` | listed |
+
+`externalSecrets.adopt` (on by default) is for Secrets that already exist: ESO merges
+into them (`creationPolicy: Merge`) and leaves them in place if the ExternalSecret
+goes (`deletionPolicy: Retain`). Off, ESO owns the Secret it creates
+(`creationPolicy: Owner`). CNPG's own Secrets (`<name>-<suffix>-app`,
+`<name>-<suffix>-ca`) stay CNPG's.
+
+**Moving an app from apply.sh to the chart:**
+
+1. Translate `params.env` (and each `jobs/<JOB>.env`) into values with the table
+   above, `postgresMajor` set to the major the cluster runs (`oc get
+   cluster.postgresql.cnpg.io <name>-db -o jsonpath='{.spec.imageName}'`), and
+   `image.digest` to the digest the Deployment runs now (`oc get deployment <name>
+   -o jsonpath='{.spec.template.spec.containers[0].image}'`), so the first sync rolls
+   nothing.
+2. Compare the two renders: `oc process --local` of the app's templates against
+   `helm template <name> charts/owt-app -f values.yaml`. `just chart` does exactly
+   this for owt-stack's fixtures (`charts/owt-app/tests/`); the only differences are
+   the three above. Differences in an app's own copy of app.yaml go into the
+   `extra*` values or a second source.
+3. Put the values and the Application in the deployments repository with manual
+   sync first, read Argo's diff (the trigger annotation's removal, the image moving to
+   Argo's field manager with the same digest, the new SecretStore and
+   ExternalSecrets, nothing on the Cluster's `bootstrap`, `imageName` or `storage`,
+   a selector or pod labels), then turn on automated sync with `prune: false`.
+4. After it has run on GitOps for a while, delete the ImageStream, turn on
+   `settings.configMap`, and replace the app's `deploy/openshift/` with a pointer to
+   the deployments repository.
+
+To go back, delete the Application without its finalizer (the objects stay), delete
+the ExternalSecrets (adopted Secrets stay), and run `deploy/openshift/apply.sh --apply`
+again, which restores the ImageStream and the trigger.
+
+**`templates/openshift` is deprecated.** It stays supported, and `apply.sh` keeps
+working, until a later release removes it; new deploys use the chart.
+
 ## Decisions
 
 - **No CSRF tokens.** Unsafe requests are refused when the browser's fetch metadata
@@ -6510,7 +6659,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
 `just check` is the gate (fmt, clippy over every crate and feature and over
 `owt-change` and `owt-auth` without their defaults, `dev-only`, the tests with the README
 doctests, `cargo audit`, the template tests, the commitlint configuration and `image-check`), and CI
-runs the same command. The Redis tests run when
+runs the same command. `just chart` (needs oc, helm, yq and jq) proves `charts/owt-app`
+against the templates; CI's `chart.yml` runs it. The Redis tests run when
 `REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
 `DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL
 whose certificate the system trusts (`SSL_CERT_FILE=ca.crt` for a test CA; the test's

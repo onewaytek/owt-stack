@@ -1,0 +1,20 @@
+{{- /*
+The app's PersistentVolumeClaims, <name>-<entry>. Argo never prunes or deletes one:
+removing an entry leaves the claim and its data.
+*/ -}}
+{{- range .Values.persistence }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "owt.name" $ }}-{{ .name }}
+  namespace: {{ include "owt.namespace" $ }}
+  labels: {app: "{{ include "owt.name" $ }}"}
+  annotations:
+    {{- include "owt.keep" $ | nindent 4 }}
+spec:
+  accessModes: {{ .accessModes | default (list "ReadWriteOnce") | toJson }}
+  storageClassName: {{ .storageClass | default $.Values.database.storageClass }}
+  resources:
+    requests: {storage: {{ required "each persistence entry needs a size" .size }}}
+{{- end }}

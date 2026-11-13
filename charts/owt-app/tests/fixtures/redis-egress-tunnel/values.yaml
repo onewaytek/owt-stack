@@ -1,0 +1,12 @@
+name: myapp
+namespace: myapp
+image: {repository: ghcr.io/onewaytek/myapp, digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+replicas: 1
+postgresMajor: "18"
+memoryLimit: 1Gi
+routeTimeout: 2m
+rustLog: myapp=info,owt_accounts=info,tower_http=info
+redis: {enabled: true, maxmemory: 64mb, memoryLimit: 128Mi}
+tunnel: {host: myapp.example.com, id: 00000000-1111-2222-3333-444444444444}
+egress: {enabled: true}
+monitoring: {enabled: true}
