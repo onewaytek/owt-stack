@@ -1,0 +1,8 @@
+name: myapp
+namespace: myapp-staging
+image: {repository: ghcr.io/onewaytek/myapp, digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+memoryLimit: 256Mi
+database: {size: 1Gi}
+cnpgNamespace: openshift-operators
+postgresMajor: "18"
+monitoring: {enabled: true}

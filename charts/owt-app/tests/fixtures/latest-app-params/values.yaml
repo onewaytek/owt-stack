@@ -1,0 +1,6 @@
+name: myapp
+namespace: myapp
+image: {repository: ghcr.io/onewaytek/myapp, digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+postgresMajor: "18"
+backup: {schedule: "0 0 2 * * *"}
+monitoring: {enabled: true}

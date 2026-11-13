@@ -62,6 +62,12 @@ templates:
     bash templates/openshift/apply-test.sh
     bash templates/openshift/env-test.sh
 
+# charts/owt-app renders what templates/openshift renders, fixture by fixture, and its
+# schema refuses what it must (needs oc, helm, yq and jq; no cluster, no Rust). Not in
+# `check`: chart.yml runs it on GitHub-hosted runners with the tools pinned.
+chart *cases:
+    bash charts/owt-app/tests/render-equivalence.sh {{ cases }}
+
 # The commitlint rules conventional-commits.yml writes for an app without its own are
 # commitlint.config.mjs, byte for byte.
 ci-config:

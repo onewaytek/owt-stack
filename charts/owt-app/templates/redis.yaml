@@ -1,0 +1,100 @@
+{{- /*
+redis.yaml's Redis: in memory, bounded by maxmemory, reachable by the app (and its
+jobs) alone, connecting to nothing. Its password is the Secret <name>-redis, made by
+hand or by the ExternalSecret.
+*/ -}}
+{{- if .Values.redis.enabled }}
+{{- $name := include "owt.name" . -}}
+{{- $ns := include "owt.namespace" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-redis
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  replicas: 1
+  # Recreate, never two at once: replicas connected to two different Redis would
+  # each hear only half of the bus.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: "{{ $name }}-redis"}
+  template:
+    metadata:
+      # Not `app: <name>`: that label is what the app's Service sends traffic to.
+      labels: {app: "{{ $name }}-redis"}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: "{{ $name }}-redis", key: password}
+          # Kubernetes expands $(REDIS_PASSWORD) when it starts the container.
+          command:
+            - redis-server
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - {{ .Values.redis.maxmemory | quote }}
+            - --maxmemory-policy
+            - {{ .Values.redis.maxmemoryPolicy | quote }}
+            - --requirepass
+            - $(REDIS_PASSWORD)
+          ports:
+            - {name: redis, containerPort: 6379}
+          readinessProbe:
+            tcpSocket: {port: redis}
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: {port: redis}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {memory: {{ .Values.redis.memoryLimit | quote }}}
+          securityContext:
+            {{- include "owt.securityContext" . | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-redis
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  selector: {app: "{{ $name }}-redis"}
+  ports:
+    - {name: redis, port: 6379, targetPort: redis}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-redis
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  podSelector:
+    matchLabels: {app: "{{ $name }}-redis"}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: "{{ $name }}"}
+      ports: [{port: redis}]
+---
+# Redis connects to nothing: `policyTypes: [Egress]` with no `egress` key denies all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-redis-egress
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  podSelector:
+    matchLabels: {app: "{{ $name }}-redis"}
+  policyTypes: [Egress]
+{{- end }}

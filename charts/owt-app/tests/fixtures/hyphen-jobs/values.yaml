@@ -1,0 +1,8 @@
+name: my-app
+namespace: myapp
+image: {repository: ghcr.io/onewaytek/my-app, digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+postgresMajor: "18"
+redis: {enabled: true}
+jobs:
+  - {name: housekeeping, schedule: "17 9 * * *", args: [prune-records]}
+monitoring: {enabled: true}

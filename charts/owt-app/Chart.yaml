@@ -1,0 +1,13 @@
+apiVersion: v2
+name: owt-app
+description: >-
+  One owt-stack app on OpenShift, rendered by Argo CD: Deployment pinned by digest,
+  Service, Route, CloudNativePG Postgres with nightly snapshots and their pruning,
+  NetworkPolicies, and optionally Redis, a Cloudflare tunnel, egress bounds, CronJobs,
+  monitoring and ExternalSecrets from OpenBao.
+type: application
+# The chart is versioned with owt-stack: Argo pins it by the repository's tag
+# (targetRevision: vX.Y.Z), so this field is informational.
+version: 0.1.0
+kubeVersion: ">=1.29.0-0"
+home: https://github.com/onewaytek/owt-stack

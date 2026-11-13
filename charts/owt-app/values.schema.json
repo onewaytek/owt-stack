@@ -1,0 +1,509 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "owt-app values",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "image",
+    "postgresMajor"
+  ],
+  "properties": {
+    "global": {
+      "type": "object"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+      "description": "NAME"
+    },
+    "namespace": {
+      "type": "string",
+      "description": "NAMESPACE; empty is the release's namespace"
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[^@:\\s]+(:[0-9]+)?(/[^@:\\s]+)*$",
+          "description": "IMAGE, without a tag"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "The image's digest, sha256:<64 hex>"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "digest"
+      ]
+    },
+    "port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "replicas": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "routeTimeout": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*(us|ms|s|m|h|d)$"
+    },
+    "memoryLimit": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$"
+    },
+    "rustLog": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sessionIdleTimeout": {
+      "type": "string",
+      "pattern": "^([1-9][0-9]*(s|m|h|d)|off)$"
+    },
+    "metricsNamespace": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cnpgNamespace": {
+      "type": "string",
+      "minLength": 1
+    },
+    "postgresMajor": {
+      "type": [
+        "string",
+        "integer"
+      ],
+      "pattern": "^[1-9][0-9]$",
+      "minimum": 10,
+      "maximum": 99,
+      "description": "POSTGRES_MAJOR: the major the running cluster is on; required"
+    },
+    "database": {
+      "type": "object",
+      "properties": {
+        "suffix": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "instances": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "size": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$"
+        },
+        "storageClass": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rolePrefix": {
+          "type": "string",
+          "pattern": "^([a-z_][a-z0-9_]*)?$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "backup": {
+      "type": "object",
+      "properties": {
+        "snapshotClass": {
+          "type": "string",
+          "minLength": 1
+        },
+        "schedule": {
+          "type": "string",
+          "pattern": "^\\S+( \\S+){5}$",
+          "description": "CNPG cron, six fields"
+        },
+        "keepDays": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "keepAtLeast": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pruneSchedule": {
+          "type": "string",
+          "pattern": "^\\S+( \\S+){4}$"
+        },
+        "online": {
+          "type": "boolean"
+        },
+        "pruneImage": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "extraEnv": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ]
+      }
+    },
+    "extraEnvFrom": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "extraVolumes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ]
+      }
+    },
+    "extraVolumeMounts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "mountPath"
+        ]
+      }
+    },
+    "probes": {
+      "type": "object",
+      "properties": {
+        "startupPath": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "readinessPath": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "livenessPath": {
+          "type": "string",
+          "pattern": "^/"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cpuLimit": {
+      "type": [
+        "string",
+        "integer",
+        "number"
+      ]
+    },
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "settings": {
+      "type": "object",
+      "properties": {
+        "configMap": {
+          "type": "boolean"
+        },
+        "values": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "redis": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "maxmemory": {
+          "type": "string",
+          "pattern": "^[0-9]+(b|kb|mb|gb)?$"
+        },
+        "maxmemoryPolicy": {
+          "type": "string",
+          "enum": [
+            "noeviction",
+            "allkeys-lru",
+            "allkeys-lfu",
+            "allkeys-random",
+            "volatile-lru",
+            "volatile-lfu",
+            "volatile-random",
+            "volatile-ttl"
+          ]
+        },
+        "memoryLimit": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "tunnel": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "pattern": "^((\\*\\.)?([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\\.)+[A-Za-z]{2,})?$"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^([0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})?$"
+        },
+        "credentialsSecret": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1
+        },
+        "memoryLimit": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "egress": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "internetCIDR": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "dns": {
+      "type": "object",
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "additionalProperties": false
+    },
+    "jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+          },
+          "schedule": {
+            "type": "string",
+            "pattern": "^\\S+( \\S+){4}$"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "dbRole": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+          },
+          "memoryLimit": {
+            "type": "string",
+            "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$"
+          },
+          "rustLog": {
+            "type": "string",
+            "minLength": 1
+          },
+          "internetCIDR": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "schedule",
+          "args"
+        ]
+      }
+    },
+    "monitoring": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "interval": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m|h)$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "persistence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+          },
+          "size": {
+            "type": "string",
+            "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$"
+          },
+          "storageClass": {
+            "type": "string"
+          },
+          "accessModes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mountPath": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "size"
+        ]
+      }
+    },
+    "externalSecrets": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "apiVersion": {
+          "type": "string",
+          "minLength": 1
+        },
+        "adopt": {
+          "type": "boolean"
+        },
+        "refreshInterval": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "store": {
+          "type": "object",
+          "properties": {
+            "server": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mount": {
+              "type": "string",
+              "minLength": 1
+            },
+            "authMount": {
+              "type": "string",
+              "minLength": 1
+            },
+            "serviceAccount": {
+              "type": "string",
+              "minLength": 1
+            },
+            "caConfigMap": {
+              "type": "string",
+              "minLength": 1
+            },
+            "caKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "role": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "env": {
+          "type": "boolean"
+        },
+        "dbRuntime": {
+          "type": "boolean"
+        },
+        "extra": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "secret": {
+                "type": "string",
+                "minLength": 1
+              },
+              "key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "type": {
+                "type": "string"
+              },
+              "labels": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "secret",
+              "key"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
