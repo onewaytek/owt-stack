@@ -100,9 +100,13 @@ impl Mfa {
     /// account. Everything [`challenge`](Self::challenge) says holds: the attempt is
     /// charged first, a pending sign-in becomes a signed-in session, a
     /// re-authentication renews the times (a passkey satisfies
-    /// [`RecentMfa`](super::RecentMfa)). The ceremony answers once, and only for its own
-    /// account: another account's passkey, or this account's for another ceremony, is
-    /// [`MfaError::Invalid`] or [`MfaError::PasskeyExpired`].
+    /// [`RecentMfa`](super::RecentMfa)). The ceremony answers once, only for its own
+    /// account and only in the session that began it: another account's passkey, a
+    /// disabled one, this account's for another ceremony, or a ceremony another session
+    /// began, is [`MfaError::Invalid`] or [`MfaError::PasskeyExpired`]. A suspected
+    /// copy ([`MfaError::PasskeyCloned`]) disables the passkey and goes to the notifier
+    /// ([`on_security_event`](Self::on_security_event)). A passkey's refusal is not
+    /// counted toward [`lockout`](Self::lockout); the throttle still charges it.
     ///
     /// # Errors
     /// As [`challenge`](Self::challenge), and [`MfaError::PasskeyExpired`],
@@ -167,7 +171,7 @@ impl Mfa {
         let factor = match proof {
             Proof::Passkey { token, credential } => {
                 used_passkey = Some(
-                    self.check_passkey(pool, &account, token, credential)
+                    self.check_passkey(pool, session, &account, token, credential)
                         .await?,
                 );
                 Factor::Passkey

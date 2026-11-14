@@ -671,6 +671,7 @@ pub struct Confirmed {
 
 /// An account's factors, as the settings page lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Factors {
     /// When the authenticator was confirmed (Unix seconds), if one is set up.
     pub totp_confirmed_at: Option<i64>,
@@ -678,22 +679,28 @@ pub struct Factors {
     pub recovery_codes_left: i64,
     /// The authenticator is locked after too many wrong codes ([`MfaError::Locked`]).
     pub totp_locked: bool,
-    /// Passkeys registered.
+    /// Passkeys registered and usable (not disabled).
     pub passkeys: i64,
+    /// Passkeys disabled as suspected copies ([`MfaError::PasskeyCloned`]): no factor,
+    /// listed until the owner removes them.
+    pub passkeys_disabled: i64,
 }
 
 impl Factors {
-    /// How many second factors the account holds (recovery codes are a way back from
-    /// losing one, not a factor of their own).
+    /// How many usable second factors the account holds (recovery codes are a way back
+    /// from losing one, not a factor of their own, and a disabled passkey is none).
     #[must_use]
     pub fn count(&self) -> usize {
         usize::from(self.totp_confirmed_at.is_some()) + usize::try_from(self.passkeys).unwrap_or(0)
     }
 
-    /// Whether the account has a second factor to challenge.
+    /// Whether the account has a second factor to challenge: a usable one, or a
+    /// disabled passkey with recovery codes left. Disabling a suspected copy does not
+    /// turn the second factor off: until the owner removes it or adds another factor,
+    /// the challenge takes a recovery code.
     #[must_use]
     pub fn any(&self) -> bool {
-        self.count() > 0
+        self.count() > 0 || (self.passkeys_disabled > 0 && self.recovery_codes_left > 0)
     }
 }
 
@@ -725,6 +732,21 @@ pub struct ChangeProof {
     pending: bool,
 }
 
+/// Tells an account's owner about a security event on their account
+/// ([`Mfa::on_security_event`]), typically by email. It is called after the change the
+/// event records is committed, so a failure is logged and changes nothing.
+pub trait Notifier: Send + Sync + 'static {
+    /// Tell the owner of `event.account` about `event`.
+    ///
+    /// # Errors
+    ///
+    /// When the owner cannot be told.
+    fn notify<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+}
+
 /// The configuration the second-factor functions share. Build one at start, keep it
 /// in the app's state.
 #[derive(Clone)]
@@ -738,6 +760,7 @@ pub struct Mfa {
     lock_after: i32,
     lock_for: Duration,
     passkeys: Option<passkey::RelyingParty>,
+    notifier: Option<Arc<dyn Notifier>>,
 }
 
 impl std::fmt::Debug for Mfa {
@@ -772,6 +795,37 @@ impl Mfa {
             lock_after: LOCK_AFTER,
             lock_for: LOCK_FOR,
             passkeys: None,
+            notifier: None,
+        }
+    }
+
+    /// Hand `notifier` each event the account's owner must hear about whatever page or
+    /// handler made it: today a passkey disabled as a suspected copy
+    /// (`mfa.passkey.clone_suspected`). Wire it to the app's mailer. Without one, the
+    /// event is only logged and returned (record it from [`MfaError::event`]).
+    #[must_use]
+    pub fn on_security_event(mut self, notifier: impl Notifier) -> Self {
+        self.notifier = Some(Arc::new(notifier));
+        self
+    }
+
+    /// Tell the notifier, if there is one, about `event`; a failure is logged.
+    async fn notify(&self, event: &Event) {
+        let Some(notifier) = &self.notifier else {
+            tracing::warn!(
+                account = event.account,
+                event = event.name(),
+                "no notifier to tell the owner: set Mfa::on_security_event"
+            );
+            return;
+        };
+        if let Err(e) = notifier.notify(event).await {
+            tracing::error!(
+                error = %e,
+                account = event.account,
+                event = event.name(),
+                "the owner could not be told of a second-factor event"
+            );
         }
     }
 
@@ -955,24 +1009,29 @@ impl Mfa {
     /// # Errors
     /// The database.
     pub async fn factors(&self, pool: &PgPool, account: i64) -> sqlx::Result<Factors> {
-        let (confirmed_at, locked, left, passkeys): (Option<i64>, bool, i64, i64) = sqlx::query_as(
-            "SELECT
+        let (confirmed_at, locked, left, passkeys, disabled): (Option<i64>, bool, i64, i64, i64) =
+            sqlx::query_as(
+                "SELECT
                (SELECT EXTRACT(EPOCH FROM confirmed_at)::bigint FROM account_totp
                  WHERE account_id = $1 AND confirmed_at IS NOT NULL),
                COALESCE((SELECT locked_until > now() FROM account_totp
                  WHERE account_id = $1 AND confirmed_at IS NOT NULL), false),
                (SELECT count(*) FROM account_recovery_codes
                  WHERE account_id = $1 AND used_at IS NULL),
-               (SELECT count(*) FROM account_passkeys WHERE account_id = $1)",
-        )
-        .bind(account)
-        .fetch_one(pool)
-        .await?;
+               (SELECT count(*) FROM account_passkeys
+                 WHERE account_id = $1 AND disabled_at IS NULL),
+               (SELECT count(*) FROM account_passkeys
+                 WHERE account_id = $1 AND disabled_at IS NOT NULL)",
+            )
+            .bind(account)
+            .fetch_one(pool)
+            .await?;
         Ok(Factors {
             totp_confirmed_at: confirmed_at,
             recovery_codes_left: left,
             totp_locked: locked,
             passkeys,
+            passkeys_disabled: disabled,
         })
     }
 

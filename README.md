@@ -2515,12 +2515,12 @@ instead of an authenticator. The button runs `{base}/passkey.js` and needs JavaS
 without WebAuthn it stays hidden and the codes remain. An app that draws its own pages
 uses the functions:
 
-- **Register:** `Mfa::begin_passkey_registration(pool, account, &proof)` (the
+- **Register:** `Mfa::begin_passkey_registration(pool, session, account, &proof)` (the
   `ChangeProof` of `authorize_change`, as for TOTP) returns a `Ceremony`: `options` for
   `navigator.credentials.create()` (`options_json()`) and an opaque `token`. Post the
   browser's answer (a `RegisterPublicKeyCredential`, as JSON) with the token and a name to
   `Mfa::finish_passkey_registration`.
-- **Answer a challenge or step-up:** `Mfa::begin_passkey_challenge(pool, account)` (the
+- **Answer a challenge or step-up:** `Mfa::begin_passkey_challenge(pool, session, account)` (the
   pending account, or the one signed in on a re-authentication page; `None` when it has no
   passkey) and `Mfa::challenge_passkey(pool, limiter, session, ip, token, credential)`,
   which does everything `Mfa::challenge` does. For step-up, `begin_reauth` checks the
@@ -2531,26 +2531,74 @@ uses the functions:
 What holds:
 
 - **The ceremony state stays on the server**, in `account_passkey_ceremonies`, bound to the
-  account; the browser holds only the token. A ceremony answers once (its row is deleted as
-  it is read) and expires after five minutes. An answer for another account's ceremony,
-  or from another account's passkey, is refused.
+  account, the purpose and the session that began it (the SHA-256 of its id); the browser
+  holds only the token. A ceremony answers once (its row is deleted as it is read), only in
+  that session, and expires after five minutes. An answer for another account's ceremony,
+  from another account's passkey, or with a token carried to another session (another
+  browser, or a session signed in since) is refused (`MfaError::PasskeyExpired`), so begin
+  and finish a ceremony with the same `Session`.
 - **Recovery codes are per account, not per factor.** The first factor (a passkey or the
   authenticator) issues them; adding another keeps them; removing a factor keeps them while
   another remains, and the last factor takes them with it. `Factors::count` counts the
-  authenticator and each passkey.
-- **Removal is TOTP's rule:** behind step-up, and never the last factor under a required
-  policy (`MfaError::LastFactor`). Every change moves the session epoch on, so the
+  authenticator and each passkey that is not disabled.
+- **Removal is TOTP's rule:** behind step-up, and never the last usable factor under a
+  required policy (`MfaError::LastFactor`); a disabled passkey is never that, so it can
+  always be removed. Every change moves the session epoch on, so the
   account's other sessions end.
 - **A counter that does not rise past the stored one is refused**
   (`MfaError::PasskeyCloned`), checked against the stored row when the answer arrives (not
   when the ceremony began): the credential may exist twice. A synced passkey reports no
-  counter, so it is never refused for this. `MfaError::event` gives its audit event, `mfa.passkey.clone_suspected`
-  (`MfaPages` records it): tell the owner. The other events are `mfa.passkey.enrolled`,
+  counter, so it is never refused for this. The passkey is disabled at once
+  (`account_passkeys.disabled_at`, `PasskeyInfo::disabled_at`): it is no longer offered,
+  accepted or counted as a factor (`Factors::passkeys` leaves it out,
+  `Factors::passkeys_disabled` counts it), and the settings page shows it as "Disabled:
+  suspected copy" with its Remove button. `MfaError::event` gives the audit event,
+  `mfa.passkey.clone_suspected` (`MfaPages` records it), and the same event goes to the
+  notifier below, to tell the owner. The other events are `mfa.passkey.enrolled`,
   `mfa.passkey.renamed`, `mfa.passkey.removed` and `mfa.challenge.passed` with
   `Event::passkey` naming the row.
+- **A disabled passkey does not turn the second factor off.** An account whose only factor
+  was the disabled passkey is still challenged while it has recovery codes left
+  (`Factors::any`, and the layer's gate, count a disabled passkey with codes left), and
+  signs in with a recovery code, then removes the copy and adds a new factor. With no codes
+  left it holds no factor: under a required policy, the next sign-in enrolls one.
+- **Passkey failures do not count toward `Mfa::lockout`.** That lockout protects six-digit
+  codes, which can be guessed; a passkey answer is a signature over a fresh challenge, which
+  cannot. Every passkey answer is still charged to the throttle (`Key::SecondFactor`) as a
+  code is, and a suspected copy disables the passkey instead of locking the account.
 - **Passkeys are counted whether or not they are on**, so turning `PASSKEY_RP_ID` off never
   lets a password alone through for an account that has one: it signs in with its
   authenticator or a recovery code until passkeys are on again.
+
+The owner hears of a suspected copy through the notifier the app gives `Mfa`, wired to its
+mailer (`owt-mail`, say). It is handed each event that warrants telling the owner, whichever
+page or handler caused it, after the change is committed; a failure is logged at `error`
+and changes nothing. Without one, the event is logged at `warn` and still returned.
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+use owt_accounts::mfa::{Event, Mfa, Notifier};
+
+struct EmailOwner; // holds the app's mailer and pool
+
+impl Notifier for EmailOwner {
+    fn notify<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // Look up `event.account`'s email; send "a passkey on your account was
+            // disabled" when `event.name()` is "mfa.passkey.clone_suspected".
+            let _ = (event.account, event.name(), event.passkey);
+            Ok(())
+        })
+    }
+}
+
+let mfa = Mfa::new("My App").on_security_event(EmailOwner);
+# let _ = mfa;
+```
 
 #### Roles
 

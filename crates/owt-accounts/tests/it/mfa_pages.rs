@@ -585,6 +585,7 @@ fn attr(html: &str, after: &str) -> String {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one flow: add, answer, then list as disabled
 async fn a_passkey_added_on_the_settings_page_answers_the_challenge() {
     use owt_accounts::mfa::passkey::{
         CreationChallengeResponse, RelyingParty, RequestChallengeResponse, Url,
@@ -684,5 +685,14 @@ async fn a_passkey_added_on_the_settings_page_answers_the_challenge() {
             .unwrap()
             .starts_with("text/javascript")
     );
+
+    // A passkey disabled as a suspected copy is listed as one, and can be removed.
+    sqlx::query("UPDATE account_passkeys SET disabled_at = now()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let html = app.client.get("/mfa").await.text();
+    assert!(html.contains("Disabled: suspected copy"), "{html}");
+    assert!(html.contains("/remove\""), "{html}");
     db.drop().await;
 }

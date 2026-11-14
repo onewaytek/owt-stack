@@ -725,10 +725,14 @@ impl<T: MfaSession> MfaPages<T> {
     }
 
     /// The passkey button for `account`, when it has a passkey and they are on.
-    async fn passkey_prompt(&self, account: &Account) -> Result<Option<PasskeyPrompt>, MfaError> {
+    async fn passkey_prompt(
+        &self,
+        session: &Session<T>,
+        account: &Account,
+    ) -> Result<Option<PasskeyPrompt>, MfaError> {
         let Some(begun) = self
             .mfa
-            .begin_passkey_challenge(&self.pool, account)
+            .begin_passkey_challenge(&self.pool, session, account)
             .await?
         else {
             return Ok(None);
@@ -973,7 +977,7 @@ async fn challenge_form<T: MfaSession>(
         Ok(_) => return to_sign_in(&parts, &next),
         Err(e) => return owt_web::Error::from(e).into_response(),
     };
-    challenge_page(&p, &parts, &account, next, None).await
+    challenge_page(&p, &parts, &session, &account, next, None).await
 }
 
 /// The challenge page for the pending `account`, with `error` if the last answer was
@@ -981,11 +985,12 @@ async fn challenge_form<T: MfaSession>(
 async fn challenge_page<T: MfaSession>(
     p: &MfaPages<T>,
     parts: &Parts,
+    session: &Session<T>,
     account: &Account,
     next: String,
     error: Option<(StatusCode, String)>,
 ) -> Response {
-    let passkey = match p.passkey_prompt(account).await {
+    let passkey = match p.passkey_prompt(session, account).await {
         Ok(prompt) => prompt,
         Err(e) => return owt_web::Error::from(e).into_response(),
     };
@@ -1061,7 +1066,7 @@ async fn challenge<T: MfaSession>(
     };
     match p.mfa.pending_account(&p.pool, &session).await {
         Ok(Some((account, Kind::Challenge))) => {
-            challenge_page(&p, &parts, &account, next, Some(refused)).await
+            challenge_page(&p, &parts, &session, &account, next, Some(refused)).await
         }
         Ok(_) => to_sign_in(&parts, &next),
         Err(e) => owt_web::Error::from(e).into_response(),
@@ -1072,6 +1077,7 @@ async fn challenge<T: MfaSession>(
 async fn reauth_page<T: MfaSession>(
     p: &MfaPages<T>,
     parts: &Parts,
+    session: &Session<T>,
     account: &Account,
     next: String,
     error: Option<(StatusCode, String)>,
@@ -1091,7 +1097,7 @@ async fn reauth_page<T: MfaSession>(
         }
         None => (StatusCode::OK, None),
     };
-    let passkey = match p.passkey_prompt(account).await {
+    let passkey = match p.passkey_prompt(session, account).await {
         Ok(prompt) => prompt,
         Err(e) => return owt_web::Error::from(e).into_response(),
     };
@@ -1112,13 +1118,14 @@ async fn reauth_page<T: MfaSession>(
 async fn reauth_form<T: MfaSession>(
     State(p): Shared<T>,
     Req(parts): Req,
+    session: Session<T>,
     Query(q): Query<NextQuery>,
 ) -> Response {
     let Some(account) = Maybe::of(&parts.extensions).0 else {
         return layer::wall(&parts).into_response();
     };
     let next = local_next(q.next.as_deref(), "/");
-    reauth_page(&p, &parts, &account, next, None).await
+    reauth_page(&p, &parts, &session, &account, next, None).await
 }
 
 async fn reauth_post<T: MfaSession>(
@@ -1143,7 +1150,7 @@ async fn reauth_post<T: MfaSession>(
     let passkey = form.passkey();
     if has_factor && answer.is_none() && passkey.is_none() {
         let error = (StatusCode::UNPROCESSABLE_ENTITY, "Enter a code.".to_owned());
-        return reauth_page(&p, &parts, &account, next, Some(error)).await;
+        return reauth_page(&p, &parts, &session, &account, next, Some(error)).await;
     }
     let begun = p
         .mfa
@@ -1183,7 +1190,7 @@ async fn reauth_post<T: MfaSession>(
                 p.record(&parts, &[event]).await;
             }
             match refusal(e) {
-                Ok(error) => reauth_page(&p, &parts, &account, next, Some(error)).await,
+                Ok(error) => reauth_page(&p, &parts, &session, &account, next, Some(error)).await,
                 Err(r) => r,
             }
         }
@@ -1362,14 +1369,15 @@ async fn settings<T: MfaSession>(
         Ok(f) => f,
         Err(e) => return owt_web::Error::from(e).into_response(),
     };
-    let passkeys = if p.mfa.relying_party().is_some() || factors.passkeys > 0 {
-        match p.mfa.list_passkeys(&p.pool, account.id).await {
-            Ok(list) => list,
-            Err(e) => return owt_web::Error::from(e).into_response(),
-        }
-    } else {
-        Vec::new()
-    };
+    let passkeys =
+        if p.mfa.relying_party().is_some() || factors.passkeys + factors.passkeys_disabled > 0 {
+            match p.mfa.list_passkeys(&p.pool, account.id).await {
+                Ok(list) => list,
+                Err(e) => return owt_web::Error::from(e).into_response(),
+            }
+        } else {
+            Vec::new()
+        };
     let passkeys = passkeys
         .into_iter()
         .map(|info| PasskeyRow {
@@ -1522,9 +1530,11 @@ impl fmt::Debug for PasskeyForm {
 
 /// The add-a-passkey page with a fresh ceremony, and `error` if the last answer was
 /// refused.
+#[allow(clippy::too_many_arguments)] // each is a separate input of the page
 async fn passkey_add_page<T: MfaSession>(
     p: &MfaPages<T>,
     parts: &Parts,
+    session: &Session<T>,
     account: &Account,
     proof: &super::ChangeProof,
     pending: bool,
@@ -1533,7 +1543,7 @@ async fn passkey_add_page<T: MfaSession>(
 ) -> Response {
     let begun = match p
         .mfa
-        .begin_passkey_registration(&p.pool, account, proof)
+        .begin_passkey_registration(&p.pool, session, account, proof)
         .await
     {
         Ok(begun) => begun,
@@ -1582,7 +1592,7 @@ async fn passkey_add_form<T: MfaSession>(
         Ok(proof) => proof,
         Err(e) => return step_up_or_sign_in(&p, &parts, e, &this),
     };
-    passkey_add_page(&p, &parts, &account, &proof, pending, next, None).await
+    passkey_add_page(&p, &parts, &session, &account, &proof, pending, next, None).await
 }
 
 async fn passkey_add<T: MfaSession>(
@@ -1675,7 +1685,17 @@ async fn passkey_add<T: MfaSession>(
         Ok(error) => error,
         Err(r) => return r,
     };
-    passkey_add_page(&p, &parts, &account, &proof, pending, next, Some(error)).await
+    passkey_add_page(
+        &p,
+        &parts,
+        &session,
+        &account,
+        &proof,
+        pending,
+        next,
+        Some(error),
+    )
+    .await
 }
 
 #[derive(Deserialize)]

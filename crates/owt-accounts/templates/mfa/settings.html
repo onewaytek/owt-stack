@@ -22,7 +22,8 @@
 <form method="post" action="{{ pk.rename }}"><label class="owt-label" for="passkey-{{ pk.info.id }}">Name</label>
 <input class="owt-input" id="passkey-{{ pk.info.id }}" name="name" value="{{ pk.info.name }}" maxlength="64" required>
 <button class="owt-button owt-button-secondary" type="submit">Rename</button></form>
-<span class="owt-hint">{% if pk.info.backup_state %}Synced. {% endif %}{% if pk.info.last_used_at.is_some() %}Used before.{% else %}Not used yet.{% endif %}</span>
+{% if pk.info.disabled_at.is_some() %}<span class="owt-badge">Disabled: suspected copy</span> <span class="owt-hint">It answered as if it had been copied, so it no longer signs you in. Remove it, and add a new one.</span>
+{% endif %}<span class="owt-hint">{% if pk.info.backup_state %}Synced. {% endif %}{% if pk.info.last_used_at.is_some() %}Used before.{% else %}Not used yet.{% endif %}</span>
 <form method="post" action="{{ pk.remove }}"><button class="owt-button owt-button-danger" type="submit">Remove</button></form>
 </div>
 {% endfor %}{% endif %}<div class="owt-actions"><a class="owt-button" href="{{ add }}">Add a passkey</a></div>

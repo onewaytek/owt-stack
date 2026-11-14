@@ -502,19 +502,26 @@ pub async fn by_id_in_epoch_with<X: Extra>(
 /// which policy versions it last accepted (for the policies gate).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Standing {
-    /// A confirmed authenticator or a passkey: [`Factors::any`](crate::mfa::Factors::any).
+    /// A confirmed authenticator, a usable passkey, or a disabled passkey with recovery
+    /// codes left: [`Factors::any`](crate::mfa::Factors::any).
     pub(crate) has_factor: bool,
     /// The `policy_acceptances` version ids, one per document the account accepted.
     pub(crate) accepted: Vec<i64>,
 }
 
 /// The columns [`standing_in_epoch`] reads for [`Standing`]. Each lookup is on an index:
-/// the primary key `account_totp (account_id)`, `account_passkeys_account` and the
-/// `(account_id, kind)` prefix of `policy_acceptances`.
+/// the primary key `account_totp (account_id)`, `account_passkeys_account`,
+/// `account_recovery_codes_account_all` and the `(account_id, kind)` prefix of
+/// `policy_acceptances`.
 const STANDING: &str = "SELECT
              (EXISTS (SELECT 1 FROM account_totp t
                       WHERE t.account_id = accounts.id AND t.confirmed_at IS NOT NULL)
-              OR EXISTS (SELECT 1 FROM account_passkeys k WHERE k.account_id = accounts.id))
+              OR EXISTS (SELECT 1 FROM account_passkeys k
+                         WHERE k.account_id = accounts.id AND k.disabled_at IS NULL)
+              OR (EXISTS (SELECT 1 FROM account_passkeys k
+                          WHERE k.account_id = accounts.id AND k.disabled_at IS NOT NULL)
+                  AND EXISTS (SELECT 1 FROM account_recovery_codes r
+                              WHERE r.account_id = accounts.id AND r.used_at IS NULL)))
                AS owt_has_factor,
              ARRAY(SELECT p.version_id FROM policy_acceptances p
                    WHERE p.account_id = accounts.id) AS owt_accepted";

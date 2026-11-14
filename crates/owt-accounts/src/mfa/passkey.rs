@@ -13,9 +13,10 @@
 //!   turns passkeys on.
 //! * **Ceremony state stays on the server.** Beginning a registration or an
 //!   authentication stores webauthn-rs's state in `account_passkey_ceremonies`, bound
-//!   to the account, and hands the browser the options and an opaque token
-//!   ([`Ceremony`]). Finishing deletes the row as it reads it, so a challenge answers
-//!   once; it expires after five minutes.
+//!   to the account, the purpose and the session that began it, and hands the browser
+//!   the options and an opaque token ([`Ceremony`]). Finishing deletes the row as it
+//!   reads it, so a challenge answers once, and only from the session that began it
+//!   (a token carried to another browser is refused); it expires after five minutes.
 //! * **A passkey is a factor like the authenticator app**: registering one needs a
 //!   [`ChangeProof`](super::ChangeProof), the first factor of an account issues its
 //!   recovery codes, removing one needs step-up, and the last factor of an account the
@@ -25,8 +26,11 @@
 //!   ([`MfaError::PasskeyCloned`]), checked against the row as it stands when the
 //!   answer arrives, not as it stood when the ceremony began: it means the credential
 //!   may exist twice. (A synced passkey reports no counter, so this never applies to
-//!   it.) The error carries an event for the audit log ([`MfaError::event`]); tell the
-//!   owner.
+//!   it.) The passkey is disabled there and then: it is no longer offered, accepted or
+//!   counted as a factor, and the settings page shows it as a suspected copy until its
+//!   owner removes it. The error carries an event for the audit log
+//!   ([`MfaError::event`]), and the same event goes to the notifier
+//!   ([`Mfa::on_security_event`](super::Mfa::on_security_event)) to tell the owner.
 
 use std::time::Duration;
 
@@ -297,6 +301,9 @@ pub struct PasskeyInfo {
     pub backup_eligible: bool,
     /// It is synced (backed up) now.
     pub backup_state: bool,
+    /// When it was disabled as a suspected copy ([`MfaError::PasskeyCloned`]), in Unix
+    /// seconds: a disabled passkey is no factor until it is removed.
+    pub disabled_at: Option<i64>,
 }
 
 /// What a ceremony is for.
@@ -349,8 +356,9 @@ fn refused(e: &WebauthnError) -> MfaError {
     }
 }
 
-async fn store_ceremony(
+async fn store_ceremony<T: state::MfaSession>(
     pool: &PgPool,
+    session: &owt_web::session::Session<T>,
     account: i64,
     purpose: Purpose,
     state: &impl Serialize,
@@ -363,12 +371,14 @@ async fn store_ceremony(
         .execute(pool)
         .await?;
     sqlx::query(
-        "INSERT INTO account_passkey_ceremonies (token_hash, account_id, purpose, state, expires_at)
-         VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+        "INSERT INTO account_passkey_ceremonies
+           (token_hash, account_id, purpose, session_hash, state, expires_at)
+         VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
     )
     .bind(digest(&token))
     .bind(account)
     .bind(purpose.as_str())
+    .bind(digest(&session.ensure_id()))
     .bind(state)
     .bind(CEREMONY_TTL.as_secs_f64())
     .execute(pool)
@@ -376,38 +386,56 @@ async fn store_ceremony(
     Ok(token)
 }
 
-/// The state `token` names, for `account` and `purpose`, deleted as it is read: `None`
-/// when there is none, it expired, or it is another account's.
-async fn take_ceremony<S: DeserializeOwned>(
+/// The state `token` names, for `account`, `purpose` and the session `session`,
+/// deleted as it is read: `None` when there is none, it expired, or it is another
+/// account's or another session's.
+async fn take_ceremony<S: DeserializeOwned, T: state::MfaSession>(
     pool: &PgPool,
+    session: &owt_web::session::Session<T>,
     token: &str,
     account: i64,
     purpose: Purpose,
 ) -> Result<Option<S>, MfaError> {
-    let row: Option<(i64, serde_json::Value, bool)> = sqlx::query_as(
+    let row: Option<(i64, Vec<u8>, serde_json::Value, bool)> = sqlx::query_as(
         "DELETE FROM account_passkey_ceremonies WHERE token_hash = $1 AND purpose = $2
-         RETURNING account_id, state, expires_at > now()",
+         RETURNING account_id, session_hash, state, expires_at > now()",
     )
     .bind(digest(token))
     .bind(purpose.as_str())
     .fetch_optional(pool)
     .await?;
+    let this_session = session.id().map(|id| digest(&id));
     match row {
-        Some((owner, state, true)) if owner == account => serde_json::from_value(state)
-            .map(Some)
-            .map_err(|e| MfaError::fault(e.into())),
+        Some((owner, began_in, state, true))
+            if owner == account && this_session.as_deref() == Some(began_in.as_slice()) =>
+        {
+            serde_json::from_value(state)
+                .map(Some)
+                .map_err(|e| MfaError::fault(e.into()))
+        }
+        Some((owner, _, _, true)) if owner == account => {
+            tracing::warn!(
+                account,
+                "a passkey ceremony was answered from another session"
+            );
+            Ok(None)
+        }
         _ => Ok(None),
     }
 }
 
+/// The account's passkeys: every one, or only those not disabled.
 async fn passkeys_of(
     db: impl sqlx::PgExecutor<'_>,
     account: i64,
+    usable_only: bool,
 ) -> Result<Vec<(i64, Passkey)>, MfaError> {
     let rows: Vec<(i64, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, passkey FROM account_passkeys WHERE account_id = $1 ORDER BY id",
+        "SELECT id, passkey FROM account_passkeys
+         WHERE account_id = $1 AND (NOT $2 OR disabled_at IS NULL) ORDER BY id",
     )
     .bind(account)
+    .bind(usable_only)
     .fetch_all(db)
     .await?;
     rows.into_iter()
@@ -442,14 +470,15 @@ impl Mfa {
     /// `navigator.credentials.create()`, which exclude the passkeys it has. The
     /// registration is finished by
     /// [`finish_passkey_registration`](Self::finish_passkey_registration) with the
-    /// token.
+    /// token, from this `session`: the ceremony is bound to it.
     ///
     /// # Errors
     /// [`MfaError::PasskeysOff`], [`MfaError::NoChallenge`] for another account's
     /// proof, or a fault.
-    pub async fn begin_passkey_registration(
+    pub async fn begin_passkey_registration<T: state::MfaSession>(
         &self,
         pool: &PgPool,
+        session: &owt_web::session::Session<T>,
         account: &Account,
         proof: &ChangeProof,
     ) -> Result<Ceremony<CreationChallengeResponse>, MfaError> {
@@ -465,7 +494,7 @@ impl Mfa {
         .fetch_one(pool)
         .await?;
         let handle = Uuid::parse_str(&handle).map_err(|e| MfaError::fault(e.into()))?;
-        let exclude = passkeys_of(pool, account.id)
+        let exclude = passkeys_of(pool, account.id, false)
             .await?
             .into_iter()
             .map(|(_, p)| p.cred_id().clone())
@@ -479,7 +508,7 @@ impl Mfa {
             .webauthn()
             .start_passkey_registration(handle, user, &account.username, Some(exclude))
             .map_err(|e| MfaError::fault(anyhow::anyhow!("passkey registration: {e}")))?;
-        let token = store_ceremony(pool, account.id, Purpose::Register, &state).await?;
+        let token = store_ceremony(pool, session, account.id, Purpose::Register, &state).await?;
         Ok(Ceremony { token, options })
     }
 
@@ -492,8 +521,8 @@ impl Mfa {
     /// [`Confirmed::recovery_codes`] is empty).
     ///
     /// # Errors
-    /// [`MfaError::BadName`], [`MfaError::PasskeyExpired`] (no such ceremony, or it
-    /// expired or was used), [`MfaError::PasskeyOrigin`], [`MfaError::Invalid`] (the
+    /// [`MfaError::BadName`], [`MfaError::PasskeyExpired`] (no such ceremony, it
+    /// expired or was used, or another session began it), [`MfaError::PasskeyOrigin`], [`MfaError::Invalid`] (the
     /// answer does not verify), [`MfaError::PasskeyTaken`] (the credential is
     /// registered already, to any account), [`MfaError::NoChallenge`], or a fault.
     #[allow(clippy::too_many_arguments)] // each is a separate input of the ceremony
@@ -510,9 +539,10 @@ impl Mfa {
         let rp = self.rp()?;
         Self::proof_for(proof, account)?;
         let name = clean_name(name)?;
-        let state: PasskeyRegistration = take_ceremony(pool, token, account.id, Purpose::Register)
-            .await?
-            .ok_or(MfaError::PasskeyExpired)?;
+        let state: PasskeyRegistration =
+            take_ceremony(pool, session, token, account.id, Purpose::Register)
+                .await?
+                .ok_or(MfaError::PasskeyExpired)?;
         let passkey = rp
             .webauthn()
             .finish_passkey_registration(credential, &state)
@@ -586,23 +616,25 @@ impl Mfa {
     }
 
     /// Begin a passkey authentication for `account`: the options for
-    /// `navigator.credentials.get()`, listing its passkeys, or `None` when it has none
-    /// or passkeys are off. [`challenge_passkey`](Self::challenge_passkey) finishes it.
+    /// `navigator.credentials.get()`, listing its passkeys (not the disabled ones), or
+    /// `None` when it has none or passkeys are off. The ceremony is bound to this
+    /// `session`, and is answered from it only. [`challenge_passkey`](Self::challenge_passkey) finishes it.
     /// Begin it for the account a pending sign-in or re-authentication is for, or the
     /// one the session is signed in as (a re-authentication page shown before the
     /// password is checked): the answer counts only for the pending account.
     ///
     /// # Errors
     /// A fault.
-    pub async fn begin_passkey_challenge(
+    pub async fn begin_passkey_challenge<T: state::MfaSession>(
         &self,
         pool: &PgPool,
+        session: &owt_web::session::Session<T>,
         account: &Account,
     ) -> Result<Option<Ceremony<RequestChallengeResponse>>, MfaError> {
         let Some(rp) = self.passkeys.as_ref() else {
             return Ok(None);
         };
-        let passkeys: Vec<Passkey> = passkeys_of(pool, account.id)
+        let passkeys: Vec<Passkey> = passkeys_of(pool, account.id, true)
             .await?
             .into_iter()
             .map(|(_, p)| p)
@@ -614,31 +646,35 @@ impl Mfa {
             .webauthn()
             .start_passkey_authentication(&passkeys)
             .map_err(|e| MfaError::fault(anyhow::anyhow!("passkey authentication: {e}")))?;
-        let token = store_ceremony(pool, account.id, Purpose::Authenticate, &state).await?;
+        let token =
+            store_ceremony(pool, session, account.id, Purpose::Authenticate, &state).await?;
         Ok(Some(Ceremony { token, options }))
     }
 
-    /// Check a passkey's answer for `account`; the passkey's row id. The counter and
-    /// backup state are updated, and the last use stamped.
-    pub(super) async fn check_passkey(
+    /// Check a passkey's answer for `account`, in the session that began the ceremony;
+    /// the passkey's row id. The counter and backup state are updated, and the last use
+    /// stamped. A suspected copy disables the passkey and tells the notifier.
+    pub(super) async fn check_passkey<T: state::MfaSession>(
         &self,
         pool: &PgPool,
+        session: &owt_web::session::Session<T>,
         account: &Account,
         token: &str,
         credential: &PublicKeyCredential,
     ) -> Result<i64, MfaError> {
         let rp = self.rp()?;
         let state: PasskeyAuthentication =
-            take_ceremony(pool, token, account.id, Purpose::Authenticate)
+            take_ceremony(pool, session, token, account.id, Purpose::Authenticate)
                 .await?
                 .ok_or(MfaError::PasskeyExpired)?;
-        // Only this account's passkeys: another account's credential is not looked at.
-        // The row stays held until the counter is stored, so two answers of one
-        // credential are checked one after the other.
+        // Only this account's passkeys that are not disabled: another account's
+        // credential is not looked at. The row stays held until the counter is stored,
+        // so two answers of one credential are checked one after the other.
         let mut tx = pool.begin().await?;
         let row: Option<(i64, serde_json::Value, i64)> = sqlx::query_as(
             "SELECT id, passkey, counter FROM account_passkeys
-             WHERE credential_id = $1 AND account_id = $2 FOR UPDATE",
+             WHERE credential_id = $1 AND account_id = $2 AND disabled_at IS NULL
+             FOR UPDATE",
         )
         .bind(credential.get_credential_id())
         .bind(account.id)
@@ -655,7 +691,7 @@ impl Mfa {
         {
             Ok(result) => result,
             Err(WebauthnError::CredentialPossibleCompromise) => {
-                return Err(MfaError::PasskeyCloned { passkey: id });
+                return Err(self.disable_cloned(tx, account.id, id).await);
             }
             Err(e) => return Err(refused(&e)),
         };
@@ -667,7 +703,7 @@ impl Mfa {
         // zero) must rise past the stored one, as webauthn-rs's own check requires.
         let counter = i64::from(result.counter());
         if (counter > 0 || held > 0) && counter <= held {
-            return Err(MfaError::PasskeyCloned { passkey: id });
+            return Err(self.disable_cloned(tx, account.id, id).await);
         }
         passkey.update_credential(&result);
         let stored = serde_json::to_value(&passkey).map_err(|e| MfaError::fault(e.into()))?;
@@ -689,7 +725,39 @@ impl Mfa {
         Ok(id)
     }
 
-    /// The account's passkeys, oldest first.
+    /// Disable the passkey `id` of `account`, whose answer suggests a copy, in `tx`
+    /// (which holds its row), and tell the notifier: the error to answer with, which is
+    /// [`MfaError::PasskeyCloned`] unless the passkey could not be disabled.
+    async fn disable_cloned(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        account: i64,
+        id: i64,
+    ) -> MfaError {
+        let disabled = async {
+            sqlx::query("UPDATE account_passkeys SET disabled_at = now() WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        }
+        .await;
+        if let Err(e) = disabled {
+            return e.into();
+        }
+        tracing::warn!(
+            account,
+            passkey = id,
+            "a passkey suspected of being copied was disabled"
+        );
+        let error = MfaError::PasskeyCloned { passkey: id };
+        if let Some(event) = error.event(account) {
+            self.notify(&event).await;
+        }
+        error
+    }
+
+    /// The account's passkeys, oldest first, the disabled ones included.
     ///
     /// # Errors
     /// A database fault.
@@ -701,7 +769,8 @@ impl Mfa {
         sqlx::query_as(
             "SELECT id, name, EXTRACT(EPOCH FROM created_at)::bigint AS created_at,
                     EXTRACT(EPOCH FROM last_used_at)::bigint AS last_used_at,
-                    backup_eligible, backup_state
+                    backup_eligible, backup_state,
+                    EXTRACT(EPOCH FROM disabled_at)::bigint AS disabled_at
              FROM account_passkeys WHERE account_id = $1 ORDER BY id",
         )
         .bind(account)
@@ -761,19 +830,23 @@ impl Mfa {
         }
         let mut tx = pool.begin().await?;
         lock_account(&mut tx, account.id).await?;
-        let held: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM account_passkeys WHERE id = $1 AND account_id = $2")
-                .bind(passkey)
-                .bind(account.id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if held.is_none() {
+        let usable: Option<bool> = sqlx::query_scalar(
+            "SELECT disabled_at IS NULL FROM account_passkeys WHERE id = $1 AND account_id = $2",
+        )
+        .bind(passkey)
+        .bind(account.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(usable) = usable else {
             return Err(MfaError::NotEnrolled);
-        }
-        let last = factor_count(&mut tx, account.id).await? <= 1;
-        if last && self.requires(account) {
+        };
+        // A disabled passkey is no factor, so removing it is never removing the last
+        // one; the codes go when no passkey or authenticator of any kind is left.
+        let count = factor_count(&mut tx, account.id).await?;
+        if usable && count <= 1 && self.requires(account) {
             return Err(MfaError::LastFactor);
         }
+        let last = count + disabled_count(&mut tx, account.id).await? <= 1;
         sqlx::query("DELETE FROM account_passkeys WHERE id = $1")
             .bind(passkey)
             .execute(&mut *tx)
@@ -828,7 +901,19 @@ pub(super) async fn lock_account(
     held.map(|_| ()).ok_or(MfaError::NoChallenge)
 }
 
-/// How many factors the account has: a confirmed authenticator and its passkeys.
+/// How many passkeys of the account are disabled.
+async fn disabled_count(tx: &mut sqlx::PgConnection, account: i64) -> Result<i64, MfaError> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM account_passkeys WHERE account_id = $1 AND disabled_at IS NOT NULL",
+    )
+    .bind(account)
+    .fetch_one(tx)
+    .await?;
+    Ok(n)
+}
+
+/// How many factors the account has: a confirmed authenticator and its passkeys that
+/// are not disabled.
 pub(super) async fn factor_count(
     tx: &mut sqlx::PgConnection,
     account: i64,
@@ -836,7 +921,8 @@ pub(super) async fn factor_count(
     let n: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*) FROM account_totp
                  WHERE account_id = $1 AND confirmed_at IS NOT NULL)
-              + (SELECT count(*) FROM account_passkeys WHERE account_id = $1)",
+              + (SELECT count(*) FROM account_passkeys
+                 WHERE account_id = $1 AND disabled_at IS NULL)",
     )
     .bind(account)
     .fetch_one(tx)
