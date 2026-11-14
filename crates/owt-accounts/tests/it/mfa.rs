@@ -1997,6 +1997,233 @@ mod passkeys {
     }
 
     #[tokio::test]
+    async fn the_layer_holds_a_passkey_only_account_to_its_second_factor() {
+        let db = db!();
+        let mfa = pk_mfa();
+        let ada = account(&db, "ada", false).await;
+        let mut key = SoftPasskey::new(true);
+        register(&db, &mfa, &signed_in(&ada), &ada, &mut key, "Key")
+            .await
+            .unwrap();
+        let ada = fresh(&db, ada.id).await;
+        let sessions = sessions();
+        let client = owt_test::Client::new(http_app(&db, &sessions, mfa.clone()));
+        // A provider or link sign-in: `session::sign_in`, nothing more.
+        let door = Session::<Data>::default();
+        owt_accounts::session::sign_in(&door, &ada);
+        client.set_cookie(
+            "s",
+            &sessions.seal(&owt_web::session::new_id(), &door.read(Clone::clone)),
+        );
+        let r = client.get("/private").await;
+        assert_eq!(r.status, 303, "a passkey is a factor the layer asks for");
+        let (_, data) = sessions.unseal(&client.cookie("s").unwrap()).unwrap();
+        assert!(data.signature().is_none());
+        assert_eq!(
+            data.mfa.pending.map(|p| (p.account, p.kind)),
+            Some((ada.id, owt_accounts::mfa::Kind::Challenge))
+        );
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_ceremony_begun_before_a_later_answer_cannot_lower_the_counter() {
+        let db = db!();
+        let mfa = pk_mfa();
+        let ada = account(&db, "ada", false).await;
+        let mut key = SoftPasskey::new(true);
+        let confirmed = register(&db, &mfa, &signed_in(&ada), &ada, &mut key, "Key")
+            .await
+            .unwrap();
+        let id = confirmed.events[0].passkey.unwrap();
+        let ada = fresh(&db, ada.id).await;
+        // Two pending sign-ins, each with its ceremony, begun before either is answered.
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            let session = Session::<Data>::default();
+            mfa.password_sign_in(&db.pool, &throttle(), &session, IP, "ada", PASSWORD)
+                .await
+                .unwrap();
+            let begun = mfa
+                .begin_passkey_challenge(&db.pool, &ada)
+                .await
+                .unwrap()
+                .unwrap();
+            pending.push((session, begun));
+        }
+        let (second_session, second) = pending.pop().unwrap();
+        let (first_session, first) = pending.pop().unwrap();
+        // The first answer signed has the lower counter, as a copy of the key would.
+        let low = key.do_authentication(origin(), first.options).unwrap();
+        let high = key.do_authentication(origin(), second.options).unwrap();
+        mfa.challenge_passkey(
+            &db.pool,
+            &throttle(),
+            &second_session,
+            IP,
+            &second.token,
+            &high,
+        )
+        .await
+        .unwrap();
+        let e = mfa
+            .challenge_passkey(
+                &db.pool,
+                &throttle(),
+                &first_session,
+                IP,
+                &first.token,
+                &low,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, MfaError::PasskeyCloned { passkey } if passkey == id),
+            "{e:?}"
+        );
+        assert!(first_session.read(Data::signature).is_none());
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_ceremony_answers_only_its_purpose_and_only_until_it_expires() {
+        let db = db!();
+        let mfa = pk_mfa();
+        let ada = account(&db, "ada", false).await;
+        let mut key = SoftPasskey::new(true);
+        let session = signed_in(&ada);
+        register(&db, &mfa, &session, &ada, &mut key, "Key")
+            .await
+            .unwrap();
+        let ada = fresh(&db, ada.id).await;
+        let challenge = |session: Session<Data>| {
+            let mfa = mfa.clone();
+            let pool = db.pool.clone();
+            async move {
+                mfa.password_sign_in(&pool, &throttle(), &session, IP, "ada", PASSWORD)
+                    .await
+                    .unwrap();
+                session
+            }
+        };
+
+        // A registration's ceremony does not answer a sign-in.
+        let pending = challenge(Session::<Data>::default()).await;
+        let begun = mfa
+            .begin_passkey_challenge(&db.pool, &ada)
+            .await
+            .unwrap()
+            .unwrap();
+        let credential = key.do_authentication(origin(), begun.options).unwrap();
+        let wrong: String = sqlx::query_scalar(
+            "UPDATE account_passkey_ceremonies SET purpose = 'register' RETURNING purpose",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(wrong, "register");
+        assert!(matches!(
+            mfa.challenge_passkey(
+                &db.pool,
+                &throttle(),
+                &pending,
+                IP,
+                &begun.token,
+                &credential
+            )
+            .await,
+            Err(MfaError::PasskeyExpired)
+        ));
+
+        // An expired ceremony does not answer, and is gone after the attempt.
+        let pending = challenge(Session::<Data>::default()).await;
+        let begun = mfa
+            .begin_passkey_challenge(&db.pool, &ada)
+            .await
+            .unwrap()
+            .unwrap();
+        let credential = key.do_authentication(origin(), begun.options).unwrap();
+        sqlx::query(
+            "UPDATE account_passkey_ceremonies SET expires_at = now() - interval '1 second'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            mfa.challenge_passkey(
+                &db.pool,
+                &throttle(),
+                &pending,
+                IP,
+                &begun.token,
+                &credential
+            )
+            .await,
+            Err(MfaError::PasskeyExpired)
+        ));
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM account_passkey_ceremonies WHERE purpose = 'authenticate'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(left, 0);
+        assert!(pending.read(Data::signature).is_none());
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_credential_another_account_holds_is_refused() {
+        let db = db!();
+        let mfa = pk_mfa();
+        let ada = account(&db, "ada", false).await;
+        let bob = account(&db, "bob", false).await;
+        let session = signed_in(&bob);
+        let proof = mfa
+            .authorize_change(&db.pool, &session, &bob, Duration::from_secs(300))
+            .await
+            .unwrap();
+        let begun = mfa
+            .begin_passkey_registration(&db.pool, &bob, &proof)
+            .await
+            .unwrap();
+        let mut key = SoftPasskey::new(true);
+        let credential = key.do_registration(origin(), begun.options).unwrap();
+        // Ada holds the same credential id already.
+        sqlx::query(
+            "INSERT INTO account_passkeys (account_id, credential_id, passkey, name)
+             VALUES ($1, $2, '{}', 'Ada''s')",
+        )
+        .bind(ada.id)
+        .bind(credential.raw_id.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let e = mfa
+            .finish_passkey_registration(
+                &db.pool,
+                &session,
+                &bob,
+                &proof,
+                &begun.token,
+                "Key",
+                &credential,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, MfaError::PasskeyTaken), "{e:?}");
+        assert_eq!(mfa.factors(&db.pool, bob.id).await.unwrap().passkeys, 0);
+        let owner: i64 =
+            sqlx::query_scalar("SELECT account_id FROM account_passkeys WHERE credential_id = $1")
+                .bind(credential.raw_id.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, ada.id);
+        db.drop().await;
+    }
+
+    #[tokio::test]
     async fn the_last_factor_cannot_be_removed_and_a_remaining_one_keeps_the_codes() {
         let db = db!();
         let mfa = pk_mfa().policy(MfaPolicy::Required);
@@ -2168,10 +2395,7 @@ mod passkeys {
             )
             .await
             .unwrap_err();
-        assert!(
-            matches!(e, MfaError::PasskeyOrigin | MfaError::Invalid),
-            "{e:?}"
-        );
+        assert!(matches!(e, MfaError::PasskeyOrigin), "{e:?}");
         assert_eq!(mfa.factors(&db.pool, ada.id).await.unwrap().passkeys, 0);
         db.drop().await;
     }

@@ -2138,8 +2138,8 @@ that checks it is unused.
 `.require_mfa::<T>(mfa)` (`T` the session data type): `Accounts::load::<T>` and `load_with`
 then enforce it, with no second layer to remember (installing `load` with another data type
 logs an error and answers 503 to anyone signed in, rather than run single-factor). A
-signature for an account that has a confirmed factor, or that the policy requires to have
-one, then counts as signed in only when the session shows a second factor passed for that
+signature for an account that has a factor (a confirmed authenticator or a passkey), or that
+the policy requires to have one, then counts as signed in only when the session shows a second factor passed for that
 account and epoch (whether the account holds a factor is read in the query that loads it,
 so the gate costs no round trip); until then the request is anonymous and the session becomes the pending
 sign-in above, so a challenge or enrollment page can continue it
@@ -2533,8 +2533,10 @@ What holds:
 - **Removal is TOTP's rule:** behind step-up, and never the last factor under a required
   policy (`MfaError::LastFactor`). Every change moves the session epoch on, so the
   account's other sessions end.
-- **A counter that goes backwards is refused** (`MfaError::PasskeyCloned`): the credential
-  may exist twice. `MfaError::event` gives its audit event, `mfa.passkey.clone_suspected`
+- **A counter that does not rise past the stored one is refused**
+  (`MfaError::PasskeyCloned`), checked against the stored row when the answer arrives (not
+  when the ceremony began): the credential may exist twice. A synced passkey reports no
+  counter, so it is never refused for this. `MfaError::event` gives its audit event, `mfa.passkey.clone_suspected`
   (`MfaPages` records it): tell the owner. The other events are `mfa.passkey.enrolled`,
   `mfa.passkey.renamed`, `mfa.passkey.removed` and `mfa.challenge.passed` with
   `Event::passkey` naming the row.

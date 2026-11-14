@@ -21,9 +21,12 @@
 //!   recovery codes, removing one needs step-up, and the last factor of an account the
 //!   policy requires cannot be removed. Every change moves the account's session epoch
 //!   on and returns [`Event`](super::Event)s.
-//! * **A counter that goes backwards is refused** ([`MfaError::PasskeyCloned`]): it
-//!   means the credential may exist twice. The error carries an event for the audit
-//!   log ([`MfaError::event`]); tell the owner.
+//! * **A counter that does not rise past the stored one is refused**
+//!   ([`MfaError::PasskeyCloned`]), checked against the row as it stands when the
+//!   answer arrives, not as it stood when the ceremony began: it means the credential
+//!   may exist twice. (A synced passkey reports no counter, so this never applies to
+//!   it.) The error carries an event for the audit log ([`MfaError::event`]); tell the
+//!   owner.
 
 use std::time::Duration;
 
@@ -630,15 +633,18 @@ impl Mfa {
                 .await?
                 .ok_or(MfaError::PasskeyExpired)?;
         // Only this account's passkeys: another account's credential is not looked at.
-        let row: Option<(i64, serde_json::Value)> = sqlx::query_as(
-            "SELECT id, passkey FROM account_passkeys
-             WHERE credential_id = $1 AND account_id = $2",
+        // The row stays held until the counter is stored, so two answers of one
+        // credential are checked one after the other.
+        let mut tx = pool.begin().await?;
+        let row: Option<(i64, serde_json::Value, i64)> = sqlx::query_as(
+            "SELECT id, passkey, counter FROM account_passkeys
+             WHERE credential_id = $1 AND account_id = $2 FOR UPDATE",
         )
         .bind(credential.get_credential_id())
         .bind(account.id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        let Some((id, stored)) = row else {
+        let Some((id, stored, held)) = row else {
             return Err(MfaError::Invalid);
         };
         let mut passkey: Passkey =
@@ -656,30 +662,30 @@ impl Mfa {
         if result.cred_id() != passkey.cred_id() {
             return Err(MfaError::Invalid);
         }
+        // webauthn-rs compares the counter with the one the ceremony began with; another
+        // answer may have stored a higher one since. A counter in use (either side above
+        // zero) must rise past the stored one, as webauthn-rs's own check requires.
+        let counter = i64::from(result.counter());
+        if (counter > 0 || held > 0) && counter <= held {
+            return Err(MfaError::PasskeyCloned { passkey: id });
+        }
         passkey.update_credential(&result);
         let stored = serde_json::to_value(&passkey).map_err(|e| MfaError::fault(e.into()))?;
         let (eligible, backed_up) = backup_flags(&stored);
-        let counter = i64::from(result.counter());
-        // A concurrent use that stored a higher counter keeps it.
-        let updated = sqlx::query(
+        sqlx::query(
             "UPDATE account_passkeys
              SET passkey = $2, counter = $3, backup_eligible = $4, backup_state = $5,
                  last_used_at = now()
-             WHERE id = $1 AND counter <= $3",
+             WHERE id = $1",
         )
         .bind(id)
         .bind(&stored)
         .bind(counter)
         .bind(eligible)
         .bind(backed_up)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-        if updated.rows_affected() == 0 {
-            sqlx::query("UPDATE account_passkeys SET last_used_at = now() WHERE id = $1")
-                .bind(id)
-                .execute(pool)
-                .await?;
-        }
+        tx.commit().await?;
         Ok(id)
     }
 
