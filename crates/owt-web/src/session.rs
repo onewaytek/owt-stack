@@ -302,7 +302,7 @@ pub const ABSOLUTE_LIFETIME_VAR: &str = "SESSION_ABSOLUTE_LIFETIME";
 
 /// A duration as the session variables write it: whole seconds, minutes, hours or days
 /// (`90s`, `30m`, `8h`, `14d`). `var` names the variable in the error; `extra` is
-/// what else the variable takes (` or `off``), for the message. Zero parses.
+/// what else the variable takes (" or `off`"), for the message. Zero parses.
 fn parse_duration(var: &str, value: &str, extra: &str) -> anyhow::Result<Duration> {
     let value = value.trim();
     let unit = value.chars().last().unwrap_or(' ');
@@ -1403,15 +1403,15 @@ mod env_tests {
             source(&build(None, Some("2h")).unwrap()),
             "SESSION_ABSOLUTE_LIFETIME"
         );
-        let built = build(None, Some("2h"))
+        let pinned = build(None, Some("2h"))
             .unwrap()
             .absolute_lifetime(Duration::from_hours(3));
         assert_eq!(
-            built.absolute(),
+            pinned.absolute(),
             Duration::from_hours(3),
             "the builder wins"
         );
-        assert_eq!(source(&built), "builder");
+        assert_eq!(source(&pinned), "builder");
     }
 
     #[test]
