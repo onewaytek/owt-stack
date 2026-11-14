@@ -1665,6 +1665,7 @@ anything else.
 | `owt_accounts_recovery_codes_index` | | `account_recovery_codes_account_all` | | |
 | `owt_accounts_revoked_sessions` | `revoked_sessions` | `revoked_sessions_pkey`, `revoked_sessions_expires_at` | | |
 | `owt_accounts_confirmed_emails` | | | | `sign_in_links.sent_to`, `account_identities.verified_email` |
+| `owt_accounts_passkeys` | `account_webauthn_users`, `account_passkeys`, `account_passkey_ceremonies` | `account_webauthn_users_pkey`, `account_webauthn_users_user_handle_key`, `account_passkeys_pkey`, `account_passkeys_id_seq`, `account_passkeys_credential_id_key`, `account_passkeys_account`, `account_passkey_ceremonies_pkey`, `account_passkey_ceremonies_expiry` | | |
 
 Each table is also a type of its name, and its triggers and constraints are its own.
 An app that already has any of these names (a table, view, index, sequence, type or
@@ -2117,10 +2118,10 @@ let app: Router = Router::new()
 #### Multi-factor sign-in and step-up
 
 `owt_accounts::mfa` adds a second factor after the password: an authenticator app (TOTP,
-`owt_auth::totp`) with single-use recovery codes behind it (`owt_auth::recovery`), a
-policy that can require it, and step-up re-authentication for sensitive actions. Like
-the sign-in functions above, they are library functions an app wires to its own routes.
-(Passkeys are not here yet.)
+`owt_auth::totp`) and passkeys (WebAuthn, [below](#passkeys)), with single-use recovery
+codes behind them (`owt_auth::recovery`), a policy that can require one, and step-up
+re-authentication for sensitive actions. Like the sign-in functions above, they are
+library functions an app wires to its own routes.
 
 `Mfa::password_sign_in` is `session::password_sign_in` plus the question *what does this
 account need next?* It answers `Next::Done` (signed in), `Next::Challenge` (it has a
@@ -2381,8 +2382,8 @@ see, remove or set up again the authenticator and make new recovery codes. It is
 like the accounts admin: the app supplies its layout as a `Chrome` closure (or an
 `AsyncChrome` that awaits), the bodies are `owt-*` markup from `tailwind/owt.css`, and an
 app with its own design implements `pages::Views` for the pages it draws itself (the view
-models carry each form's URL; the fields are `code`, `recovery_code`, `password` and
-`next`).
+models carry each form's URL; the fields are `code`, `recovery_code`, `password`,
+`next`, and for passkeys `name`, `passkey_token` and `passkey_credential`).
 
 | Route | Page |
 |---|---|
@@ -2390,7 +2391,10 @@ models carry each form's URL; the fields are `code`, `recovery_code`, `password`
 | `GET, POST /mfa/challenge?next=` | the code a pending sign-in (`Next::Challenge`) waits for |
 | `GET, POST /mfa/enroll?next=` | enrolling; also where `RecentMfa` sends an account with no factor |
 | `POST /mfa/remove`, `/mfa/reenroll`, `/mfa/recovery-codes` | changes, each behind step-up |
-| `GET, POST /reauth?next=` | step-up: the password (if the account has one) and a code (if it has a factor) |
+| `GET, POST /reauth?next=` | step-up: the password (if the account has one) and a code or a passkey (if it has a factor) |
+| `GET, POST /mfa/passkeys/add?next=` | names and creates a passkey, behind step-up (or for a pending enrollment) |
+| `POST /mfa/passkeys/{id}/rename`, `/mfa/passkeys/{id}/remove` | renames one; removes one, behind step-up |
+| `GET /mfa/passkey.js` | the script the passkey buttons run (same origin: `script-src 'self'` allows it) |
 
 `MfaPages::at("/account/mfa")` and `.reauth_at("/account/confirm")` move them; tell
 `Accounts::enroll_at` (`{base}/enroll`) and `Accounts::reauth_at` the same. What they hold
@@ -2460,6 +2464,83 @@ let _app: Router = Router::new()
 An app with its own session type adds `.session::<MySession>()`. Under
 `MfaPolicy::Required` the last factor cannot be removed, and so cannot be set up again
 here either: staff unlock a locked one (`Mfa::unlock_totp`).
+
+#### Passkeys
+
+A passkey (WebAuthn, through `webauthn-rs` 0.6 on RustCrypto, no OpenSSL) is a second
+factor beside the authenticator app: an account may hold the authenticator and any number
+of passkeys, any one of them answers the challenge and step-up, and a passkey satisfies
+`RecentMfa` as a code does. Passkeys are off until the app names its site:
+
+| Variable | Production | Local development |
+|---|---|---|
+| `PASSKEY_RP_ID` | `example.com` (the domain; a passkey works only for the id it was made for, so pick it once) | `localhost` |
+| `PASSKEY_ORIGIN` | `https://example.com` (several, comma-separated, each the id or a subdomain of it) | `http://localhost:3000` |
+| `PASSKEY_RP_NAME` | the name an authenticator shows (the id if unset) | |
+
+An origin is `https`, except `http://localhost` with any port, which browsers treat as
+secure; so develop on `localhost`, not `127.0.0.1` or a LAN address. A configuration whose
+origin is not the id or a subdomain of it fails at start with `RelyingPartyError`, which
+names both. A browser answering from another origin (a site reached by a name the
+variables leave out) is refused with `MfaError::PasskeyOrigin`, and the log says which
+origin. Passkeys made against `localhost` do not work in production, and the reverse.
+
+```rust,no_run
+use owt_accounts::mfa::Mfa;
+use owt_accounts::mfa::passkey::RelyingParty;
+
+# fn demo() -> anyhow::Result<()> {
+let mut mfa = Mfa::new("My App");
+// From PASSKEY_RP_ID, PASSKEY_ORIGIN and PASSKEY_RP_NAME; None (off) when the id is unset.
+if let Some(rp) = RelyingParty::from_env()? {
+    mfa = mfa.passkeys(rp);
+}
+// Or in code:
+let _local = RelyingParty::new("localhost", "http://localhost:3000")?.name("My App")?;
+# Ok(()) }
+```
+
+With the relying party set, `MfaPages` does the rest: the settings page lists the
+account's passkeys (rename, remove, add), the challenge and re-authentication pages show a
+"Use a passkey" button beside the code fields, and the enrollment page offers a passkey
+instead of an authenticator. The button runs `{base}/passkey.js` and needs JavaScript;
+without WebAuthn it stays hidden and the codes remain. An app that draws its own pages
+uses the functions:
+
+- **Register:** `Mfa::begin_passkey_registration(pool, account, &proof)` (the
+  `ChangeProof` of `authorize_change`, as for TOTP) returns a `Ceremony`: `options` for
+  `navigator.credentials.create()` (`options_json()`) and an opaque `token`. Post the
+  browser's answer (a `RegisterPublicKeyCredential`, as JSON) with the token and a name to
+  `Mfa::finish_passkey_registration`.
+- **Answer a challenge or step-up:** `Mfa::begin_passkey_challenge(pool, account)` (the
+  pending account, or the one signed in on a re-authentication page; `None` when it has no
+  passkey) and `Mfa::challenge_passkey(pool, limiter, session, ip, token, credential)`,
+  which does everything `Mfa::challenge` does. For step-up, `begin_reauth` checks the
+  password first, as it does before a code.
+- **Manage:** `Mfa::list_passkeys`, `Mfa::rename_passkey` (a label: no step-up),
+  `Mfa::remove_passkey` (behind a `ChangeProof`).
+
+What holds:
+
+- **The ceremony state stays on the server**, in `account_passkey_ceremonies`, bound to the
+  account; the browser holds only the token. A ceremony answers once (its row is deleted as
+  it is read) and expires after five minutes. An answer for another account's ceremony,
+  or from another account's passkey, is refused.
+- **Recovery codes are per account, not per factor.** The first factor (a passkey or the
+  authenticator) issues them; adding another keeps them; removing a factor keeps them while
+  another remains, and the last factor takes them with it. `Factors::count` counts the
+  authenticator and each passkey.
+- **Removal is TOTP's rule:** behind step-up, and never the last factor under a required
+  policy (`MfaError::LastFactor`). Every change moves the session epoch on, so the
+  account's other sessions end.
+- **A counter that goes backwards is refused** (`MfaError::PasskeyCloned`): the credential
+  may exist twice. `MfaError::event` gives its audit event, `mfa.passkey.clone_suspected`
+  (`MfaPages` records it): tell the owner. The other events are `mfa.passkey.enrolled`,
+  `mfa.passkey.renamed`, `mfa.passkey.removed` and `mfa.challenge.passed` with
+  `Event::passkey` naming the row.
+- **Passkeys are counted whether or not they are on**, so turning `PASSKEY_RP_ID` off never
+  lets a password alone through for an account that has one: it signs in with its
+  authenticator or a recovery code until passkeys are on again.
 
 #### Roles
 

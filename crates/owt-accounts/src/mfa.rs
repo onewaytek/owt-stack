@@ -1,9 +1,12 @@
 //! A second factor after the password, a policy that can require it, and step-up
 //! re-authentication for sensitive actions.
 //!
-//! Two factors exist: an **authenticator app** (TOTP, [`owt_auth::totp`]) and, behind it,
-//! **recovery codes** ([`owt_auth::recovery`]) for the day the phone is lost. (Passkeys
-//! are not here yet.) Everything is a function an app wires to routes, in the style of
+//! Three factors exist: an **authenticator app** (TOTP, [`owt_auth::totp`]),
+//! **passkeys** (Web Authentication, [`passkey`]; on once [`Mfa::passkeys`] names the site) and,
+//! behind them, **recovery codes** ([`owt_auth::recovery`]) for the day the phone is
+//! lost. An account may hold an authenticator and any number of passkeys; any one of
+//! them answers a challenge, and the recovery codes stay while one of them remains.
+//! Everything is a function an app wires to routes, in the style of
 //! [`crate::session::password_sign_in`]; [`Mfa`] holds the configuration they share.
 //!
 //! # The sign-in
@@ -96,6 +99,7 @@ use crate::store::{self, Account};
 
 mod challenge;
 pub mod pages;
+pub mod passkey;
 mod state;
 mod step_up;
 
@@ -136,6 +140,8 @@ pub enum Factor {
     Totp,
     /// A single-use recovery code.
     RecoveryCode,
+    /// A passkey (Web Authentication).
+    Passkey,
 }
 
 impl Factor {
@@ -145,6 +151,7 @@ impl Factor {
         match self {
             Self::Totp => "totp",
             Self::RecoveryCode => "recovery_code",
+            Self::Passkey => "passkey",
         }
     }
 }
@@ -162,6 +169,9 @@ pub struct Event {
     /// required a factor and the account had none). Whoever holds the password can do
     /// this, so tell the account's owner by email whenever it is true.
     pub while_pending: bool,
+    /// The passkey (its row id, as [`Mfa::list_passkeys`] lists it) the event is about,
+    /// for the events of one.
+    pub passkey: Option<i64>,
 }
 
 impl Event {
@@ -170,6 +180,7 @@ impl Event {
             account,
             kind,
             while_pending: false,
+            passkey: None,
         }
     }
 }
@@ -198,24 +209,34 @@ pub enum EventKind {
     /// A second-factor challenge was passed: a sign-in completed, or a session was
     /// re-authenticated.
     ChallengePassed(Factor),
+    /// A factor was renamed (a passkey).
+    Renamed(Factor),
+    /// A passkey answered with a signature counter at or below the one stored: the
+    /// credential may have been copied. The answer was refused; tell the owner.
+    CloneSuspected(Factor),
 }
 
 impl Event {
     /// A stable, dotted name for the audit log: `mfa.totp.enrolled`,
     /// `mfa.totp.removed`, `mfa.recovery_codes.issued`, `mfa.recovery_code.used`,
-    /// `mfa.challenge.passed`.
+    /// `mfa.challenge.passed`, `mfa.passkey.enrolled`, `mfa.passkey.removed`,
+    /// `mfa.passkey.renamed`, `mfa.passkey.clone_suspected`.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self.kind {
             EventKind::Enrolled(Factor::Totp) => "mfa.totp.enrolled",
+            EventKind::Enrolled(Factor::Passkey) => "mfa.passkey.enrolled",
             EventKind::Enrolled(_) => "mfa.factor.enrolled",
             EventKind::Removed(Factor::Totp) => "mfa.totp.removed",
+            EventKind::Removed(Factor::Passkey) => "mfa.passkey.removed",
             EventKind::Removed(_) => "mfa.factor.removed",
             EventKind::RecoveryCodesIssued => "mfa.recovery_codes.issued",
             EventKind::RecoveryCodeUsed { .. } => "mfa.recovery_code.used",
             EventKind::Locked(_) => "mfa.factor.locked",
             EventKind::Unlocked(_) => "mfa.factor.unlocked",
             EventKind::ChallengePassed(_) => "mfa.challenge.passed",
+            EventKind::Renamed(_) => "mfa.passkey.renamed",
+            EventKind::CloneSuspected(_) => "mfa.passkey.clone_suspected",
         }
     }
 }
@@ -498,6 +519,31 @@ pub enum MfaError {
     /// Re-authenticating needs a password or a factor, and the account has neither.
     #[error("There is nothing to confirm your identity with. Sign in again.")]
     NothingToProve,
+    /// Passkeys are not turned on ([`Mfa::passkeys`]).
+    #[error("Passkeys are not available on this site.")]
+    PasskeysOff,
+    /// The passkey ceremony the answer names does not exist, has expired (five
+    /// minutes) or was used: begin again.
+    #[error("That passkey request has expired. Please try again.")]
+    PasskeyExpired,
+    /// The browser answered for another origin or relying-party id than the
+    /// configuration names ([`passkey::RelyingParty`]); the log says which.
+    #[error("That passkey was made for another site address.")]
+    PasskeyOrigin,
+    /// The credential is registered already (to this account or another).
+    #[error("That passkey is already registered.")]
+    PasskeyTaken,
+    /// The passkey's signature counter went backwards: the credential may have been
+    /// copied. The answer was refused; [`MfaError::event`] gives the audit event.
+    #[error("That passkey was refused because it may have been copied. Use another factor.")]
+    PasskeyCloned {
+        /// The passkey's row id.
+        passkey: i64,
+    },
+    /// A passkey's name is empty, longer than 64 characters or holds control
+    /// characters.
+    #[error("Give the passkey a name of 1 to 64 characters.")]
+    BadName,
     /// A fault: the database, the random source or the sealer. Its source may name
     /// tables; log it and never show it.
     #[error("The check could not be made. Try again in a moment.")]
@@ -548,6 +594,21 @@ impl MfaError {
             }
         )
         .then(|| Event::new(account, EventKind::Locked(Factor::Totp)))
+    }
+
+    /// The audit event a refusal carries, to record and email the owner about: the
+    /// lock this answer just caused ([`locked_event`](Self::locked_event)), or a
+    /// passkey suspected of being copied ([`MfaError::PasskeyCloned`]). `None` for any
+    /// other answer.
+    #[must_use]
+    pub fn event(&self, account: i64) -> Option<Event> {
+        match self {
+            Self::PasskeyCloned { passkey } => Some(Event {
+                passkey: Some(*passkey),
+                ..Event::new(account, EventKind::CloneSuspected(Factor::Passkey))
+            }),
+            _ => self.locked_event(account),
+        }
     }
 
     /// The status a form answers with: 429 throttled, 503 unavailable, 422 a code or
@@ -617,6 +678,8 @@ pub struct Factors {
     pub recovery_codes_left: i64,
     /// The authenticator is locked after too many wrong codes ([`MfaError::Locked`]).
     pub totp_locked: bool,
+    /// Passkeys registered.
+    pub passkeys: i64,
 }
 
 impl Factors {
@@ -624,7 +687,7 @@ impl Factors {
     /// losing one, not a factor of their own).
     #[must_use]
     pub fn count(&self) -> usize {
-        usize::from(self.totp_confirmed_at.is_some())
+        usize::from(self.totp_confirmed_at.is_some()) + usize::try_from(self.passkeys).unwrap_or(0)
     }
 
     /// Whether the account has a second factor to challenge.
@@ -652,7 +715,9 @@ pub const LOCK_FOR_MIN: Duration = Duration::from_mins(1);
 /// Proof that the person may change their factors now: made by [`Mfa::authorize_change`]
 /// and nothing else, and asked for by every function that changes them
 /// ([`Mfa::begin_totp`], [`Mfa::confirm_totp`], [`Mfa::remove_totp`],
-/// [`Mfa::regenerate_recovery_codes`]), so a handler that forgets the step-up does not
+/// [`Mfa::regenerate_recovery_codes`], and for passkeys
+/// [`Mfa::begin_passkey_registration`], [`Mfa::finish_passkey_registration`] and
+/// [`Mfa::remove_passkey`]), so a handler that forgets the step-up does not
 /// compile.
 #[derive(Debug)]
 pub struct ChangeProof {
@@ -672,6 +737,7 @@ pub struct Mfa {
     accept_plaintext: bool,
     lock_after: i32,
     lock_for: Duration,
+    passkeys: Option<passkey::RelyingParty>,
 }
 
 impl std::fmt::Debug for Mfa {
@@ -705,6 +771,7 @@ impl Mfa {
             accept_plaintext: true,
             lock_after: LOCK_AFTER,
             lock_for: LOCK_FOR,
+            passkeys: None,
         }
     }
 
@@ -888,14 +955,15 @@ impl Mfa {
     /// # Errors
     /// The database.
     pub async fn factors(&self, pool: &PgPool, account: i64) -> sqlx::Result<Factors> {
-        let (confirmed_at, locked, left): (Option<i64>, bool, i64) = sqlx::query_as(
+        let (confirmed_at, locked, left, passkeys): (Option<i64>, bool, i64, i64) = sqlx::query_as(
             "SELECT
                (SELECT EXTRACT(EPOCH FROM confirmed_at)::bigint FROM account_totp
                  WHERE account_id = $1 AND confirmed_at IS NOT NULL),
                COALESCE((SELECT locked_until > now() FROM account_totp
                  WHERE account_id = $1 AND confirmed_at IS NOT NULL), false),
                (SELECT count(*) FROM account_recovery_codes
-                 WHERE account_id = $1 AND used_at IS NULL)",
+                 WHERE account_id = $1 AND used_at IS NULL),
+               (SELECT count(*) FROM account_passkeys WHERE account_id = $1)",
         )
         .bind(account)
         .fetch_one(pool)
@@ -904,6 +972,7 @@ impl Mfa {
             totp_confirmed_at: confirmed_at,
             recovery_codes_left: left,
             totp_locked: locked,
+            passkeys,
         })
     }
 
@@ -1132,15 +1201,10 @@ impl Mfa {
             .await
             .map_err(MfaError::fault)?;
         let mut tx = pool.begin().await?;
-        // Held for the swap, and gone if the authenticator was removed meanwhile.
-        let held: Option<(i64,)> = sqlx::query_as(
-            "SELECT account_id FROM account_totp
-             WHERE account_id = $1 AND confirmed_at IS NOT NULL FOR UPDATE",
-        )
-        .bind(account.id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if held.is_none() {
+        // The account is held for the swap, and refused if its last factor was removed
+        // meanwhile.
+        passkey::lock_account(&mut tx, account.id).await?;
+        if passkey::factor_count(&mut tx, account.id).await? == 0 {
             return Err(MfaError::NotEnrolled);
         }
         replace_codes(&mut tx, account.id, &codes).await?;
@@ -1163,9 +1227,10 @@ impl Mfa {
         ))
     }
 
-    /// Remove the authenticator and the recovery codes behind it. Refused with
-    /// [`MfaError::LastFactor`] when the policy requires `account` to have a factor and
-    /// this is its last. Moves the session epoch on (other sessions end) and reseals
+    /// Remove the authenticator, and the recovery codes behind it when it is the
+    /// account's last factor (an account that keeps a passkey keeps its codes). Refused
+    /// with [`MfaError::LastFactor`] when the policy requires `account` to have a factor
+    /// and this is its last. Moves the session epoch on (other sessions end) and reseals
     /// this one. Tell the owner.
     ///
     /// # Errors
@@ -1182,6 +1247,7 @@ impl Mfa {
             return Err(MfaError::NotEnrolled);
         }
         let mut tx = pool.begin().await?;
+        passkey::lock_account(&mut tx, account.id).await?;
         let held: Option<(Option<i64>,)> = sqlx::query_as(
             "SELECT EXTRACT(EPOCH FROM confirmed_at)::bigint FROM account_totp
              WHERE account_id = $1 FOR UPDATE",
@@ -1194,18 +1260,22 @@ impl Mfa {
             // An enrollment never confirmed is not a factor: there is nothing to remove.
             _ => return Err(MfaError::NotEnrolled),
         }
-        // Other factors would be counted here; there are none yet.
-        if self.requires(account) {
+        // The authenticator is one of the factors counted: it is the last when the count
+        // is one.
+        let last = passkey::factor_count(&mut tx, account.id).await? <= 1;
+        if last && self.requires(account) {
             return Err(MfaError::LastFactor);
         }
         sqlx::query("DELETE FROM account_totp WHERE account_id = $1")
             .bind(account.id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM account_recovery_codes WHERE account_id = $1")
-            .bind(account.id)
-            .execute(&mut *tx)
-            .await?;
+        if last {
+            sqlx::query("DELETE FROM account_recovery_codes WHERE account_id = $1")
+                .bind(account.id)
+                .execute(&mut *tx)
+                .await?;
+        }
         let epoch = bump_epoch(&mut tx, account.id, account.session_epoch).await?;
         tx.commit().await?;
         let account_now = Account {

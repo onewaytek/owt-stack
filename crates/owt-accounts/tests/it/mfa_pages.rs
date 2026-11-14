@@ -164,7 +164,10 @@ struct App {
 }
 
 fn app(db: &Db, per_account: u32) -> App {
-    let mfa = mfa();
+    app_with(db, per_account, mfa())
+}
+
+fn app_with(db: &Db, per_account: u32, mfa: Mfa) -> App {
     let throttle = Arc::new(throttle(per_account));
     let st = AppState {
         pool: db.pool.clone(),
@@ -560,5 +563,126 @@ async fn a_cross_origin_post_is_refused() {
         )
         .await;
     assert_eq!(r.status, 403);
+    db.drop().await;
+}
+
+/// The value of the first `name="…" value="…"` or `data-options="…"` attribute,
+/// unescaped.
+fn attr(html: &str, after: &str) -> String {
+    let rest = html
+        .split(after)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{after} in {html}"));
+    rest.split('"')
+        .next()
+        .unwrap()
+        .replace("&#34;", "\"")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+#[tokio::test]
+async fn a_passkey_added_on_the_settings_page_answers_the_challenge() {
+    use owt_accounts::mfa::passkey::{
+        CreationChallengeResponse, RelyingParty, RequestChallengeResponse, Url,
+    };
+    use webauthn_authenticator_rs::WebauthnAuthenticator as _;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let db = db!();
+    account(&db, "ada").await;
+    let origin = Url::parse("http://localhost:3000").unwrap();
+    let mfa = mfa().passkeys(RelyingParty::new("localhost", origin.as_str()).unwrap());
+    let app = app_with(&db, 1000, mfa);
+    let r = app
+        .client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(r.text(), "Done");
+    assert!(
+        app.client
+            .get("/mfa")
+            .await
+            .text()
+            .contains("No passkeys yet.")
+    );
+
+    let r = app.client.get("/mfa/passkeys/add").await;
+    assert_eq!(r.status, 200);
+    let html = r.text();
+    assert!(html.contains("src=\"/mfa/passkey.js\""), "{html}");
+    let options: CreationChallengeResponse =
+        serde_json::from_str(&attr(&html, "data-options=\"")).unwrap();
+    let token = attr(&html, "name=\"passkey_token\" value=\"");
+    let mut key = SoftPasskey::new(true);
+    let credential = key.do_registration(origin.clone(), options).unwrap();
+    let r = app
+        .client
+        .post_form(
+            "/mfa/passkeys/add",
+            &[
+                ("name", "Laptop"),
+                ("passkey_token", &token),
+                (
+                    "passkey_credential",
+                    &serde_json::to_string(&credential).unwrap(),
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(
+        secrets(&r.text()).len(),
+        3,
+        "the first factor shows its codes"
+    );
+    assert_eq!(
+        app.log.take(),
+        ["mfa.passkey.enrolled", "mfa.recovery_codes.issued"]
+    );
+    assert!(
+        app.client
+            .get("/mfa")
+            .await
+            .text()
+            .contains("value=\"Laptop\"")
+    );
+
+    sign_in_again(&app).await;
+    let r = app.client.get("/mfa/challenge?next=%2Fprivate").await;
+    let html = r.text();
+    let options: RequestChallengeResponse =
+        serde_json::from_str(&attr(&html, "data-options=\"")).unwrap();
+    let token = attr(&html, "name=\"passkey_token\" value=\"");
+    let credential = key.do_authentication(origin, options).unwrap();
+    let r = app
+        .client
+        .post_form(
+            "/mfa/challenge",
+            &[
+                ("passkey_token", token.as_str()),
+                (
+                    "passkey_credential",
+                    &serde_json::to_string(&credential).unwrap(),
+                ),
+                ("next", "/private"),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, 303, "{}", r.text());
+    assert_eq!(r.location(), Some("/private"));
+    assert_eq!(app.client.get("/private").await.text(), "private for ada");
+    assert_eq!(app.log.take(), ["mfa.challenge.passed"]);
+
+    let r = app.client.get("/mfa/passkey.js").await;
+    assert_eq!(r.status, 200);
+    assert!(
+        r.header("content-type")
+            .unwrap()
+            .starts_with("text/javascript")
+    );
     db.drop().await;
 }

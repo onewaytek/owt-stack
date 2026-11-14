@@ -15,4 +15,15 @@
 <form method="post" action="{{ v.remove }}"><button class="owt-button owt-button-danger" type="submit">Remove</button></form>
 </div>
 {% else %}<div class="owt-actions"><a class="owt-button" href="{{ v.enroll }}">Set up an authenticator</a></div>
+{% endif %}{% if let Some(add) = v.add_passkey %}<h2>Passkeys</h2>
+<p class="owt-hint">A passkey signs you in with your fingerprint, face or screen lock instead of a code. Removing one asks you to confirm it is you first.</p>
+{% if v.passkeys.is_empty() %}<p>No passkeys yet.</p>
+{% else %}{% for pk in v.passkeys %}<div class="owt-toolbar">
+<form method="post" action="{{ pk.rename }}"><label class="owt-label" for="passkey-{{ pk.info.id }}">Name</label>
+<input class="owt-input" id="passkey-{{ pk.info.id }}" name="name" value="{{ pk.info.name }}" maxlength="64" required>
+<button class="owt-button owt-button-secondary" type="submit">Rename</button></form>
+<span class="owt-hint">{% if pk.info.backup_state %}Synced. {% endif %}{% if pk.info.last_used_at.is_some() %}Used before.{% else %}Not used yet.{% endif %}</span>
+<form method="post" action="{{ pk.remove }}"><button class="owt-button owt-button-danger" type="submit">Remove</button></form>
+</div>
+{% endfor %}{% endif %}<div class="owt-actions"><a class="owt-button" href="{{ add }}">Add a passkey</a></div>
 {% endif %}</section>
