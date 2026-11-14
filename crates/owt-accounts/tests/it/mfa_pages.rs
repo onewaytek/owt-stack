@@ -137,6 +137,18 @@ async fn login(
     }
 }
 
+/// Another first factor (a sign-in link, a provider, a password gate): each ends in
+/// `session::sign_in`, and the layer holds what follows.
+async fn door(
+    State(st): State<AppState>,
+    session: Session<Data>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> &'static str {
+    let account = store::by_id(&st.pool, id).await.unwrap().unwrap();
+    owt_accounts::session::sign_in(&session, &account);
+    "signed"
+}
+
 #[derive(Clone, Default)]
 struct Log(Arc<Mutex<Vec<String>>>);
 
@@ -194,6 +206,7 @@ fn app_with(db: &Db, per_account: u32, mfa: Mfa) -> App {
     );
     let router = Router::new()
         .route("/login", post(login))
+        .route("/door/{id}", post(door))
         .route(
             "/private",
             get(|Signed(a): Signed| async move { format!("private for {}", a.username) }),
@@ -694,5 +707,124 @@ async fn a_passkey_added_on_the_settings_page_answers_the_challenge() {
     let html = app.client.get("/mfa").await.text();
     assert!(html.contains("Disabled: suspected copy"), "{html}");
     assert!(html.contains("/remove\""), "{html}");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn an_account_locked_until_recovery_is_refused_at_every_door_until_cleared() {
+    let db = db!();
+    let ada = account(&db, "ada").await;
+    let staff = account(&db, "staff").await;
+    let mfa = mfa();
+    let app = app_with(&db, 1000, mfa.clone());
+    // As a passkey disabled as a suspected copy leaves it, with nothing else to sign in.
+    sqlx::query("UPDATE accounts SET mfa_recovery_locked_at = now() WHERE id = $1")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(mfa.factors(&db.pool, ada.id).await.unwrap().recovery_locked);
+
+    // The password: refused, and the challenge route shows the locked page.
+    let r = app
+        .client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(r.text(), "Locked");
+    assert_eq!(app.client.get("/private").await.status, 303);
+    let r = app.client.get("/mfa/challenge?next=%2Fprivate").await;
+    assert_eq!(r.status, 403);
+    let page = r.text();
+    assert!(page.contains("This account is locked"), "{page}");
+    assert!(page.contains("/login?next=%2Fprivate"), "{page}");
+    // No code answers it.
+    let r = app
+        .client
+        .post_form(
+            "/mfa/challenge",
+            &[("recovery_code", "aaaa-bbbb"), ("next", "/private")],
+        )
+        .await;
+    assert_eq!(r.status, 403);
+    assert_eq!(app.client.get("/private").await.status, 303);
+
+    // A link, a provider or a password gate: the signature does not stand, and the
+    // session shows the locked page.
+    let other = app_with(&db, 1000, mfa.clone());
+    assert_eq!(
+        other
+            .client
+            .post_form(&format!("/door/{}", ada.id), &[])
+            .await
+            .text(),
+        "signed"
+    );
+    let r = other.client.get("/private").await;
+    assert_eq!(r.status, 303);
+    assert!(r.location().unwrap().starts_with("/login?next="));
+    assert_eq!(other.client.get("/mfa/challenge").await.status, 403);
+
+    // Staff clear the lock: the event is returned and the next sign-in stands.
+    let event = mfa
+        .clear_recovery_lock(&db.pool, ada.id, staff.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.name(), "mfa.account.recovery_lock_cleared");
+    assert!(
+        mfa.clear_recovery_lock(&db.pool, ada.id, staff.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let r = app
+        .client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(r.text(), "Done");
+    assert_eq!(app.client.get("/private").await.text(), "private for ada");
+    other
+        .client
+        .post_form(&format!("/door/{}", ada.id), &[])
+        .await;
+    assert_eq!(other.client.get("/private").await.text(), "private for ada");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn without_require_mfa_the_layer_still_refuses_a_locked_account() {
+    let db = db!();
+    let ada = account(&db, "ada").await;
+    sqlx::query("UPDATE accounts SET mfa_recovery_locked_at = now() WHERE id = $1")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let st = AppState {
+        pool: db.pool.clone(),
+        mfa: mfa(),
+        throttle: Arc::new(throttle(1000)),
+    };
+    let sessions = Sessions::<Data>::new(
+        owt_test::accounts::test_key(),
+        "s",
+        Duration::from_secs(3600),
+        false,
+    );
+    let router = Router::new()
+        .route("/door/{id}", post(door))
+        .route(
+            "/private",
+            get(|Signed(a): Signed| async move { format!("private for {}", a.username) }),
+        )
+        .with_state(st)
+        .layer(from_fn_with_state(
+            Accounts::new(db.pool.clone(), "/login"),
+            Accounts::load::<Data>,
+        ))
+        .layer(from_fn_with_state(sessions, Sessions::layer));
+    let client = owt_test::Client::new(router);
+    client.post_form(&format!("/door/{}", ada.id), &[]).await;
+    assert_eq!(client.get("/private").await.status, 303);
     db.drop().await;
 }

@@ -1690,8 +1690,8 @@ async fn the_step_up_gate_can_ask_for_the_second_factor() {
 /// Passkeys, with webauthn-rs's software authenticator standing in for the browser.
 mod passkeys {
     use super::*;
-    use owt_accounts::mfa::Confirmed;
     use owt_accounts::mfa::passkey::{RelyingParty, RelyingPartyError, Url};
+    use owt_accounts::mfa::{AfterSuspectedCopy, Confirmed};
     use webauthn_authenticator_rs::WebauthnAuthenticator as _;
     use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
@@ -2146,6 +2146,233 @@ mod passkeys {
         assert!(matches!(answered, Err(MfaError::PasskeyCloned { passkey }) if passkey == id));
         let factors = mfa.factors(&db.pool, ada.id).await.unwrap();
         assert_eq!((factors.passkeys, factors.passkeys_disabled), (0, 1));
+        db.drop().await;
+    }
+
+    /// Register a passkey for `ada`, take her recovery codes if not `keep_codes`, and
+    /// answer with a copy of it: the passkey is disabled as a suspected clone.
+    async fn copy_suspected(
+        db: &Db,
+        mfa: &Mfa,
+        ada: &store::Account,
+        keep_codes: bool,
+    ) -> Session<Data> {
+        let mut key = SoftPasskey::new(true);
+        let session = signed_in(ada);
+        register(db, mfa, &session, ada, &mut key, "Key")
+            .await
+            .unwrap();
+        if !keep_codes {
+            sqlx::query("DELETE FROM account_recovery_codes")
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE account_passkeys
+             SET passkey = jsonb_set(passkey, '{cred,counter}', '1000'), counter = 1000",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (_, answered) = sign_in_with(db, mfa, &ada.username, &mut key).await;
+        assert!(matches!(answered, Err(MfaError::PasskeyCloned { .. })));
+        session
+    }
+
+    #[tokio::test]
+    async fn a_suspected_copy_with_nothing_left_locks_the_account_until_recovery() {
+        let db = db!();
+        let told = Told::default();
+        // LockUntilRecovery is the default, whatever the policy.
+        let mfa = pk_mfa().on_security_event(told.clone());
+        let ada = account(&db, "ada", false).await;
+        let staff = account(&db, "staff", true).await;
+        copy_suspected(&db, &mfa, &ada, false).await;
+        let names: Vec<_> = told.0.lock().unwrap().iter().map(|t| t.1).collect();
+        assert_eq!(
+            names,
+            ["mfa.passkey.clone_suspected", "mfa.account.recovery_locked"]
+        );
+        let factors = mfa.factors(&db.pool, ada.id).await.unwrap();
+        assert!(factors.recovery_locked && !factors.any());
+
+        // The lock is on the account, so another Mfa (a restart) refuses it too.
+        let restarted = pk_mfa();
+        let session = Session::<Data>::default();
+        let next = restarted
+            .password_sign_in(&db.pool, &throttle(), &session, IP, "ada", PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(next, Next::Locked);
+        assert!(session.read(Data::signature).is_none());
+        let (_, kind) = restarted
+            .pending_account(&db.pool, &session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kind, owt_accounts::mfa::Kind::Locked);
+        assert!(matches!(
+            restarted
+                .challenge(&db.pool, &throttle(), &session, IP, Answer::Recovery("x"))
+                .await,
+            Err(MfaError::NoChallenge)
+        ));
+
+        // Cleared: told and returned, and the account signs in as one without a factor.
+        let event = mfa
+            .clear_recovery_lock(&db.pool, ada.id, staff.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event.kind,
+            EventKind::RecoveryLockCleared { actor: staff.id }
+        );
+        assert_eq!(
+            told.0.lock().unwrap().last().unwrap().1,
+            "mfa.account.recovery_lock_cleared"
+        );
+        let session = Session::<Data>::default();
+        let next = mfa
+            .password_sign_in(&db.pool, &throttle(), &session, IP, "ada", PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(next, Next::Done);
+        let required = pk_mfa().policy(MfaPolicy::Required);
+        let next = required
+            .password_sign_in(
+                &db.pool,
+                &throttle(),
+                &Session::<Data>::default(),
+                IP,
+                "ada",
+                PASSWORD,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next, Next::Enroll);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn allowing_reenrolment_keeps_the_account_unlocked() {
+        let db = db!();
+        let told = Told::default();
+        let mfa = pk_mfa()
+            .policy(MfaPolicy::Required)
+            .after_suspected_copy(AfterSuspectedCopy::AllowReenrolment)
+            .on_security_event(told.clone());
+        let ada = account(&db, "ada", false).await;
+        copy_suspected(&db, &mfa, &ada, false).await;
+        assert_eq!(told.0.lock().unwrap().len(), 1);
+        assert!(!mfa.factors(&db.pool, ada.id).await.unwrap().recovery_locked);
+        let next = mfa
+            .password_sign_in(
+                &db.pool,
+                &throttle(),
+                &Session::<Data>::default(),
+                IP,
+                "ada",
+                PASSWORD,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next, Next::Enroll);
+        let optional = pk_mfa().after_suspected_copy(AfterSuspectedCopy::AllowReenrolment);
+        let next = optional
+            .password_sign_in(
+                &db.pool,
+                &throttle(),
+                &Session::<Data>::default(),
+                IP,
+                "ada",
+                PASSWORD,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next, Next::Done);
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn the_lock_waits_until_no_factor_and_no_recovery_code_remain() {
+        let db = db!();
+        let mfa = pk_mfa();
+        // Recovery codes left: challenged, not locked.
+        let ada = account(&db, "ada", false).await;
+        copy_suspected(&db, &mfa, &ada, true).await;
+        assert!(!mfa.factors(&db.pool, ada.id).await.unwrap().recovery_locked);
+        let next = mfa
+            .password_sign_in(
+                &db.pool,
+                &throttle(),
+                &Session::<Data>::default(),
+                IP,
+                "ada",
+                PASSWORD,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next, Next::Challenge);
+
+        // An authenticator left, and no codes: challenged, not locked.
+        let bob = account(&db, "bob", false).await;
+        let enrolled = enroll(&db, &mfa, &bob).await;
+        let mut key = SoftPasskey::new(true);
+        register(
+            &db,
+            &mfa,
+            &enrolled.session,
+            &enrolled.account,
+            &mut key,
+            "Key",
+        )
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM account_recovery_codes WHERE account_id = $1")
+            .bind(bob.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE account_passkeys
+             SET passkey = jsonb_set(passkey, '{cred,counter}', '1000'), counter = 1000
+             WHERE account_id = $1",
+        )
+        .bind(bob.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let session = Session::<Data>::default();
+        mfa.password_sign_in(&db.pool, &throttle(), &session, IP, "bob", PASSWORD)
+            .await
+            .unwrap();
+        let (pending, _) = mfa
+            .pending_account(&db.pool, &session)
+            .await
+            .unwrap()
+            .unwrap();
+        let begun = mfa
+            .begin_passkey_challenge(&db.pool, &session, &pending)
+            .await
+            .unwrap()
+            .unwrap();
+        let credential = key.do_authentication(origin(), begun.options).unwrap();
+        assert!(matches!(
+            mfa.challenge_passkey(
+                &db.pool,
+                &throttle(),
+                &session,
+                IP,
+                &begun.token,
+                &credential
+            )
+            .await,
+            Err(MfaError::PasskeyCloned { .. })
+        ));
+        let factors = mfa.factors(&db.pool, bob.id).await.unwrap();
+        assert!(!factors.recovery_locked && factors.any());
         db.drop().await;
     }
 

@@ -2,7 +2,7 @@
 -- Copy this file into the app's migrations directory as its next unused version,
 -- unaltered, if the app keeps copies.
 --
--- Schema only: three new tables, nothing rewritten.
+-- Schema only: three new tables and a nullable column on `accounts`, nothing rewritten.
 
 SET LOCAL lock_timeout = '5s';
 
@@ -54,3 +54,9 @@ CREATE TABLE account_passkey_ceremonies (
     expires_at timestamptz NOT NULL
 );
 CREATE INDEX account_passkey_ceremonies_expiry ON account_passkey_ceremonies (expires_at);
+
+-- Set when a passkey is disabled as a suspected copy and the account is left with no
+-- usable second factor and no recovery code, under `AfterSuspectedCopy::LockUntilRecovery`
+-- (the default): every sign-in is refused until `Mfa::clear_recovery_lock` clears it.
+-- Adding a nullable column with no default rewrites nothing.
+ALTER TABLE accounts ADD COLUMN mfa_recovery_locked_at timestamptz;

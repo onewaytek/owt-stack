@@ -2564,7 +2564,7 @@ What holds:
   was the disabled passkey is still challenged while it has recovery codes left
   (`Factors::any`, and the layer's gate, count a disabled passkey with codes left), and
   signs in with a recovery code, then removes the copy and adds a new factor. With no codes
-  left it holds no factor: under a required policy, the next sign-in enrolls one.
+  left, what follows is the app's choice, `Mfa::after_suspected_copy` (below).
 - **Passkey failures do not count toward `Mfa::lockout`.** That lockout protects six-digit
   codes, which can be guessed; a passkey answer is a signature over a fresh challenge, which
   cannot. Every passkey answer is still charged to the throttle (`Key::SecondFactor`) as a
@@ -2592,7 +2592,8 @@ impl Notifier for EmailOwner {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             // Look up `event.account`'s email; send "a passkey on your account was
-            // disabled" when `event.name()` is "mfa.passkey.clone_suspected".
+            // disabled" when `event.name()` is "mfa.passkey.clone_suspected", and how to
+            // recover the account when it is "mfa.account.recovery_locked".
             let _ = (event.account, event.name(), event.passkey);
             Ok(())
         })
@@ -2601,6 +2602,51 @@ impl Notifier for EmailOwner {
 
 let mfa = Mfa::new("My App").on_security_event(EmailOwner);
 # let _ = mfa;
+```
+
+When a suspected copy leaves an account with no usable factor and no recovery code, the
+app chooses what follows with `Mfa::after_suspected_copy`:
+
+- **`AfterSuspectedCopy::LockUntilRecovery`, the default.** The disable records the lock on
+  the account (`accounts.mfa_recovery_locked_at`, in migration 0011) in the same
+  transaction as the disable and the epoch bump, so it survives restarts. Every sign-in is
+  refused, by any door: `Mfa::password_sign_in` answers `Next::Locked` (send it to
+  `{base}/challenge` as a challenge), and the layer holds a link, a provider or a password
+  gate the same way, even without `require_mfa`. `MfaPages`' challenge route shows a page
+  that says the account is locked pending recovery (`Views::locked`, `LockedView`: tell the
+  person how the app recovers accounts). The notifier hears `mfa.account.recovery_locked`
+  after `mfa.passkey.clone_suspected`; `Factors::recovery_locked` reads the state.
+- **`AfterSuspectedCopy::AllowReenrolment`.** The account signs in on what remains: a
+  password alone under an optional policy, a forced enrollment under a required one.
+
+Whoever holds the copy may hold the password too, so the lock is the safer default. While
+another factor or a recovery code remains, neither choice changes anything: the account is
+challenged. A lock already recorded stands if the app later allows re-enrolment.
+
+The app's recovery is its own: staff, or a flow that proves the owner by the app's own
+means (identity documents, a call back to a number on file). Once it has, it calls
+`Mfa::clear_recovery_lock(pool, account, actor)`, where `actor` is the member of staff or
+the account itself. It returns the `mfa.account.recovery_lock_cleared` event for the audit
+log (`None` if the account was not locked), tells the notifier, and the account then signs
+in as one without a factor does, adding a new passkey or authenticator.
+
+```rust
+use owt_accounts::mfa::{AfterSuspectedCopy, Mfa};
+
+// The default: locked until recovery.
+let strict = Mfa::new("My App");
+// Opting in to re-enrolment instead.
+let lenient = Mfa::new("My App").after_suspected_copy(AfterSuspectedCopy::AllowReenrolment);
+# let _ = (strict, lenient);
+
+async fn recover(mfa: &Mfa, pool: &sqlx::PgPool, account: i64, staff: i64) -> anyhow::Result<()> {
+    if let Some(event) = mfa.clear_recovery_lock(pool, account, staff).await? {
+        // Record `event.name()` in the app's audit log.
+        let _ = event;
+    }
+    Ok(())
+}
+# let _ = recover;
 ```
 
 #### Roles

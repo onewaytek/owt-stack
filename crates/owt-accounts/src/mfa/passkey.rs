@@ -50,7 +50,10 @@ pub use webauthn_rs::prelude::{
     RequestChallengeResponse, Url,
 };
 
-use super::{ChangeProof, Confirmed, Event, EventKind, Factor, Mfa, MfaError, Next, state};
+use super::{
+    AfterSuspectedCopy, ChangeProof, Confirmed, Event, EventKind, Factor, Mfa, MfaError, Next,
+    state,
+};
 use crate::session;
 use crate::store::{self, Account};
 
@@ -730,29 +733,55 @@ impl Mfa {
     /// session of the account (its session epoch moves on, so a session the copy opened
     /// ends too), in `tx` (which holds the passkey's row), then tell the notifier: the
     /// error to answer with, which is [`MfaError::PasskeyCloned`] unless the passkey
-    /// could not be disabled.
+    /// could not be disabled. Under [`AfterSuspectedCopy::LockUntilRecovery`], an account
+    /// left with no usable factor and no recovery code is locked until recovery in the
+    /// same transaction.
     async fn disable_cloned(
         &self,
         mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
         account: i64,
         id: i64,
     ) -> MfaError {
+        let lock = self.after_suspected_copy == AfterSuspectedCopy::LockUntilRecovery;
         let disabled = async {
             sqlx::query("UPDATE account_passkeys SET disabled_at = now() WHERE id = $1")
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-            // Whatever epoch the account is at: every session it has ends.
+            // Whatever epoch the account is at: every session it has ends. The update
+            // holds the account's row, as every factor change does, so the check below
+            // sees the factors as they stand.
             sqlx::query("UPDATE accounts SET session_epoch = session_epoch + 1 WHERE id = $1")
                 .bind(account)
                 .execute(&mut *tx)
                 .await?;
-            tx.commit().await
+            let locked = if lock {
+                sqlx::query(
+                    "UPDATE accounts SET mfa_recovery_locked_at = now()
+                     WHERE id = $1
+                       AND NOT EXISTS (SELECT 1 FROM account_totp
+                                       WHERE account_id = $1 AND confirmed_at IS NOT NULL)
+                       AND NOT EXISTS (SELECT 1 FROM account_passkeys
+                                       WHERE account_id = $1 AND disabled_at IS NULL)
+                       AND NOT EXISTS (SELECT 1 FROM account_recovery_codes
+                                       WHERE account_id = $1 AND used_at IS NULL)",
+                )
+                .bind(account)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                    > 0
+            } else {
+                false
+            };
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(locked)
         }
         .await;
-        if let Err(e) = disabled {
-            return e.into();
-        }
+        let locked = match disabled {
+            Ok(locked) => locked,
+            Err(e) => return e.into(),
+        };
         tracing::warn!(
             account,
             passkey = id,
@@ -761,6 +790,14 @@ impl Mfa {
         let error = MfaError::PasskeyCloned { passkey: id };
         if let Some(event) = error.event(account) {
             self.notify(&event).await;
+        }
+        if locked {
+            tracing::warn!(
+                account,
+                "the account has no other factor and no recovery code: it is locked until recovery"
+            );
+            self.notify(&Event::new(account, EventKind::RecoveryLocked))
+                .await;
         }
         error
     }

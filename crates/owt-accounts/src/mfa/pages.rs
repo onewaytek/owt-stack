@@ -11,7 +11,7 @@
 //! | Route | What it is |
 //! |---|---|
 //! | `GET {base}` | the account's factors, with buttons to set up, remove or set up again the authenticator and to make new recovery codes |
-//! | `GET, POST {base}/challenge?next=` | the code a pending sign-in waits for ([`Next::Challenge`]): a TOTP code or a recovery code |
+//! | `GET, POST {base}/challenge?next=` | the code a pending sign-in waits for ([`Next::Challenge`]): a TOTP code or a recovery code; for an account locked until recovery ([`Next::Locked`]), a page that says so |
 //! | `GET, POST {base}/enroll?next=` | a fresh secret as a QR code and as text; the first code turns it on and shows the recovery codes once |
 //! | `POST {base}/remove` | removes the authenticator and its recovery codes |
 //! | `POST {base}/reenroll` | removes it, then sends the person to enroll a new one |
@@ -56,8 +56,8 @@
 //!
 //! The app provides the sealer ([`Mfa::sealer`]; a release build refuses
 //! [`Unsealed`](super::Unsealed)), the layout ([`Chrome`]), and its own sign-in page, which
-//! sends [`Next::Challenge`] to `{base}/challenge` and [`Next::Enroll`] to
-//! `{base}/enroll`, each with `?next=`.
+//! sends [`Next::Challenge`] and [`Next::Locked`] to `{base}/challenge` and
+//! [`Next::Enroll`] to `{base}/enroll`, each with `?next=`.
 
 use std::fmt;
 use std::future::Future;
@@ -235,6 +235,16 @@ pub trait Views: Send + Sync + 'static {
         let _ = request;
         Body::render(&PasskeyAddHtml { v: view })
     }
+
+    /// The page a sign-in sees while its account is locked until recovery
+    /// ([`Next::Locked`]). Tell the person how the app's recovery works.
+    ///
+    /// # Errors
+    /// When the template does not render.
+    fn locked(&self, request: &Parts, view: &LockedView) -> owt_web::Result<Body> {
+        let _ = request;
+        Body::render(&LockedHtml { v: view })
+    }
 }
 
 /// The pages in `owt-*` classes from `tailwind/owt.css`: what [`MfaPages`] draws unless
@@ -243,6 +253,15 @@ pub trait Views: Send + Sync + 'static {
 pub struct Tailwind;
 
 impl Views for Tailwind {}
+
+/// The page of a sign-in whose account is locked until recovery
+/// ([`AfterSuspectedCopy::LockUntilRecovery`](super::AfterSuspectedCopy::LockUntilRecovery)).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct LockedView {
+    /// The sign-in page, with `?next=` set.
+    pub sign_in: String,
+}
 
 /// The sign-in challenge. Its form posts `code` or `recovery_code`, and `next`, to
 /// `action`.
@@ -438,6 +457,12 @@ impl Notice {
         };
         Some(Self { error, text })
     }
+}
+
+#[derive(Template)]
+#[template(path = "mfa/locked.html")]
+struct LockedHtml<'a> {
+    v: &'a LockedView,
 }
 
 #[derive(Template)]
@@ -974,10 +999,30 @@ async fn challenge_form<T: MfaSession>(
     let account = match p.mfa.pending_account(&p.pool, &session).await {
         Ok(Some((account, Kind::Challenge))) => account,
         Ok(Some((_, Kind::Enroll))) => return see_other(&with_next(&p.enroll_url(), &next)),
+        Ok(Some((account, Kind::Locked))) => return locked_page(&p, &parts, &account, &next).await,
         Ok(_) => return to_sign_in(&parts, &next),
         Err(e) => return owt_web::Error::from(e).into_response(),
     };
     challenge_page(&p, &parts, &session, &account, next, None).await
+}
+
+/// The page of the pending sign-in of `account`, locked until recovery.
+async fn locked_page<T: MfaSession>(
+    p: &MfaPages<T>,
+    parts: &Parts,
+    account: &Account,
+    next: &str,
+) -> Response {
+    tracing::info!(
+        account = account.id,
+        "a sign-in was refused: the account is locked until recovery"
+    );
+    let view = LockedView {
+        sign_in: with_next(layer::sign_in_at(&parts.extensions), next),
+    };
+    let body = p.views.locked(parts, &view);
+    p.render(parts, None, "Account locked", StatusCode::FORBIDDEN, body)
+        .await
 }
 
 /// The challenge page for the pending `account`, with `error` if the last answer was
@@ -1041,15 +1086,16 @@ async fn challenge<T: MfaSession>(
                     return see_other(&next);
                 }
                 Err(MfaError::NoChallenge) => {
-                    // A sign-in held to enrollment has no code to answer: it enrolls.
-                    let enrolling = matches!(
-                        p.mfa.pending_account(&p.pool, &session).await,
-                        Ok(Some((_, Kind::Enroll)))
-                    );
-                    return if enrolling {
-                        see_other(&with_next(&p.enroll_url(), &next))
-                    } else {
-                        to_sign_in(&parts, &next)
+                    // A sign-in held to enrollment has no code to answer: it enrolls. One
+                    // locked until recovery has none either: it is shown as locked.
+                    return match p.mfa.pending_account(&p.pool, &session).await {
+                        Ok(Some((_, Kind::Enroll))) => {
+                            see_other(&with_next(&p.enroll_url(), &next))
+                        }
+                        Ok(Some((account, Kind::Locked))) => {
+                            locked_page(&p, &parts, &account, &next).await
+                        }
+                        _ => to_sign_in(&parts, &next),
                     };
                 }
                 Err(e) => {
@@ -1817,6 +1863,19 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(html.contains("<svg></svg>") && html.contains("ABCD"));
+        let html = Tailwind
+            .locked(
+                &dummy(),
+                &LockedView {
+                    sign_in: "/login?next=%2F\"><script>".into(),
+                },
+            )
+            .unwrap()
+            .to_string();
+        assert!(
+            html.contains("locked") && !html.contains("<script>"),
+            "{html}"
+        );
     }
 
     fn dummy() -> Parts {
