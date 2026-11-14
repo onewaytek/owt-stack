@@ -104,7 +104,8 @@ impl Mfa {
     /// account and only in the session that began it: another account's passkey, a
     /// disabled one, this account's for another ceremony, or a ceremony another session
     /// began, is [`MfaError::Invalid`] or [`MfaError::PasskeyExpired`]. A suspected
-    /// copy ([`MfaError::PasskeyCloned`]) disables the passkey and goes to the notifier
+    /// copy ([`MfaError::PasskeyCloned`]) disables the passkey, ends every session of the
+    /// account, and goes to the notifier
     /// ([`on_security_event`](Self::on_security_event)). A passkey's refusal is not
     /// counted toward [`lockout`](Self::lockout); the throttle still charges it.
     ///

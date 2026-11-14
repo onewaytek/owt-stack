@@ -1287,9 +1287,9 @@ impl Mfa {
     }
 
     /// Remove the authenticator, and the recovery codes behind it when it is the
-    /// account's last factor (an account that keeps a passkey keeps its codes). Refused
-    /// with [`MfaError::LastFactor`] when the policy requires `account` to have a factor
-    /// and this is its last. Moves the session epoch on (other sessions end) and reseals
+    /// account's last factor (an account that keeps a passkey, even a disabled one, keeps
+    /// its codes). Refused with [`MfaError::LastFactor`] when the policy requires
+    /// `account` to have a factor and this is its last usable one. Moves the session epoch on (other sessions end) and reseals
     /// this one. Tell the owner.
     ///
     /// # Errors
@@ -1319,12 +1319,14 @@ impl Mfa {
             // An enrollment never confirmed is not a factor: there is nothing to remove.
             _ => return Err(MfaError::NotEnrolled),
         }
-        // The authenticator is one of the factors counted: it is the last when the count
-        // is one.
-        let last = passkey::factor_count(&mut tx, account.id).await? <= 1;
-        if last && self.requires(account) {
+        // The authenticator is one of the factors counted: it is the last usable one when
+        // the count is one. The codes go only when no passkey of any kind is left either,
+        // as when a passkey is removed: a disabled one with codes left is still challenged.
+        let count = passkey::factor_count(&mut tx, account.id).await?;
+        if count <= 1 && self.requires(account) {
             return Err(MfaError::LastFactor);
         }
+        let last = count + passkey::disabled_count(&mut tx, account.id).await? <= 1;
         sqlx::query("DELETE FROM account_totp WHERE account_id = $1")
             .bind(account.id)
             .execute(&mut *tx)

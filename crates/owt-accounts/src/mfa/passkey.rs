@@ -28,7 +28,8 @@
 //!   may exist twice. (A synced passkey reports no counter, so this never applies to
 //!   it.) The passkey is disabled there and then: it is no longer offered, accepted or
 //!   counted as a factor, and the settings page shows it as a suspected copy until its
-//!   owner removes it. The error carries an event for the audit log
+//!   owner removes it. Every session of the account ends with it (the session epoch
+//!   moves on in the same transaction), so a session the copy opened ends too. The error carries an event for the audit log
 //!   ([`MfaError::event`]), and the same event goes to the notifier
 //!   ([`Mfa::on_security_event`](super::Mfa::on_security_event)) to tell the owner.
 
@@ -725,9 +726,11 @@ impl Mfa {
         Ok(id)
     }
 
-    /// Disable the passkey `id` of `account`, whose answer suggests a copy, in `tx`
-    /// (which holds its row), and tell the notifier: the error to answer with, which is
-    /// [`MfaError::PasskeyCloned`] unless the passkey could not be disabled.
+    /// Disable the passkey `id` of `account`, whose answer suggests a copy, and end every
+    /// session of the account (its session epoch moves on, so a session the copy opened
+    /// ends too), in `tx` (which holds the passkey's row), then tell the notifier: the
+    /// error to answer with, which is [`MfaError::PasskeyCloned`] unless the passkey
+    /// could not be disabled.
     async fn disable_cloned(
         &self,
         mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
@@ -739,6 +742,11 @@ impl Mfa {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+            // Whatever epoch the account is at: every session it has ends.
+            sqlx::query("UPDATE accounts SET session_epoch = session_epoch + 1 WHERE id = $1")
+                .bind(account)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await
         }
         .await;
@@ -748,7 +756,7 @@ impl Mfa {
         tracing::warn!(
             account,
             passkey = id,
-            "a passkey suspected of being copied was disabled"
+            "a passkey suspected of being copied was disabled; the account's sessions end"
         );
         let error = MfaError::PasskeyCloned { passkey: id };
         if let Some(event) = error.event(account) {
@@ -902,7 +910,10 @@ pub(super) async fn lock_account(
 }
 
 /// How many passkeys of the account are disabled.
-async fn disabled_count(tx: &mut sqlx::PgConnection, account: i64) -> Result<i64, MfaError> {
+pub(super) async fn disabled_count(
+    tx: &mut sqlx::PgConnection,
+    account: i64,
+) -> Result<i64, MfaError> {
     let n: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM account_passkeys WHERE account_id = $1 AND disabled_at IS NOT NULL",
     )

@@ -2041,6 +2041,15 @@ mod passkeys {
         .unwrap();
         let (_, answered) = sign_in_with(&db, &mfa, "ada", &mut key).await;
         assert!(matches!(answered, Err(MfaError::PasskeyCloned { passkey }) if passkey == id));
+        // Every session of the account ends: the one signed in before no longer stands.
+        let epoch = session.read(Data::signature).unwrap().epoch;
+        assert_eq!(fresh(&db, ada.id).await.session_epoch, epoch + 1);
+        assert!(
+            store::by_id_in_epoch(&db.pool, ada.id, epoch, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             *told.0.lock().unwrap(),
             [(ada.id, "mfa.passkey.clone_suspected", Some(id))]
@@ -2097,6 +2106,94 @@ mod passkeys {
             (factors.passkeys_disabled, factors.recovery_codes_left),
             (0, 0)
         );
+        db.drop().await;
+    }
+
+    /// A notifier that cannot reach the owner.
+    struct Unreachable;
+
+    impl owt_accounts::mfa::Notifier for Unreachable {
+        fn notify<'a>(
+            &'a self,
+            _: &'a owt_accounts::mfa::Event,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            Box::pin(async { Err(anyhow::anyhow!("the mailer is down")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_notifier_leaves_the_suspected_clone_disabled() {
+        let db = db!();
+        let mfa = pk_mfa().on_security_event(Unreachable);
+        let ada = account(&db, "ada", false).await;
+        let mut key = SoftPasskey::new(true);
+        let session = signed_in(&ada);
+        let id = register(&db, &mfa, &session, &ada, &mut key, "Key")
+            .await
+            .unwrap()
+            .events[0]
+            .passkey
+            .unwrap();
+        sqlx::query(
+            "UPDATE account_passkeys
+             SET passkey = jsonb_set(passkey, '{cred,counter}', '1000'), counter = 1000",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (_, answered) = sign_in_with(&db, &mfa, "ada", &mut key).await;
+        assert!(matches!(answered, Err(MfaError::PasskeyCloned { passkey }) if passkey == id));
+        let factors = mfa.factors(&db.pool, ada.id).await.unwrap();
+        assert_eq!((factors.passkeys, factors.passkeys_disabled), (0, 1));
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn removing_the_authenticator_keeps_the_codes_behind_a_disabled_passkey() {
+        let db = db!();
+        let mfa = pk_mfa();
+        let ada = account(&db, "ada", false).await;
+        let enrolled = enroll(&db, &mfa, &ada).await;
+        let mut key = SoftPasskey::new(true);
+        let id = register(
+            &db,
+            &mfa,
+            &enrolled.session,
+            &enrolled.account,
+            &mut key,
+            "Key",
+        )
+        .await
+        .unwrap()
+        .events[0]
+            .passkey
+            .unwrap();
+        sqlx::query("UPDATE account_passkeys SET disabled_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let ada = fresh(&db, ada.id).await;
+        let proof = mfa
+            .authorize_change(&db.pool, &enrolled.session, &ada, Duration::from_secs(300))
+            .await
+            .unwrap();
+        mfa.remove_totp(&db.pool, &enrolled.session, &ada, &proof)
+            .await
+            .unwrap();
+        // As when a passkey is removed beside a disabled one: the codes stay, and still
+        // answer the challenge.
+        let factors = mfa.factors(&db.pool, ada.id).await.unwrap();
+        assert_eq!(
+            (
+                factors.count(),
+                factors.passkeys_disabled,
+                factors.recovery_codes_left
+            ),
+            (0, 1, 3)
+        );
+        assert!(factors.any());
         db.drop().await;
     }
 

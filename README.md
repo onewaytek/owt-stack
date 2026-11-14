@@ -2552,7 +2552,10 @@ What holds:
   (`account_passkeys.disabled_at`, `PasskeyInfo::disabled_at`): it is no longer offered,
   accepted or counted as a factor (`Factors::passkeys` leaves it out,
   `Factors::passkeys_disabled` counts it), and the settings page shows it as "Disabled:
-  suspected copy" with its Remove button. `MfaError::event` gives the audit event,
+  suspected copy" with its Remove button. Every session of the account ends in the same
+  transaction (its session epoch moves on, as at a password change), so a session the copy
+  opened ends too; the owner signs in again with another factor or a recovery code.
+  `MfaError::event` gives the audit event,
   `mfa.passkey.clone_suspected` (`MfaPages` records it), and the same event goes to the
   notifier below, to tell the owner. The other events are `mfa.passkey.enrolled`,
   `mfa.passkey.renamed`, `mfa.passkey.removed` and `mfa.challenge.passed` with
