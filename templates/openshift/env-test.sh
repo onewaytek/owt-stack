@@ -33,7 +33,8 @@ case "$*" in
   "-n myapp-staging patch secret/myapp-env --type=merge --patch-file="*)
     [ -f "$FAKE_SECRET" ] || { echo "fake: not found" >&2; exit 1; }
     cp "${6#--patch-file=}" "$FAKE_SECRET.patch"
-    yaml_pairs "${6#--patch-file=}" | while IFS='=' read -r k v; do
+    yaml_pairs "${6#--patch-file=}" | while IFS= read -r kv; do
+      k=${kv%%=*} v=${kv#*=}
       sed "/^$k=/d" "$FAKE_SECRET" >"$FAKE_SECRET.tmp" && mv "$FAKE_SECRET.tmp" "$FAKE_SECRET"
       echo "$k=$v" >>"$FAKE_SECRET"
     done
