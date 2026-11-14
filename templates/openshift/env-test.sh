@@ -34,7 +34,7 @@ case "$*" in
     [ -f "$FAKE_SECRET" ] || { echo "fake: not found" >&2; exit 1; }
     cp "${6#--patch-file=}" "$FAKE_SECRET.patch"
     yaml_pairs "${6#--patch-file=}" | while IFS='=' read -r k v; do
-      sed -i "/^$k=/d" "$FAKE_SECRET"
+      sed "/^$k=/d" "$FAKE_SECRET" >"$FAKE_SECRET.tmp" && mv "$FAKE_SECRET.tmp" "$FAKE_SECRET"
       echo "$k=$v" >>"$FAKE_SECRET"
     done
     ;;
@@ -88,8 +88,9 @@ grep -qx "unchanged PUBLIC_BASE_URL" "$work/out" || fail "reports an unchanged l
 
 # 4. A changed literal and a new @env value are set; a key set by hand is left alone;
 #    the generated key still survives. An apply patches an existing Secret.
-echo "EXTRA=$(printf %s hand | base64 -w0)" >>"$FAKE_SECRET"
-sed -i 's#https://myapp.example#https://myapp.example/v2#' "$work/deploy/env.env"
+echo "EXTRA=$(printf %s hand | base64 | tr -d '\n')" >>"$FAKE_SECRET"
+sed 's#https://myapp.example#https://myapp.example/v2#' "$work/deploy/env.env" >"$work/deploy/env.env.tmp"
+mv "$work/deploy/env.env.tmp" "$work/deploy/env.env"
 rc=0; PROVIDER_TOKEN=tok-2 run || rc=$?
 [ "$rc" -eq 1 ] || fail "a changed value is a change (got $rc)"
 grep -qx "set PUBLIC_BASE_URL" "$work/out" || fail "reports the changed literal"
