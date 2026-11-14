@@ -387,6 +387,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn admin() -> Option<PgConnectOptions> {
         let url = std::env::var("DATABASE_URL")
             .ok()

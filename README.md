@@ -371,6 +371,7 @@ it from the environment:
 | Variable | Value | Unset |
 |---|---|---|
 | `SESSION_IDLE_TIMEOUT` | Whole seconds, minutes, hours or days (`90s`, `30m`, `8h`, `14d`), or `off` for none. Zero, a bare number or another unit is an error at startup. | 30 minutes (`session::IDLE_TIMEOUT`); blank is unset |
+| `SESSION_ABSOLUTE_LIFETIME` | Whole seconds, minutes, hours or days (`12h`, `14d`), above zero and at least the idle timeout in force (unless that is `off`). Zero, a bare number, `off`, another unit or a lifetime shorter than the idle timeout is an error at startup, naming the variable. | 24 hours (`session::ABSOLUTE_LIFETIME`); blank is unset |
 
 The OpenShift template passes it as a parameter (default `30m`), so an app sets
 `SESSION_IDLE_TIMEOUT=14d` or `off` in `params.env`. A builder call after `from_env`
@@ -379,8 +380,11 @@ must keep a short timeout (staff-only, health data) calls it in code and the set
 cannot loosen it. The first request through `Sessions::layer` logs the idle timeout
 in force and what set it at `info` (`session idle timeout idle_timeout=1800s
 source=default`; the source is `default`, `SESSION_IDLE_TIMEOUT` or `builder`; the
-timeout is `off` when none), so a manifest's value that the app's code overrode shows
-in the log. A mixed app keeps the app-wide session long and puts
+timeout is `off` when none) and, in a second line, the absolute lifetime the same way
+(`session absolute lifetime absolute_lifetime=86400s source=default`; the source is
+`default`, `SESSION_ABSOLUTE_LIFETIME` or `builder`), so a manifest's value that the
+app's code overrode shows in the log. `absolute_lifetime(d)` after `from_env` wins over
+`SESSION_ABSOLUTE_LIFETIME` as the idle builder calls win over theirs. A mixed app keeps the app-wide session long and puts
 `StepUpGate::new(window)` on its staff router instead.
 
 ```rust
@@ -394,12 +398,14 @@ let env = |idle: &'static str| {
     move |name: &str| match name {
         "SESSION_SECRET" => Some(secret.clone()),
         "SESSION_IDLE_TIMEOUT" => Some(idle.to_owned()),
+        "SESSION_ABSOLUTE_LIFETIME" => Some("30d".to_owned()),
         _ => None,
     }
 };
 let max_age = Duration::from_secs(14 * 86_400);
 let reading = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("14d"))?;
 assert_eq!(reading.idle(), Some(Duration::from_secs(14 * 86_400)));
+assert_eq!(reading.absolute(), Duration::from_secs(30 * 86_400));
 let game = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("off"))?;
 assert_eq!(game.idle(), None);
 let unset = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env(""))?;
@@ -408,6 +414,8 @@ assert_eq!(unset.idle(), Some(IDLE_TIMEOUT), "30 minutes");
 let staff = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("off"))?
     .idle_timeout(Duration::from_mins(15));
 assert_eq!(staff.idle(), Some(Duration::from_mins(15)));
+let capped = staff.absolute_lifetime(Duration::from_hours(12));
+assert_eq!(capped.absolute(), Duration::from_hours(12));
 # Ok(()) }
 ```
 
@@ -560,7 +568,7 @@ the handler and write `<script nonce="{{ nonce }}">`.
   `POD_NAMESPACE`, else `local` (`session::purpose_from`); `local` is for
   development, and in a pod (`KUBERNETES_SERVICE_HOST` set) without any of the three
   variables it is an error. It also reads `SESSION_IDLE_TIMEOUT` (30 minutes when
-  unset; see "Idle timeout and lifetimes"). `Sessions::from_vars` reads a map
+  unset) and `SESSION_ABSOLUTE_LIFETIME` (24 hours when unset; see "Idle timeout and lifetimes"). `Sessions::from_vars` reads a map
   instead, for tests.
 
   **Moving onto `from_env` without signing anyone out.** The key must stay the one
