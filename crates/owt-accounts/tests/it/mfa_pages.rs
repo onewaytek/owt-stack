@@ -747,6 +747,11 @@ async fn an_account_locked_until_recovery_is_refused_at_every_door_until_cleared
         .await;
     assert_eq!(r.status, 403);
     assert_eq!(app.client.get("/private").await.status, 303);
+    // Nor does enrollment: a locked sign-in cannot add a factor of its own.
+    let r = app.client.get("/mfa/enroll?next=%2Fprivate").await;
+    assert_ne!(r.status, 200);
+    assert!(!r.text().contains("otpauth://"), "{}", r.text());
+    assert_eq!(app.client.get("/private").await.status, 303);
 
     // A link, a provider or a password gate: the signature does not stand, and the
     // session shows the locked page.

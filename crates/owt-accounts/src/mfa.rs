@@ -866,6 +866,12 @@ impl Mfa {
     /// notifier, and the event is returned for the app's audit log; `None` if the account
     /// was not locked.
     ///
+    /// Whoever holds the copy may hold the password too, and the first sign-in after the
+    /// lock clears is the one that enrolls a factor. Replace the password first
+    /// ([`store::set_password`](crate::store::set_password), with one the owner chose
+    /// through the recovery), or turn password sign-in off for the account and let the
+    /// owner in by a link or a provider the recovery proved.
+    ///
     /// # Errors
     /// A fault.
     pub async fn clear_recovery_lock(

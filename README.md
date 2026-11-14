@@ -2628,7 +2628,11 @@ means (identity documents, a call back to a number on file). Once it has, it cal
 `Mfa::clear_recovery_lock(pool, account, actor)`, where `actor` is the member of staff or
 the account itself. It returns the `mfa.account.recovery_lock_cleared` event for the audit
 log (`None` if the account was not locked), tells the notifier, and the account then signs
-in as one without a factor does, adding a new passkey or authenticator.
+in as one without a factor does, adding a new passkey or authenticator. Whoever holds the
+copy may hold the password too, and the first sign-in after the lock clears is the one that
+enrolls a factor: replace the password first (`store::set_password`, with one the owner
+chose through the recovery), or turn password sign-in off and let the owner in by a link
+or a provider the recovery proved.
 
 ```rust
 use owt_accounts::mfa::{AfterSuspectedCopy, Mfa};
