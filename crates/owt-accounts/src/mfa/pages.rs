@@ -11,12 +11,21 @@
 //! | Route | What it is |
 //! |---|---|
 //! | `GET {base}` | the account's factors, with buttons to set up, remove or set up again the authenticator and to make new recovery codes |
-//! | `GET, POST {base}/challenge?next=` | the code a pending sign-in waits for ([`Next::Challenge`]): a TOTP code or a recovery code |
+//! | `GET, POST {base}/challenge?next=` | the code a pending sign-in waits for ([`Next::Challenge`]): a TOTP code or a recovery code; for an account locked until recovery ([`Next::Locked`]), a page that says so |
 //! | `GET, POST {base}/enroll?next=` | a fresh secret as a QR code and as text; the first code turns it on and shows the recovery codes once |
 //! | `POST {base}/remove` | removes the authenticator and its recovery codes |
 //! | `POST {base}/reenroll` | removes it, then sends the person to enroll a new one |
 //! | `POST {base}/recovery-codes` | replaces the recovery codes, shown once |
 //! | `GET, POST {reauth}?next=` | step-up: the password (if the account has one) and the second factor (if it has one) |
+//! | `GET, POST {base}/passkeys/add?next=` | names and creates a passkey (behind step-up, or for a pending enrollment); the first factor shows the recovery codes once |
+//! | `POST {base}/passkeys/{id}/rename` | renames one of the account's passkeys (`name`) |
+//! | `POST {base}/passkeys/{id}/remove` | removes one, behind step-up; never the last factor under a required policy |
+//! | `GET {base}/passkey.js` | the script the passkey buttons run (same origin, so a CSP of `script-src 'self'` allows it) |
+//!
+//! The passkey routes, and the passkey buttons on the challenge and re-authentication
+//! pages, appear once [`Mfa::passkeys`] names the site; each page that shows a button
+//! begins its ceremony as it renders, and the answer is posted with the form
+//! (`passkey_token`, `passkey_credential`).
 //!
 //! `base` is `/mfa` and `reauth` is `/reauth` unless [`MfaPages::at`] and
 //! [`MfaPages::reauth_at`] say otherwise; they are the defaults of
@@ -47,8 +56,8 @@
 //!
 //! The app provides the sealer ([`Mfa::sealer`]; a release build refuses
 //! [`Unsealed`](super::Unsealed)), the layout ([`Chrome`]), and its own sign-in page, which
-//! sends [`Next::Challenge`] to `{base}/challenge` and [`Next::Enroll`] to
-//! `{base}/enroll`, each with `?next=`.
+//! sends [`Next::Challenge`] and [`Next::Locked`] to `{base}/challenge` and
+//! [`Next::Enroll`] to `{base}/enroll`, each with `?next=`.
 
 use std::fmt;
 use std::future::Future;
@@ -72,6 +81,10 @@ use owt_web::session::Session;
 use serde::Deserialize;
 use sqlx::PgPool;
 
+use super::passkey::{
+    Ceremony, PasskeyInfo, PublicKeyCredential, RegisterPublicKeyCredential,
+    RequestChallengeResponse,
+};
 use super::{
     Answer, Event, Key, Kind, Limiter, Mfa, MfaError, MfaSession, Next, Throttled, TotpEnrollment,
 };
@@ -213,6 +226,25 @@ pub trait Views: Send + Sync + 'static {
         let _ = request;
         Body::render(&SettingsHtml { v: view })
     }
+
+    /// The page that names and creates a passkey.
+    ///
+    /// # Errors
+    /// When the template does not render.
+    fn add_passkey(&self, request: &Parts, view: &PasskeyAddView) -> owt_web::Result<Body> {
+        let _ = request;
+        Body::render(&PasskeyAddHtml { v: view })
+    }
+
+    /// The page a sign-in sees while its account is locked until recovery
+    /// ([`Next::Locked`]). Tell the person how the app's recovery works.
+    ///
+    /// # Errors
+    /// When the template does not render.
+    fn locked(&self, request: &Parts, view: &LockedView) -> owt_web::Result<Body> {
+        let _ = request;
+        Body::render(&LockedHtml { v: view })
+    }
 }
 
 /// The pages in `owt-*` classes from `tailwind/owt.css`: what [`MfaPages`] draws unless
@@ -221,6 +253,15 @@ pub trait Views: Send + Sync + 'static {
 pub struct Tailwind;
 
 impl Views for Tailwind {}
+
+/// The page of a sign-in whose account is locked until recovery
+/// ([`AfterSuspectedCopy::LockUntilRecovery`](super::AfterSuspectedCopy::LockUntilRecovery)).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct LockedView {
+    /// The sign-in page, with `?next=` set.
+    pub sign_in: String,
+}
 
 /// The sign-in challenge. Its form posts `code` or `recovery_code`, and `next`, to
 /// `action`.
@@ -233,6 +274,56 @@ pub struct ChallengeView {
     pub next: String,
     /// Why the last answer was refused.
     pub error: Option<String>,
+    /// The passkey button, when the account has a passkey: a second form posting
+    /// `passkey_token`, `passkey_credential` and `next` to `action`.
+    pub passkey: Option<PasskeyPrompt>,
+}
+
+/// A passkey ceremony begun for a page: what its button needs.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PasskeyPrompt {
+    /// The token to post back as `passkey_token`.
+    pub token: String,
+    /// The options for `navigator.credentials`, as JSON (put it in `data-options`;
+    /// the template escapes it).
+    pub options: String,
+    /// The URL of the script that runs the button.
+    pub script: String,
+}
+
+/// The page that names and creates a passkey. Its form posts `name`,
+/// `passkey_token`, `passkey_credential` (filled by the script) and `next` to
+/// `action`.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PasskeyAddView {
+    /// Where the form posts.
+    pub action: String,
+    /// Where the person goes once through, a path on this site.
+    pub next: String,
+    /// The token to post back as `passkey_token`.
+    pub token: String,
+    /// The options for `navigator.credentials.create()`, as JSON.
+    pub options: String,
+    /// The URL of the script that runs the button.
+    pub script: String,
+    /// Why the last answer was refused.
+    pub error: Option<String>,
+    /// The person is not signed in yet: the policy requires a factor before they are.
+    pub pending: bool,
+}
+
+/// One passkey on the settings page, with where its forms post.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PasskeyRow {
+    /// The passkey.
+    pub info: PasskeyInfo,
+    /// Where "rename" posts (`name`).
+    pub rename: String,
+    /// Where "remove" posts.
+    pub remove: String,
 }
 
 /// Step-up re-authentication. Its form posts `password` (when asked), `code` or
@@ -253,6 +344,9 @@ pub struct ReauthView {
     pub error: Option<String>,
     /// The sign-in page, for an account with nothing to prove here.
     pub sign_in: String,
+    /// The passkey button, when the account has a passkey: it posts
+    /// `passkey_token` and `passkey_credential` with the password.
+    pub passkey: Option<PasskeyPrompt>,
 }
 
 /// An authenticator being set up. Its form posts `code` and `next` to `action`.
@@ -270,6 +364,8 @@ pub struct EnrollView<'a> {
     pub error: Option<String>,
     /// The person is not signed in yet: the policy requires a factor before they are.
     pub pending: bool,
+    /// The page that adds a passkey instead, when passkeys are on.
+    pub add_passkey: Option<String>,
 }
 
 impl fmt::Debug for EnrollView<'_> {
@@ -322,6 +418,11 @@ pub struct SettingsView {
     pub reenroll: String,
     /// Where "new recovery codes" posts.
     pub recovery_codes: String,
+    /// The page that adds a passkey (a `GET` link), when passkeys are on; `None`
+    /// hides the passkey section.
+    pub add_passkey: Option<String>,
+    /// The account's passkeys.
+    pub passkeys: Vec<PasskeyRow>,
 }
 
 /// A sentence for the settings page, after a redirect.
@@ -347,10 +448,21 @@ impl Notice {
                 "This account must keep a second factor, so it cannot be removed.",
             ),
             "not-enrolled" => (true, "This account has no authenticator."),
+            "passkey-added" => (false, "The passkey was added."),
+            "passkey-renamed" => (false, "The passkey was renamed."),
+            "passkey-removed" => (false, "The passkey was removed."),
+            "passkey-unknown" => (true, "This account has no such passkey."),
+            "passkey-name" => (true, "Give the passkey a name of 1 to 64 characters."),
             _ => return None,
         };
         Some(Self { error, text })
     }
+}
+
+#[derive(Template)]
+#[template(path = "mfa/locked.html")]
+struct LockedHtml<'a> {
+    v: &'a LockedView,
 }
 
 #[derive(Template)]
@@ -375,6 +487,12 @@ struct EnrollHtml<'a, 'b> {
 #[template(path = "mfa/codes.html")]
 struct CodesHtml<'a> {
     v: &'a CodesView,
+}
+
+#[derive(Template)]
+#[template(path = "mfa/passkey_add.html")]
+struct PasskeyAddHtml<'a> {
+    v: &'a PasskeyAddView,
 }
 
 #[derive(Template)]
@@ -593,6 +711,19 @@ impl<T: MfaSession> MfaPages<T> {
             .route(&format!("{base}/remove"), post(remove::<T>))
             .route(&format!("{base}/reenroll"), post(reenroll::<T>))
             .route(&format!("{base}/recovery-codes"), post(recovery_codes::<T>))
+            .route(&format!("{base}/passkey.js"), get(passkey_script))
+            .route(
+                &format!("{base}/passkeys/add"),
+                get(passkey_add_form::<T>).post(passkey_add::<T>),
+            )
+            .route(
+                &format!("{base}/passkeys/{{id}}/rename"),
+                post(passkey_rename::<T>),
+            )
+            .route(
+                &format!("{base}/passkeys/{{id}}/remove"),
+                post(passkey_remove::<T>),
+            )
             .route(&reauth, get(reauth_form::<T>).post(reauth_post::<T>))
             .with_state(pages)
             .layer(axum::middleware::from_fn_with_state(
@@ -606,6 +737,43 @@ impl<T: MfaSession> MfaPages<T> {
 
     fn enroll_url(&self) -> String {
         format!("{}/enroll", self.base)
+    }
+
+    fn script_url(&self) -> String {
+        format!("{}/passkey.js", self.base)
+    }
+
+    fn add_passkey_url(&self) -> Option<String> {
+        self.mfa
+            .relying_party()
+            .map(|_| format!("{}/passkeys/add", self.base))
+    }
+
+    /// The passkey button for `account`, when it has a passkey and they are on.
+    async fn passkey_prompt(
+        &self,
+        session: &Session<T>,
+        account: &Account,
+    ) -> Result<Option<PasskeyPrompt>, MfaError> {
+        let Some(begun) = self
+            .mfa
+            .begin_passkey_challenge(&self.pool, session, account)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.prompt(&begun)?))
+    }
+
+    fn prompt(
+        &self,
+        begun: &Ceremony<RequestChallengeResponse>,
+    ) -> Result<PasskeyPrompt, MfaError> {
+        Ok(PasskeyPrompt {
+            token: begun.token.clone(),
+            options: begun.options_json()?,
+            script: self.script_url(),
+        })
     }
 
     async fn render(
@@ -715,10 +883,45 @@ struct CodeForm {
     #[serde(default)]
     recovery_code: Option<String>,
     #[serde(default)]
+    passkey_token: Option<String>,
+    #[serde(default)]
+    passkey_credential: Option<String>,
+    #[serde(default)]
     next: Option<String>,
 }
 
+/// A passkey answer a form carried: its token and the browser's credential, parsed.
+struct PasskeyAnswer<C> {
+    token: String,
+    credential: C,
+}
+
+/// The passkey answer in `token` and `credential`, if both were posted; `Err` when the
+/// credential is not the JSON the browser sends.
+fn passkey_answer<C: serde::de::DeserializeOwned>(
+    token: Option<&String>,
+    credential: Option<&String>,
+) -> Option<Result<PasskeyAnswer<C>, MfaError>> {
+    let token = token.map(|t| t.trim()).filter(|t| !t.is_empty())?;
+    let credential = credential.map(|c| c.trim()).filter(|c| !c.is_empty())?;
+    Some(
+        serde_json::from_str(credential)
+            .map(|credential| PasskeyAnswer {
+                token: token.to_owned(),
+                credential,
+            })
+            .map_err(|_| MfaError::Invalid),
+    )
+}
+
 impl CodeForm {
+    fn passkey(&self) -> Option<Result<PasskeyAnswer<PublicKeyCredential>, MfaError>> {
+        passkey_answer(
+            self.passkey_token.as_ref(),
+            self.passkey_credential.as_ref(),
+        )
+    }
+
     fn answer(&self) -> Option<Answer<'_>> {
         fn given(s: Option<&String>) -> Option<&str> {
             s.map(|s| s.trim()).filter(|s| !s.is_empty())
@@ -793,19 +996,58 @@ async fn challenge_form<T: MfaSession>(
     if Maybe::of(&parts.extensions).0.is_some() {
         return see_other(&next);
     }
-    match p.mfa.pending_account(&p.pool, &session).await {
-        Ok(Some((_, Kind::Challenge))) => {}
+    let account = match p.mfa.pending_account(&p.pool, &session).await {
+        Ok(Some((account, Kind::Challenge))) => account,
         Ok(Some((_, Kind::Enroll))) => return see_other(&with_next(&p.enroll_url(), &next)),
+        Ok(Some((account, Kind::Locked))) => return locked_page(&p, &parts, &account, &next).await,
         Ok(_) => return to_sign_in(&parts, &next),
         Err(e) => return owt_web::Error::from(e).into_response(),
-    }
+    };
+    challenge_page(&p, &parts, &session, &account, next, None).await
+}
+
+/// The page of the pending sign-in of `account`, locked until recovery.
+async fn locked_page<T: MfaSession>(
+    p: &MfaPages<T>,
+    parts: &Parts,
+    account: &Account,
+    next: &str,
+) -> Response {
+    tracing::info!(
+        account = account.id,
+        "a sign-in was refused: the account is locked until recovery"
+    );
+    let view = LockedView {
+        sign_in: with_next(layer::sign_in_at(&parts.extensions), next),
+    };
+    let body = p.views.locked(parts, &view);
+    p.render(parts, None, "Account locked", StatusCode::FORBIDDEN, body)
+        .await
+}
+
+/// The challenge page for the pending `account`, with `error` if the last answer was
+/// refused.
+async fn challenge_page<T: MfaSession>(
+    p: &MfaPages<T>,
+    parts: &Parts,
+    session: &Session<T>,
+    account: &Account,
+    next: String,
+    error: Option<(StatusCode, String)>,
+) -> Response {
+    let passkey = match p.passkey_prompt(session, account).await {
+        Ok(prompt) => prompt,
+        Err(e) => return owt_web::Error::from(e).into_response(),
+    };
+    let (status, error) = error.map_or((StatusCode::OK, None), |(s, e)| (s, Some(e)));
     let view = ChallengeView {
         action: format!("{}/challenge", p.base),
         next,
-        error: None,
+        error,
+        passkey,
     };
-    let body = p.views.challenge(&parts, &view);
-    p.render(&parts, None, "Confirm it is you", StatusCode::OK, body)
+    let body = p.views.challenge(parts, &view);
+    p.render(parts, None, "Confirm it is you", status, body)
         .await
 }
 
@@ -821,32 +1063,43 @@ async fn challenge<T: MfaSession>(
         Err(r) => return r,
     };
     let pending = session.read(|d| d.mfa().pending.map(|p| p.account));
-    let refused = match form.answer() {
-        None => (StatusCode::UNPROCESSABLE_ENTITY, "Enter a code.".to_owned()),
-        Some(answer) => {
-            match p
-                .mfa
+    let attempt = match (form.passkey(), form.answer()) {
+        (Some(Ok(pk)), _) => Some(
+            p.mfa
+                .challenge_passkey(&p.pool, &p.limiter, &session, ip, &pk.token, &pk.credential)
+                .await,
+        ),
+        (Some(Err(e)), _) => Some(Err(e)),
+        (None, Some(answer)) => Some(
+            p.mfa
                 .challenge(&p.pool, &p.limiter, &session, ip, answer)
-                .await
-            {
+                .await,
+        ),
+        (None, None) => None,
+    };
+    let refused = match attempt {
+        None => (StatusCode::UNPROCESSABLE_ENTITY, "Enter a code.".to_owned()),
+        Some(attempt) => {
+            match attempt {
                 Ok((_, events)) => {
                     p.record(&parts, &events).await;
                     return see_other(&next);
                 }
                 Err(MfaError::NoChallenge) => {
-                    // A sign-in held to enrollment has no code to answer: it enrolls.
-                    let enrolling = matches!(
-                        p.mfa.pending_account(&p.pool, &session).await,
-                        Ok(Some((_, Kind::Enroll)))
-                    );
-                    return if enrolling {
-                        see_other(&with_next(&p.enroll_url(), &next))
-                    } else {
-                        to_sign_in(&parts, &next)
+                    // A sign-in held to enrollment has no code to answer: it enrolls. One
+                    // locked until recovery has none either: it is shown as locked.
+                    return match p.mfa.pending_account(&p.pool, &session).await {
+                        Ok(Some((_, Kind::Enroll))) => {
+                            see_other(&with_next(&p.enroll_url(), &next))
+                        }
+                        Ok(Some((account, Kind::Locked))) => {
+                            locked_page(&p, &parts, &account, &next).await
+                        }
+                        _ => to_sign_in(&parts, &next),
                     };
                 }
                 Err(e) => {
-                    if let Some(event) = pending.and_then(|a| e.locked_event(a)) {
+                    if let Some(event) = pending.and_then(|a| e.event(a)) {
                         p.record(&parts, &[event]).await;
                     }
                     match refusal(e) {
@@ -857,20 +1110,20 @@ async fn challenge<T: MfaSession>(
             }
         }
     };
-    let view = ChallengeView {
-        action: format!("{}/challenge", p.base),
-        next,
-        error: Some(refused.1),
-    };
-    let body = p.views.challenge(&parts, &view);
-    p.render(&parts, None, "Confirm it is you", refused.0, body)
-        .await
+    match p.mfa.pending_account(&p.pool, &session).await {
+        Ok(Some((account, Kind::Challenge))) => {
+            challenge_page(&p, &parts, &session, &account, next, Some(refused)).await
+        }
+        Ok(_) => to_sign_in(&parts, &next),
+        Err(e) => owt_web::Error::from(e).into_response(),
+    }
 }
 
 /// The reauthentication page for `account`, with `error` if the last answer was refused.
 async fn reauth_page<T: MfaSession>(
     p: &MfaPages<T>,
     parts: &Parts,
+    session: &Session<T>,
     account: &Account,
     next: String,
     error: Option<(StatusCode, String)>,
@@ -890,6 +1143,10 @@ async fn reauth_page<T: MfaSession>(
         }
         None => (StatusCode::OK, None),
     };
+    let passkey = match p.passkey_prompt(session, account).await {
+        Ok(prompt) => prompt,
+        Err(e) => return owt_web::Error::from(e).into_response(),
+    };
     let view = ReauthView {
         action: p.reauth.clone(),
         sign_in: with_next(layer::sign_in_at(&parts.extensions), &next),
@@ -897,6 +1154,7 @@ async fn reauth_page<T: MfaSession>(
         password: has_password,
         code: has_factor,
         error,
+        passkey,
     };
     let body = p.views.reauth(parts, &view);
     p.render(parts, Some(account), "Confirm it is you", status, body)
@@ -906,13 +1164,14 @@ async fn reauth_page<T: MfaSession>(
 async fn reauth_form<T: MfaSession>(
     State(p): Shared<T>,
     Req(parts): Req,
+    session: Session<T>,
     Query(q): Query<NextQuery>,
 ) -> Response {
     let Some(account) = Maybe::of(&parts.extensions).0 else {
         return layer::wall(&parts).into_response();
     };
     let next = local_next(q.next.as_deref(), "/");
-    reauth_page(&p, &parts, &account, next, None).await
+    reauth_page(&p, &parts, &session, &account, next, None).await
 }
 
 async fn reauth_post<T: MfaSession>(
@@ -934,9 +1193,10 @@ async fn reauth_post<T: MfaSession>(
         Err(e) => return owt_web::Error::from(e).into_response(),
     };
     let answer = form.answer();
-    if has_factor && answer.is_none() {
+    let passkey = form.passkey();
+    if has_factor && answer.is_none() && passkey.is_none() {
         let error = (StatusCode::UNPROCESSABLE_ENTITY, "Enter a code.".to_owned());
-        return reauth_page(&p, &parts, &account, next, Some(error)).await;
+        return reauth_page(&p, &parts, &session, &account, next, Some(error)).await;
     }
     let begun = p
         .mfa
@@ -949,15 +1209,20 @@ async fn reauth_post<T: MfaSession>(
             form.password.as_deref(),
         )
         .await;
-    let outcome = match (begun, answer) {
-        (Ok(Next::Challenge), Some(answer)) => p
+    let outcome = match (begun, passkey, answer) {
+        (Ok(Next::Challenge), Some(Ok(pk)), _) => p
+            .mfa
+            .challenge_passkey(&p.pool, &p.limiter, &session, ip, &pk.token, &pk.credential)
+            .await
+            .map(|(_, events)| events),
+        (Ok(Next::Challenge), Some(Err(e)), _) | (Err(e), _, _) => Err(e),
+        (Ok(Next::Challenge), None, Some(answer)) => p
             .mfa
             .challenge(&p.pool, &p.limiter, &session, ip, answer)
             .await
             .map(|(_, events)| events),
-        (Ok(Next::Challenge), None) => Err(MfaError::Invalid),
-        (Ok(_), _) => Ok(Vec::new()),
-        (Err(e), _) => Err(e),
+        (Ok(Next::Challenge), None, None) => Err(MfaError::Invalid),
+        (Ok(_), _, _) => Ok(Vec::new()),
     };
     match outcome {
         Ok(events) => {
@@ -967,11 +1232,11 @@ async fn reauth_post<T: MfaSession>(
         // The session is no longer signed in as the account: the form cannot help.
         Err(MfaError::NoChallenge) => to_sign_in(&parts, &next),
         Err(e) => {
-            if let Some(event) = e.locked_event(account.id) {
+            if let Some(event) = e.event(account.id) {
                 p.record(&parts, &[event]).await;
             }
             match refusal(e) {
-                Ok(error) => reauth_page(&p, &parts, &account, next, Some(error)).await,
+                Ok(error) => reauth_page(&p, &parts, &session, &account, next, Some(error)).await,
                 Err(r) => r,
             }
         }
@@ -1010,6 +1275,7 @@ async fn enroll_page<T: MfaSession>(
         secret: &enrollment.secret,
         error,
         pending,
+        add_passkey: p.add_passkey_url(),
     };
     let body = p.views.enroll(parts, &view);
     let signed = (!pending).then_some(account);
@@ -1149,7 +1415,26 @@ async fn settings<T: MfaSession>(
         Ok(f) => f,
         Err(e) => return owt_web::Error::from(e).into_response(),
     };
+    let passkeys =
+        if p.mfa.relying_party().is_some() || factors.passkeys + factors.passkeys_disabled > 0 {
+            match p.mfa.list_passkeys(&p.pool, account.id).await {
+                Ok(list) => list,
+                Err(e) => return owt_web::Error::from(e).into_response(),
+            }
+        } else {
+            Vec::new()
+        };
+    let passkeys = passkeys
+        .into_iter()
+        .map(|info| PasskeyRow {
+            rename: format!("{}/passkeys/{}/rename", p.base, info.id),
+            remove: format!("{}/passkeys/{}/remove", p.base, info.id),
+            info,
+        })
+        .collect();
     let view = SettingsView {
+        add_passkey: p.add_passkey_url(),
+        passkeys,
         totp: factors.totp_confirmed_at.is_some(),
         locked: factors.totp_locked,
         codes_left: factors.recovery_codes_left,
@@ -1259,6 +1544,268 @@ async fn recovery_codes<T: MfaSession>(
     }
 }
 
+/// The script the passkey buttons run.
+async fn passkey_script() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        include_str!("../../assets/passkey.js"),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct PasskeyForm {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    passkey_token: Option<String>,
+    #[serde(default)]
+    passkey_credential: Option<String>,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+impl fmt::Debug for PasskeyForm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PasskeyForm(<redacted>)")
+    }
+}
+
+/// The add-a-passkey page with a fresh ceremony, and `error` if the last answer was
+/// refused.
+#[allow(clippy::too_many_arguments)] // each is a separate input of the page
+async fn passkey_add_page<T: MfaSession>(
+    p: &MfaPages<T>,
+    parts: &Parts,
+    session: &Session<T>,
+    account: &Account,
+    proof: &super::ChangeProof,
+    pending: bool,
+    next: String,
+    error: Option<(StatusCode, String)>,
+) -> Response {
+    let begun = match p
+        .mfa
+        .begin_passkey_registration(&p.pool, session, account, proof)
+        .await
+    {
+        Ok(begun) => begun,
+        Err(e) => return owt_web::Error::from(e).into_response(),
+    };
+    let options = match begun.options_json() {
+        Ok(o) => o,
+        Err(e) => return owt_web::Error::from(e).into_response(),
+    };
+    let (status, error) = error.map_or((StatusCode::OK, None), |(s, e)| (s, Some(e)));
+    let view = PasskeyAddView {
+        action: format!("{}/passkeys/add", p.base),
+        next,
+        token: begun.token,
+        options,
+        script: p.script_url(),
+        error,
+        pending,
+    };
+    let body = p.views.add_passkey(parts, &view);
+    let signed = (!pending).then_some(account);
+    p.render(parts, signed, "Add a passkey", status, body).await
+}
+
+async fn passkey_add_form<T: MfaSession>(
+    State(p): Shared<T>,
+    Req(parts): Req,
+    session: Session<T>,
+    Query(q): Query<NextQuery>,
+) -> Response {
+    let this = layer::asked_for(&parts.extensions, &parts.uri).to_owned();
+    if p.mfa.relying_party().is_none() {
+        return see_other(&p.base);
+    }
+    let (account, pending) = match p.enrolling(&parts, &session).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return to_sign_in(&parts, &this),
+        Err(e) => return e.into_response(),
+    };
+    let next = local_next(q.next.as_deref(), if pending { "/" } else { &p.base });
+    let proof = match p
+        .mfa
+        .authorize_change(&p.pool, &session, &account, p.change_within)
+        .await
+    {
+        Ok(proof) => proof,
+        Err(e) => return step_up_or_sign_in(&p, &parts, e, &this),
+    };
+    passkey_add_page(&p, &parts, &session, &account, &proof, pending, next, None).await
+}
+
+async fn passkey_add<T: MfaSession>(
+    State(p): Shared<T>,
+    Req(parts): Req,
+    session: Session<T>,
+    Form(form): Form<PasskeyForm>,
+) -> Response {
+    let add = format!("{}/passkeys/add", p.base);
+    let (account, pending) = match p.enrolling(&parts, &session).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return to_sign_in(&parts, &add),
+        Err(e) => return e.into_response(),
+    };
+    let next = local_next(form.next.as_deref(), if pending { "/" } else { &p.base });
+    let again = with_next(&add, &next);
+    let ip = match client_ip(&parts) {
+        Ok(ip) => ip,
+        Err(r) => return r,
+    };
+    let proof = match p
+        .mfa
+        .authorize_change(&p.pool, &session, &account, p.change_within)
+        .await
+    {
+        Ok(proof) => proof,
+        Err(e) => return step_up_or_sign_in(&p, &parts, e, &again),
+    };
+    let answer = passkey_answer::<RegisterPublicKeyCredential>(
+        form.passkey_token.as_ref(),
+        form.passkey_credential.as_ref(),
+    );
+    let refused = match answer {
+        None => MfaError::Invalid,
+        Some(Err(e)) => e,
+        Some(Ok(_))
+            if p.limiter
+                .charge(ip, Key::SecondFactor(account.id))
+                .await
+                .is_err() =>
+        {
+            MfaError::Throttled
+        }
+        Some(Ok(pk)) => match p
+            .mfa
+            .finish_passkey_registration(
+                &p.pool,
+                &session,
+                &account,
+                &proof,
+                &pk.token,
+                form.name.as_deref().unwrap_or_default(),
+                &pk.credential,
+            )
+            .await
+        {
+            Ok(confirmed) => {
+                p.record(&parts, &confirmed.events).await;
+                if confirmed.recovery_codes.is_empty() {
+                    let to = if pending {
+                        next
+                    } else {
+                        format!("{}?notice=passkey-added", p.base)
+                    };
+                    return see_other(&to);
+                }
+                let view = CodesView {
+                    codes: confirmed
+                        .recovery_codes
+                        .into_iter()
+                        .map(|r| r.code)
+                        .collect(),
+                    next,
+                };
+                let body = p.views.recovery_codes(&parts, &view);
+                return p
+                    .render(
+                        &parts,
+                        Some(&account),
+                        "Your recovery codes",
+                        StatusCode::OK,
+                        body,
+                    )
+                    .await;
+            }
+            Err(e) => e,
+        },
+    };
+    let error = match refusal(refused) {
+        Ok(error) => error,
+        Err(r) => return r,
+    };
+    passkey_add_page(
+        &p,
+        &parts,
+        &session,
+        &account,
+        &proof,
+        pending,
+        next,
+        Some(error),
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct NameForm {
+    #[serde(default)]
+    name: String,
+}
+
+async fn passkey_rename<T: MfaSession>(
+    State(p): Shared<T>,
+    Req(parts): Req,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Form(form): Form<NameForm>,
+) -> Response {
+    let Some(account) = Maybe::of(&parts.extensions).0 else {
+        return layer::wall(&parts).into_response();
+    };
+    match p
+        .mfa
+        .rename_passkey(&p.pool, &account, id, &form.name)
+        .await
+    {
+        Ok(event) => {
+            p.record(&parts, &[event]).await;
+            see_other(&format!("{}?notice=passkey-renamed", p.base))
+        }
+        Err(MfaError::BadName) => see_other(&format!("{}?notice=passkey-name", p.base)),
+        Err(MfaError::NotEnrolled) => see_other(&format!("{}?notice=passkey-unknown", p.base)),
+        Err(e) => owt_web::Error::from(e).into_response(),
+    }
+}
+
+async fn passkey_remove<T: MfaSession>(
+    State(p): Shared<T>,
+    Req(parts): Req,
+    session: Session<T>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    let Some(account) = Maybe::of(&parts.extensions).0 else {
+        return layer::wall(&parts).into_response();
+    };
+    let proof = match p
+        .mfa
+        .authorize_change(&p.pool, &session, &account, p.change_within)
+        .await
+    {
+        Ok(proof) => proof,
+        Err(e) => return step_up_or_sign_in(&p, &parts, e, &p.base),
+    };
+    match p
+        .mfa
+        .remove_passkey(&p.pool, &session, &account, &proof, id)
+        .await
+    {
+        Ok(event) => {
+            p.record(&parts, &[event]).await;
+            see_other(&format!("{}?notice=passkey-removed", p.base))
+        }
+        Err(MfaError::LastFactor) => see_other(&format!("{}?notice=last-factor", p.base)),
+        Err(MfaError::NotEnrolled) => see_other(&format!("{}?notice=passkey-unknown", p.base)),
+        Err(e) => owt_web::Error::from(e).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1292,6 +1839,7 @@ mod tests {
             action: "/mfa/challenge".into(),
             next: "/x\"><script>".into(),
             error: Some("<b>no</b>".into()),
+            passkey: None,
         };
         let html = Tailwind.challenge(&dummy(), &view).unwrap().to_string();
         assert!(html.contains("name=\"code\"") && html.contains("name=\"recovery_code\""));
@@ -1309,11 +1857,25 @@ mod tests {
                     secret: "ABCD",
                     error: None,
                     pending: false,
+                    add_passkey: None,
                 },
             )
             .unwrap()
             .to_string();
         assert!(html.contains("<svg></svg>") && html.contains("ABCD"));
+        let html = Tailwind
+            .locked(
+                &dummy(),
+                &LockedView {
+                    sign_in: "/login?next=%2F\"><script>".into(),
+                },
+            )
+            .unwrap()
+            .to_string();
+        assert!(
+            html.contains("locked") && !html.contains("<script>"),
+            "{html}"
+        );
     }
 
     fn dummy() -> Parts {

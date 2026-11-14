@@ -137,6 +137,18 @@ async fn login(
     }
 }
 
+/// Another first factor (a sign-in link, a provider, a password gate): each ends in
+/// `session::sign_in`, and the layer holds what follows.
+async fn door(
+    State(st): State<AppState>,
+    session: Session<Data>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> &'static str {
+    let account = store::by_id(&st.pool, id).await.unwrap().unwrap();
+    owt_accounts::session::sign_in(&session, &account);
+    "signed"
+}
+
 #[derive(Clone, Default)]
 struct Log(Arc<Mutex<Vec<String>>>);
 
@@ -164,7 +176,10 @@ struct App {
 }
 
 fn app(db: &Db, per_account: u32) -> App {
-    let mfa = mfa();
+    app_with(db, per_account, mfa())
+}
+
+fn app_with(db: &Db, per_account: u32, mfa: Mfa) -> App {
     let throttle = Arc::new(throttle(per_account));
     let st = AppState {
         pool: db.pool.clone(),
@@ -191,6 +206,7 @@ fn app(db: &Db, per_account: u32) -> App {
     );
     let router = Router::new()
         .route("/login", post(login))
+        .route("/door/{id}", post(door))
         .route(
             "/private",
             get(|Signed(a): Signed| async move { format!("private for {}", a.username) }),
@@ -560,5 +576,260 @@ async fn a_cross_origin_post_is_refused() {
         )
         .await;
     assert_eq!(r.status, 403);
+    db.drop().await;
+}
+
+/// The value of the first `name="…" value="…"` or `data-options="…"` attribute,
+/// unescaped.
+fn attr(html: &str, after: &str) -> String {
+    let rest = html
+        .split(after)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{after} in {html}"));
+    rest.split('"')
+        .next()
+        .unwrap()
+        .replace("&#34;", "\"")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one flow: add, answer, then list as disabled
+async fn a_passkey_added_on_the_settings_page_answers_the_challenge() {
+    use owt_accounts::mfa::passkey::{
+        CreationChallengeResponse, RelyingParty, RequestChallengeResponse, Url,
+    };
+    use webauthn_authenticator_rs::WebauthnAuthenticator as _;
+    use webauthn_authenticator_rs::softpasskey::SoftPasskey;
+
+    let db = db!();
+    account(&db, "ada").await;
+    let origin = Url::parse("http://localhost:3000").unwrap();
+    let mfa = mfa().passkeys(RelyingParty::new("localhost", origin.as_str()).unwrap());
+    let app = app_with(&db, 1000, mfa);
+    let r = app
+        .client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(r.text(), "Done");
+    assert!(
+        app.client
+            .get("/mfa")
+            .await
+            .text()
+            .contains("No passkeys yet.")
+    );
+
+    let r = app.client.get("/mfa/passkeys/add").await;
+    assert_eq!(r.status, 200);
+    let html = r.text();
+    assert!(html.contains("src=\"/mfa/passkey.js\""), "{html}");
+    let options: CreationChallengeResponse =
+        serde_json::from_str(&attr(&html, "data-options=\"")).unwrap();
+    let token = attr(&html, "name=\"passkey_token\" value=\"");
+    let mut key = SoftPasskey::new(true);
+    let credential = key.do_registration(origin.clone(), options).unwrap();
+    let r = app
+        .client
+        .post_form(
+            "/mfa/passkeys/add",
+            &[
+                ("name", "Laptop"),
+                ("passkey_token", &token),
+                (
+                    "passkey_credential",
+                    &serde_json::to_string(&credential).unwrap(),
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(
+        secrets(&r.text()).len(),
+        3,
+        "the first factor shows its codes"
+    );
+    assert_eq!(
+        app.log.take(),
+        ["mfa.passkey.enrolled", "mfa.recovery_codes.issued"]
+    );
+    assert!(
+        app.client
+            .get("/mfa")
+            .await
+            .text()
+            .contains("value=\"Laptop\"")
+    );
+
+    sign_in_again(&app).await;
+    let r = app.client.get("/mfa/challenge?next=%2Fprivate").await;
+    let html = r.text();
+    let options: RequestChallengeResponse =
+        serde_json::from_str(&attr(&html, "data-options=\"")).unwrap();
+    let token = attr(&html, "name=\"passkey_token\" value=\"");
+    let credential = key.do_authentication(origin, options).unwrap();
+    let r = app
+        .client
+        .post_form(
+            "/mfa/challenge",
+            &[
+                ("passkey_token", token.as_str()),
+                (
+                    "passkey_credential",
+                    &serde_json::to_string(&credential).unwrap(),
+                ),
+                ("next", "/private"),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, 303, "{}", r.text());
+    assert_eq!(r.location(), Some("/private"));
+    assert_eq!(app.client.get("/private").await.text(), "private for ada");
+    assert_eq!(app.log.take(), ["mfa.challenge.passed"]);
+
+    let r = app.client.get("/mfa/passkey.js").await;
+    assert_eq!(r.status, 200);
+    assert!(
+        r.header("content-type")
+            .unwrap()
+            .starts_with("text/javascript")
+    );
+
+    // A passkey disabled as a suspected copy is listed as one, and can be removed.
+    sqlx::query("UPDATE account_passkeys SET disabled_at = now()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let html = app.client.get("/mfa").await.text();
+    assert!(html.contains("Disabled: suspected copy"), "{html}");
+    assert!(html.contains("/remove\""), "{html}");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn an_account_locked_until_recovery_is_refused_at_every_door_until_cleared() {
+    let db = db!();
+    let ada = account(&db, "ada").await;
+    let staff = account(&db, "staff").await;
+    let mfa = mfa();
+    let app = app_with(&db, 1000, mfa.clone());
+    // As a passkey disabled as a suspected copy leaves it, with nothing else to sign in.
+    sqlx::query("UPDATE accounts SET mfa_recovery_locked_at = now() WHERE id = $1")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(mfa.factors(&db.pool, ada.id).await.unwrap().recovery_locked);
+
+    // The password: refused, and the challenge route shows the locked page.
+    let r = app
+        .client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(r.text(), "Locked");
+    assert_eq!(app.client.get("/private").await.status, 303);
+    let r = app.client.get("/mfa/challenge?next=%2Fprivate").await;
+    assert_eq!(r.status, 403);
+    let page = r.text();
+    assert!(page.contains("This account is locked"), "{page}");
+    assert!(page.contains("/login?next=%2Fprivate"), "{page}");
+    // No code answers it.
+    let r = app
+        .client
+        .post_form(
+            "/mfa/challenge",
+            &[("recovery_code", "aaaa-bbbb"), ("next", "/private")],
+        )
+        .await;
+    assert_eq!(r.status, 403);
+    assert_eq!(app.client.get("/private").await.status, 303);
+    // Nor does enrollment: a locked sign-in cannot add a factor of its own.
+    let r = app.client.get("/mfa/enroll?next=%2Fprivate").await;
+    assert_ne!(r.status, 200);
+    assert!(!r.text().contains("otpauth://"), "{}", r.text());
+    assert_eq!(app.client.get("/private").await.status, 303);
+
+    // A link, a provider or a password gate: the signature does not stand, and the
+    // session shows the locked page.
+    let other = app_with(&db, 1000, mfa.clone());
+    assert_eq!(
+        other
+            .client
+            .post_form(&format!("/door/{}", ada.id), &[])
+            .await
+            .text(),
+        "signed"
+    );
+    let r = other.client.get("/private").await;
+    assert_eq!(r.status, 303);
+    assert!(r.location().unwrap().starts_with("/login?next="));
+    assert_eq!(other.client.get("/mfa/challenge").await.status, 403);
+
+    // Staff clear the lock: the event is returned and the next sign-in stands.
+    let event = mfa
+        .clear_recovery_lock(&db.pool, ada.id, staff.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.name(), "mfa.account.recovery_lock_cleared");
+    assert!(
+        mfa.clear_recovery_lock(&db.pool, ada.id, staff.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let r = app
+        .client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(r.text(), "Done");
+    assert_eq!(app.client.get("/private").await.text(), "private for ada");
+    other
+        .client
+        .post_form(&format!("/door/{}", ada.id), &[])
+        .await;
+    assert_eq!(other.client.get("/private").await.text(), "private for ada");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn without_require_mfa_the_layer_still_refuses_a_locked_account() {
+    let db = db!();
+    let ada = account(&db, "ada").await;
+    sqlx::query("UPDATE accounts SET mfa_recovery_locked_at = now() WHERE id = $1")
+        .bind(ada.id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let st = AppState {
+        pool: db.pool.clone(),
+        mfa: mfa(),
+        throttle: Arc::new(throttle(1000)),
+    };
+    let sessions = Sessions::<Data>::new(
+        owt_test::accounts::test_key(),
+        "s",
+        Duration::from_secs(3600),
+        false,
+    );
+    let router = Router::new()
+        .route("/door/{id}", post(door))
+        .route(
+            "/private",
+            get(|Signed(a): Signed| async move { format!("private for {}", a.username) }),
+        )
+        .with_state(st)
+        .layer(from_fn_with_state(
+            Accounts::new(db.pool.clone(), "/login"),
+            Accounts::load::<Data>,
+        ))
+        .layer(from_fn_with_state(sessions, Sessions::layer));
+    let client = owt_test::Client::new(router);
+    client.post_form(&format!("/door/{}", ada.id), &[]).await;
+    assert_eq!(client.get("/private").await.status, 303);
     db.drop().await;
 }

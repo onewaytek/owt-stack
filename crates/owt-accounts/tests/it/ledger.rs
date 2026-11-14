@@ -116,9 +116,12 @@ async fn tables(pool: &PgPool) -> Vec<String> {
 const LIBRARY_TABLES: &[&str] = &[
     "account_identities",
     "account_local_identities",
+    "account_passkey_ceremonies",
+    "account_passkeys",
     "account_recovery_codes",
     "account_roles",
     "account_totp",
+    "account_webauthn_users",
     "accounts",
     "policy_acceptance_events",
     "policy_acceptances",
@@ -219,7 +222,7 @@ async fn an_apps_applied_copies_are_adopted_never_run_again() {
     // Once no binary carries the copies, their rows can go, and the app's migrator
     // no longer needs to ignore them.
     let forgotten = migrations::forget_copies(&db.pool).await.unwrap();
-    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    assert_eq!(forgotten, [1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     let left: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
         .fetch_all(&db.pool)
         .await
@@ -599,7 +602,10 @@ async fn replicas_running_the_whole_start_at_once_all_succeed() {
 #[tokio::test]
 async fn identities_linked_before_0010_keep_their_verified_emails() {
     let Some(db) = Db::new().await else { return };
-    let before = ALL.len() - 1;
+    let before = ALL
+        .iter()
+        .position(|m| m.name == "owt_accounts_confirmed_emails")
+        .unwrap();
     for (i, m) in ALL.iter().enumerate().take(before) {
         db.write(&copy_file(i), m.sql);
     }
@@ -633,7 +639,10 @@ async fn identities_linked_before_0010_keep_their_verified_emails() {
     .await
     .unwrap();
     let done = migrations::run(&db.pool).await.unwrap();
-    assert_eq!(done.applied, [ALL[before].name]);
+    assert_eq!(
+        done.applied,
+        ALL[before..].iter().map(|m| m.name).collect::<Vec<_>>()
+    );
     let verified: Vec<(String, Option<String>)> =
         sqlx::query_as("SELECT subject, verified_email FROM account_identities ORDER BY subject")
             .fetch_all(&db.pool)

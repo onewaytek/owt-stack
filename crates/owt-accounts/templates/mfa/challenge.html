@@ -2,6 +2,13 @@
 <h1>Confirm it is you</h1>
 <p class="owt-hint">Enter the six-digit code from your authenticator app. Without your phone, a recovery code works once.</p>
 {% if let Some(e) = v.error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endif %}{% if let Some(pk) = v.passkey %}<form class="owt-form" method="post" action="{{ v.action }}">
+<input type="hidden" name="passkey_token" value="{{ pk.token }}"><input type="hidden" name="passkey_credential" value="">
+<input type="hidden" name="next" value="{{ v.next }}">
+<div class="owt-alert owt-alert-error" role="alert" data-owt-passkey-error hidden></div>
+<div class="owt-actions"><button class="owt-button" type="button" data-owt-passkey="get" data-options="{{ pk.options }}" hidden>Use a passkey</button></div>
+</form>
+<script src="{{ pk.script }}" defer></script>
 {% endif %}<form class="owt-form" method="post" action="{{ v.action }}">
 <div class="owt-field"><label class="owt-label" for="mfa-code">Code from your authenticator app</label>
 <input class="owt-input" id="mfa-code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]*" autofocus></div>

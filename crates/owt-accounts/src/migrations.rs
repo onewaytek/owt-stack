@@ -89,6 +89,10 @@ pub const ALL: &[Migration] = &[
         name: "owt_accounts_confirmed_emails",
         sql: include_str!("../migrations/0010_confirmed_emails.sql"),
     },
+    Migration {
+        name: "owt_accounts_passkeys",
+        sql: include_str!("../migrations/0011_passkeys.sql"),
+    },
 ];
 
 /// The table [`run`] records the library's migrations in, in the schema they run in
@@ -759,6 +763,7 @@ const SHIPPED_SHA256: &[&str] = &[
     "50d4c3618cbbe298ad4ade48bdb68015b7f947e4c25d78a24b7a3692072e34ac",
     "aa6faf71cfa9f5136beed2899744ab0ac1e964b7e92da7e4c9509eaa1bc8ffae",
     "d5d2953c0621db0256279180f9da1e5f16dfcc32fe43a23dfc309ff9584b0803",
+    "1394bff933800a0238a606cb74a4620eb4856ac421f25f0170f3765dbd33dce6",
 ];
 
 /// The names each of [`ALL`] gives a relation (table, index, sequence) in the schema
@@ -837,6 +842,22 @@ const RELATIONS: &[(&str, &[&str])] = &[
             "revoked_sessions",
             "revoked_sessions_pkey",
             "revoked_sessions_expires_at",
+        ],
+    ),
+    (
+        "owt_accounts_passkeys",
+        &[
+            "account_webauthn_users",
+            "account_webauthn_users_pkey",
+            "account_webauthn_users_user_handle_key",
+            "account_passkeys",
+            "account_passkeys_pkey",
+            "account_passkeys_id_seq",
+            "account_passkeys_credential_id_key",
+            "account_passkeys_account",
+            "account_passkey_ceremonies",
+            "account_passkey_ceremonies_pkey",
+            "account_passkey_ceremonies_expiry",
         ],
     ),
 ];
