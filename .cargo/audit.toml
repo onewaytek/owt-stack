@@ -3,10 +3,14 @@
 [advisories]
 ignore = [
     # rsa: Marvin, a timing side channel on private-key operations (decryption,
-    # signing); no fixed release. It arrives through jsonwebtoken's rust_crypto
-    # backend, behind owt-auth's `jwt` feature (owt-accounts builds without it), and
-    # owt-auth only verifies signatures, a public-key operation.
-    # (The test suite signs with a throwaway key.)
+    # signing). The advisory names >=0.10.0, but the pre-release in use
+    # (0.10.0-rc.19) predates it. It arrives two ways. Through jsonwebtoken's
+    # rust_crypto backend, behind owt-auth's `jwt` feature (owt-accounts builds
+    # without it), and through owt-accounts' passkeys: webauthn-rs -> webauthn-rs-core
+    # and webauthn-attestation-ca -> crypto-glue 0.2.2 -> rsa 0.10.0-rc.19. Both
+    # paths only verify signatures, a public-key operation. (The test suite signs
+    # with a throwaway key.) Lifts when jsonwebtoken and webauthn-rs move to rsa
+    # >=0.10.0.
     "RUSTSEC-2023-0071",
 
     # crypto-bigint 0.5: secret-dependent branches in arithmetic meant to be
