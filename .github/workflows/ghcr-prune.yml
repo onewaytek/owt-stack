@@ -23,6 +23,9 @@ name: ghcr prune
 #   - what a kept version needs: an image index's children, its cosign signature and
 #     attestation versions (and their children), and any manifest whose `subject` is
 #     a kept digest.
+# With `delete: true` it fails when the checkout yields no pins at all (no digest and no
+# `version:` tag), and a dry run warns. A pin that names an rc by tag (`version:` in an
+# `apps/*/*/image.yaml`) protects the version carrying that tag, as a digest pin does.
 # A manifest it cannot read for a kept digest stops the run before any deletion. With
 # `deployments-repo` set and no DEPLOY_APP_CLIENT_ID secret, a dry run warns that it read no
 # pins and a deletion run fails.
@@ -136,6 +139,35 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Read the pins
+        id: pins
+        if: ${{ steps.inputs.outputs.pins == 'true' }}
+        env:
+          DELETE: ${{ inputs.delete }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/ghcr-prune"; mkdir -p "$work"
+          # Digests: every one named anywhere in the deployments repository.
+          grep -rhoE --exclude-dir=.git 'sha256:[a-f0-9]{64}' deployments | sort -u > "$work/pins" || true
+          # Tags: the `version:` of each apps/*/*/image.yaml, which protects the version
+          # carrying that tag when a pin names an rc by tag and not by digest.
+          : > "$work/pin-tags"
+          if [ -d deployments/apps ]; then
+            find deployments/apps -name image.yaml -exec sed -nE \
+              's/^[[:space:]]*version:[[:space:]]*["'"'"']?([^"'"'"'[:space:]#]+).*/\1/p' {} + \
+              | sort -u > "$work/pin-tags" || true
+          fi
+          digests="$(wc -l < "$work/pins")"; tags="$(wc -l < "$work/pin-tags")"
+          echo "pins read from the deployments repository: ${digests} digests, ${tags} version tags"
+          if [ "$digests" -eq 0 ] && [ "$tags" -eq 0 ]; then
+            if [ "$DELETE" = true ]; then
+              echo "::error::pins read: 0 digests and 0 version tags from the deployments checkout: no deletion without the pins"
+              exit 1
+            fi
+            echo "::warning::pins read: 0 digests and 0 version tags from the deployments checkout: a deletion run would fail"
+          fi
+
       - name: Prune
         id: prune
         env:
@@ -184,12 +216,9 @@ jobs:
               "https://ghcr.io/v2/${owner}/${PACKAGE}/manifests/$1"
           }
 
-          # The pins: every digest named in the deployments repository.
-          : > "$work/pins"
-          if [ "$PINS" = true ]; then
-            grep -rhoE --exclude-dir=.git 'sha256:[a-f0-9]{64}' deployments | sort -u > "$work/pins" || true
-            echo "pins read from the deployments repository: $(wc -l < "$work/pins") digests"
-          fi
+          # The pins: the digests and version tags the "Read the pins" step wrote.
+          [ -e "$work/pins" ] || : > "$work/pins"
+          [ -e "$work/pin-tags" ] || : > "$work/pin-tags"
 
           # Classify. kind: keep (another tag), rc, cosign, scan, untagged.
           now="$(date -u +%s)"
@@ -216,6 +245,17 @@ jobs:
                 elif (.kind == "untagged" or .kind == "scan") and .young then "young"
                 else null end)})
           ' "$work/all.json" > "$work/classified.json"
+
+          # A pin by tag protects the version carrying that tag (X.Y.Z, or vX.Y.Z).
+          # resolve-begin
+          if [ -s "$work/pin-tags" ]; then
+            jq -r --rawfile t "$work/pin-tags" '
+              ($t | split("\n") | map(select(. != "") | ltrimstr("v"))) as $tags
+              | .[] | select(any(.tags[]; ltrimstr("v") as $x | $tags | index($x))) | .digest' \
+              "$work/classified.json" >> "$work/pins"
+            sort -u -o "$work/pins" "$work/pins"
+          fi
+          # resolve-end
 
           # Protect: kept versions and pins, then everything they reach, to a fixed point.
           jq -r '.[] | select(.kept) | .digest' "$work/classified.json" | sort -u > "$work/protected"

@@ -43,6 +43,9 @@ on:
 
 jobs:
   artifacts:
+    concurrency:
+      group: actions-cleanup-${{ github.repository }}-${{ inputs.run-id || 'sweep' }}
+      cancel-in-progress: false
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     timeout-minutes: 10
     steps:
@@ -84,7 +87,9 @@ jobs:
                 || conclusion[$run]=unknown
             fi
             [ "${conclusion[$run]}" = success ] || continue
-            gh_api -X DELETE "${api}/artifacts/${id}" > /dev/null
+            # 404: the sweep or a workflow_run cleanup deleted it first; it is gone.
+            code="$(gh_api -o /dev/null -w '%{http_code}' -X DELETE "${api}/artifacts/${id}" || true)"
+            case "$code" in 204|404) ;; *) fail "deleting artifact ${id} returned HTTP ${code:-none}" ;; esac
             freed=$((freed + size)); count=$((count + 1))
           done < "$rows"
           echo "deleted ${count} artifacts, ${freed} bytes" | tee -a "$GITHUB_STEP_SUMMARY"

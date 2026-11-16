@@ -5756,6 +5756,15 @@ jobs:
 ```
 <!-- x-release-please-end -->
 
+Two guards keep a bad run harmless. The artifact cleanup treats a 404 on a delete as
+success (the sweep and a `workflow_run` cleanup can reach the same artifact, and the
+second finds it gone), any other error fails the job, and its jobs queue per repository
+and run id without cancelling one another. The prune refuses to delete when the
+deployments checkout yields no pins (no digest and no `version:` tag): with
+`delete: true` it fails with "pins read: 0 digests", and a dry run warns and proceeds.
+It also reads the `version:` of each `apps/*/*/image.yaml`, so an rc a pin names by
+tag, not digest, keeps the version carrying that tag.
+
 The prune deletes untagged versions and versions tagged only `scan-<run>` older than a
 day, rc versions but the newest 10 of each variant (`keep-rc`), and cosign signature
 versions whose image is gone. It never deletes a version with any other tag (a
