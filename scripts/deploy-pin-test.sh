@@ -4,7 +4,9 @@
 # digest changes nothing and reuses it, a rerun with another digest for the same
 # version adds a commit to the same branch (a fast-forward push), a new version opens
 # a new pull request and closes the old one, and a pin the base already holds opens
-# nothing. `just templates` runs it; it needs bash 4 and git, and no network.
+# nothing. A version lower than the base's or than an open pin's is refused: no pull
+# request, no branch, nothing closed (rc.10 outranks rc.9, a release outranks its rcs);
+# a higher one still closes the older pin. `just templates` runs it; it needs bash 4 and git, and no network.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -23,9 +25,11 @@ awk '
 
 cat >"$work/bin/yq" <<'YQ'
 #!/usr/bin/env bash
-# Only the three calls the step makes.
+# Only the four calls the step makes.
 if [ "$1" = -n ]; then
   printf 'image:\n  repository: %s\n  digest: %s\n  version: %s\n' "$REPO" "$DIGEST" "$VERSION"
+elif [[ $1 == *.image.version* ]]; then
+  sed -n 's/^  version: //p' "$2"
 elif [[ $1 == *.promote* ]]; then
   sed -n 's/^promote: //p' "$2"
 else
@@ -37,14 +41,16 @@ YQ
 cat >"$work/bin/gh" <<'GH'
 #!/usr/bin/env bash
 # Pull requests are lines "number|head|state|url" in $PRS; every call is logged.
-echo "gh ${*//$'\n'/ }" >>"$GH_LOG"
+echo "gh ${*//$'\n'/ }" | tee -a "$GH_LOG.last" >>"$GH_LOG"
 head=""; prev=""
 for a in "$@"; do [ "$prev" = --head ] && head=$a; prev=$a; done
 case "$1 $2" in
   "api users/"*) echo 42 ;;
   "label create") ;;
   "pr list")
-    if [[ " $* " == *" --head "* ]]; then
+    if [[ " $* " == *" --json headRefName "* ]]; then
+      awk -F'|' -v p="$PREFIX" '$3 == "open" && index($2, p) == 1 { print $2 }' "$PRS"
+    elif [[ " $* " == *" --head "* ]]; then
       awk -F'|' -v h="$head" '$2 == h && $3 == "open" { print $4; exit }' "$PRS"
     else
       awk -F'|' '$3 == "open" { print $1 "\t" $2 }' "$PRS" \
@@ -88,7 +94,7 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails
 
 run() { # run VERSION DIGEST: a fresh clone each time, as the workflow checks out
   rm -rf "$work/deployments"; git clone -q "$work/origin.git" "$work/deployments" 2>/dev/null
-  : >"$GITHUB_OUTPUT"
+  : >"$GITHUB_OUTPUT"; : >"$GH_LOG.last"
   export VERSION=$1 DIGEST=$2 PREFIX=deploy-pin/myapp-rc-auto- BRANCH=deploy-pin/myapp-rc-auto-$1
   (cd "$work/deployments" && bash -c "$(cat "$work/pin.sh")") >"$work/run.log" 2>&1 \
     || { cat "$work/run.log"; echo "FAIL run $1 exited non-zero"; fails=$((fails + 1)); }
@@ -128,6 +134,30 @@ before=$(wc -l <"$PRS")
 run 1.0.0-rc.2 "$d1"
 check "a pin the base already holds opens nothing" \
   '[ "$(wc -l <"$PRS")" = "$before" ] && grep -q "already run" "$work/run.log" && grep -q "^pull-requests=$" "$GITHUB_OUTPUT"'
+# Downgrades: the base runs 1.0.0-rc.2 and no pin is open.
+before=$(wc -l <"$PRS")
+run 1.0.0-rc.1 "$d2"
+check "an older rc than the base's opens nothing" \
+  '[ "$(wc -l <"$PRS")" = "$before" ] && grep -q "is lower, so nothing is pinned" "$work/run.log" && grep -q "^pull-requests=$" "$GITHUB_OUTPUT"'
+check "an older rc than the base's pushes no commit" \
+  '[ "$(commits 1.0.0-rc.1)" = 2 ] && ! grep -q "^gh pr \(create\|edit\|close\)" "$GH_LOG.last"'
+run 0.9.0 "$d2"
+check "an older release creates no branch" \
+  '! git -C "$work/origin.git" rev-parse -q --verify refs/heads/deploy-pin/myapp-rc-auto-0.9.0 >/dev/null && [ "$(wc -l <"$PRS")" = "$before" ]'
+
+run 1.0.0-rc.10 "$d2"
+check "rc.10 is higher than rc.2 and opens a pull request" '[ "$(prs open)" = 1 ] && [ "$(wc -l <"$PRS")" = $((before + 1)) ]'
+before=$(wc -l <"$PRS")
+run 1.0.0-rc.9 "$d1"
+check "rc.9 is lower than the open rc.10 pin and opens nothing" '[ "$(wc -l <"$PRS")" = "$before" ] && [ "$(prs open)" = 1 ]'
+check "rc.9 closes nothing" '! grep -q "^gh pr close" "$GH_LOG.last"'
+run 1.0.0 "$d1"
+check "a release is higher than its rc.10 and replaces it" \
+  '[ "$(wc -l <"$PRS")" = $((before + 1)) ] && [ "$(prs open)" = 1 ] && grep -q "^[0-9]*|deploy-pin/myapp-rc-auto-1.0.0|open|" "$PRS"'
+before=$(wc -l <"$PRS")
+run 1.0.0-rc.11 "$d2"
+check "an rc below the open release pin opens nothing" '[ "$(wc -l <"$PRS")" = "$before" ] && [ "$(prs open)" = 1 ]'
+
 check "the step never force-pushes" '! grep -Eq "push.*(--force|-f )" "$work/pin.sh"'
 
 [ "$fails" = 0 ] || { echo "$fails check(s) failed"; exit 1; }

@@ -28,7 +28,10 @@ name: Deploy pin
 #                  owner, whose merge is the release (CODEOWNERS)
 # It never pushes to the deployments repository's default branch. An older open pin
 # for the same app, channel, variant and mode is closed as superseded, so pins never
-# conflict. A rerun for the same version continues the pin branch with ordinary commits
+# conflict; a version lower than the one the environments run, or than an open pin of
+# the stream, is refused with a notice instead (nothing opened, closed or pushed), so a
+# rerun or a late release job never rolls an environment back. A deliberate rollback is
+# a pull request written by hand in the deployments repository. A rerun for the same version continues the pin branch with ordinary commits
 # (never a force push) and reuses its open pull request. No matching environment is a
 # notice, not a failure: an app pins nothing
 # until the deployments repository lists it.
@@ -192,6 +195,41 @@ jobs:
           git config user.name "${SLUG}[bot]"
           git config user.email "${uid}+${SLUG}[bot]@users.noreply.github.com"
 
+          # Semver precedence of two versions: prints -1, 0 or 1 (a build variant's suffix
+          # is dropped first; a pre-release is lower than its release; numeric
+          # pre-release identifiers compare as numbers, so rc.10 is higher than rc.9).
+          vcmp() {
+            local a=$1 b=$2 pa="" pb="" i x y
+            if [[ -n $VARIANT ]]; then a=${a%-"$VARIANT"}; b=${b%-"$VARIANT"}; fi
+            [[ $a == *-* ]] && pa=${a#*-}
+            [[ $b == *-* ]] && pb=${b#*-}
+            local -a ca cb ia ib
+            IFS=. read -ra ca <<<"${a%%-*}"; IFS=. read -ra cb <<<"${b%%-*}"
+            for i in 0 1 2; do
+              x=$((10#${ca[i]:-0})); y=$((10#${cb[i]:-0}))
+              if (( x != y )); then (( x > y )) && echo 1 || echo -1; return; fi
+            done
+            if [[ $pa == "$pb" ]]; then echo 0; return; fi
+            if [[ -z $pa ]]; then echo 1; return; fi
+            if [[ -z $pb ]]; then echo -1; return; fi
+            IFS=. read -ra ia <<<"$pa"; IFS=. read -ra ib <<<"$pb"
+            for (( i = 0; i < ${#ia[@]} || i < ${#ib[@]}; i++ )); do
+              if (( i >= ${#ia[@]} )); then echo -1; return; fi
+              if (( i >= ${#ib[@]} )); then echo 1; return; fi
+              x=${ia[i]}; y=${ib[i]}
+              if [[ $x == "$y" ]]; then continue; fi
+              if [[ $x =~ ^[0-9]+$ && $y =~ ^[0-9]+$ ]]; then
+                (( 10#$x > 10#$y )) && echo 1 || echo -1
+              elif [[ $x =~ ^[0-9]+$ ]]; then echo -1
+              elif [[ $y =~ ^[0-9]+$ ]]; then echo 1
+              else
+                [[ $(printf '%s\n%s\n' "$x" "$y" | LC_ALL=C sort | head -n1) == "$x" ]] && echo -1 || echo 1
+              fi
+              return
+            done
+            echo 0
+          }
+
           declare -A envs=()
           shopt -s nullglob
           for t in apps/*/*/target.yaml; do
@@ -213,6 +251,30 @@ jobs:
             git checkout -q "$base"
             prefix="deploy-pin/${APP}-${CHANNEL}${VARIANT:+-$VARIANT}-${promote}-"
             branch="${prefix}${VERSION}"
+            # A pin never goes backwards: a version lower than the one the base runs, or
+            # than an open pin of the same stream, is refused (a late or rerun release
+            # job carries an old version). Nothing is opened, pushed or closed.
+            newer=""
+            for d in $dirs; do
+              cur=$(yq '.image.version // ""' "$d/image.yaml" 2>/dev/null || true)
+              if [[ -n $cur && $cur != null && $(vcmp "$VERSION" "$cur") == -1 ]]; then
+                newer="$cur (running in ${d#apps/})"; break
+              fi
+            done
+            if [[ -z $newer ]]; then
+              while read -r head; do
+                [[ -n $head && $head != "$branch" ]] || continue
+                other=${head#"$prefix"}
+                if [[ $other =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ && $(vcmp "$VERSION" "$other") == -1 ]]; then
+                  newer="$other (open pin $head)"; break
+                fi
+              done < <(gh pr list --state open --json headRefName \
+                --jq ".[].headRefName | select(startswith(\"$prefix\"))")
+            fi
+            if [[ -n $newer ]]; then
+              echo "::notice::$APP $CHANNEL${VARIANT:+ ($VARIANT)} ($promote) already has $newer; $VERSION is lower, so nothing is pinned"
+              continue
+            fi
             # A rerun for the same version continues the bot's branch with ordinary
             # commits; it never rewrites history.
             if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then

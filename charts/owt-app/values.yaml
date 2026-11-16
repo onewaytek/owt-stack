@@ -49,7 +49,10 @@ backup:
   keepAtLeast: 3                 # BACKUP_KEEP_AT_LEAST
   pruneSchedule: "30 3 * * *"    # PRUNE_SCHEDULE (Kubernetes cron: five fields)
   online: false                  # BACKUP_ONLINE
-  pruneImage: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest  # PRUNE_IMAGE
+  # The cluster's own `cli` image by digest (name:tag@sha256, the tag is for reading).
+  # Renovate cannot reach the internal registry: when the cluster upgrades, read the new
+  # digest with `oc get istag cli:latest -n openshift -o jsonpath='{.image.metadata.name}'`.
+  pruneImage: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest@sha256:74e57568b3a1bcf36a85f5cef0861bc979fb86fd457710d31edc8e61d86ee02f  # PRUNE_IMAGE
 
 # What the app container adds to the template's: variables after the template's
 # own (a name given twice takes the last value), Secrets or ConfigMaps read whole
@@ -82,7 +85,9 @@ settings:
 # Secret `<name>-redis` (keys `password` and `url`).
 redis:
   enabled: false
-  image: mirror.gcr.io/library/redis:8-alpine  # REDIS_IMAGE
+  # name:tag@sha256, the tag is for reading; Renovate keeps the digest current
+  # (renovate/base-images.json).
+  image: mirror.gcr.io/library/redis:8-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3  # REDIS_IMAGE
   maxmemory: 128mb                             # MAXMEMORY
   maxmemoryPolicy: allkeys-lru                 # MAXMEMORY_POLICY
   memoryLimit: 256Mi                           # REDIS_MEMORY_LIMIT
