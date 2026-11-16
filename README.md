@@ -5751,7 +5751,7 @@ jobs:
     with:
       delete: ${{ github.event_name == 'workflow_dispatch' && inputs.delete }}
     secrets:
-      DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+      DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
       DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
 ```
 <!-- x-release-please-end -->
@@ -5761,7 +5761,7 @@ day, rc versions but the newest 10 of each variant (`keep-rc`), and cosign signa
 versions whose image is gone. It never deletes a version with any other tag (a
 release, `latest`, `rc`, `X.Y`, a test tag), a digest named anywhere in the
 deployments repository's default branch (read with a contents-read token from
-`DEPLOY_APP_ID`), or what a kept version needs: an index's children, its signature
+`DEPLOY_APP_CLIENT_ID`), or what a kept version needs: an index's children, its signature
 and attestation, a manifest whose `subject` it is. It lists what it would delete in the
 job summary and deletes only with `delete: true`: leave the schedule a dry run until a
 listing has been read, then run it from `workflow_dispatch` with `delete` ticked (or set
