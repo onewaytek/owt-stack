@@ -120,7 +120,8 @@ while IFS= read -r line || [ -n "$line" ]; do
     echo "$k: unchanged"; continue
   fi
   if [ "$have" = true ]; then echo "$k: set"; else echo "$k: created"; fi
-  updates=$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$updates")
+  # The value goes to jq on stdin, never in its argv.
+  updates=$(printf '%s\n%s\n' "$updates" "$v" | jq -c -n -R --arg k "$k" 'input as $u | input as $v | ($u | fromjson) + {($k): $v}')
   changed=1
 done <"$file"
 

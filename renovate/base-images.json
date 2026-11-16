@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "description": "Base images pinned by digest in an app's Dockerfile and its release workflow's base-image input, kept current by the self-hosted Renovate. Digest-only bumps (same tag, new digest) automerge to main once their checks pass, the digest is 24 h old, and Renovate's next scheduled run comes round; promote-rc has had them on rc since the pull request opened. Tag changes (a new major) never automerge.",
+  "description": "Base images pinned by digest in an app's Dockerfile and its release workflow's base-image input, kept current by the self-hosted Renovate. Digest-only bumps (same tag, new digest) automerge to main once their checks pass, the digest is 24 h old upstream (minimumReleaseAge counts from the registry's publication, not from the pull request or its time on rc), and Renovate's next scheduled run comes round. Tag changes (a new major) never automerge.",
   "extends": ["docker:pinDigests", ":semanticCommits", ":disableDependencyDashboard"],
   "enabledManagers": ["dockerfile", "custom.regex"],
   "semanticCommitType": "fix",
@@ -16,8 +16,7 @@
       "matchStrings": [
         "base-image:\\s*\"?(?<depName>[^:@\\s\"]+):(?<currentValue>[^@\\s\"]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
-      "datasourceTemplate": "docker",
-      "autoReplaceStringTemplate": "base-image: {{depName}}:{{newValue}}@{{newDigest}}"
+      "datasourceTemplate": "docker"
     }
   ],
   "packageRules": [

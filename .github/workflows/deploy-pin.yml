@@ -97,6 +97,9 @@ jobs:
     env:
       YQ_VERSION: v4.54.1
       YQ_SHA256: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
+      # The ARC runner image has no gh (release.yml): installed here, pinned.
+      GH_VERSION: 2.103.3
+      GH_SHA256: 4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
     steps:
       - name: Check the inputs
         id: inputs
@@ -128,7 +131,7 @@ jobs:
           echo "owner=${DEPLOYMENTS%%/*}" >> "$GITHUB_OUTPUT"
           echo "name=${DEPLOYMENTS#*/}" >> "$GITHUB_OUTPUT"
 
-      - name: Install yq
+      - name: Install yq and gh
         shell: bash
         run: |
           set -euo pipefail
@@ -137,6 +140,12 @@ jobs:
             "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
           echo "${YQ_SHA256}  $bin/yq" | sha256sum -c -
           chmod +x "$bin/yq"
+          tgz="$RUNNER_TEMP/gh.tar.gz"
+          curl -sSfL --retry 3 -o "$tgz" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          echo "${GH_SHA256}  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$bin" --strip-components=2 "gh_${GH_VERSION}_linux_amd64/bin/gh"
+          rm -f "$tgz"
           echo "$bin" >> "$GITHUB_PATH"
 
       - name: Mint a token for the deployments repository

@@ -6527,8 +6527,10 @@ It groups every `registry.access.redhat.com/hi/*` image into one `fix(deps)` pul
 request, so builder and runtime glibc move together, on Monday and Thursday mornings
 (UTC). The pull request ships on rc through promote-rc like any other. A digest-only
 bump (same tag) automerges to `main` on Renovate's next scheduled run once its checks
-pass and the digest is 24 hours old, so it has run on rc for at least that long; a
-tag change never automerges. An app that must not automerge at all (regulated data)
+pass and the digest is 24 hours old. That age counts from the registry's
+publication of the digest, not from the pull request: a digest older than a day
+can merge on the run that opens its pull request, so time on rc is not guaranteed.
+A tag change never automerges. An app that must not automerge at all (regulated data)
 adds `"packageRules": [{"matchPackageNames": ["*"], "automerge": false}]` after the
 `extends`.
 
