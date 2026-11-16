@@ -6491,7 +6491,7 @@ pushed in the deployments repository, and Argo CD syncs the commit:
       version: ${{ needs.release.outputs.version }}
       digest: ${{ needs.image.outputs.digest }}
     secrets:
-      DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+      DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
       DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
 ```
 
@@ -6502,11 +6502,14 @@ pull request: one with auto-merge on for `promote: auto` environments, which mer
 once the deployments repository's checks pass, and one labelled `production` for
 `promote: pr` environments, whose merge by the owner is the release. It never pushes
 to the deployments repository's default branch, and it closes an older open pin of
-the same stream as superseded. No matching environment is a notice: an app can add
+the same stream as superseded. A rerun (a retried release job) is idempotent: the
+same digest changes nothing and reuses the open pull request, another digest for the
+same version adds a commit to the bot's branch (never a force push), and a pin the
+base already holds opens nothing. No matching environment is a notice: an app can add
 the job before the deployments repository lists it.
 
-The token comes from a GitHub App (the `DEPLOY_APP_ID` and `DEPLOY_APP_KEY`
-secrets, an org secret limited to the app repositories) installed on the deployments
+The token comes from a GitHub App (the `DEPLOY_APP_CLIENT_ID`, the App's client ID, and
+`DEPLOY_APP_KEY` secrets, an org secret limited to the app repositories) installed on the deployments
 repository alone with contents and pull-requests write; the job asks for nothing
 more. `variant` pins only environments whose target.yaml names the same variant, and
 its version must end in `-<variant>`: a second build published as tags of the same
