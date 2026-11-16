@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/onewaytek/owt-stack/compare/v0.14.0...v0.14.1) (2026-11-16)
+
+
+### Features
+
+* **deploy:** owt-app helm chart with render-equivalence tests ([#342](https://github.com/onewaytek/owt-stack/issues/342)) ([469e58c](https://github.com/onewaytek/owt-stack/commit/469e58c6d3c3ffdfd892d76db63f4cde71e78f4e))
+
 ## [0.14.0](https://github.com/onewaytek/owt-stack/compare/v0.13.0...v0.14.0) (2026-11-14)
 
 
