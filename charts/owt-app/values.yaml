@@ -1,0 +1,164 @@
+# owt-app's values. Each key names the templates/openshift parameter it replaces
+# (params.env's KEY), so an app's params.env translates line by line; the README's
+# "Deploying with GitOps" has the whole table. values.schema.json checks every key,
+# and a render without `name`, `image.repository`, `image.digest` or `postgresMajor`
+# fails.
+
+# NAME: every object is named after it, and `app: <name>` is the Deployment's
+# selector and pod label.
+name: ""
+# NAMESPACE: empty takes the namespace Argo renders into (the Application's
+# destination).
+namespace: ""
+
+# The image, pinned by digest: the app container, the migrate init container and
+# every job run `<repository>@<digest>`. CI's deploy-pin writes this block into the
+# deployments repository's image.yaml; `version` is the release it names, and nothing
+# renders it.
+image:
+  repository: ""   # IMAGE (ghcr.io/onewaytek/myapp)
+  digest: ""       # sha256:<64 hex>
+  version: ""
+
+port: 8000                 # PORT
+replicas: 1                # REPLICAS
+routeTimeout: 30s          # ROUTE_TIMEOUT, with its unit
+memoryLimit: 512Mi         # MEMORY_LIMIT
+rustLog: info              # RUST_LOG
+sessionIdleTimeout: 30m    # SESSION_IDLE_TIMEOUT
+metricsNamespace: openshift-user-workload-monitoring  # METRICS_NAMESPACE
+cnpgNamespace: openshift-operators                    # CNPG_NAMESPACE
+
+# POSTGRES_MAJOR, required: the major the running cluster is on. Another value
+# changes the Cluster's imageName, which CNPG carries out as an in-place major
+# upgrade.
+postgresMajor: ""
+
+database:
+  suffix: db               # DB_SUFFIX
+  instances: 1             # DB_INSTANCES
+  size: 2Gi                # DB_SIZE
+  storageClass: lvms-vg1   # STORAGE_CLASS
+  # DB_ROLE_PREFIX: empty is `name` with each hyphen as an underscore.
+  rolePrefix: ""
+
+backup:
+  snapshotClass: lvms-vg1        # SNAPSHOT_CLASS
+  schedule: "0 0 2 * * *"        # BACKUP_SCHEDULE (CNPG cron: six fields)
+  keepDays: 14                   # BACKUP_KEEP_DAYS
+  keepAtLeast: 3                 # BACKUP_KEEP_AT_LEAST
+  pruneSchedule: "30 3 * * *"    # PRUNE_SCHEDULE (Kubernetes cron: five fields)
+  online: false                  # BACKUP_ONLINE
+  pruneImage: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest  # PRUNE_IMAGE
+
+# What the app container adds to the template's: variables after the template's
+# own (a name given twice takes the last value), Secrets or ConfigMaps read whole
+# after `<name>-env`, volumes and their mounts, and the probes' paths.
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []
+probes:
+  startupPath: /healthz
+  readinessPath: /healthz
+  livenessPath: /healthz
+# The app container's CPU limit; empty sets none, so CPU-bound work bursts.
+cpuLimit: ""
+
+# Annotations on the app's pod template. `rotation` is the convention for rolling
+# the pods after a secret rotation: bump its value in git.
+podAnnotations: {}
+  # rotation: "1"
+
+# Plain settings in a ConfigMap `<name>-settings`, read after `<name>-env` by the
+# app, the migrate init container and every job, so a key here wins over the
+# Secret's. Off by default: turning it on changes the pod template, which rolls the
+# pods once.
+settings:
+  configMap: false
+  values: {}
+
+# redis.yaml: a Redis of the app's own, reachable by it alone. Its password is the
+# Secret `<name>-redis` (keys `password` and `url`).
+redis:
+  enabled: false
+  image: mirror.gcr.io/library/redis:8-alpine  # REDIS_IMAGE
+  maxmemory: 128mb                             # MAXMEMORY
+  maxmemoryPolicy: allkeys-lru                 # MAXMEMORY_POLICY
+  memoryLimit: 256Mi                           # REDIS_MEMORY_LIMIT
+
+# tunnel.yaml: rendered when `host` and `id` are both set.
+tunnel:
+  host: ""                 # TUNNEL_HOST
+  id: ""                   # TUNNEL_ID
+  credentialsSecret: ""    # CREDENTIALS_SECRET; empty is <name>-tunnel
+  image: docker.io/cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4  # CLOUDFLARED_IMAGE
+  memoryLimit: 256Mi       # TUNNEL_MEMORY_LIMIT
+
+# egress.yaml: the app's pods, and each job's, may reach their database, their
+# Redis, the cluster's DNS and port 443 of `internetCIDR`, and nothing else.
+egress:
+  enabled: false
+  internetCIDR: 0.0.0.0/0  # INTERNET_CIDR
+
+# The cluster's DNS, for the tunnel's and egress's policies.
+dns:
+  namespace: openshift-dns  # DNS_NAMESPACE
+  port: 5353                # DNS_PORT
+
+# cronjob.yaml, once per entry (jobs/<JOB>.env). `name` is JOB, `schedule` SCHEDULE,
+# `args` ARGS (a list); `dbRole` (DB_ROLE, default runtime), `memoryLimit` (default
+# 256Mi), `rustLog` (default the app's) and `internetCIDR` (default egress's) are
+# optional.
+jobs: []
+  # - name: digest
+  #   schedule: "0 6 * * *"
+  #   args: [send-digest]
+
+# monitoring.yaml: a ServiceMonitor, a PodMonitor and the exporter's NetworkPolicy.
+# Needs monitoring-edit and user-workload monitoring.
+monitoring:
+  enabled: false
+  interval: 30s  # INTERVAL
+
+# App PersistentVolumeClaims, each `<name>-<entry name>`, never pruned or deleted by
+# Argo. With `mountPath`, the app container mounts it there.
+persistence: []
+  # - name: exports
+  #   size: 5Gi
+  #   storageClass: lvms-vg1
+  #   accessModes: [ReadWriteOnce]
+  #   mountPath: /var/lib/myapp/exports
+
+# The app's Secrets from OpenBao, through External Secrets' vault provider: a
+# SecretStore `openbao` authenticating as the ServiceAccount `eso-openbao`, and one
+# ExternalSecret per Secret. Each Secret is read whole from `<path>/<key>` in the KV
+# v2 mount.
+externalSecrets:
+  enabled: false
+  apiVersion: external-secrets.io/v1
+  # true while the Secrets made by hand still exist: ESO merges into them
+  # (creationPolicy Merge) and leaves them when the ExternalSecret goes (deletionPolicy
+  # Retain). false: ESO owns the Secret it creates.
+  adopt: true
+  refreshInterval: 1h
+  # apps/<app>/<env>: the secrets' folder in the KV mount.
+  path: ""
+  store:
+    server: https://openbao.openbao.svc:8200
+    mount: kv
+    # Kubernetes auth: the auth mount and the role bound to eso-openbao in this
+    # namespace; empty role is <namespace>.
+    authMount: kubernetes
+    role: ""
+    serviceAccount: eso-openbao
+    # The OpenShift service CA, which signs OpenBao's serving certificate.
+    caConfigMap: openshift-service-ca.crt
+    caKey: service-ca.crt
+  # The Secrets: <name>-env from <path>/env, <name>-<suffix>-runtime from
+  # <path>/db-runtime, <name>-redis from <path>/redis (with redis.enabled), and the
+  # tunnel's credentials Secret from <path>/tunnel (with a tunnel).
+  env: true
+  dbRuntime: true
+  # More Secrets: {secret: <Secret name>, key: <entry under path>, type: <optional>}.
+  extra: []

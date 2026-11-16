@@ -1,0 +1,13 @@
+name: myapp
+namespace: myapp
+image: {repository: ghcr.io/onewaytek/myapp, digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", version: 1.2.3}
+postgresMajor: "18"
+podAnnotations: {rotation: "2"}
+settings:
+  configMap: true
+  values: {PUBLIC_URL: https://myapp.example.com, NOINDEX: true}
+persistence:
+  - {name: exports, size: 5Gi, mountPath: /var/lib/myapp/exports}
+redis: {enabled: true}
+tunnel: {host: myapp.example.com, id: 00000000-1111-2222-3333-444444444444}
+externalSecrets: {enabled: true, path: apps/myapp/rc}

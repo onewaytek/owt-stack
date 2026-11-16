@@ -1,0 +1,47 @@
+{{- /*
+egress.yaml's bounds, for the app's pods and each job's: their database, their
+Redis, the cluster's DNS and port 443 of internetCIDR, and nothing else. The pods
+lose every other egress the moment this applies.
+*/ -}}
+{{- if .Values.egress.enabled }}
+{{- $name := include "owt.name" . -}}
+{{- $pods := list (dict "pod" $name "cidr" .Values.egress.internetCIDR) -}}
+{{- range .Values.jobs }}
+{{- $pods = append $pods (dict "pod" (printf "%s-%s" $name .name) "cidr" (.internetCIDR | default $.Values.egress.internetCIDR)) -}}
+{{- end }}
+{{- range $pods }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .pod }}-egress
+  namespace: {{ include "owt.namespace" $ }}
+  labels: {app: "{{ $name }}"}
+spec:
+  podSelector:
+    matchLabels: {app: "{{ .pod }}"}
+  policyTypes: [Egress]
+  egress:
+    # The cluster's resolvers.
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: "{{ $.Values.dns.namespace }}"}
+      ports:
+        - {protocol: UDP, port: {{ $.Values.dns.port }}}
+        - {protocol: TCP, port: {{ $.Values.dns.port }}}
+    # Postgres.
+    - to:
+        - podSelector:
+            matchLabels: {cnpg.io/cluster: "{{ include "owt.db" $ }}"}
+      ports: [{port: 5432}]
+    # Redis; without one this selects nothing.
+    - to:
+        - podSelector:
+            matchLabels: {app: "{{ $name }}-redis"}
+      ports: [{port: 6379}]
+    # HTTPS to the internet (and to the cluster's Routes, at the router's address).
+    - to:
+        - ipBlock: {cidr: "{{ .cidr }}"}
+      ports: [{port: 443}]
+{{- end }}
+{{- end }}
