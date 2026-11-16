@@ -342,11 +342,14 @@ impl Audit {
 /// transaction must be READ COMMITTED (Postgres's default); the database refuses
 /// others.
 ///
-/// An event recorded here rolls back with its transaction, so record a refusal or
-/// failure with [`Audit::record`] (a transaction of its own) instead. Record for one
-/// tenant per transaction, or for several in a fixed order: two transactions that
-/// lock two tenants' chains in opposite orders deadlock. While this transaction holds
-/// a tenant's chain, an [`Audit::record`] for that tenant waits on it.
+/// An event recorded here rolls back with its transaction. A request that is refused
+/// records the refusal with [`record_refusal`] (or [`record_refusal_with`]), on its
+/// own connection, after undoing its work; a failure outside a request (a job, a
+/// failure with no request transaction) uses [`Audit::record`] (a transaction of its
+/// own). Record for one tenant per transaction, or for several in a fixed order: two
+/// transactions that lock two tenants' chains in opposite orders deadlock. While this
+/// transaction holds a tenant's chain, an [`Audit::record`] for that tenant waits on
+/// it.
 ///
 /// The database assigns the event's place, time and hash; this checks that its hash
 /// is the one the crate's encoding gives, and fails ([`RecordError::Mismatch`])
@@ -388,6 +391,88 @@ pub async fn record_in(conn: &mut PgConnection, event: &Event) -> Result<Recorde
         return Err(RecordError::Mismatch);
     }
     Ok(recorded)
+}
+
+/// Record a refused request's refusal on the request's own connection: undo
+/// everything `tx` did, then append `event` and commit it there.
+///
+/// ```text
+/// tx: request work ... refused -> ROLLBACK AND CHAIN -> event -> COMMIT AND CHAIN
+/// ```
+///
+/// The request's work is rolled back whole, not to a savepoint. The refusal must
+/// outlive the request's transaction, which rolls back as the refusal propagates, so
+/// it has to commit, and only the end of the transaction commits; a savepoint would
+/// leave it in the transaction that rolls back. `ROLLBACK AND CHAIN` and `COMMIT AND
+/// CHAIN` end a transaction and open the next one at once, on the same connection
+/// and with the same isolation level, so `tx` stays a live sqlx transaction: no
+/// second connection is taken, the request's locks (its tenant's chain lock among
+/// them) are released before the refusal waits on any, and a burst of refused
+/// requests holds no more connections than the requests themselves. On return,
+/// `tx` is a fresh, empty transaction: committing or dropping it changes nothing,
+/// and a caller that keeps using it sets its `SET LOCAL` settings again, since the
+/// rollback discards them.
+///
+/// `tx` is `'static`, as [`sqlx::PgPool::begin`] gives it: a nested transaction (a
+/// savepoint) borrows its parent and does not fit, since rolling back its parent's
+/// work is not its to do.
+///
+/// On an error the refusal is not recorded: `tx` is rolled back and chained again,
+/// the error is returned, and the caller decides how the request still fails (it is
+/// refused all the same).
+pub async fn record_refusal(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    event: &Event,
+) -> Result<Recorded, RecordError> {
+    record_refusal_with(tx, async |conn: &mut PgConnection| {
+        record_in(conn, event).await
+    })
+    .await
+}
+
+/// [`record_refusal`], with the app's own writes: `record` runs on the request's
+/// connection in the fresh transaction after the rollback, and commits if it
+/// returns `Ok`. It sets what the refusal's transaction needs (`SET LOCAL ROLE`, a
+/// tenant setting for row-level security), calls [`record_in`] and writes any rows
+/// that belong with the event. If `record` fails, its writes are rolled back as the
+/// request's were, and its error is returned.
+pub async fn record_refusal_with<T, E>(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    record: impl AsyncFnOnce(&mut PgConnection) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<sqlx::Error>,
+{
+    use sqlx::Executor;
+    tx.execute("ROLLBACK AND CHAIN").await?;
+    let conn: &mut PgConnection = tx;
+    let recorded = match record(&mut *conn).await {
+        Ok(v) => conn.execute("COMMIT AND CHAIN").await.map(|_| v),
+        Err(e) => {
+            rechain(conn).await;
+            return Err(e);
+        }
+    };
+    match recorded {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            rechain(conn).await;
+            Err(e.into())
+        }
+    }
+}
+
+/// Leave `conn` in a fresh, empty transaction after a failed refusal, as sqlx's
+/// transaction expects: `ROLLBACK AND CHAIN` from a transaction (failed or not), or
+/// `BEGIN` when a failed commit has already ended it.
+async fn rechain(conn: &mut PgConnection) {
+    use sqlx::Executor;
+    if conn.execute("ROLLBACK AND CHAIN").await.is_ok() {
+        return;
+    }
+    if let Err(e) = conn.execute("BEGIN").await {
+        tracing::error!(error = %e, "reopening a refused request's transaction failed");
+    }
 }
 
 /// The first key of the advisory locks that serialize each chain's appends, taken by

@@ -4006,12 +4006,20 @@ let signed = Event::new(ActorKind::Account, "17", "note.sign", "note")
 owt_audit::record_in(&mut tx, &signed).await?;
 tx.commit().await?;
 
-// Refusals are events too.
+// A refused request: undo its work, then record the refusal on its own connection.
+let mut tx = pool.begin().await?;
+// ... the request's reads and writes in `tx`, then the access check refuses ...
 let denied = Event::new(ActorKind::Account, "23", "record.view", "chart")
     .tenant("practice-3")
     .subject("patient:4821")
     .outcome(Outcome::Denied);
-audit.record(&denied).await?;
+owt_audit::record_refusal(&mut tx, &denied).await?;
+drop(tx); // a fresh, empty transaction: nothing to roll back
+
+// A failure outside any request (a job): a transaction of its own.
+let failed = Event::new(ActorKind::System, "system", "key.rotate", "kek")
+    .outcome(Outcome::Failure);
+audit.record(&failed).await?;
 # Ok(()) }
 ```
 
@@ -4037,10 +4045,39 @@ event).
   waits for your transaction's lock while your task waits for `record`. Postgres
   cannot see that wait, so it lasts until a statement timeout ends it, or forever
   without one.
-- Record refusals and failures (`Outcome::Denied`, a failed attempt) with
-  `audit.record`, in a transaction of their own, as in the example above. An event
-  recorded with `record_in` rolls back with its transaction, and the transaction of
-  a refused or failed request is usually the one that rolls back.
+- Record a refused request (`Outcome::Denied`) with `owt_audit::record_refusal`
+  on the request's own transaction, as in the example above. An event recorded with
+  `record_in` rolls back with its transaction, and a refused request's transaction
+  rolls back. `record_refusal` rolls the request's work back whole (`ROLLBACK AND
+  CHAIN`), appends the event and commits it (`COMMIT AND CHAIN`) on the same
+  connection, and leaves `tx` a fresh, empty transaction. So it takes no second
+  connection (a burst of refused requests holds no more than the requests do), and
+  it never waits on the request's own chain lock, which the rollback releases. The
+  rollback also discards `SET LOCAL` settings: when the app's role or row-level
+  security needs them for the insert, use `record_refusal_with`, whose closure sets
+  them, calls `record_in` and writes any rows of the app's own that belong with the
+  event, all on the request's connection:
+
+  ```rust,no_run
+  # async fn demo(
+  #     mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+  #     denied: owt_audit::Event,
+  # ) -> Result<(), owt_audit::RecordError> {
+  use sqlx::Executor;
+  owt_audit::record_refusal_with(&mut tx, async |conn: &mut sqlx::PgConnection| {
+      conn.execute("SET LOCAL ROLE myapp_app").await?;
+      owt_audit::record_in(&mut *conn, &denied).await?;
+      Ok::<_, owt_audit::RecordError>(())
+  })
+  .await?;
+  # Ok(()) }
+  ```
+
+  If the refusal cannot be recorded, it returns the error with nothing recorded and
+  `tx` again a fresh transaction; the request is still refused, and the app decides
+  how that failure shows (an error log, a metric, a 5xx).
+- Record failures outside a request (a job, a failure with no request transaction)
+  with `audit.record`, in a transaction of their own.
 
 **Roles.** Run the migrations as the role that owns the schema. Give the app's role
 `INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
