@@ -18,13 +18,13 @@ name: ghcr prune
 #   - a version with any other tag: a release (X.Y.Z), `latest`, `rc`, X.Y, X, a test
 #     tag;
 #   - a digest named anywhere in `deployments-repo`'s default branch (a GitOps pin),
-#     read with a token minted from DEPLOY_APP_ID/DEPLOY_APP_KEY for contents: read on
+#     read with a token minted from DEPLOY_APP_CLIENT_ID/DEPLOY_APP_KEY for contents: read on
 #     that repository alone;
 #   - what a kept version needs: an image index's children, its cosign signature and
 #     attestation versions (and their children), and any manifest whose `subject` is
 #     a kept digest.
 # A manifest it cannot read for a kept digest stops the run before any deletion. With
-# `deployments-repo` set and no DEPLOY_APP_ID secret, a dry run warns that it read no
+# `deployments-repo` set and no DEPLOY_APP_CLIENT_ID secret, a dry run warns that it read no
 # pins and a deletion run fails.
 #
 # The job takes the caller's token permissions (it names none of its own, so a caller
@@ -40,7 +40,7 @@ name: ghcr prune
 #       with:
 #         delete: false   # true deletes; review a dry run's list first
 #       secrets:
-#         DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+#         DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
 #         DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
 
 on:
@@ -67,7 +67,7 @@ on:
         type: string
         default: onewaytek/deployments
     secrets:
-      DEPLOY_APP_ID:
+      DEPLOY_APP_CLIENT_ID:
         required: false
       DEPLOY_APP_KEY:
         required: false
@@ -91,7 +91,7 @@ jobs:
         env:
           PACKAGE: ${{ inputs.package }}
           DEPLOYMENTS: ${{ inputs.deployments-repo }}
-          HAVE_APP: ${{ secrets.DEPLOY_APP_ID != '' && secrets.DEPLOY_APP_KEY != '' }}
+          HAVE_APP: ${{ secrets.DEPLOY_APP_CLIENT_ID != '' && secrets.DEPLOY_APP_KEY != '' }}
           DELETE: ${{ inputs.delete }}
         shell: bash
         run: |
@@ -109,9 +109,9 @@ jobs:
               echo "owner=${DEPLOYMENTS%%/*}" >> "$GITHUB_OUTPUT"
               echo "name=${DEPLOYMENTS#*/}" >> "$GITHUB_OUTPUT"
             elif [[ $DELETE == true ]]; then
-              fail "deployments-repo is set but DEPLOY_APP_ID/DEPLOY_APP_KEY are not: no deletion without the pins"
+              fail "deployments-repo is set but DEPLOY_APP_CLIENT_ID/DEPLOY_APP_KEY are not: no deletion without the pins"
             else
-              echo "::warning::no DEPLOY_APP_ID/DEPLOY_APP_KEY: this dry run read no pins from $DEPLOYMENTS"
+              echo "::warning::no DEPLOY_APP_CLIENT_ID/DEPLOY_APP_KEY: this dry run read no pins from $DEPLOYMENTS"
             fi
           fi
           echo "pins=$pins" >> "$GITHUB_OUTPUT"
@@ -121,7 +121,7 @@ jobs:
         if: ${{ steps.inputs.outputs.pins == 'true' }}
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ secrets.DEPLOY_APP_ID }}
+          client-id: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
           private-key: ${{ secrets.DEPLOY_APP_KEY }}
           owner: ${{ steps.inputs.outputs.owner }}
           repositories: ${{ steps.inputs.outputs.name }}
