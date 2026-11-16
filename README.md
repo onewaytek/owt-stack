@@ -6221,7 +6221,12 @@ oc get istag cli:latest -n openshift
 and, after the first night, that a prune succeeded
 (`oc get cronjob myapp-backup-prune -o jsonpath='{.status.lastSuccessfulTime}'` prints
 a time). A cluster without the registry passes `-p PRUNE_IMAGE=<image>`: any image the
-namespace can pull that has `bash`, `oc` and `python3`.
+namespace can pull that has `bash`, `oc` and `python3`. The default names the image
+by digest (`…/openshift/cli:latest@sha256:…`, the tag is for reading), as the chart's
+`redis.image` does for Redis (`mirror.gcr.io/library/redis:8-alpine@sha256:…`, kept
+current by the Renovate preset). Renovate cannot read the internal registry, so after
+a cluster upgrade set the new `cli` digest by hand
+(`oc get istag cli:latest -n openshift -o jsonpath='{.image.metadata.name}'`).
 
 These snapshots live in the same volume group, on the same node: they undo a bad
 migration or a dropped table, not the loss of the disk. Off-node copies need object
@@ -6570,7 +6575,13 @@ pull request: one with auto-merge on for `promote: auto` environments, which mer
 once the deployments repository's checks pass, and one labelled `production` for
 `promote: pr` environments, whose merge by the owner is the release. It never pushes
 to the deployments repository's default branch, and it closes an older open pin of
-the same stream as superseded. A rerun (a retried release job) is idempotent: the
+the same stream as superseded. It never pins backwards: a version that is semver-lower
+than the one the matching environments run, or than an open pin of the same stream (app,
+channel, variant and mode), is a notice that opens, pushes and closes nothing, so a rerun
+of an old release job or an older release's job that finishes last cannot roll an
+environment back or close the newer pin (`rc.10` outranks `rc.9`, a release outranks its
+rcs, and a variant's `-hsm` suffix is ignored). A rollback is a pull request written by
+hand in the deployments repository. A rerun (a retried release job) is idempotent: the
 same digest changes nothing and reuses the open pull request, another digest for the
 same version adds a commit to the bot's branch (never a force push), and a pin the
 base already holds opens nothing. No matching environment is a notice: an app can add
@@ -6601,7 +6612,10 @@ bump (same tag) automerges to `main` on Renovate's next scheduled run once its c
 pass and the digest is 24 hours old. That age counts from the registry's
 publication of the digest, not from the pull request: a digest older than a day
 can merge on the run that opens its pull request, so time on rc is not guaranteed.
-A tag change never automerges. An app that must not automerge at all (regulated data)
+A tag change never automerges.
+The preset also reads the `image:` lines of `charts/owt-app/values.yaml` (the Redis and
+cloudflared defaults, `name:tag@sha256:…`), so those digests are bumped like the base
+images; it matches that path in the repository it runs on. An app that must not automerge at all (regulated data)
 adds `"packageRules": [{"matchPackageNames": ["*"], "automerge": false}]` after the
 `extends`.
 

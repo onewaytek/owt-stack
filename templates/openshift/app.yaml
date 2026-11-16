@@ -149,7 +149,7 @@ parameters:
       The backup prune's image: bash, oc and python3. The default comes from the
       internal image registry; a cluster without one passes another image the
       namespace can pull, or pruning never runs and snapshots fill the volume group.
-    value: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+    value: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest@sha256:74e57568b3a1bcf36a85f5cef0861bc979fb86fd457710d31edc8e61d86ee02f
   - name: CNPG_NAMESPACE
     description: >-
       The namespace the CloudNativePG operator runs in (openshift-operators when

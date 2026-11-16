@@ -17,6 +17,15 @@
         "base-image:\\s*\"?(?<depName>[^:@\\s\"]+):(?<currentValue>[^@\\s\"]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "image: name:tag@sha256:digest in the owt-app chart's default values (Redis, cloudflared); backup.pruneImage names the cluster's internal registry, which Renovate cannot read",
+      "managerFilePatterns": ["/^charts/owt-app/values\\.yaml$/"],
+      "matchStrings": [
+        "^\\s+image:\\s*(?<depName>[^:@\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
     }
   ],
   "packageRules": [

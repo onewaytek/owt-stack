@@ -40,7 +40,7 @@ parameters:
       The Redis image. Docker Hub's official image through Google's mirror, out of
       reach of Docker Hub's anonymous pull limit; it runs under the arbitrary UID
       restricted-v2 assigns.
-    value: mirror.gcr.io/library/redis:8-alpine
+    value: mirror.gcr.io/library/redis:8-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3
   - name: MAXMEMORY
     description: What Redis holds before it evicts (or, with noeviction, refuses).
     value: 128mb
