@@ -15,7 +15,7 @@ name: Deploy pin
 #       version: ${{ needs.release.outputs.version }}
 #       digest: ${{ needs.image.outputs.digest }}
 #     secrets:
-#       DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+#       DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
 #       DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
 #
 # For every `apps/*/*/target.yaml` in the deployments repository whose `app`,
@@ -28,7 +28,9 @@ name: Deploy pin
 #                  owner, whose merge is the release (CODEOWNERS)
 # It never pushes to the deployments repository's default branch. An older open pin
 # for the same app, channel, variant and mode is closed as superseded, so pins never
-# conflict. No matching environment is a notice, not a failure: an app pins nothing
+# conflict. A rerun for the same version continues the pin branch with ordinary commits
+# (never a force push) and reuses its open pull request. No matching environment is a
+# notice, not a failure: an app pins nothing
 # until the deployments repository lists it.
 #
 # The token is minted from GitHub App `owt-deploy` for the deployments repository
@@ -72,7 +74,7 @@ on:
         type: string
         default: onewaytek/deployments
     secrets:
-      DEPLOY_APP_ID:
+      DEPLOY_APP_CLIENT_ID:
         required: true
       DEPLOY_APP_KEY:
         required: true
@@ -152,7 +154,7 @@ jobs:
         id: token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ secrets.DEPLOY_APP_ID }}
+          client-id: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
           private-key: ${{ secrets.DEPLOY_APP_KEY }}
           owner: ${{ steps.inputs.outputs.owner }}
           repositories: ${{ steps.inputs.outputs.name }}
@@ -211,7 +213,14 @@ jobs:
             git checkout -q "$base"
             prefix="deploy-pin/${APP}-${CHANNEL}${VARIANT:+-$VARIANT}-${promote}-"
             branch="${prefix}${VERSION}"
-            git checkout -q -b "$branch"
+            # A rerun for the same version continues the bot's branch with ordinary
+            # commits; it never rewrites history.
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+              git fetch -q --depth=1 origin "$branch"
+              git checkout -q -B "$branch" FETCH_HEAD
+            else
+              git checkout -q -b "$branch"
+            fi
             names=()
             for d in $dirs; do
               REPO="$repo" DIGEST="$DIGEST" VERSION="$VERSION" yq -n \
@@ -220,18 +229,22 @@ jobs:
               git add "$d/image.yaml"
               names+=("${d#apps/}")
             done
-            if git diff --cached --quiet; then
-              echo "::notice::${names[*]} already run $VERSION ($DIGEST)"; continue
-            fi
             list=$(IFS=,; echo "${names[*]}")
             title="chore(deploy): ${APP} ${VERSION} to ${list//,/, }"
             # The commit header obeys the deployments repository's commitlint (<= 100).
             [[ ${#title} -le 100 ]] || title="chore(deploy): ${APP} ${VERSION} to ${#names[@]} environments"
             # Body lines stay <= 100 too: the digest and the run on lines of their own.
-            git commit -q -m "$title" -m "Repository: ${repo}
+            if ! git diff --cached --quiet; then
+              git commit -q -m "$title" -m "Repository: ${repo}
           Digest: ${DIGEST}
           Run: ${SOURCE}"
-            git push -q origin "$branch"
+              git push -q origin "$branch"
+            fi
+            # The environments' image.yaml files equal the base's: they already run this pin.
+            files=(); for d in $dirs; do files+=("$d/image.yaml"); done
+            if git diff --quiet "$base" HEAD -- "${files[@]}"; then
+              echo "::notice::${names[*]} already run $VERSION ($DIGEST)"; continue
+            fi
 
             body="Pins \`${repo}@${DIGEST}\` (${VERSION}) in: ${list//,/, }.
 
@@ -240,13 +253,21 @@ jobs:
             if [[ $promote == pr ]]; then
               gh label create production --color B60205 \
                 --description "A production pin: the owner's merge is the release" --force >/dev/null
-              labels=(--label production)
+              labels=(production)
               body+="
 
           **Production:** merging this pull request releases ${VERSION}."
             fi
-            url=$(gh pr create --base "$base" --head "$branch" --title "$title" --body "$body" "${labels[@]}")
-            echo "opened $url"; urls+=("$url")
+            # A rerun reuses the branch's open pull request and refreshes its text.
+            url=$(gh pr list --state open --head "$branch" --json url --jq '.[0].url // empty')
+            if [[ -n $url ]]; then
+              gh pr edit "$url" --title "$title" --body "$body" "${labels[@]/#/--add-label=}" >/dev/null
+              echo "reused $url"
+            else
+              url=$(gh pr create --base "$base" --head "$branch" --title "$title" --body "$body" "${labels[@]/#/--label=}")
+              echo "opened $url"
+            fi
+            urls+=("$url")
 
             # Older pins of the same stream would conflict with this one: close them.
             gh pr list --state open --json number,headRefName \
