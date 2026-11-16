@@ -88,11 +88,16 @@ impl Db {
 }
 
 async fn pool_in(url: &str, schema: &str, role: Option<&str>) -> PgPool {
+    pool_of(url, schema, role, 8).await
+}
+
+async fn pool_of(url: &str, schema: &str, role: Option<&str>, max: u32) -> PgPool {
     let opts: PgConnectOptions = url.parse().unwrap();
     let schema = schema.to_owned();
     let role = role.map(str::to_owned);
     PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(max)
+        .acquire_timeout(std::time::Duration::from_secs(5))
         .after_connect(move |conn, _| {
             let (schema, role) = (schema.clone(), role.clone());
             Box::pin(async move {
@@ -791,4 +796,90 @@ mod cli {
         assert!(run(&db.pool, None::<&NoAnchor>, false).await.is_err());
         db.drop().await;
     }
+}
+
+fn denied(tenant: &str, patient: &str) -> Event {
+    Event::new(ActorKind::Account, "23", "record.view", "chart")
+        .tenant(tenant)
+        .subject(patient)
+        .outcome(Outcome::Denied)
+}
+
+async fn work_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM work")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_refusal_is_recorded_on_the_requests_own_connection() {
+    let Some(db) = Db::new().await else { return };
+    db.pool.execute("CREATE TABLE work (n int)").await.unwrap();
+    // One connection, and the request holds it.
+    let one = pool_of(&db.url, &db.schema, None, 1).await;
+    let mut tx = one.begin().await.unwrap();
+    tx.execute("INSERT INTO work VALUES (1)").await.unwrap();
+    // The request has already taken its tenant's chain lock.
+    owt_audit::record_in(&mut tx, &view("t1", "p1"))
+        .await
+        .unwrap();
+    let recorded = owt_audit::record_refusal(&mut tx, &denied("t1", "p1"))
+        .await
+        .unwrap();
+    assert_eq!((recorded.seq, recorded.prev), (1, owt_audit::GENESIS));
+    // `tx` is a fresh transaction: still usable, and dropping it changes nothing.
+    tx.execute("INSERT INTO work VALUES (2)").await.unwrap();
+    drop(tx);
+    one.close().await;
+    // Only the refusal survives: not the request's write, nor its audited view.
+    assert_eq!(work_rows(&db.pool).await, 0);
+    assert_eq!(verify(&db.pool, "t1").await.unwrap().events, 1);
+    let outcome: String =
+        sqlx::query_scalar("SELECT outcome FROM owt_audit_events WHERE tenant = 't1'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(outcome, "denied");
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn a_refusal_records_the_apps_rows_with_it_or_nothing() {
+    let Some(db) = Db::new().await else { return };
+    db.pool.execute("CREATE TABLE work (n int)").await.unwrap();
+    let one = pool_of(&db.url, &db.schema, None, 1).await;
+    // The app's own rows commit with the event.
+    let mut tx = one.begin().await.unwrap();
+    tx.execute("INSERT INTO work VALUES (1)").await.unwrap();
+    let seq = owt_audit::record_refusal_with(&mut tx, async |conn: &mut sqlx::PgConnection| {
+        let r = owt_audit::record_in(&mut *conn, &denied("t1", "p1")).await?;
+        conn.execute("INSERT INTO work VALUES (10)").await?;
+        Ok::<_, owt_audit::RecordError>(r.seq)
+    })
+    .await
+    .unwrap();
+    assert_eq!(seq, 1);
+    tx.commit().await.unwrap();
+    let kept: Vec<i32> = sqlx::query_scalar("SELECT n FROM work")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, [10]);
+    // A refusal that fails records nothing, and the transaction stays usable.
+    let mut tx = one.begin().await.unwrap();
+    tx.execute("INSERT INTO work VALUES (2)").await.unwrap();
+    let failed = owt_audit::record_refusal_with(&mut tx, async |conn: &mut sqlx::PgConnection| {
+        owt_audit::record_in(&mut *conn, &denied("t1", "p2")).await?;
+        conn.execute("SELECT 1/0").await?;
+        Ok::<_, owt_audit::RecordError>(())
+    })
+    .await;
+    assert!(failed.is_err());
+    tx.execute("SELECT 1").await.unwrap();
+    tx.commit().await.unwrap();
+    one.close().await;
+    assert_eq!(work_rows(&db.pool).await, 1);
+    assert_eq!(verify(&db.pool, "t1").await.unwrap().events, 1);
+    db.drop().await;
 }
