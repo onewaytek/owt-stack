@@ -30,6 +30,9 @@ Outside the crates:
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease, or into `rc-candidate` for checking first |
 | `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
 | `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
+| `.github/workflows/deploy-pin.yml` | reusable: pin a released image's digest in the deployments repository through a pull request, which merges itself for rc environments and waits for the owner for production ("Deploying with GitOps") |
+| `renovate/base-images.json` | a Renovate preset: the base images pinned by digest in the Dockerfile and the `base-image` input, grouped, digest-only bumps automerged after 24 hours |
+| `scripts/bao-set.sh` | `env.sh` for OpenBao: writes an app environment's secrets from an `env.env` where `charts/owt-app`'s ExternalSecrets read them |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its action and workflow pins, its crates and its npm packages, minors and patches grouped |
@@ -5484,7 +5487,7 @@ the template's:
 | `node-version` / `node-version-file` | `22` / none | the assets stage's `hi/nodejs` |
 | `files` | `static` | `COPY` into the work directory |
 | `files-owner` | `65532:0` | `--chown` |
-| `base-image` | `registry.access.redhat.com/hi/core-runtime:2` | the runtime `FROM` (a digest is used as given) |
+| `base-image` | `registry.access.redhat.com/hi/core-runtime:2` | the runtime `FROM` (a digest is used as given, also as `name:tag@sha256:…`) |
 | `base-requires` | `/usr/bin/sh /usr/bin/env /usr/bin/timeout` | `RUN timeout 5 env` |
 | `workdir` / `user` | `/app` / `65532` | `WORKDIR` / `USER` |
 | `workdir-owner` | `65532:65532` | `WORKDIR` made as core-runtime's user |
@@ -5551,7 +5554,9 @@ the SBOM, not the scan.
 without a bot bumping pins. Two builds of one commit can therefore differ. What a
 given image was built from is still on record: the signature binds its digest, and
 the SBOM attestation lists the base's packages and versions. An app that needs a
-rebuild to be byte-reproducible passes `base-image` as a digest (used as given).
+rebuild to be byte-reproducible passes `base-image` as a digest (used as given). An
+app deployed with GitOps pins it as `name:tag@sha256:…` and lets Renovate move the
+digest ("Deploying with GitOps": "Base images").
 
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
@@ -6470,6 +6475,79 @@ goes (`deletionPolicy: Retain`). Off, ESO owns the Secret it creates
 To go back, delete the Application without its finalizer (the objects stay), delete
 the ExternalSecrets (adopted Secrets stay), and run `deploy/openshift/apply.sh --apply`
 again, which restores the ImageStream and the trigger.
+
+**Rollout: `deploy-pin.yml`.** The release workflow's last job pins the image it
+pushed in the deployments repository, and Argo CD syncs the commit:
+
+```yaml
+  deploy:
+    needs: [release, image]
+    if: needs.release.outputs.version != ''
+    permissions: {contents: read}
+    uses: onewaytek/owt-stack/.github/workflows/deploy-pin.yml@<commit>  # vX.Y.Z
+    with:
+      app: myapp
+      channel: ${{ needs.release.outputs.channel }}   # rc | stable
+      version: ${{ needs.release.outputs.version }}
+      digest: ${{ needs.image.outputs.digest }}
+    secrets:
+      DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+      DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
+```
+
+It reads every `apps/*/*/target.yaml` in the deployments repository (`app`,
+`channel`, `promote`, and `variant` for a second build of the same app), rewrites the
+matching environments' `image.yaml` (`repository`, `digest`, `version`), and opens a
+pull request: one with auto-merge on for `promote: auto` environments, which merges
+once the deployments repository's checks pass, and one labelled `production` for
+`promote: pr` environments, whose merge by the owner is the release. It never pushes
+to the deployments repository's default branch, and it closes an older open pin of
+the same stream as superseded. No matching environment is a notice: an app can add
+the job before the deployments repository lists it.
+
+The token comes from a GitHub App (the `DEPLOY_APP_ID` and `DEPLOY_APP_KEY`
+secrets, an org secret limited to the app repositories) installed on the deployments
+repository alone with contents and pull-requests write; the job asks for nothing
+more. `variant` pins only environments whose target.yaml names the same variant, and
+its version must end in `-<variant>`: a second build published as tags of the same
+repository (`1.4.2-hsm`) reaches only the environments that run it. `repository`
+overrides `ghcr.io/onewaytek/<app>` for an image of its own.
+
+**Base images.** The app pins its runtime base by digest in both places it is named,
+the Dockerfile's `FROM` and release.yml's `base-image:` input, with the tag kept for
+reading (`registry.access.redhat.com/hi/core-runtime:2@sha256:…`), and the builders
+the same way. A self-hosted Renovate keeps them current with this preset, in the
+app's `renovate.json`:
+
+```json
+{"extends": ["github>onewaytek/owt-stack//renovate/base-images#vX.Y.Z"]}
+```
+
+It groups every `registry.access.redhat.com/hi/*` image into one `fix(deps)` pull
+request, so builder and runtime glibc move together, on Monday and Thursday mornings
+(UTC). The pull request ships on rc through promote-rc like any other. A digest-only
+bump (same tag) automerges to `main` on Renovate's next scheduled run once its checks
+pass and the digest is 24 hours old. That age counts from the registry's
+publication of the digest, not from the pull request: a digest older than a day
+can merge on the run that opens its pull request, so time on rc is not guaranteed.
+A tag change never automerges. An app that must not automerge at all (regulated data)
+adds `"packageRules": [{"matchPackageNames": ["*"], "automerge": false}]` after the
+`extends`.
+
+**Secrets: `scripts/bao-set.sh`.** `env.sh`'s counterpart for OpenBao. It reads the
+same `env.env` (literals, `@generate`, `@env`, and `@prompt` for a value typed at a
+hidden prompt) and writes `kv/apps/<app>/<env>/env`, or another key with
+`KEY=db-runtime|redis|tunnel|…`:
+
+```bash
+scripts/bao-set.sh myapp rc deploy/openshift/env.env            # what would change
+scripts/bao-set.sh myapp rc deploy/openshift/env.env --apply    # write it
+```
+
+Values are never printed, and every value and the OpenBao token reach the OpenBao
+pod on stdin (`oc exec -i`). A key OpenBao holds and the file does not list is left
+alone. ESO refreshes the Secret within its `refreshInterval`; bump
+`podAnnotations.rotation` in the deployments repository to restart the pods on it.
 
 **`templates/openshift` is deprecated.** It stays supported, and `apply.sh` keeps
 working, until a later release removes it; new deploys use the chart.

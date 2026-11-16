@@ -1,0 +1,263 @@
+name: Deploy pin
+
+# Reusable: after a release's image is pushed, pin its digest in the deployments
+# repository, which Argo CD syncs (README, "Deploying with GitOps": "Rollout").
+#
+#   # release.yml, after the image job:
+#   deploy:
+#     needs: [release, image]
+#     if: needs.release.outputs.version != ''
+#     permissions: {contents: read}
+#     uses: onewaytek/owt-stack/.github/workflows/deploy-pin.yml@<commit>  # vX.Y.Z
+#     with:
+#       app: myapp
+#       channel: ${{ needs.release.outputs.channel }}   # rc | stable
+#       version: ${{ needs.release.outputs.version }}
+#       digest: ${{ needs.image.outputs.digest }}
+#     secrets:
+#       DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+#       DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
+#
+# For every `apps/*/*/target.yaml` in the deployments repository whose `app`,
+# `channel` and `variant` (empty unless set) match, it rewrites that environment's
+# `image.yaml` (repository, digest, version) and opens one pull request per
+# promotion mode:
+#   promote: auto  the pull request merges itself once the deployments checks pass
+#                  (auto-merge, squash); rc and ux environments
+#   promote: pr    the pull request is labelled `production` and waits for the
+#                  owner, whose merge is the release (CODEOWNERS)
+# It never pushes to the deployments repository's default branch. An older open pin
+# for the same app, channel, variant and mode is closed as superseded, so pins never
+# conflict. No matching environment is a notice, not a failure: an app pins nothing
+# until the deployments repository lists it.
+#
+# The token is minted from GitHub App `owt-deploy` for the deployments repository
+# alone, with contents and pull-requests write: the app repository's own token never
+# reaches it, and the App can do nothing anywhere else. The deployments repository's
+# policies limit the App's commits to image.yaml files, and its image policy to the
+# app's own ghcr repository by digest.
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: The app's name, as in target.yaml `app` (and ghcr.io/onewaytek/<app>).
+        type: string
+        required: true
+      channel:
+        description: The release's channel, `rc` or `stable`.
+        type: string
+        required: true
+      version:
+        description: The released version (X.Y.Z or X.Y.Z-rc.N; an hsm build adds `-hsm`).
+        type: string
+        required: true
+      digest:
+        description: The image's digest, sha256:<64 hex>.
+        type: string
+        required: true
+      variant:
+        description: >-
+          A build variant; only environments whose target.yaml names the same
+          `variant` are pinned (a hardware-key production build: `hsm`). Empty for the
+          normal build.
+        type: string
+        default: ""
+      repository:
+        description: The image repository; empty means ghcr.io/onewaytek/<app>.
+        type: string
+        default: ""
+      deployments-repo:
+        description: The deployments repository, owner/name.
+        type: string
+        default: onewaytek/deployments
+    secrets:
+      DEPLOY_APP_ID:
+        required: true
+      DEPLOY_APP_KEY:
+        required: true
+    outputs:
+      pull-requests:
+        description: The URLs of the pull requests opened, space-separated.
+        value: ${{ jobs.pin.outputs.pull-requests }}
+
+permissions: {}
+
+jobs:
+  pin:
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    permissions: {}
+    timeout-minutes: 10
+    # One pin at a time per app, so supersession sees the previous run's PR.
+    concurrency:
+      group: deploy-pin-${{ inputs.app }}-${{ inputs.channel }}-${{ inputs.variant }}
+      cancel-in-progress: false
+    outputs:
+      pull-requests: ${{ steps.pin.outputs.pull-requests }}
+    env:
+      YQ_VERSION: v4.54.1
+      YQ_SHA256: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
+      # The ARC runner image has no gh (release.yml): installed here, pinned.
+      GH_VERSION: 2.103.3
+      GH_SHA256: 4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+    steps:
+      - name: Check the inputs
+        id: inputs
+        env:
+          APP: ${{ inputs.app }}
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+          DIGEST: ${{ inputs.digest }}
+          VARIANT: ${{ inputs.variant }}
+          REPOSITORY: ${{ inputs.repository }}
+          DEPLOYMENTS: ${{ inputs.deployments-repo }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [[ $APP =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || fail "app '$APP' is not a name"
+          [[ $CHANNEL == rc || $CHANNEL == stable ]] || fail "channel must be rc or stable, not '$CHANNEL'"
+          [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || fail "version '$VERSION' is not X.Y.Z[-pre]"
+          [[ $DIGEST =~ ^sha256:[a-f0-9]{64}$ ]] || fail "digest '$DIGEST' is not sha256:<64 hex>"
+          [[ -z $VARIANT || $VARIANT =~ ^[a-z0-9]+$ ]] || fail "variant '$VARIANT' is not a word"
+          if [[ -n $VARIANT ]]; then
+            [[ $VERSION == *-"$VARIANT" ]] || fail "a $VARIANT build's version ends in -$VARIANT, not '$VERSION'"
+          else
+            [[ $VERSION != *-hsm ]] || fail "version '$VERSION' is an hsm build: pass variant: hsm"
+          fi
+          [[ -z $REPOSITORY || $REPOSITORY =~ ^ghcr\.io/onewaytek/[a-z0-9-]+$ ]] \
+            || fail "repository '$REPOSITORY' is not ghcr.io/onewaytek/<name>"
+          [[ $DEPLOYMENTS =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || fail "deployments-repo '$DEPLOYMENTS' is not owner/name"
+          echo "owner=${DEPLOYMENTS%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${DEPLOYMENTS#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Install yq and gh
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"; mkdir -p "$bin"
+          curl -sSfL --retry 3 -o "$bin/yq" \
+            "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  $bin/yq" | sha256sum -c -
+          chmod +x "$bin/yq"
+          tgz="$RUNNER_TEMP/gh.tar.gz"
+          curl -sSfL --retry 3 -o "$tgz" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          echo "${GH_SHA256}  $tgz" | sha256sum -c -
+          tar -xzf "$tgz" -C "$bin" --strip-components=2 "gh_${GH_VERSION}_linux_amd64/bin/gh"
+          rm -f "$tgz"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Mint a token for the deployments repository
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.DEPLOY_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_KEY }}
+          owner: ${{ steps.inputs.outputs.owner }}
+          repositories: ${{ steps.inputs.outputs.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.deployments-repo }}
+          token: ${{ steps.token.outputs.token }}
+          path: deployments
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Pin the digest
+        id: pin
+        working-directory: deployments
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          GH_REPO: ${{ inputs.deployments-repo }}
+          SLUG: ${{ steps.token.outputs.app-slug }}
+          APP: ${{ inputs.app }}
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+          DIGEST: ${{ inputs.digest }}
+          VARIANT: ${{ inputs.variant }}
+          REPOSITORY: ${{ inputs.repository }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo=${REPOSITORY:-ghcr.io/onewaytek/$APP}
+          base=$(git rev-parse --abbrev-ref HEAD)
+          uid=$(gh api "users/${SLUG}[bot]" --jq .id)
+          git config user.name "${SLUG}[bot]"
+          git config user.email "${uid}+${SLUG}[bot]@users.noreply.github.com"
+
+          declare -A envs=()
+          shopt -s nullglob
+          for t in apps/*/*/target.yaml; do
+            match=$(APP="$APP" CHANNEL="$CHANNEL" VARIANT="$VARIANT" yq \
+              '.app == strenv(APP) and .channel == strenv(CHANNEL) and (.variant // "") == strenv(VARIANT)' "$t")
+            [[ $match == true ]] || continue
+            promote=$(yq '.promote' "$t")
+            [[ $promote == auto || $promote == pr ]] || { echo "::error::$t: promote '$promote'"; exit 1; }
+            envs[$promote]+="$(dirname "$t") "
+          done
+          if [[ ${#envs[@]} -eq 0 ]]; then
+            echo "::notice::no environment in $GH_REPO follows $APP $CHANNEL${VARIANT:+ ($VARIANT)}; nothing pinned"
+            echo "pull-requests=" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          urls=()
+          for promote in auto pr; do
+            dirs=${envs[$promote]:-}; [[ -n $dirs ]] || continue
+            git checkout -q "$base"
+            prefix="deploy-pin/${APP}-${CHANNEL}${VARIANT:+-$VARIANT}-${promote}-"
+            branch="${prefix}${VERSION}"
+            git checkout -q -b "$branch"
+            names=()
+            for d in $dirs; do
+              REPO="$repo" DIGEST="$DIGEST" VERSION="$VERSION" yq -n \
+                '.image.repository = strenv(REPO) | .image.digest = strenv(DIGEST) | .image.version = strenv(VERSION)' \
+                > "$d/image.yaml"
+              git add "$d/image.yaml"
+              names+=("${d#apps/}")
+            done
+            if git diff --cached --quiet; then
+              echo "::notice::${names[*]} already run $VERSION ($DIGEST)"; continue
+            fi
+            list=$(IFS=,; echo "${names[*]}")
+            title="chore(deploy): ${APP} ${VERSION} to ${list//,/, }"
+            # The commit header obeys the deployments repository's commitlint (<= 100).
+            [[ ${#title} -le 100 ]] || title="chore(deploy): ${APP} ${VERSION} to ${#names[@]} environments"
+            # Body lines stay <= 100 too: the digest and the run on lines of their own.
+            git commit -q -m "$title" -m "Repository: ${repo}
+          Digest: ${DIGEST}
+          Run: ${SOURCE}"
+            git push -q origin "$branch"
+
+            body="Pins \`${repo}@${DIGEST}\` (${VERSION}) in: ${list//,/, }.
+
+          Opened by owt-stack deploy-pin from ${SOURCE}."
+            labels=()
+            if [[ $promote == pr ]]; then
+              gh label create production --color B60205 \
+                --description "A production pin: the owner's merge is the release" --force >/dev/null
+              labels=(--label production)
+              body+="
+
+          **Production:** merging this pull request releases ${VERSION}."
+            fi
+            url=$(gh pr create --base "$base" --head "$branch" --title "$title" --body "$body" "${labels[@]}")
+            echo "opened $url"; urls+=("$url")
+
+            # Older pins of the same stream would conflict with this one: close them.
+            gh pr list --state open --json number,headRefName \
+              --jq ".[] | select(.headRefName | startswith(\"$prefix\")) | select(.headRefName != \"$branch\") | .number" \
+              | while read -r n; do
+                  gh pr close "$n" --delete-branch --comment "Superseded by $url." >/dev/null
+                  echo "closed #$n (superseded)"
+                done
+
+            if [[ $promote == auto ]]; then
+              gh pr merge "$url" --auto --squash
+            fi
+          done
+          echo "pull-requests=${urls[*]}" >> "$GITHUB_OUTPUT"

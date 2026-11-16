@@ -134,7 +134,8 @@ on:
       base-image:
         description: >-
           The runtime base. A tag is resolved once to its linux/amd64 digest; a digest
-          is used as given. Either way the digest is recorded in the
+          is used as given, also with the tag kept before it (`name:tag@sha256:…`, the
+          form Renovate keeps current). Either way the digest is recorded in the
           org.opencontainers.image.base.digest label.
         type: string
         default: registry.access.redhat.com/hi/core-runtime:2
@@ -576,7 +577,15 @@ jobs:
           name="${BASE%@*}"
           # A tag after the last slash, if any.
           if [[ "${name##*/}" == *:* ]]; then name="${name%:*}"; fi
-          digest="$(crane digest --platform linux/amd64 "$BASE")"
+          if [[ "$BASE" == *@* ]]; then
+            # Pinned, with or without its tag: the tag is only a label for Renovate, so
+            # the digest alone is resolved (an index to its linux/amd64 manifest).
+            pinned="${BASE##*@}"
+            [[ "$pinned" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "::error::base-image digest '$pinned' is malformed"; exit 1; }
+            digest="$(crane digest --platform linux/amd64 "${name}@${pinned}")"
+          else
+            digest="$(crane digest --platform linux/amd64 "$BASE")"
+          fi
           ref="${name}@${digest}"
           echo "base ${BASE} is ${ref} for linux/amd64"
           fs="$RUNNER_TEMP/base"
