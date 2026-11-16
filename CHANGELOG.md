@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.3](https://github.com/onewaytek/owt-stack/compare/v0.14.2...v0.14.3) (2026-11-16)
+
+
+### Features
+
+* **ci:** actions-cleanup and ghcr-prune workflows, shorter-lived artifacts ([#352](https://github.com/onewaytek/owt-stack/issues/352)) ([4e21786](https://github.com/onewaytek/owt-stack/commit/4e21786ba53c6e9d1106afdcb81d0f7f4d12058e))
+
+
+### Bug Fixes
+
+* **ci:** ghcr-prune mints its token from DEPLOY_APP_CLIENT_ID, as deploy-pin does ([#354](https://github.com/onewaytek/owt-stack/issues/354)) ([c0ea26e](https://github.com/onewaytek/owt-stack/commit/c0ea26eee8150831969274169bda266484a6c69a))
+* **deploy:** deploy-pin reruns idempotently; client-id for the app token ([#351](https://github.com/onewaytek/owt-stack/issues/351)) ([6617ebb](https://github.com/onewaytek/owt-stack/commit/6617ebb2c76bfa21583a0ae65ea0a740bf7f1bf3))
+
 ## [0.14.2](https://github.com/onewaytek/owt-stack/compare/v0.14.1...v0.14.2) (2026-11-16)
 
 
