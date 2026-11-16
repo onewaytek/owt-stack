@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.4](https://github.com/onewaytek/owt-stack/compare/v0.14.3...v0.14.4) (2026-11-16)
+
+
+### Bug Fixes
+
+* **deploy:** refuse downgrade pins and pin redis and pruner images by digest ([#356](https://github.com/onewaytek/owt-stack/issues/356)) ([01218cb](https://github.com/onewaytek/owt-stack/commit/01218cb27174fde2e9357030f6a15b35f73407f4))
+* **workflows:** harden actions-cleanup and ghcr-prune ([#355](https://github.com/onewaytek/owt-stack/issues/355)) ([eec9063](https://github.com/onewaytek/owt-stack/commit/eec9063ef46b623c2b5693097c61f4b0263ba106))
+
 ## [0.14.3](https://github.com/onewaytek/owt-stack/compare/v0.14.2...v0.14.3) (2026-11-16)
 
 
