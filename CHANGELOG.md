@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.5](https://github.com/onewaytek/owt-stack/compare/v0.14.4...v0.14.5) (2026-11-16)
+
+
+### Features
+
+* **audit:** record a refusal on the request's own connection ([#358](https://github.com/onewaytek/owt-stack/issues/358)) ([998b47a](https://github.com/onewaytek/owt-stack/commit/998b47aef746396c63cd735d78b168fb52e2c44c))
+
 ## [0.14.4](https://github.com/onewaytek/owt-stack/compare/v0.14.3...v0.14.4) (2026-11-16)
 
 
