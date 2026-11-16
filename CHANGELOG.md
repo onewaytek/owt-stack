@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/onewaytek/owt-stack/compare/v0.14.1...v0.14.2) (2026-11-16)
+
+
+### Features
+
+* **deploy:** deploy-pin workflow, renovate base-image preset and bao-set.sh ([#349](https://github.com/onewaytek/owt-stack/issues/349)) ([db97393](https://github.com/onewaytek/owt-stack/commit/db973936cd6d106285232936b113baed12eab459))
+
 ## [0.14.1](https://github.com/onewaytek/owt-stack/compare/v0.14.0...v0.14.1) (2026-11-16)
 
 
