@@ -61,6 +61,7 @@ audit:
 templates:
     bash templates/openshift/apply-test.sh
     bash templates/openshift/env-test.sh
+    bash scripts/bao-set-test.sh
 
 # charts/owt-app renders what templates/openshift renders, fixture by fixture, and its
 # schema refuses what it must (needs oc, helm, yq and jq; no cluster, no Rust). Not in
