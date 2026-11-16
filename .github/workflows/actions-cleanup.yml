@@ -1,0 +1,90 @@
+name: Actions cleanup
+
+# Reusable: delete the `image-layer` artifacts image.yml and image-check.yml hand
+# from their build job to the jobs after it, once their run has succeeded, so they do
+# not count against the account's Actions storage for the day they are kept.
+# Artifact storage is billed by the hour; the layer is 15 to 45 MB and nothing reads
+# it after the run.
+#
+# - With `run-id` (a `workflow_run` caller passes the finished run's id), the
+#   artifacts of that run alone.
+# - Without it (a schedule), every such artifact in the repository whose run has
+#   succeeded: the sweep catches a run whose `workflow_run` event never came.
+# A failed or cancelled run keeps its layer, so "Re-run failed jobs" still finds it;
+# it expires after the day its upload set.
+#
+# The job takes the caller's token permissions (it names none of its own, so a
+# Dependabot pull request that touches the caller still starts): grant
+# `actions: write`.
+#
+#   on:
+#     workflow_run:
+#       workflows: [Release, Image check]   # the workflows that call image.yml / image-check.yml
+#       types: [completed]
+#     schedule: [{cron: "41 */6 * * *"}]
+#   jobs:
+#     artifacts:
+#       permissions: {actions: write}
+#       uses: onewaytek/owt-stack/.github/workflows/actions-cleanup.yml@<commit>  # vX.Y.Z
+#       with:
+#         run-id: ${{ github.event.workflow_run.id || '' }}
+
+on:
+  workflow_call:
+    inputs:
+      run-id:
+        description: The workflow run whose artifacts to delete; empty to sweep the repository.
+        type: string
+        default: ""
+      names:
+        description: The artifact names deleted, space-separated.
+        type: string
+        default: image-layer
+
+jobs:
+  artifacts:
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    timeout-minutes: 10
+    steps:
+      - name: Delete the artifacts of succeeded runs
+        env:
+          TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run-id }}
+          NAMES: ${{ inputs.names }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [[ -z $RUN_ID || $RUN_ID =~ ^[0-9]+$ ]] || fail "run-id '$RUN_ID' is not a run id"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions"
+          gh_api() {
+            curl -sSf --retry 3 -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+          }
+          set -f
+          # The whole list first: deleting while paging would shift the pages.
+          rows="$RUNNER_TEMP/artifacts"; : > "$rows"
+          for name in $NAMES; do
+            [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || fail "names: '$name' is not an artifact name"
+            if [ -n "$RUN_ID" ]; then base="${api}/runs/${RUN_ID}/artifacts"; else base="${api}/artifacts"; fi
+            page=1
+            while :; do
+              batch="$(gh_api "${base}?name=${name}&per_page=100&page=${page}")"
+              [ "$(jq '.artifacts | length' <<<"$batch")" -gt 0 ] || break
+              jq -r '.artifacts[] | select(.expired | not) | "\(.id) \(.workflow_run.id) \(.size_in_bytes)"' \
+                <<<"$batch" >> "$rows"
+              page=$((page + 1))
+            done
+          done
+          declare -A conclusion
+          freed=0; count=0
+          while read -r id run size; do
+            if [ -z "${conclusion[$run]:-}" ]; then
+              conclusion[$run]="$(gh_api "${api}/runs/${run}" | jq -r '.conclusion // "running"')" \
+                || conclusion[$run]=unknown
+            fi
+            [ "${conclusion[$run]}" = success ] || continue
+            gh_api -X DELETE "${api}/artifacts/${id}" > /dev/null
+            freed=$((freed + size)); count=$((count + 1))
+          done < "$rows"
+          echo "deleted ${count} artifacts, ${freed} bytes" | tee -a "$GITHUB_STEP_SUMMARY"

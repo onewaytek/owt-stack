@@ -18,6 +18,10 @@ name: Image check
 # runner's daemon. Nothing is signed and no SBOM is made here: that needs a pushed image
 # and `id-token: write`.
 #
+# The crane build hands its layer to `verify` and `scan` as the `image-layer` artifact,
+# kept a day at most; actions-cleanup.yml, called by the app on `workflow_run`, deletes
+# it once the run has succeeded (no job here can, holding no write permission).
+#
 # It is a workflow of its own because no job in it can write: a caller's token needs
 # only `contents: read`. A reusable workflow whose jobs ask for `packages: write` (as
 # image.yml's push does) fails to start for a caller that grants less, even when the
@@ -626,7 +630,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # No build record artifact: it would count against the Actions storage for days.
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
