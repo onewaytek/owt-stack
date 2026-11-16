@@ -17,9 +17,10 @@ name: ghcr prune
 # What it never deletes:
 #   - a version with any other tag: a release (X.Y.Z), `latest`, `rc`, X.Y, X, a test
 #     tag;
-#   - a digest named anywhere in `deployments-repo`'s default branch (a GitOps pin),
-#     read with a token minted from DEPLOY_APP_CLIENT_ID/DEPLOY_APP_KEY for contents: read on
-#     that repository alone;
+#   - a digest named anywhere in `deployments-repo`'s default branch or in the diff of
+#     one of its open pull requests (a GitOps pin, one in flight, a rollback target),
+#     read with a token minted from DEPLOY_APP_CLIENT_ID/DEPLOY_APP_KEY for contents: read and
+#     pull requests: read on that repository alone;
 #   - what a kept version needs: an image index's children, its cosign signature and
 #     attestation versions (and their children), and any manifest whose `subject` is
 #     a kept digest.
@@ -129,6 +130,7 @@ jobs:
           owner: ${{ steps.inputs.outputs.owner }}
           repositories: ${{ steps.inputs.outputs.name }}
           permission-contents: read
+          permission-pull-requests: read
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ steps.inputs.outputs.pins == 'true' }}
@@ -144,6 +146,8 @@ jobs:
         if: ${{ steps.inputs.outputs.pins == 'true' }}
         env:
           DELETE: ${{ inputs.delete }}
+          TOKEN: ${{ steps.token.outputs.token }}
+          DEPLOYMENTS: ${{ inputs.deployments-repo }}
         shell: bash
         run: |
           set -euo pipefail
@@ -158,6 +162,34 @@ jobs:
               's/^[[:space:]]*version:[[:space:]]*["'"'"']?([^"'"'"'[:space:]#]+).*/\1/p' {} + \
               | sort -u > "$work/pin-tags" || true
           fi
+          # Open pull requests to the deployments repository: pins in flight and rollback
+          # targets. The changed lines of each diff name digests and `version:` tags.
+          prs=0
+          if ! plist="$(curl -sSf --retry 3 -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${DEPLOYMENTS}/pulls?state=open&per_page=100" \
+                | jq -r '.[].number')"; then
+            if [ "$DELETE" = true ]; then
+              echo "::error::cannot list the open pull requests of $DEPLOYMENTS: no deletion without them"
+              exit 1
+            fi
+            echo "::warning::cannot list the open pull requests of $DEPLOYMENTS: a deletion run would fail"
+            plist=""
+          fi
+          for n in $plist; do
+            if ! diff="$(curl -sSf --retry 3 -H "Authorization: Bearer $TOKEN" \
+                  -H "Accept: application/vnd.github.diff" \
+                  "https://api.github.com/repos/${DEPLOYMENTS}/pulls/${n}")"; then
+              [ "$DELETE" = true ] && { echo "::error::cannot read pull request #${n} of $DEPLOYMENTS"; exit 1; }
+              echo "::warning::cannot read pull request #${n} of $DEPLOYMENTS"; continue
+            fi
+            grep -E '^[+-]' <<<"$diff" | grep -oE 'sha256:[a-f0-9]{64}' >> "$work/pins" || true
+            grep -E '^[+-][[:space:]]*version:' <<<"$diff" \
+              | sed -E 's/^[+-][[:space:]]*version:[[:space:]]*["'"'"']?([^"'"'"'[:space:]#]+).*/\1/' >> "$work/pin-tags" || true
+            prs=$((prs + 1))
+          done
+          sort -u -o "$work/pins" "$work/pins"; sort -u -o "$work/pin-tags" "$work/pin-tags"
+          echo "open pull requests read: ${prs}"
           digests="$(wc -l < "$work/pins")"; tags="$(wc -l < "$work/pin-tags")"
           echo "pins read from the deployments repository: ${digests} digests, ${tags} version tags"
           if [ "$digests" -eq 0 ] && [ "$tags" -eq 0 ]; then
@@ -286,10 +318,17 @@ jobs:
           # Referrers by subject: an untagged manifest that names a kept digest.
           for d in $(jq -r '.[] | select(.kind == "untagged" and (.kept | not)) | .digest' "$work/classified.json" \
                      | sort -u | comm -23 - "$work/protected"); do
-            s="$(manifest "$d" | jq -r '.subject.digest // empty')" || continue
+            # An unreadable manifest fails closed: kept, and a deletion run stops here.
+            if ! m="$(manifest "$d")"; then
+              [ "$DELETE" = true ] && fail "cannot read the manifest of untagged ${d}: deleting nothing"
+              echo "::warning::cannot read the manifest of untagged ${d}: kept"
+              echo "$d" >> "$work/protected"
+              continue
+            fi
+            s="$(jq -r '.subject.digest // empty' <<<"$m")"
             if [ -n "$s" ] && grep -qxF "$s" "$work/protected"; then
               echo "$d" >> "$work/protected"
-              manifest "$d" | jq -r '.manifests[]?.digest' >> "$work/protected"
+              jq -r '.manifests[]?.digest' <<<"$m" >> "$work/protected"
             fi
           done
           sort -u -o "$work/protected" "$work/protected"
@@ -320,6 +359,14 @@ jobs:
           [ "$DELETE" = true ] || exit 0
           deleted=0
           for id in $(jq -r '.[].id' "$work/candidates.json"); do
+            # The tags now: a tag put on it since the listing keeps it.
+            now_tags="$(gh_api "${api}/${id}" | jq -c '.metadata.container.tags // []')" \
+              || fail "cannot re-read version ${id} after ${deleted} deletions"
+            if jq -e 'any(.[]; test("^v?[0-9]+\\.[0-9]+\\.[0-9]+-rc\\.[0-9]+(-[0-9A-Za-z]+)?$|^sha256-[a-f0-9]{64}(\\.[a-z]+)?$|^scan-[0-9]+") | not)' \
+                 <<<"$now_tags" > /dev/null; then
+              echo "skipping version ${id}: it is now tagged ${now_tags}"
+              continue
+            fi
             gh_api -X DELETE "${api}/${id}" > /dev/null || fail "deleting version ${id} failed after ${deleted} deletions"
             deleted=$((deleted + 1))
           done

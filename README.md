@@ -5742,14 +5742,22 @@ jobs:
     uses: onewaytek/owt-stack/.github/workflows/actions-cleanup.yml@<commit>  # v0.14.3
     with:
       run-id: ${{ github.event.workflow_run.id || '' }}
-  ghcr:
+  ghcr:   # a dry run: read-only, and the only one a pull request or the schedule runs
     if: >-
-      github.event_name == 'workflow_dispatch' || github.event.schedule == '17 5 * * 1'
+      (github.event_name == 'workflow_dispatch' && !inputs.delete)
+      || github.event.schedule == '17 5 * * 1'
       || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions: {contents: read, packages: read}
+    uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.3
+    secrets:
+      DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
+      DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
+  ghcr-delete:   # the only job holding packages: write
+    if: github.event_name == 'workflow_dispatch' && inputs.delete
     permissions: {contents: read, packages: write}
     uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.3
     with:
-      delete: ${{ github.event_name == 'workflow_dispatch' && inputs.delete }}
+      delete: true
     secrets:
       DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
       DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
@@ -5763,7 +5771,14 @@ and run id without cancelling one another. The prune refuses to delete when the
 deployments checkout yields no pins (no digest and no `version:` tag): with
 `delete: true` it fails with "pins read: 0 digests", and a dry run warns and proceeds.
 It also reads the `version:` of each `apps/*/*/image.yaml`, so an rc a pin names by
-tag, not digest, keeps the version carrying that tag.
+tag, not digest, keeps the version carrying that tag. Digests and `version:` tags in
+the diffs of the deployments repository's open pull requests (pins in flight, rollback
+targets) are pins too, so the deployments app needs `pull requests: read` beside
+`contents: read`; a deletion run that cannot list them fails. A manifest it cannot read
+fails closed: a deletion run stops before deleting anything, a dry run keeps the
+version. Each version's tags are read again just before its deletion, and a version
+that has since gained a kept tag is skipped. Only the `ghcr-delete` job holds
+`packages: write`; the pull request and the schedule run read-only.
 
 The prune deletes untagged versions and versions tagged only `scan-<run>` older than a
 day, rc versions but the newest 10 of each variant (`keep-rc`), and cosign signature

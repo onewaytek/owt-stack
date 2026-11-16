@@ -68,10 +68,24 @@ check "cleanup: no cancel-in-progress" "$c" yes
 # --- ghcr-prune.yml: Read the pins ---------------------------------------------
 step "$wf/ghcr-prune.yml" "Read the pins" >"$work/pins.sh"
 [ -s "$work/pins.sh" ] || { echo "no pins script found" >&2; exit 1; }
-run_pins() { # $1 = delete, in $work/ws
-  (cd "$work/ws" && RUNNER_TEMP="$work/tmp" DELETE="$1" bash "$work/pins.sh" >"$work/out" 2>&1)
-}
 d1=sha256:$(printf 'a%.0s' {1..64}); d2=sha256:$(printf 'b%.0s' {1..64})
+mkdir -p "$work/prbin"
+cat >"$work/prbin/curl" <<'CURL'
+#!/usr/bin/env bash
+# The deployments repository's open pull requests: none when NOPR is set, an error when
+# PRFAIL is set, else #7, whose diff moves a pin from the digest $PRDIGEST.
+url="${*: -1}"
+[ -z "${PRFAIL:-}" ] || exit 22
+case "$url" in
+  */pulls\?*) [ -n "${NOPR:-}" ] && echo '[]' || echo '[{"number":7}]' ;;
+  */pulls/7) printf -- '-  digest: %s\n+  digest: sha256:%s\n+  version: 2.0.0-rc.1\n' "$PRDIGEST" "$(printf 'e%.0s' {1..64})" ;;
+esac
+CURL
+chmod +x "$work/prbin/curl"
+run_pins() { # $1 = delete, in $work/ws
+  (cd "$work/ws" && PATH="$work/prbin:$PATH" NOPR="${NOPR-1}" PRFAIL="${PRFAIL:-}" PRDIGEST="$d2" TOKEN=t \
+    DEPLOYMENTS=o/d RUNNER_TEMP="$work/tmp" DELETE="$1" bash "$work/pins.sh" >"$work/out" 2>&1)
+}
 rm -rf "$work/ws" "$work/tmp"; mkdir -p "$work/ws/deployments/apps/x/prod" "$work/ws/deployments/apps/x/rc" "$work/tmp"
 rc=0; run_pins true || rc=$?
 check "prune: delete with zero pins fails" "$rc" 1
@@ -93,6 +107,13 @@ printf 'image:\n  version: 1.3.0-rc.4\n' >"$work/ws/deployments/apps/x/rc/image.
 rm -f "$work/ws/deployments/apps/x/prod/image.yaml"
 rc=0; run_pins true || rc=$?
 check "prune: a tag pin alone counts as a pin" "$rc" 0
+NOPR= run_pins true
+check "prune: open pull request digests are pins" "$(grep -c "$d2\|eeee" "$work/tmp/ghcr-prune/pins")" 2
+check "prune: open pull request versions are pin tags" "$(grep -c '^2.0.0-rc.1$' "$work/tmp/ghcr-prune/pin-tags")" 1
+rc=0; PRFAIL=1 run_pins true || rc=$?
+check "prune: delete fails when the pull requests cannot be read" "$rc" 1
+rc=0; PRFAIL=1 run_pins false || rc=$?
+check "prune: a dry run proceeds when they cannot be read" "$rc" 0
 
 # --- ghcr-prune.yml: tag resolution -----------------------------------------------
 awk '/# resolve-begin/ {on=1; next} /# resolve-end/ {on=0} on {sub(/^          /, ""); print}' \
