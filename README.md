@@ -31,6 +31,8 @@ Outside the crates:
 | `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
 | `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
 | `.github/workflows/deploy-pin.yml` | reusable: pin a released image's digest in the deployments repository through a pull request, which merges itself for rc environments and waits for the owner for production ("Deploying with GitOps") |
+| `.github/workflows/actions-cleanup.yml` | reusable: delete the `image-layer` artifacts of an app's succeeded image runs, so they stop counting against the Actions storage ("Actions storage") |
+| `.github/workflows/ghcr-prune.yml` | reusable, a dry run unless told to delete: remove the app's untagged ghcr versions and all but its newest rc versions, never a release, a floating tag or a digest the deployments repository pins ("Actions storage") |
 | `renovate/base-images.json` | a Renovate preset: the base images pinned by digest in the Dockerfile and the `base-image` input, grouped, digest-only bumps automerged after 24 hours |
 | `scripts/bao-set.sh` | `env.sh` for OpenBao: writes an app environment's secrets from an `env.env` where `charts/owt-app`'s ExternalSecrets read them |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
@@ -5539,7 +5541,7 @@ the template's:
   tag instead uses `@refs/tags/vX.Y.Z`. Never match a pattern that ends at `@`: it
   also verifies an image signed by a workflow run from an unreviewed branch.
 - **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
-  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact and attaches
+  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact (kept 7 days) and attaches
   it to the image as a signed attestation (`cosign verify-attestation --type
   spdxjson ...`, with the same identity flags).
 
@@ -5617,7 +5619,8 @@ cluster already pulls the app's images, and two things show the whole image:
 - Its files: the build job's `image-layer` artifact is the exact layer pushed
   (`gh run download <run-id> --repo <the app's repository> -n image-layer && tar -tvf
   layer.tar` lists paths, owners and modes, with `actions: read` there). It is kept
-  for a day.
+  for a day, or until `actions-cleanup.yml` deletes it ("Actions storage"): download it
+  from a failed run, or before the app's housekeeping runs.
 
 The binary is built in Debian's Rust image, not Hummingbird's (which has no `tar`
 for the setup actions), so the verify job checks the newest `GLIBC_` version the
@@ -5703,6 +5706,71 @@ its own ref, its base branch and the default branch, and the release builds writ
 theirs under tag refs, so none is read (a cold BuildKit build of a Rust app takes
 ten minutes or more). Keep the `paths:` list to the files the image reads, and leave
 the check out of an app whose Dockerfile rarely changes.
+
+**Actions storage.** An account's Actions storage is its artifacts, billed by the hour
+(GB-hours) against the plan's allowance; the Actions cache is a separate 10 GB per
+repository, billed only when a repository's cache limit is raised past it. The large
+artifact is `image-layer`: the crane build's job hands its layer (15 to 45 MB) to the
+jobs after it, and the jobs stay apart so the one running the app's code never holds a
+write token. It is kept a day; `actions-cleanup.yml` deletes it as soon as its run has
+succeeded (a failed run keeps it, for "Re-run failed jobs"). The SBOM artifact is kept
+a week (the image's attestation is the SBOM of record), and the docker builder uploads
+no build record. `ghcr-prune.yml` keeps the package itself in bounds. One caller does
+both, `.github/workflows/housekeeping.yml`, with the release and image-check workflows'
+`name:`s:
+
+<!-- x-release-please-start-version -->
+```yaml
+name: Housekeeping
+on:
+  workflow_run:
+    workflows: [Release, Image check]
+    types: [completed]
+  schedule:
+    - cron: "41 */6 * * *"   # the artifact sweep
+    - cron: "17 5 * * 1"     # the ghcr prune, weekly
+  pull_request:
+    paths: [.github/workflows/housekeeping.yml]   # a dry run of the prune
+  workflow_dispatch:
+    inputs:
+      delete: {type: boolean, default: false, description: Delete the listed versions}
+permissions: {}
+jobs:
+  artifacts:
+    if: github.event_name == 'workflow_run' || github.event.schedule == '41 */6 * * *'
+    permissions: {actions: write}
+    uses: onewaytek/owt-stack/.github/workflows/actions-cleanup.yml@<commit>  # v0.14.1
+    with:
+      run-id: ${{ github.event.workflow_run.id || '' }}
+  ghcr:
+    if: >-
+      github.event_name == 'workflow_dispatch' || github.event.schedule == '17 5 * * 1'
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions: {contents: read, packages: write}
+    uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.1
+    with:
+      delete: ${{ github.event_name == 'workflow_dispatch' && inputs.delete }}
+    secrets:
+      DEPLOY_APP_ID: ${{ secrets.DEPLOY_APP_ID }}
+      DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
+```
+<!-- x-release-please-end -->
+
+The prune deletes untagged versions and versions tagged only `scan-<run>` older than a
+day, rc versions but the newest 10 of each variant (`keep-rc`), and cosign signature
+versions whose image is gone. It never deletes a version with any other tag (a
+release, `latest`, `rc`, `X.Y`, a test tag), a digest named anywhere in the
+deployments repository's default branch (read with a contents-read token from
+`DEPLOY_APP_ID`), or what a kept version needs: an index's children, its signature
+and attestation, a manifest whose `subject` it is. It lists what it would delete in the
+job summary and deletes only with `delete: true`: leave the schedule a dry run until a
+listing has been read, then run it from `workflow_dispatch` with `delete` ticked (or set
+`delete: true` for the schedule). It needs `packages: write`, and the package's
+"Manage Actions access" giving the repository Admin, which ghcr gives the repository
+that first pushed it. Neither reusable workflow names permissions of its own: each
+takes the caller's grant, so a Dependabot pull request that edits the caller still
+starts. The jobs run on `RUNS_ON` (the ARC scale set by default), so they bill no
+GitHub-hosted minutes.
 
 **OpenShift:** the templates are deprecated: a new deploy uses `charts/owt-app` through
 Argo CD ("Deploying with GitOps"), and an existing one moves to it. Until it does,
