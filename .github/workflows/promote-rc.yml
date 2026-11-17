@@ -56,18 +56,36 @@ name: Promote to rc
 # pass and still break rc together (two migrations taking one number merge without a
 # conflict). With `candidate: true` the merge goes to `rc-candidate` instead, nothing
 # is released, and the outputs name it; the app runs its checks on that commit
-# (rust-ci.yml's `ref`) and publish-rc.yml then moves rc to it. The calling workflow
-# holds a concurrency group, so one candidate is checked at a time. GitHub keeps only
-# one run waiting on a group (a third cancels the waiting one), and publish-rc.yml
-# refuses a candidate when rc moved under it; requeue-rc.yml re-runs the promotions
-# those lose, and runs as a last job here and on a schedule:
+# (rust-ci.yml's `ref`) and publish-rc.yml then moves rc to it. One candidate is
+# checked at a time: the three jobs sit in a workflow of the app's own, called by one
+# job that holds the promote-rc concurrency group. The group goes on that job, not
+# on the workflow: GitHub keeps only one waiting run or job per group (a third
+# cancels the waiting one), and on the workflow that cancels the PR's own checks
+# with it. publish-rc.yml also refuses a candidate when rc moved under it;
+# requeue-rc.yml re-runs the promotions those lose, and runs after the promotion
+# here and on a schedule:
 #
-#   concurrency: {group: promote-rc, cancel-in-progress: false}
+#   # pr.yml
+#   jobs:
+#     ci:
+#       uses: ./.github/workflows/ci.yml
+#     rc:
+#       needs: ci
+#       if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+#       concurrency: {group: promote-rc, cancel-in-progress: false}
+#       permissions: {contents: write, actions: write, pull-requests: write}
+#       uses: ./.github/workflows/rc.yml
+#       with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}"}
+#     requeue:
+#       needs: rc
+#       # requeue-rc.yml's caller, with `job: rc`
+#
+#   # rc.yml, on workflow_call with the inputs source and pr
 #   jobs:
 #     candidate:
 #       permissions: {contents: write, actions: write, pull-requests: write}
 #       uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # vX.Y.Z
-#       with: {source: "${{ inputs.source }}", candidate: true}
+#       with: {source: "${{ inputs.source }}", pr: "${{ inputs.pr }}", candidate: true}
 #     check:
 #       needs: candidate
 #       if: needs.candidate.outputs.changed == 'true'
@@ -80,7 +98,7 @@ name: Promote to rc
 #       with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
 #
 # When `check` is rust-ci.yml in the run that already checked the PR (the app's
-# `ci` job, which `candidate` needs), a candidate with the PR's tree is not checked
+# `ci` job, which `rc` needs), a candidate with the PR's tree is not checked
 # twice: rust-ci.yml skips its jobs on a tree it passed earlier in the run attempt.
 #
 # Runs on the arc-openshift-k8s ARC scale set, as rust-ci.yml does (override with the
