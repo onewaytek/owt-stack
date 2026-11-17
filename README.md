@@ -5381,12 +5381,13 @@ jobs:
   required check on the skipped names counts as passing. A different tree, a failed
   lookup or a re-run attempt runs the checks. `check-rc` must pass the same inputs as
   `ci` (only `ref` may differ), or nothing matches. It
-  needs `candidate` to need `ci` in one workflow, as above; an app that checks the
-  candidate in a workflow of its own gets no skip. Nothing to adopt beyond the pin;
+  needs the promotion to need `ci` in one workflow run, as below (a reusable workflow
+  the run calls is the same run); an app that checks the candidate in a workflow run of
+  its own gets no skip. Nothing to adopt beyond the pin;
   `reuse-passed: false` on the call turns it off.
 - **A promotion can be lost** in the candidate flow, two ways. GitHub keeps one
-  *pending* run per concurrency group, so a third PR updated while one promotion runs
-  and another waits cancels the waiting one, not queues it. And `publish-rc.yml`
+  *pending* run or job per concurrency group, so a third PR updated while one promotion
+  runs and another waits cancels the waiting one, not queues it. And `publish-rc.yml`
   refuses a candidate when `rc` moved while it was checked (a `sync-rc`, say): that
   run fails at "Move rc to the candidate" rather than publish a merge nobody checked.
   Either way the PR is left out of `rc` until it is pushed again, unless
@@ -5414,9 +5415,18 @@ jobs:
   again), is logged and passes, whatever the refusal's wording; a run deleted in
   between is skipped. Any other refusal of a run (one over a
   month old, say) is a warning, and the next PR is tried; a refusal for want of
-  `actions: write` fails the job once every PR is walked. It sees waiting *runs*, not
-  waiting jobs, so put the `promote-rc` concurrency group on the workflow, as below:
-  on a job, a re-run can cancel that job while it waits (a later requeue picks it up).
+  `actions: write` fails the job once every PR is walked.
+
+  Put the `promote-rc` concurrency group on one job, `rc` below, that calls a
+  workflow of the app's own holding the candidate, its check and the publish, and pass
+  that job's id as `requeue-rc.yml`'s `job`. Not on the workflow: there a waiting
+  run is cancelled whole, so a burst of PRs on busy runners cancels other PRs' `ci`
+  and `commits` and leaves them with no checks until a re-run. On the job, only the
+  promotion is cancelled; `requeue-rc.yml` then also treats a run in progress whose
+  `rc` job (or a job it calls, "rc / ...") is held or queued as waiting, and a failed
+  run whose `rc` job was cancelled as lost, so a promotion cancelled beside an
+  unrelated failing check (an image check, say) is still re-run. The cost is a
+  second workflow file, and that a re-run repeats the run's checks, as before.
 
   **Dependabot on the rc channel.** A Dependabot pull request is promoted like any
   other, and `rc` is where a bump is tried: merged into `rc`, released as a
@@ -5433,7 +5443,7 @@ jobs:
   checks without its secrets, and the PR waits for a person.
 
   Dependabot opens its pull requests in bursts, and the group admits one promotion
-  with one waiting, so a burst cancels waiting runs. A person's pull request is not
+  with one waiting, so a burst cancels waiting promotions. A person's pull request is not
   left behind it: `requeue-rc.yml` re-runs every person's lost promotion before any
   bot's, and a person's re-run may cancel a run *pending* in the group that a bot
   started (that PR is requeued after every person's); a bot's re-run cancels nothing.
@@ -5448,7 +5458,6 @@ on:
     # The defaults plus ready_for_review: a draft marked ready is promoted then, not
     # at its next push. Not `edited` (see "A promotion can be lost" above).
     types: [opened, synchronize, reopened, ready_for_review]
-concurrency: {group: promote-rc, cancel-in-progress: false}
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml   # the app's own
@@ -5458,12 +5467,33 @@ jobs:
     uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.5, and "commits / commits"
     # with: {title: false}   # an app that checks titles another way: only "commits / commits" runs (the skipped
     # "commits / title" counts as passing for a required check)
-  candidate:
+  rc:   # one promotion at a time; only this job waits in the group, never the checks
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    concurrency: {group: promote-rc, cancel-in-progress: false}
+    permissions: {contents: write, actions: write, pull-requests: write}
+    uses: ./.github/workflows/rc.yml
+    with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}"}
+    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
+  requeue:
+    needs: rc
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    permissions: {actions: write, contents: read, pull-requests: read}
+    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # v0.14.5
+    with: {workflow: pr.yml, job: rc}  # this file, and the job holding the group
+# rc.yml
+on:
+  workflow_call:
+    inputs:
+      source: {type: string, required: true}
+      pr: {type: string, required: true}
+    secrets:
+      SCCACHE_REDIS_PASSWORD: {required: false}
+jobs:
+  candidate:
     permissions: {contents: write, actions: write, pull-requests: write}
     uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.14.5
-    with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}", candidate: true}
+    with: {source: "${{ inputs.source }}", pr: "${{ inputs.pr }}", candidate: true}
   check-rc:
     needs: candidate
     if: needs.candidate.outputs.changed == 'true'
@@ -5475,12 +5505,6 @@ jobs:
     permissions: {contents: write, actions: write}
     uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.14.5
     with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
-  requeue:
-    needs: promote
-    if: always() && github.event.pull_request.head.repo.full_name == github.repository
-    permissions: {actions: write, contents: read, pull-requests: read}
-    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # v0.14.5
-    with: {workflow: pr.yml}  # this file
 # in requeue-rc.yml, on {schedule: [{cron: "*/30 * * * *"}], workflow_dispatch: {}}:
 # the requeue job above, without its needs and if
 # in release.yml
