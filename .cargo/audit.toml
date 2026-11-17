@@ -35,4 +35,12 @@ ignore = [
     # nothing compiles or links it. sqlx-sqlite 0.9.0 caps it at <0.38, so no
     # lockfile update can move it. Lifts when an sqlx release accepts 0.39.
     "RUSTSEC-2026-0459",
+
+    # chrono, humantime: unmaintained (informational only; no known vulnerability and
+    # no patched release). Both arrive through object_store 0.14, behind owt-storage,
+    # which depends on them unconditionally; no owt-stack crate uses either directly,
+    # and no semver-compatible object_store release drops them. Lifts when
+    # object_store moves to jiff or time.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0542",
 ]
