@@ -24,7 +24,9 @@ name: Promote to rc
 # histories disagree on every line a later change edits again; main holds the final
 # form of anything rc already has, and a feature head is the newest intent for its
 # lines. A structural conflict (modify/delete, rename) still fails, and is reported
-# on the PR. The cost of -X theirs: two features in flight that edit the same lines
+# on the PR. A PR that merged or closed, or whose branch was deleted, before its
+# promotion ran is skipped with a notice and no comment.
+# The cost of -X theirs: two features in flight that edit the same lines
 # leave rc with whichever was promoted last until the next promotion or sync, and a
 # PR closed without merging stays in rc until it is reverted there.
 #
@@ -173,10 +175,37 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # A PR that merged or closed, or whose branch is deleted, while its checks ran has
+      # nothing to promote: the merge step is skipped, the job succeeds and the PR gets
+      # no comment. Only a merge that fails on a live branch is reported as a conflict.
+      - id: live
+        name: Check the source is still open
+        if: ${{ inputs.pr != '' && inputs.source != 'main' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR: ${{ inputs.pr }}
+          SRC: ${{ inputs.source }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number: Number(process.env.PR)});
+            if (pr.state !== 'open') {
+              core.notice(`#${process.env.PR} is ${pr.merged ? 'merged' : pr.state}; nothing to promote into rc`);
+              core.setOutput('skip', 'true');
+              return;
+            }
+            try {
+              await github.rest.git.getRef({owner, repo, ref: `heads/${process.env.SRC}`});
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              core.notice(`branch ${process.env.SRC} no longer exists; nothing to promote into rc`);
+              core.setOutput('skip', 'true');
+            }
       # Keep this name: requeue-rc.yml tells a run that set out to promote from one
       # that skipped promotion by whether this step ran.
       - id: merge
         name: Merge into rc
+        if: ${{ steps.live.outputs.skip != 'true' }}
         env:
           SRC: ${{ inputs.source }}
           PR: ${{ inputs.pr }}
