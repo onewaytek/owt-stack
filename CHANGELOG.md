@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.7](https://github.com/onewaytek/owt-stack/compare/v0.14.6...v0.14.7) (2026-11-17)
+
+
+### Bug Fixes
+
+* **ci:** renovate reads template digests; deploy-pin rejects unparseable versions ([#365](https://github.com/onewaytek/owt-stack/issues/365)) ([6550292](https://github.com/onewaytek/owt-stack/commit/6550292f796b2c494df4e12030ca04843449ae16))
+* **ci:** skip rc promotion for merged or deleted branches ([#363](https://github.com/onewaytek/owt-stack/issues/363)) ([d24f14d](https://github.com/onewaytek/owt-stack/commit/d24f14d03f3988e796b9a0c0d58e4c147ec72496))
+* **deps:** bump aes-gcm and chacha20poly1305 to 0.11 together ([#313](https://github.com/onewaytek/owt-stack/issues/313)) ([97badcf](https://github.com/onewaytek/owt-stack/commit/97badcf5cf3972488c0d9f8c3c91f1f16f733547))
+* **deps:** bump amannn/action-semantic-pull-request from 6.1.1 to 6.1.2 ([#331](https://github.com/onewaytek/owt-stack/issues/331)) ([96e7139](https://github.com/onewaytek/owt-stack/commit/96e71395aee1072e3aa606e06045990eb4c6d31b))
+* **deps:** bump docker/login-action from 4.7.0 to 4.8.0 ([#329](https://github.com/onewaytek/owt-stack/issues/329)) ([d7d2e44](https://github.com/onewaytek/owt-stack/commit/d7d2e44f8279bf251ee661e25f4b2b471a8caff5))
+* **deps:** bump getrandom from 0.3.4 to 0.4.3 ([#308](https://github.com/onewaytek/owt-stack/issues/308)) ([f8ba5f7](https://github.com/onewaytek/owt-stack/commit/f8ba5f7a61b43ef3e6562d96ce6a01e226a1787b))
+* **deps:** bump taiki-e/install-action from 2.88.1 to 2.90.3 ([#362](https://github.com/onewaytek/owt-stack/issues/362)) ([b9e7bd2](https://github.com/onewaytek/owt-stack/commit/b9e7bd2b5b837b34788da747c4ba1714c73dcc04))
+* **deps:** bump the patch-and-minor group across 1 directory with 2 updates ([#346](https://github.com/onewaytek/owt-stack/issues/346)) ([47da9d0](https://github.com/onewaytek/owt-stack/commit/47da9d0526b0dc98dab3784237cd2331bbfb5ddc))
+
 ## [0.14.6](https://github.com/onewaytek/owt-stack/compare/v0.14.5...v0.14.6) (2026-11-17)
 
 
