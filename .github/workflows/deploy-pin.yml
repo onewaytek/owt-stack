@@ -31,7 +31,9 @@ name: Deploy pin
 # conflict; a version lower than the one the environments run, or than an open pin of
 # the stream, is refused with a notice instead (nothing opened, closed or pushed), so a
 # rerun or a late release job never rolls an environment back. A deliberate rollback is
-# a pull request written by hand in the deployments repository. A rerun for the same version continues the pin branch with ordinary commits
+# a pull request written by hand in the deployments repository. An image.yaml version
+# that is not N.N.N[-suffix] (one leading v is dropped) fails the step, pinning nothing.
+# A rerun for the same version continues the pin branch with ordinary commits
 # (never a force push) and reuses its open pull request. No matching environment is a
 # notice, not a failure: an app pins nothing
 # until the deployments repository lists it.
@@ -257,6 +259,15 @@ jobs:
             newer=""
             for d in $dirs; do
               cur=$(yq '.image.version // ""' "$d/image.yaml" 2>/dev/null || true)
+              if [[ -n $cur && $cur != null ]]; then
+                # A hand-written base may carry a leading v; any other shape cannot be
+                # compared, so the guard refuses to pin rather than guess.
+                cur=${cur#v}
+                if [[ ! $cur =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+                  echo "::error::$d/image.yaml: image.version '$cur' is not a semantic version (N.N.N, optional leading v, optional -suffix); fix it by hand, nothing is pinned"
+                  exit 1
+                fi
+              fi
               if [[ -n $cur && $cur != null && $(vcmp "$VERSION" "$cur") == -1 ]]; then
                 newer="$cur (running in ${d#apps/})"; break
               fi

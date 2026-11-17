@@ -6666,8 +6666,11 @@ than the one the matching environments run, or than an open pin of the same stre
 channel, variant and mode), is a notice that opens, pushes and closes nothing, so a rerun
 of an old release job or an older release's job that finishes last cannot roll an
 environment back or close the newer pin (`rc.10` outranks `rc.9`, a release outranks its
-rcs, and a variant's `-hsm` suffix is ignored). A rollback is a pull request written by
-hand in the deployments repository. A rerun (a retried release job) is idempotent: the
+rcs, and a variant's `-hsm` suffix is ignored). An environment's `image.version` is read
+with one leading `v` removed (a hand-written `v1.4.0` compares as `1.4.0`); any other value
+that is not `N.N.N` with an optional `-suffix` fails the job with an error naming the file
+and pins nothing, so a hand edit cannot switch the guard off. A rollback is a pull request
+written by hand in the deployments repository. A rerun (a retried release job) is idempotent: the
 same digest changes nothing and reuses the open pull request, another digest for the
 same version adds a commit to the bot's branch (never a force push), and a pin the
 base already holds opens nothing. No matching environment is a notice: an app can add
@@ -6699,9 +6702,13 @@ pass and the digest is 24 hours old. That age counts from the registry's
 publication of the digest, not from the pull request: a digest older than a day
 can merge on the run that opens its pull request, so time on rc is not guaranteed.
 A tag change never automerges.
-The preset also reads the `image:` lines of `charts/owt-app/values.yaml` (the Redis and
-cloudflared defaults, `name:tag@sha256:…`), so those digests are bumped like the base
-images; it matches that path in the repository it runs on. An app that must not automerge at all (regulated data)
+The preset also reads the `image:` lines of `charts/owt-app/values.yaml` and the `value:`
+lines of `templates/openshift/redis.yaml` and `tunnel.yaml` (the Redis and cloudflared
+defaults, `name:tag@sha256:…`), so those digests are bumped like the base images and
+the chart and the templates move together; it matches those paths in the repository it
+runs on. `just ci-config` runs `scripts/renovate-test.sh`, which checks that each
+pattern matches its files and that every digest pin in them is read (the pruner image,
+which names the cluster's internal registry, is updated by hand). An app that must not automerge at all (regulated data)
 adds `"packageRules": [{"matchPackageNames": ["*"], "automerge": false}]` after the
 `extends`.
 

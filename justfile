@@ -72,9 +72,11 @@ chart *cases:
     bash charts/owt-app/tests/render-equivalence.sh {{ cases }}
 
 # The commitlint rules conventional-commits.yml writes for an app without its own are
-# commitlint.config.mjs, byte for byte.
+# commitlint.config.mjs, byte for byte; the Renovate preset reads every digest pin it
+# should (scripts/renovate-test.sh).
 ci-config:
     diff -u commitlint.config.mjs <(sed -n "/<<'JS'$/,/^ *JS$/p" .github/workflows/conventional-commits.yml | sed '1d;$d' | sed 's/^          //')
+    bash scripts/renovate-test.sh
 
 # image-check.yml's `build` and `verify` jobs are image.yml's: `build` but for the
 # release's version and tag checkout, `verify` byte for byte.
