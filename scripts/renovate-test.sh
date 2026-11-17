@@ -1,54 +1,61 @@
 #!/usr/bin/env bash
 # Proves renovate/base-images.json against the files it governs: every custom manager
-# matches at least one digest-pinned image in the tracked files its managerFilePatterns
-# select, every `name:tag@sha256:` pin in templates/, charts/ and .github/workflows/ is
-# read by some manager (the pruner image, which names the cluster's internal registry
-# and which Renovate cannot read, is the one listed exception), and no matchStrings
-# pattern is anchored with ^ or $, which would match only if Renovate applied the
-# multiline flag. `just ci-config` runs it; it needs node and git, and no network.
+# matches at least one digest-pinned image in the files its managerFilePatterns select,
+# every `name:tag@sha256:` pin in templates/, charts/ and .github/workflows/ is read by
+# some manager (the pruner image, which names the cluster's internal registry and which
+# Renovate cannot read, is the one listed exception), and no matchStrings pattern is
+# anchored with ^ or $, which would match only if Renovate applied the multiline flag.
+# The patterns are JavaScript regular expressions in Renovate; here `grep -P` (PCRE)
+# runs them line by line, which agrees for these patterns (named groups, \s, classes,
+# non-capturing groups). `just ci-config` runs it; it needs bash, jq, find and GNU grep,
+# and no git or network.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-git ls-files -z | node -e '
-const fs = require("fs");
-const preset = JSON.parse(fs.readFileSync("renovate/base-images.json", "utf8"));
-const files = fs.readFileSync(0, "utf8").split("\0").filter(Boolean);
-const unreadable = /^image-registry\.openshift-image-registry\.svc:/;
-const pin = /([A-Za-z0-9][^\s"=]*:[^\s@"]+)@sha256:[a-f0-9]{64}/g;
-let fails = 0;
-const check = (name, ok) => { console.log((ok ? "ok   " : "FAIL ") + name); if (!ok) fails++; };
-const asRegex = (p) => new RegExp(p.replace(/^\/|\/$/g, ""));
-const read = (f) => fs.readFileSync(f, "utf8");
-const covered = new Map(); // "file:offset" -> true
-for (const m of preset.customManagers) {
-  const label = m.managerFilePatterns.join(", ");
-  const targets = files.filter((f) => m.managerFilePatterns.some((p) => asRegex(p).test(f)));
-  for (const f of m.managerFilePatterns) {
-    const re = asRegex(f);
-    check(`${f} selects a file`, files.some((t) => re.test(t)));
-  }
-  for (const s of m.matchStrings) {
-    check(`${s.slice(0, 40)}... has no ^ or $ anchor`, !/(^|[^\\])[\^$]/.test(s.replace(/\[[^\]]*\]/g, "")));
-    const re = new RegExp(s, "g");
-    // The release-workflow manager governs an app'"'"'s workflows; this repository'"'"'s own
-    // carry no pin, so a sample line stands in for them.
-    let total = 0;
-    for (const t of targets) {
-      const found = [...read(t).matchAll(re)];
-      total += found.length;
-      for (const x of found) covered.set(t + ":" + (x.index + x[0].indexOf(x.groups.depName)), true);
-    }
-    const sample = `    base-image: "registry.access.redhat.com/hi/core-runtime:2@sha256:${"a".repeat(64)}"`;
-    if (total === 0 && /base-image/.test(s)) total = [...sample.matchAll(re)].length;
-    check(`${m.description.slice(0, 40)}... matches a pin`, total > 0);
-  }
-}
-for (const f of files.filter((f) => /^(templates|charts)\//.test(f) || /^\.github\/workflows\//.test(f))) {
-  if (!/\.(ya?ml|json)$/.test(f)) continue;
-  const text = read(f);
-  for (const x of text.matchAll(pin)) {
-    if (unreadable.test(x[1])) continue;
-    check(`${f}: ${x[1]} is read by a manager`, covered.has(f + ":" + x.index));
-  }
-}
-process.exit(fails ? 1 : 0);
-' && echo "renovate: all checks passed"
+preset=renovate/base-images.json
+fails=0
+check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
+
+mapfile -t files < <(find . -type f -not -path './.git/*' -not -path './target/*' | sed 's|^\./||' | LC_ALL=C sort)
+# A Renovate file pattern is /regex/; strip the slashes.
+unslash() { local p=$1; p=${p#/}; printf '%s' "${p%/}"; }
+sample="    base-image: \"registry.access.redhat.com/hi/core-runtime:2@sha256:$(printf 'a%.0s' {1..64})\""
+covered=$(mktemp); trap 'rm -f "$covered"' EXIT
+
+n=$(jq '.customManagers | length' "$preset")
+for ((m = 0; m < n; m++)); do
+  desc=$(jq -r ".customManagers[$m].description" "$preset"); desc=${desc:0:40}
+  targets=()
+  while IFS= read -r fp; do
+    re=$(unslash "$fp")
+    selected=$(printf '%s\n' "${files[@]}" | grep -P -e "$re" || true)
+    check "$fp selects a file" '[ -n "$selected" ]'
+    while IFS= read -r f; do [ -z "$f" ] || targets+=("$f"); done <<<"$selected"
+  done < <(jq -r ".customManagers[$m].managerFilePatterns[]" "$preset")
+  while IFS= read -r s; do
+    stripped=$(printf '%s' "$s" | sed -E 's/\[[^]]*\]//g')
+    anchored=0
+    [[ $stripped == ^* || $stripped == *\$ || $stripped == *'|^'* || $stripped == *'(^'* ]] && anchored=1
+    check "$desc... pattern has no ^ or \$ anchor" '[ "$anchored" = 0 ]'
+    total=0
+    for t in "${targets[@]}"; do
+      hits=$(grep -nP -e "$s" "$t" | cut -d: -f1 || true)
+      for h in $hits; do echo "$t:$h" >>"$covered"; total=$((total + 1)); done
+    done
+    # The release-workflow manager governs an app's workflows; this repository's own
+    # carry no pin, so a sample line stands in for them.
+    if [ "$total" = 0 ] && [[ $s == *base-image* ]]; then
+      total=$(printf '%s\n' "$sample" | grep -cP -e "$s" || true)
+    fi
+    check "$desc... matches a pin" '[ "$total" -gt 0 ]'
+  done < <(jq -r ".customManagers[$m].matchStrings[]" "$preset")
+done
+
+for f in "${files[@]}"; do
+  [[ $f =~ ^(templates|charts|\.github/workflows)/ && $f =~ \.(ya?ml|json)$ ]] || continue
+  while IFS=: read -r line pin; do
+    [[ $pin == image-registry.openshift-image-registry.svc:* ]] && continue
+    check "$f:$line $pin is read by a manager" 'grep -qxF "$f:$line" "$covered"'
+  done < <(grep -noP '[A-Za-z0-9][^\s"=]*:[^\s@"]+(?=@sha256:[a-f0-9]{64})' "$f" || true)
+done
+[ "$fails" = 0 ] || { echo "$fails check(s) failed"; exit 1; }
+echo "renovate: all checks passed"
