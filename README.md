@@ -5397,7 +5397,8 @@ jobs:
   one at a time and only while no run is waiting (a re-run is itself a new arrival in
   the group; a waiting run a bot started is the exception). A run that succeeded
   without running "Merge into rc" (an `edited` or `labeled` trigger whose candidate
-  job was skipped) doesn't count, so it
+  job was skipped, or a PR that merged or closed, or whose branch was deleted, while its
+  checks ran: promote-rc.yml skips the merge with a notice and posts no comment) doesn't count, so it
   can't hide a lost promotion of the same head. A cancelled run always counts, since
   one cancelled before its candidate job ran can't be told from one that would have
   skipped it: a non-promoting one is re-run, succeeds having merged nothing, and the
