@@ -6,7 +6,8 @@
 # a new pull request and closes the old one, and a pin the base already holds opens
 # nothing. A version lower than the base's or than an open pin's is refused: no pull
 # request, no branch, nothing closed (rc.10 outranks rc.9, a release outranks its rcs);
-# a higher one still closes the older pin. `just templates` runs it; it needs bash 4 and git, and no network.
+# a higher one still closes the older pin. A base version reads with one leading v; any
+# other non-semantic value fails the step and pins nothing. `just templates` runs it; it needs bash 4 and git, and no network.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -157,6 +158,30 @@ check "a release is higher than its rc.10 and replaces it" \
 before=$(wc -l <"$PRS")
 run 1.0.0-rc.11 "$d2"
 check "an rc below the open release pin opens nothing" '[ "$(wc -l <"$PRS")" = "$before" ] && [ "$(prs open)" = 1 ]'
+
+# A hand-written base version: one leading v is read as the version; anything else that
+# is not a semantic version fails the step with an error and pins nothing.
+setbase() { (cd "$work/seed"; git pull -q origin main
+  printf 'image:\n  repository: r\n  digest: %s\n  version: %s\n' "$d1" "$1" >apps/myapp/rc/image.yaml
+  git commit -q -am "base $1"; git push -q origin main); }
+setbase v1.4.0
+before=$(wc -l <"$PRS")
+run 1.3.2 "$d2"
+check "a v-prefixed base version is compared: an older release opens nothing" \
+  '[ "$(wc -l <"$PRS")" = "$before" ] && grep -q "is lower, so nothing is pinned" "$work/run.log"'
+run 1.5.0 "$d2"
+check "a v-prefixed base version is compared: a newer release opens a pull request" \
+  '[ "$(wc -l <"$PRS")" = $((before + 1)) ]'
+for bad in latest v1.4 "1.4.0+build"; do
+  setbase "$bad"
+  before=$(wc -l <"$PRS")
+  rm -rf "$work/deployments"; git clone -q "$work/origin.git" "$work/deployments" 2>/dev/null
+  : >"$GITHUB_OUTPUT"; : >"$GH_LOG.last"
+  export VERSION=1.3.2 DIGEST=$d2 PREFIX=deploy-pin/myapp-rc-auto- BRANCH=deploy-pin/myapp-rc-auto-1.3.2
+  rc=0; (cd "$work/deployments" && bash -c "$(cat "$work/pin.sh")") >"$work/run.log" 2>&1 || rc=$?
+  check "an unparseable base version '$bad' fails the step with a message and pins nothing" \
+    '[ "$rc" != 0 ] && grep -q "::error::.*is not a semantic version" "$work/run.log" && [ "$(wc -l <"$PRS")" = "$before" ] && ! git -C "$work/origin.git" rev-parse -q --verify refs/heads/deploy-pin/myapp-rc-auto-1.3.2 >/dev/null'
+done
 
 check "the step never force-pushes" '! grep -Eq "push.*(--force|-f )" "$work/pin.sh"'
 
