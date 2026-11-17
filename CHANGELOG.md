@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.6](https://github.com/onewaytek/owt-stack/compare/v0.14.5...v0.14.6) (2026-11-17)
+
+
+### Features
+
+* **ci:** requeue-rc follows a promote-rc group held by one job ([#360](https://github.com/onewaytek/owt-stack/issues/360)) ([8aa0c25](https://github.com/onewaytek/owt-stack/commit/8aa0c252a6ce99c2ed3bdd95865d571d516e58b7))
+
 ## [0.14.5](https://github.com/onewaytek/owt-stack/compare/v0.14.4...v0.14.5) (2026-11-16)
 
 
