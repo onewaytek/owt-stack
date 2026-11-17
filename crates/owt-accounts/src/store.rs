@@ -104,7 +104,7 @@ pub fn username_problem(username: &str) -> Option<Refused> {
 
 /// One address: something before one `@`, something after, no whitespace. The
 /// mail that proves it is the app's business.
-fn valid_email(email: &str) -> bool {
+pub(crate) fn valid_email(email: &str) -> bool {
     let Some((local, domain)) = email.split_once('@') else {
         return false;
     };
@@ -502,19 +502,31 @@ pub async fn by_id_in_epoch_with<X: Extra>(
 /// which policy versions it last accepted (for the policies gate).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Standing {
-    /// A confirmed authenticator: [`Factors::any`](crate::mfa::Factors::any).
+    /// A confirmed authenticator, a usable passkey, or a disabled passkey with recovery
+    /// codes left: [`Factors::any`](crate::mfa::Factors::any).
     pub(crate) has_factor: bool,
+    /// The account is locked until recovery:
+    /// [`Factors::recovery_locked`](crate::mfa::Factors::recovery_locked).
+    pub(crate) recovery_locked: bool,
     /// The `policy_acceptances` version ids, one per document the account accepted.
     pub(crate) accepted: Vec<i64>,
 }
 
-/// The columns [`standing_in_epoch`] reads for [`Standing`]. Both lookups are on a primary
-/// key: `account_totp (account_id)` and the `(account_id, kind)` prefix of
+/// The columns [`standing_in_epoch`] reads for [`Standing`]. Each lookup is on an index:
+/// the primary key `account_totp (account_id)`, `account_passkeys_account`,
+/// `account_recovery_codes_account_all` and the `(account_id, kind)` prefix of
 /// `policy_acceptances`.
 const STANDING: &str = "SELECT
-             EXISTS (SELECT 1 FROM account_totp t
-                     WHERE t.account_id = accounts.id AND t.confirmed_at IS NOT NULL)
+             (EXISTS (SELECT 1 FROM account_totp t
+                      WHERE t.account_id = accounts.id AND t.confirmed_at IS NOT NULL)
+              OR EXISTS (SELECT 1 FROM account_passkeys k
+                         WHERE k.account_id = accounts.id AND k.disabled_at IS NULL)
+              OR (EXISTS (SELECT 1 FROM account_passkeys k
+                          WHERE k.account_id = accounts.id AND k.disabled_at IS NOT NULL)
+                  AND EXISTS (SELECT 1 FROM account_recovery_codes r
+                              WHERE r.account_id = accounts.id AND r.used_at IS NULL)))
                AS owt_has_factor,
+             accounts.mfa_recovery_locked_at IS NOT NULL AS owt_recovery_locked,
              ARRAY(SELECT p.version_id FROM policy_acceptances p
                    WHERE p.account_id = accounts.id) AS owt_accepted";
 
@@ -558,6 +570,7 @@ impl Standing {
         use sqlx::Row;
         Ok(Self {
             has_factor: row.try_get("owt_has_factor")?,
+            recovery_locked: row.try_get("owt_recovery_locked")?,
             accepted: row.try_get("owt_accepted")?,
         })
     }
@@ -659,6 +672,60 @@ pub async fn by_username(db: impl PgExecutor<'_>, username: &str) -> sqlx::Resul
     .bind(normalize(username))
     .fetch_optional(db)
     .await
+}
+
+/// The addresses `account_id` has proven it holds, normalized ([`normalize`]),
+/// sorted and without repeats: what an app compares an invitation's address with
+/// before it seats the account.
+///
+/// An address is proven by either of:
+///
+/// - a sign-in link emailed to it ([`links::mint_emailed`](crate::links::mint_emailed))
+///   that the account redeemed. A link voided unused proves nothing, and neither does
+///   one minted without an address ([`links::mint`](crate::links::mint),
+///   [`links::mint_with`](crate::links::mint_with), the staff page, the CLI, and every
+///   link minted before the address was recorded): which address such a link reached
+///   is unknown. One emailed sign-in proves the address again.
+/// - a linked provider identity whose provider says it checked the email
+///   ([`owt_auth::oauth::Identity::email_verified`], as the provider's `identity`
+///   reads it: Google's and `OpenID` Connect's `email_verified`, Discord's `verified`,
+///   Twitch's email), as of the identity's last sign-in. Unlinking the identity
+///   takes the address away.
+///
+/// The account's own `email` counts only when proven the same way: a change of it
+/// (the staff admin's, [`set_email`]) proves nothing until a link emailed to the new
+/// address is redeemed. A proof does not
+/// expire, and it holds for the account that made it even if another account holds
+/// the address later; an app that wants a recent proof mints a link and asks for it.
+///
+/// Read inside the transaction that acts on the answer, with the account's row held
+/// (`SELECT … FOR SHARE`), so an identity unlinked meanwhile cannot slip between the
+/// check and the write.
+pub async fn confirmed_emails(
+    db: impl PgExecutor<'_>,
+    account_id: i64,
+) -> sqlx::Result<Vec<String>> {
+    // `voided` is the `used_from` the library writes when it voids an unused link;
+    // a redeemed link holds the client's address there.
+    let found: Vec<String> = sqlx::query_scalar(
+        "SELECT sent_to FROM sign_in_links
+         WHERE account_id = $1 AND sent_to IS NOT NULL
+           AND used_at IS NOT NULL AND used_from IS DISTINCT FROM 'voided'
+         UNION
+         SELECT verified_email FROM account_identities
+         WHERE account_id = $1 AND verified_email IS NOT NULL",
+    )
+    .bind(account_id)
+    .fetch_all(db)
+    .await?;
+    let mut emails: Vec<String> = found
+        .iter()
+        .map(|e| normalize(e))
+        .filter(|e| !e.is_empty())
+        .collect();
+    emails.sort();
+    emails.dedup();
+    Ok(emails)
 }
 
 /// The active account with this email, if the email is set and is a sign-in name: an

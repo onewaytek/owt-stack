@@ -5,12 +5,13 @@ Rust, Axum, SQLx on Postgres, Redis, Askama, htmx and Tailwind, deployed to Open
 
 | Crate | What an app gets |
 |---|---|
-| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
-| `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool and migrations under an advisory lock; serving with graceful shutdown |
+| `owt-web` | the handler error type and its HTTP mapping; tokenless cross-origin protection; typed sessions sealed in an encrypted cookie; flash messages; the request as page chrome reads it; htmx fragments at their own URLs; fingerprinted static URLs; `Cache-Control` as a typed policy; security headers and a nonce-based content security policy; a response deadline and body cap; safe `?next=` redirects and http(s)-only links people supply; preference cookies (an allowed set, `Secure`, apart from the session's); the client's address behind proxies; htmx extractors (re-exported `axum-htmx`); SSE framing; pager and text helpers; shared page components (alerts, form fields, pagination, an error body) styled by semantic tokens |
+| `owt-runtime` | configuration from the environment; logging (JSON in production) and OTLP export (feature `otel`); Prometheus (feature `metrics`, default); a Redis read-through cache that never fails a request (feature `redis`); background jobs on every replica, on one at a time or on a Redis lease's holder (feature `redis`); the Postgres pool, migrations under an advisory lock, and the database's clock for outcome-deciding comparisons; serving with graceful shutdown |
 | `owt-auth` | sign-in throttling by address and account; a guard for anonymous forms (honeypot, Turnstile, a budget per address); Argon2id hashing off the runtime with bounded concurrency and a decoy check for unknown accounts; OAuth 2 sign-in with PKCE (Google, Discord, Twitch, any OIDC); JWT bearer verification against a JWKS |
-| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links; roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
+| `owt-accounts` | the `accounts` table and its migration; create and authenticate (decoy check, rehash, username or email); sessions revoked by epoch (sign out everywhere, password change, deactivation); the `Signed`, `Staff` and `Maybe` extractors over one load per request; provider identities linked to accounts; local and system accounts an app reaches by a key of its own, with no password; one-time sign-in links, and the addresses an account has proven by one (`confirmed_emails`); roles (user, staff, and the app's own, with the `Holds<R>` extractor); the staff accounts admin; the operator's account commands as a clap subcommand (feature `cli`); sign-in with a provider (routes, configuration, buttons, connections) |
 | `owt-crypt` | envelope field encryption: XChaCha20-Poly1305 field seals under data keys per tenant wrapped by a KEK, ciphertexts bound to their table, column and row, key versions with rotation, re-encryption and rewrap jobs, HMAC blind indexes for equality search, zeroized keys; a local KEK for development and staging, and a YubiHSM 2 KEK (feature `yubihsm`) |
 | `owt-storage` | objects in an S3-compatible bucket (B2, R2, MinIO): client-side encryption through `owt-crypt` in bounded memory, streaming multipart uploads, presigned URLs, verified deletion |
+| `owt-mail` | outgoing email: one `Mailer` over SMTP (lettre), Resend or SES, plain text with an HTML alternative, recipients parsed as mailboxes (no header injection), a timeout, credentials kept out of `Debug`; an in-memory outbox and a failing transport for tests; an allowlist for demo deployments; a not-configured mode callers report instead of failing |
 | `owt-audit` | an append-only, hash-chained audit log: one chain per tenant, SHA-256 over a canonical encoding, triggers that refuse changes, a verifier (and its clap subcommand, feature `cli`), and anchoring of the chain heads to external write-once storage |
 | `owt-change` | change requests from a site's own pages: a floating "Request a change" button for signed-in admins, and the endpoint that forwards what they ask, with who asked, to a work tracker under the site's key |
 | `owt-bus` | topic fan-out to a replica's sockets and streams, across replicas over Redis pub/sub, with heartbeat, resubscription and resync |
@@ -22,18 +23,24 @@ Outside the crates:
 |---|---|
 | `.github/workflows/rust-ci.yml` | the reusable check workflow on ARC: the app's `just check`, or built-in fmt, audit, sqlx metadata, clippy and tests; the stylesheet build |
 | `.github/workflows/release-please.yml` | this repository's releases: versions and the changelog by release-please |
-| `.github/workflows/conventional-commits.yml` | Conventional Commits checked on every pull request, here and, as a reusable workflow, in an app: the title and every commit, with one commitlint and one configuration |
+| `.github/workflows/conventional-commits.yml` | Conventional Commits checked on every pull request, here and, as a reusable workflow, in an app: the title and every commit but a merge of the base into the branch (a squash merge drops it), with one commitlint and one configuration |
 | `.github/workflows/release.yml` | reusable releases from conventional commits: stable on `main`, prereleases on `rc`, optional version write-back and changelog |
 | `.github/workflows/image.yml` | reusable image build for a released tag, daemonless on ARC (or the Dockerfile, GitHub-hosted), pushed to ghcr with the channel's floating tags |
 | `.github/workflows/image-check.yml` | reusable, opt-in: the same image built and verified on a pull request, pushing nothing, for a caller that grants only `contents: read` |
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease, or into `rc-candidate` for checking first |
 | `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
 | `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
+| `.github/workflows/deploy-pin.yml` | reusable: pin a released image's digest in the deployments repository through a pull request, which merges itself for rc environments and waits for the owner for production ("Deploying with GitOps") |
+| `.github/workflows/actions-cleanup.yml` | reusable: delete the `image-layer` artifacts of an app's succeeded image runs, so they stop counting against the Actions storage ("Actions storage") |
+| `.github/workflows/ghcr-prune.yml` | reusable, a dry run unless told to delete: remove the app's untagged ghcr versions and all but its newest rc versions, never a release, a floating tag or a digest the deployments repository pins ("Actions storage") |
+| `renovate/base-images.json` | a Renovate preset: the base images pinned by digest in the Dockerfile and the `base-image` input, grouped, digest-only bumps automerged after 24 hours |
+| `scripts/bao-set.sh` | `env.sh` for OpenBao: writes an app environment's secrets from an `env.env` where `charts/owt-app`'s ExternalSecrets read them |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its action and workflow pins, its crates and its npm packages, minors and patches grouped |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
-| `templates/openshift/app.yaml` | an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, a `migrate` init container as the schema's owner and the app serving as a runtime role that owns nothing, the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
+| `charts/owt-app` | the app's deploy as a Helm chart for Argo CD ("Deploying with GitOps"): the templates below with the image pinned by digest, stateful objects never pruned, and Secrets from OpenBao through External Secrets; `just chart` proves its renders match the templates' |
+| `templates/openshift/app.yaml` | deprecated for `charts/owt-app`, supported until its removal: an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, a `migrate` init container as the schema's owner and the app serving as a runtime role that owns nothing, the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
 | `templates/openshift/redis.yaml` | an optional Redis for the cache, the bus and leases: in memory, bounded, LRU-evicted, behind a password, reachable by the app alone, connecting to nothing |
 | `templates/openshift/egress.yaml` | where the app's pods (or a task's) may connect: its database, its Redis, the cluster's DNS and port 443 of the internet, and nothing else |
 | `templates/openshift/tunnel.yaml` | the public address on a private cluster: a locally managed Cloudflare named tunnel of the app's own, two `cloudflared` connectors forwarding its host to the app's Service, and their NetworkPolicies |
@@ -52,22 +59,23 @@ file as its docs), so an API change that breaks these instructions fails CI.
 <!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
-owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
+owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
+owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
 # As needed:
-owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
-owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
-owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
-owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
-owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
-owt-storage = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
-owt-audit = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
+owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
+owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
+owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
+owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
+owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
+owt-storage = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
+owt-audit = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
+owt-mail = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
 
 [dev-dependencies]
-owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2" }
+owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6" }
 ```
 <!-- x-release-please-end -->
 
@@ -92,6 +100,23 @@ one, and the first `rediss://` connection would panic; `Bus::redis` installs aws
 as the process's provider if none is set, and an app that connects to a `rediss://`
 Redis before or without the bus (a lease's `ConnectionManager`, say) calls
 `owt_bus::ensure_crypto_provider()` first.
+
+Cargo.lock lists `sqlx-sqlite` and `libsqlite3-sys` even in a Postgres-only app: Cargo
+resolves the lockfile with every optional dependency, and `sqlx` and `sqlx-macros-core`
+both name `sqlx-sqlite` as one. Nothing compiles it unless a crate turns on an sqlx
+SQLite feature (`cargo tree -i libsqlite3-sys --target all` prints nothing), but
+`cargo audit` reads the lockfile, so RUSTSEC-2026-0459 (SQLite CVE-2026-119375,
+libsqlite3-sys 0.37, which sqlx-sqlite 0.9.0 caps below 0.38) fails it. An app checks
+that the tree is empty and ignores the advisory in its `.cargo/audit.toml`:
+
+```toml
+[advisories]
+ignore = [
+    # libsqlite3-sys 0.37 (SQLite CVE-2026-119375): in Cargo.lock only, as sqlx's
+    # optional sqlx-sqlite; no SQLite feature is on, so nothing compiles or links it.
+    "RUSTSEC-2026-0459",
+]
+```
 
 **Developing against a local checkout:** patch the git source in the app's
 `.cargo/config.toml` (not committed) instead of editing `Cargo.toml`:
@@ -128,18 +153,14 @@ async fn main() -> anyhow::Result<()> {
         otel_endpoint: env::var("OTEL_EXPORTER_OTLP_ENDPOINT"),
         ..logging::Options::default()
     });
-    let pool = PoolConfig { max: env::parse_or("DB_POOL_MAX", 10)?, ..PoolConfig::default() }
-        .connect(&env::required("DATABASE_URL")?)
-        .await?;
+    // DB_POOL_MAX sizes the pool (10 when unset): the one name every app reads.
+    let pool = PoolConfig::from_env()?.connect(&env::required("DATABASE_URL")?).await?;
     // Replicas starting together migrate once; the rest wait on the lock.
     owt_runtime::db::migrate_locked(&pool, &MIGRATOR, 8_531_207).await?;
     let bind = env::var("BIND_ADDR").unwrap_or_else(|| "0.0.0.0:8000".into());
-    // Behind the OpenShift router: an idle kept-alive connection is closed after
-    // `header_read_timeout` (30 s by default), and the router may reuse one for up to
-    // 300 s, so keep the app's wait above the router's (see "Bounds" below).
-    let mut options = serve::ServeOptions::default();
-    options.header_read_timeout = std::time::Duration::from_secs(310);
-    serve::serve_with(&bind, router(pool), serve::shutdown_signal(), options).await
+    // Kept-alive connections idle up to 310 s, above the OpenShift router's 300 s
+    // (see "Bounds" below).
+    serve::serve(&bind, router(pool), serve::shutdown_signal()).await
 }
 ```
 
@@ -148,10 +169,10 @@ A credential is read with `env::secret`, which returns a
 a derived `Debug` of the config that keeps it does not print it. `env::Vars`, a map
 of variables for tests, prints its names and never its values.
 
-`serve::serve` is the same with `ServeOptions::default()`: a request head must arrive
-within 30 s (an idle kept-alive connection closes then too), at most 4096 connections
-are open at once, and a stop drains for up to 20 s. `ServeOptions` is built from its
-default and changed field by field:
+`serve::serve` is `serve_with` and `ServeOptions::default()`: a request head must arrive
+within 310 s (an idle kept-alive connection closes then too, just after the OpenShift
+router's 300 s), at most 4096 connections are open at once, and a stop drains for up to
+20 s. `ServeOptions` is built from its default and changed field by field:
 
 ```rust,no_run
 # async fn run(app: axum::Router) -> anyhow::Result<()> {
@@ -175,10 +196,10 @@ feature is on.
   connection may sit idle before the app closes it. A proxy that keeps idle
   connections to the app for reuse longer than that sends, now and then, a request
   on a connection the app has just closed, and answers it with a 502. The OpenShift
-  router's HAProxy waits up to 300 s by default (`timeout http-keep-alive`), so an
-  app behind it sets the timeout above that, as the example above does. The router
-  reads request heads itself, so the longer wait costs an idle socket, not
-  protection from slow clients.
+  router's HAProxy waits up to 300 s by default (`timeout http-keep-alive`), so the
+  default is 310 s; an app with a different proxy in front sets it above that
+  proxy's. The router reads request heads itself, so the longer wait costs an idle
+  socket, not protection from slow clients.
 - **Connections.** `max_connections` counts every connection from its accept to its
   close: one idle between kept-alive requests, and one holding a Server-Sent Events
   stream, which is an ordinary HTTP/1.1 response that does not end. A WebSocket
@@ -212,11 +233,64 @@ URL's `options`. `migrate_locked` runs without the statement timeout; other long
 uses `SET LOCAL statement_timeout` in its transaction, or a pool with
 `statement_timeout: None` (`reserve_beside` builds one beside the main pool). `None`
 leaves either to the server. A connection pooler in transaction mode that refuses
-startup parameters needs both `None`, and the timeouts set on the database role. It also warns at start when the database is not
+startup parameters needs both `None`, and the timeouts set on the database role.
+The pool does not ping a connection before handing it out (`test_before_acquire:
+false`, unlike sqlx's default): the ping is a round trip on every acquire, doubling a
+signed-in request's account load. A connection that died while idle (a database
+restart, a switchover) then fails its one query, which the request answers as a 503,
+and the pool replaces it; `test_before_acquire: true` brings the ping back for an app
+that would rather pay the round trip.
+
+```rust,no_run
+# async fn demo(url: &str) -> anyhow::Result<()> {
+use owt_runtime::db::PoolConfig;
+let pool = PoolConfig { test_before_acquire: true, ..PoolConfig::from_env()? }
+    .connect(url)
+    .await?;
+# let _ = pool; Ok(()) }
+```
+
+`connect` also warns at start when the database is not
 on this machine and its TLS is not verified (`db::unverified_tls(&options)` asks the
 same of any `PgConnectOptions`): give the pod `PGSSLMODE=verify-full` and
 `PGSSLROOTCERT` (the OpenShift template does), since sqlx's default (`prefer`)
 neither requires TLS nor checks the server.
+
+**Decide by the database's clock.** A comparison that decides an outcome (an answer
+inside its round's window, a vote before the cut-off, a link not yet expired) reads
+`db::now(executor)`, the database's `clock_timestamp()`, rather than
+`OffsetDateTime::now_utc()`. Every replica then reads one clock, so two pods whose
+clocks drift apart cannot decide one case two ways, and the reading agrees with the
+stamps the database wrote (`DEFAULT now()`, `SET closed_at = clock_timestamp()`). Read it
+after taking the row locks the decision depends on: `clock_timestamp()` is the moment of
+the reading, where `now()` is the transaction's start and would read a time before a
+lock wait, when a cut-off that passed during the wait had not yet passed. The app's
+clock stays right for what decides nothing: input validation (a date of birth not in
+the future), display ("closes in 3 minutes"), logging, and timeouts within the process.
+
+```rust
+# async fn answer(pool: &sqlx::PgPool, round: i64, text: &str) -> anyhow::Result<bool> {
+use owt_runtime::db;
+
+let mut tx = pool.begin().await?;
+// The lock first, so a close that holds it has stamped `closes_at` before the reading.
+let closes_at: time::OffsetDateTime =
+    sqlx::query_scalar("SELECT closes_at FROM rounds WHERE id = $1 FOR SHARE")
+        .bind(round)
+        .fetch_one(&mut *tx)
+        .await?;
+if db::now(&mut *tx).await? >= closes_at {
+    return Ok(false); // too late, on every replica alike
+}
+sqlx::query("INSERT INTO answers (round_id, text) VALUES ($1, $2)")
+    .bind(round)
+    .bind(text)
+    .execute(&mut *tx)
+    .await?;
+tx.commit().await?;
+# Ok(true)
+# }
+```
 
 The router composes the layers. Order matters: a layer added later wraps the ones
 before it, so cross-origin refusal runs before the session is opened, and the outer
@@ -285,13 +359,71 @@ pub fn router(key: cookie::Key, assets: Assets, cross_origin: CrossOrigin, pool:
 cookie lives without being resealed), `absolute_lifetime` (from sign-in, however
 active: `session::ABSOLUTE_LIFETIME`, 24 hours, unless set, or `max_age` if longer),
 and `idle_timeout` (since the person's last activity: `session::IDLE_TIMEOUT`, 30
-minutes, unless set). These are NIST SP 800-63B-4's AAL2 bounds; an app handling
-health data sets AAL3's (12 hours, 15 minutes). An app whose sessions guard nothing
-a copied cookie could misuse (a game's guest identity) may call
-`without_idle_timeout()`. Revocation is the epoch above:
+minutes, unless set). The 24 hours is NIST SP 800-63B-4's reauthentication bound at
+AAL2; the 30 minutes is inside its AAL2 inactivity bound (1 hour) and OWASP's 15 to
+30 minutes for low-risk applications. An app handling health data sets AAL3's (12
+hours, 15 minutes). Revocation is the epoch above:
 `sign_out_everywhere`, a password change or a deactivation moves the account's
 `session_epoch`, and the validator refuses every session sealed under the old one on
 its next request, on every replica.
+
+**The idle timeout is on by default, at 30 minutes.** A person who leaves a tab for
+half an hour is signed out, whatever `max_age` says, and each refresh of the
+last-active time sends a `Set-Cookie`, which makes that response private to shared
+caches. That suits staff areas and health data; a public or low-risk app (a game, a
+reading site) usually wants days or none. `Sessions::from_env` and `from_vars` read
+it from the environment:
+
+| Variable | Value | Unset |
+|---|---|---|
+| `SESSION_IDLE_TIMEOUT` | Whole seconds, minutes, hours or days (`90s`, `30m`, `8h`, `14d`), or `off` for none. Zero, a bare number or another unit is an error at startup. | 30 minutes (`session::IDLE_TIMEOUT`); blank is unset |
+| `SESSION_ABSOLUTE_LIFETIME` | Whole seconds, minutes, hours or days (`12h`, `14d`), above zero and at least the idle timeout in force (unless that is `off`). Zero, a bare number, `off`, another unit or a lifetime shorter than the idle timeout is an error at startup, naming the variable. | 24 hours (`session::ABSOLUTE_LIFETIME`); blank is unset |
+
+The OpenShift template passes it as a parameter (default `30m`), so an app sets
+`SESSION_IDLE_TIMEOUT=14d` or `off` in `params.env`. A builder call after `from_env`
+(`idle_timeout(d)`, `without_idle_timeout()`) wins over the variable, so an app that
+must keep a short timeout (staff-only, health data) calls it in code and the setting
+cannot loosen it. The first request through `Sessions::layer` logs the idle timeout
+in force and what set it at `info` (`session idle timeout idle_timeout=1800s
+source=default`; the source is `default`, `SESSION_IDLE_TIMEOUT` or `builder`; the
+timeout is `off` when none) and, in a second line, the absolute lifetime the same way
+(`session absolute lifetime absolute_lifetime=86400s source=default`; the source is
+`default`, `SESSION_ABSOLUTE_LIFETIME` or `builder`), so a manifest's value that the
+app's code overrode shows in the log. `absolute_lifetime(d)` after `from_env` wins over
+`SESSION_ABSOLUTE_LIFETIME` as the idle builder calls win over theirs. A mixed app keeps the app-wide session long and puts
+`StepUpGate::new(window)` on its staff router instead.
+
+```rust
+# fn main() -> anyhow::Result<()> {
+use std::time::Duration;
+use owt_web::session::{IDLE_TIMEOUT, Sessions};
+# #[derive(Clone, Default, serde::Serialize, serde::Deserialize)] struct SessionData;
+# let secret = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==".to_owned();
+let env = |idle: &'static str| {
+    let secret = secret.clone();
+    move |name: &str| match name {
+        "SESSION_SECRET" => Some(secret.clone()),
+        "SESSION_IDLE_TIMEOUT" => Some(idle.to_owned()),
+        "SESSION_ABSOLUTE_LIFETIME" => Some("30d".to_owned()),
+        _ => None,
+    }
+};
+let max_age = Duration::from_secs(14 * 86_400);
+let reading = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("14d"))?;
+assert_eq!(reading.idle(), Some(Duration::from_secs(14 * 86_400)));
+assert_eq!(reading.absolute(), Duration::from_secs(30 * 86_400));
+let game = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("off"))?;
+assert_eq!(game.idle(), None);
+let unset = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env(""))?;
+assert_eq!(unset.idle(), Some(IDLE_TIMEOUT), "30 minutes");
+// Code wins: a staff app pins its own window whatever the environment says.
+let staff = Sessions::<SessionData>::from_vars("myapp", "__Host-session", max_age, true, env("off"))?
+    .idle_timeout(Duration::from_mins(15));
+assert_eq!(staff.idle(), Some(Duration::from_mins(15)));
+let capped = staff.absolute_lifetime(Duration::from_hours(12));
+assert_eq!(capped.absolute(), Duration::from_hours(12));
+# Ok(()) }
+```
 
 With an idle timeout, the cookie also carries the last-active time. Activity (a
 request that carries the session, is not passive and does not fail) refreshes it at
@@ -441,7 +573,9 @@ the handler and write `<script nonce="{{ nonce }}">`.
   (the whole purpose, taken exactly), else `myapp/` plus `SESSION_PURPOSE`, else
   `POD_NAMESPACE`, else `local` (`session::purpose_from`); `local` is for
   development, and in a pod (`KUBERNETES_SERVICE_HOST` set) without any of the three
-  variables it is an error. `Sessions::from_vars` reads a map instead, for tests.
+  variables it is an error. It also reads `SESSION_IDLE_TIMEOUT` (30 minutes when
+  unset) and `SESSION_ABSOLUTE_LIFETIME` (24 hours when unset; see "Idle timeout and lifetimes"). `Sessions::from_vars` reads a map
+  instead, for tests.
 
   **Moving onto `from_env` without signing anyone out.** The key must stay the one
   the app derives today, so first read the purpose actually in effect, from the live
@@ -836,6 +970,33 @@ like_escape(q.trim())
 
 Pass the escaped term as a bound parameter, never spliced into the SQL.
 
+**Links people supply** (a profile's website, an event's page) go through
+`owt_web::redirect::web_url` before they become an `href`: it returns the parsed URL
+only when it is absolute `http` or `https`, with a host and no user or password, so a
+`javascript:`, `data:` or relative link never reaches a page. Check at the form, and
+again where the page renders the link, so rows saved before the check are covered;
+render the parsed form, which the template escapes as any text.
+
+```rust
+use askama::Template;
+use owt_web::redirect::web_url;
+
+#[derive(Template)]
+#[template(ext = "html", source = r#"{% if let Some(url) = website %}<a href="{{ url }}" rel="nofollow ugc noopener">website</a>{% endif %}"#)]
+struct Profile { website: Option<String> }
+
+// At the form: refuse what is not a web page.
+assert!(web_url("javascript:alert(1)").is_none());
+assert!(web_url("data:text/html,<script>alert(1)</script>").is_none());
+// At the page: a stored value that would not pass today shows no link.
+let page = |stored: &str| Profile { website: web_url(stored).map(String::from) }.render().unwrap();
+assert_eq!(page("javascript:alert(1)"), "");
+assert_eq!(
+    page(" https://Example.com/me "),
+    r#"<a href="https://example.com/me" rel="nofollow ugc noopener">website</a>"#
+);
+```
+
 ### htmx fragments
 
 A fragment lives at a URL of its own, never the page's URL negotiated on
@@ -963,6 +1124,32 @@ let cache = match owt_runtime::env::var("REDIS_URL") {
     None => Cache::disabled(),
 };
 # let _ = cache; Ok(()) }
+```
+
+**A route of public pages.** HTML that sets no `Cache-Control` stays `private` /
+`no-store` (`headers::private_by_default`, and `Stack` installs it): a shared cache must
+never keep a signed-in page. A route whose pages are the same for everyone (an about
+page, a public article, a map that changes on a tick) opts in with the route layer
+`headers::public(max_age)`, rather than each handler writing the header. It sets
+`public, max-age=N` on a `200` that sets no cookie and has no `Cache-Control` of its own;
+`headers::public_with(policy)` takes a whole `CachePolicy` (an edge lifetime, say). The
+session layer runs outside it, so a response that carries a cookie or a signed-in
+person's idle time is still marked private.
+
+```rust
+use std::time::Duration;
+use axum::{Router, response::Html, routing::get};
+use owt_web::{cache::CachePolicy, headers};
+
+let public = Router::<()>::new()
+    .route("/about", get(|| async { Html("<h1>About</h1>") }))
+    .route_layer(headers::public(Duration::from_mins(5)));
+let articles = Router::<()>::new()
+    .route("/articles/{slug}", get(|| async { Html("<article>…</article>") }))
+    .route_layer(headers::public_with(
+        CachePolicy::public(Duration::from_secs(60)).edge(Duration::from_hours(1)),
+    ));
+let _app: Router = public.merge(articles);
 ```
 
 - **Policies:** `immutable()` for fingerprinted bytes, `public(d)` with `.edge(s_maxage)`
@@ -1135,7 +1322,7 @@ only for passwords, throttles or `oauth` turns the feature off:
 
 <!-- x-release-please-start-version -->
 ```toml
-owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.12.2", default-features = false }
+owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.6", default-features = false }
 ```
 <!-- x-release-please-end -->
 
@@ -1357,8 +1544,20 @@ its own), as the leases do. **When Redis
 fails, sign-in fails closed** (`Refusal::Unavailable`: answer 503, not "too many
 attempts"): the throttle is all that bounds online guessing, and an outage that locks
 people out is a better failure for health records than one that lets an attacker guess;
-`FailMode::Open` reverses it. `on_lockout` is called once per window when an account
-crosses its limit, the moment to email its owner.
+`FailMode::Open` reverses it. `FailMode::Local` is the posture between: during an
+outage it counts in the process, against the same budgets, as `Throttle` does, so
+sign-ins go on and guessing stays bounded (at N times each budget with N replicas). Use
+it for a budget guarding a mailbox or a form rather than a password (an emailed sign-in
+link, a sign-up), where an outage should neither stop sign-ins nor stop counting; keep
+`Closed` for passwords on sensitive data. A refusal counted locally never has
+`just_locked` set and does not call the hook. `on_lockout` is called once per window
+when an account crosses its limit, the moment to email its owner.
+
+| `FailMode` | Redis down |
+|---|---|
+| `Closed` (default) | Every sign-in and attempt refused, `Refusal::Unavailable` (503) |
+| `Local` | Counted in this process against the same budgets; refused as usual when spent |
+| `Open` | Every sign-in and attempt allowed, uncounted; each error logged |
 
 ```rust,no_run
 # async fn demo(url: &str, ip: std::net::IpAddr, account: &str) -> anyhow::Result<()> {
@@ -1378,6 +1577,12 @@ match throttle.sign_in(ip, account).await {
     Err(Refusal::Unavailable) => { /* 503, and page whoever runs Redis */ }
     Err(_) => { /* 429 */ }
 }
+
+// An emailed sign-in link's budget: keep counting, per replica, through an outage.
+let links = SharedThrottle::connect(url, "myapp-links", Budgets::default())
+    .await?
+    .fail_mode(FailMode::Local);
+if links.attempt(ip).await.is_err() { /* 429 */ }
 # Ok(())
 # }
 ```
@@ -1471,6 +1676,10 @@ anything else.
 | `owt_accounts_local` | `account_local_identities` | `account_local_identities_pkey`, `account_local_identities_account` | | `accounts.password_sign_in`; constraint `accounts_password_sign_in_hash` on `accounts` |
 | `owt_accounts_link_next` | | | | `sign_in_links.next` |
 | `owt_accounts_mfa` | `account_totp`, `account_recovery_codes` | `account_totp_pkey`, `account_recovery_codes_pkey`, `account_recovery_codes_id_seq`, `account_recovery_codes_account` | | |
+| `owt_accounts_recovery_codes_index` | | `account_recovery_codes_account_all` | | |
+| `owt_accounts_revoked_sessions` | `revoked_sessions` | `revoked_sessions_pkey`, `revoked_sessions_expires_at` | | |
+| `owt_accounts_confirmed_emails` | | | | `sign_in_links.sent_to`, `account_identities.verified_email` |
+| `owt_accounts_passkeys` | `account_webauthn_users`, `account_passkeys`, `account_passkey_ceremonies` | `account_webauthn_users_pkey`, `account_webauthn_users_user_handle_key`, `account_passkeys_pkey`, `account_passkeys_id_seq`, `account_passkeys_credential_id_key`, `account_passkeys_account`, `account_passkey_ceremonies_pkey`, `account_passkey_ceremonies_expiry` | | |
 
 Each table is also a type of its name, and its triggers and constraints are its own.
 An app that already has any of these names (a table, view, index, sequence, type or
@@ -1755,6 +1964,20 @@ let _opened = links::redeem(&pool, &minted.token, &ip.to_string()).await; // Ref
 let minted = links::mint_with(&pool, ada.id, std::time::Duration::from_secs(900), "outage", Some("/admin/")).await?;
 let opened = links::redeem_with(&pool, &minted.token, &ip.to_string()).await?;
 let _land_on = opened.next.as_deref().unwrap_or("/"); // opened.account signs in
+// A link the app emails records the address (`mint_emailed`, normalized as
+// `accounts.email` is; `Refused::Email` when it is not one address). Redeeming it
+// proves the account holds that address: `owt_accounts::confirmed_emails` lists every
+// address proven so, with the email of each linked identity whose provider checked it
+// (Google's `email_verified`, Discord's `verified`), normalized and sorted. The
+// account's own email is not assumed: a staff change of it proves nothing until a
+// link emailed there is redeemed, and a link minted with `mint`/`mint_with` (or before
+// the address was recorded) proves no address. Compare an invitation's address with
+// it inside the transaction that accepts, the account's row held `FOR SHARE`.
+let minted = links::mint_emailed(&pool, ada.id, "ada@example.com", std::time::Duration::from_secs(1800), "emailed sign-in", Some("/invites")).await?;
+let opened = links::redeem_with(&pool, &minted.token, &ip.to_string()).await?;
+assert_eq!(opened.sent_to.as_deref(), Some("ada@example.com"));
+let proven: Vec<String> = owt_accounts::confirmed_emails(&pool, ada.id).await?;
+let _may_accept = proven.contains(&owt_accounts::normalize("Ada@Example.com"));
 # let _ = app; Ok(()) }
 ```
 
@@ -1909,10 +2132,10 @@ let app: Router = Router::new()
 #### Multi-factor sign-in and step-up
 
 `owt_accounts::mfa` adds a second factor after the password: an authenticator app (TOTP,
-`owt_auth::totp`) with single-use recovery codes behind it (`owt_auth::recovery`), a
-policy that can require it, and step-up re-authentication for sensitive actions. Like
-the sign-in functions above, they are library functions an app wires to its own routes.
-(Passkeys are not here yet.)
+`owt_auth::totp`) and passkeys (WebAuthn, [below](#passkeys)), with single-use recovery
+codes behind them (`owt_auth::recovery`), a policy that can require one, and step-up
+re-authentication for sensitive actions. Like the sign-in functions above, they are
+library functions an app wires to its own routes.
 
 `Mfa::password_sign_in` is `session::password_sign_in` plus the question *what does this
 account need next?* It answers `Next::Done` (signed in), `Next::Challenge` (it has a
@@ -1929,8 +2152,8 @@ that checks it is unused.
 `.require_mfa::<T>(mfa)` (`T` the session data type): `Accounts::load::<T>` and `load_with`
 then enforce it, with no second layer to remember (installing `load` with another data type
 logs an error and answers 503 to anyone signed in, rather than run single-factor). A
-signature for an account that has a confirmed factor, or that the policy requires to have
-one, then counts as signed in only when the session shows a second factor passed for that
+signature for an account that has a factor (a confirmed authenticator or a passkey), or that
+the policy requires to have one, then counts as signed in only when the session shows a second factor passed for that
 account and epoch (whether the account holds a factor is read in the query that loads it,
 so the gate costs no round trip); until then the request is anonymous and the session becomes the pending
 sign-in above, so a challenge or enrollment page can continue it
@@ -2012,7 +2235,21 @@ on a used recovery code, and on any event with `while_pending` set (a factor enr
 pending sign-in, on a password alone). Ten wrong authenticator codes in a row lock it for 15 minutes
 (`MfaError::Locked { until, just_locked }`, counted in the database; the answer that locked it
 has an event, `err.locked_event(account_id)`, to email the owner about); a recovery code or
-`Mfa::unlock_totp` (for staff) unlocks it at once. A `SharedThrottle`'s `on_lockout` hook gets the throttle key of a
+`Mfa::unlock_totp` (for staff) unlocks it at once. `Mfa::lockout(after, for_)` tunes both
+(a practice that wants five codes and an hour, say), but cannot turn the lockout off: `after`
+is clamped to 3..=100 (NIST SP 800-63B-4 caps consecutive failures at 100) and `for_` to
+at least a minute.
+
+```rust
+use std::time::Duration;
+use owt_accounts::mfa::Mfa;
+
+let mfa = Mfa::new("Acme Health").lockout(5, Duration::from_hours(1));
+assert_eq!(mfa.lockout_policy(), (5, Duration::from_hours(1)));
+// Zero is not "off": the floor holds.
+assert_eq!(Mfa::new("Acme").lockout(0, Duration::ZERO).lockout_policy(), (3, Duration::from_mins(1)));
+```
+ A `SharedThrottle`'s `on_lockout` hook gets the throttle key of a
 second-factor lockout; `mfa::lockout_account(&lockout.account)` is the account id to email.
 
 **The policy and the secret.** `MfaPolicy::Optional` challenges only accounts that
@@ -2119,6 +2356,36 @@ async fn break_glass(session: Session<Data>) -> Result<&'static str, &'static st
 }
 ```
 
+**Step-up for a group of routes.** `mfa::StepUpGate` is the same check as a middleware, so
+every route under it is covered, including ones added later. For every request, reads
+included, it checks who first (any signed-in account; `.staff()`; or `.role(ROLE)`; the
+sign-in wall for an anonymous visitor and a 403 for anyone else), so the gate authorizes the
+whole group. A change then needs the proof within the window (`.second_factor()` for
+`RecentMfa`'s); reads (`GET`, `HEAD`, `OPTIONS`) need it too only with `.reads()`, for pages
+whose content is itself sensitive. A redirect cannot repeat a `POST`,
+so `?next=` names the page the change came from: `HX-Current-URL` for htmx, else the
+`Referer`, each only when it is this site's (`owt_web::redirect::htmx_current_page`,
+`redirect::referer_page`), else the request's path. The person re-authenticates, lands back
+on the form and sends it again. An htmx request (not a boosted one) gets a 204 with
+`HX-Redirect` and `Cache-Control: no-store` instead of the 303, so the re-authentication
+page loads whole rather than into a fragment. Add the layer before `Accounts::load` (so it
+runs after it); an app with its own session data names it with `.with_session::<MyData>()`
+and `StepUpGate::<MyData>::guard`.
+
+```rust,no_run
+use std::time::Duration;
+use axum::{Router, middleware::from_fn_with_state, routing::{get, post}};
+use owt_accounts::mfa::StepUpGate;
+use owt_accounts::session::Data;
+
+// Everything under /staff is for staff only; every change also needs a second factor
+// used in the last 5 minutes. Add `.reads()` to ask for it on page loads too.
+let gate = StepUpGate::new(Duration::from_secs(300)).staff().second_factor();
+let staff: Router = Router::new()
+    .route("/staff/refunds", get(|| async { "refunds" }).post(|| async { "refunded" }))
+    .layer(from_fn_with_state(gate, StepUpGate::<Data>::guard));
+```
+
 #### The second-factor pages
 
 `owt_accounts::mfa::pages::MfaPages` mounts the pages the functions above need, so an app
@@ -2129,8 +2396,8 @@ see, remove or set up again the authenticator and make new recovery codes. It is
 like the accounts admin: the app supplies its layout as a `Chrome` closure (or an
 `AsyncChrome` that awaits), the bodies are `owt-*` markup from `tailwind/owt.css`, and an
 app with its own design implements `pages::Views` for the pages it draws itself (the view
-models carry each form's URL; the fields are `code`, `recovery_code`, `password` and
-`next`).
+models carry each form's URL; the fields are `code`, `recovery_code`, `password`,
+`next`, and for passkeys `name`, `passkey_token` and `passkey_credential`).
 
 | Route | Page |
 |---|---|
@@ -2138,7 +2405,10 @@ models carry each form's URL; the fields are `code`, `recovery_code`, `password`
 | `GET, POST /mfa/challenge?next=` | the code a pending sign-in (`Next::Challenge`) waits for |
 | `GET, POST /mfa/enroll?next=` | enrolling; also where `RecentMfa` sends an account with no factor |
 | `POST /mfa/remove`, `/mfa/reenroll`, `/mfa/recovery-codes` | changes, each behind step-up |
-| `GET, POST /reauth?next=` | step-up: the password (if the account has one) and a code (if it has a factor) |
+| `GET, POST /reauth?next=` | step-up: the password (if the account has one) and a code or a passkey (if it has a factor) |
+| `GET, POST /mfa/passkeys/add?next=` | names and creates a passkey, behind step-up (or for a pending enrollment) |
+| `POST /mfa/passkeys/{id}/rename`, `/mfa/passkeys/{id}/remove` | renames one; removes one, behind step-up |
+| `GET /mfa/passkey.js` | the script the passkey buttons run (same origin: `script-src 'self'` allows it) |
 
 `MfaPages::at("/account/mfa")` and `.reauth_at("/account/confirm")` move them; tell
 `Accounts::enroll_at` (`{base}/enroll`) and `Accounts::reauth_at` the same. What they hold
@@ -2208,6 +2478,186 @@ let _app: Router = Router::new()
 An app with its own session type adds `.session::<MySession>()`. Under
 `MfaPolicy::Required` the last factor cannot be removed, and so cannot be set up again
 here either: staff unlock a locked one (`Mfa::unlock_totp`).
+
+#### Passkeys
+
+A passkey (WebAuthn, through `webauthn-rs` 0.6 on RustCrypto, no OpenSSL) is a second
+factor beside the authenticator app: an account may hold the authenticator and any number
+of passkeys, any one of them answers the challenge and step-up, and a passkey satisfies
+`RecentMfa` as a code does. Passkeys are off until the app names its site:
+
+| Variable | Production | Local development |
+|---|---|---|
+| `PASSKEY_RP_ID` | `example.com` (the domain; a passkey works only for the id it was made for, so pick it once) | `localhost` |
+| `PASSKEY_ORIGIN` | `https://example.com` (several, comma-separated, each the id or a subdomain of it) | `http://localhost:3000` |
+| `PASSKEY_RP_NAME` | the name an authenticator shows (the id if unset) | |
+
+An origin is `https`, except `http://localhost` with any port, which browsers treat as
+secure; so develop on `localhost`, not `127.0.0.1` or a LAN address. A configuration whose
+origin is not the id or a subdomain of it fails at start with `RelyingPartyError`, which
+names both. A browser answering from another origin (a site reached by a name the
+variables leave out) is refused with `MfaError::PasskeyOrigin`, and the log says which
+origin. Passkeys made against `localhost` do not work in production, and the reverse.
+
+```rust,no_run
+use owt_accounts::mfa::Mfa;
+use owt_accounts::mfa::passkey::RelyingParty;
+
+# fn demo() -> anyhow::Result<()> {
+let mut mfa = Mfa::new("My App");
+// From PASSKEY_RP_ID, PASSKEY_ORIGIN and PASSKEY_RP_NAME; None (off) when the id is unset.
+if let Some(rp) = RelyingParty::from_env()? {
+    mfa = mfa.passkeys(rp);
+}
+// Or in code:
+let _local = RelyingParty::new("localhost", "http://localhost:3000")?.name("My App")?;
+# Ok(()) }
+```
+
+With the relying party set, `MfaPages` does the rest: the settings page lists the
+account's passkeys (rename, remove, add), the challenge and re-authentication pages show a
+"Use a passkey" button beside the code fields, and the enrollment page offers a passkey
+instead of an authenticator. The button runs `{base}/passkey.js` and needs JavaScript;
+without WebAuthn it stays hidden and the codes remain. An app that draws its own pages
+uses the functions:
+
+- **Register:** `Mfa::begin_passkey_registration(pool, session, account, &proof)` (the
+  `ChangeProof` of `authorize_change`, as for TOTP) returns a `Ceremony`: `options` for
+  `navigator.credentials.create()` (`options_json()`) and an opaque `token`. Post the
+  browser's answer (a `RegisterPublicKeyCredential`, as JSON) with the token and a name to
+  `Mfa::finish_passkey_registration`.
+- **Answer a challenge or step-up:** `Mfa::begin_passkey_challenge(pool, session, account)` (the
+  pending account, or the one signed in on a re-authentication page; `None` when it has no
+  passkey) and `Mfa::challenge_passkey(pool, limiter, session, ip, token, credential)`,
+  which does everything `Mfa::challenge` does. For step-up, `begin_reauth` checks the
+  password first, as it does before a code.
+- **Manage:** `Mfa::list_passkeys`, `Mfa::rename_passkey` (a label: no step-up),
+  `Mfa::remove_passkey` (behind a `ChangeProof`).
+
+What holds:
+
+- **The ceremony state stays on the server**, in `account_passkey_ceremonies`, bound to the
+  account, the purpose and the session that began it (the SHA-256 of its id); the browser
+  holds only the token. A ceremony answers once (its row is deleted as it is read), only in
+  that session, and expires after five minutes. An answer for another account's ceremony,
+  from another account's passkey, or with a token carried to another session (another
+  browser, or a session signed in since) is refused (`MfaError::PasskeyExpired`), so begin
+  and finish a ceremony with the same `Session`.
+- **Recovery codes are per account, not per factor.** The first factor (a passkey or the
+  authenticator) issues them; adding another keeps them; removing a factor keeps them while
+  another remains, and the last factor takes them with it. `Factors::count` counts the
+  authenticator and each passkey that is not disabled.
+- **Removal is TOTP's rule:** behind step-up, and never the last usable factor under a
+  required policy (`MfaError::LastFactor`); a disabled passkey is never that, so it can
+  always be removed. Every change moves the session epoch on, so the
+  account's other sessions end.
+- **A counter that does not rise past the stored one is refused**
+  (`MfaError::PasskeyCloned`), checked against the stored row when the answer arrives (not
+  when the ceremony began): the credential may exist twice. A synced passkey reports no
+  counter, so it is never refused for this. The passkey is disabled at once
+  (`account_passkeys.disabled_at`, `PasskeyInfo::disabled_at`): it is no longer offered,
+  accepted or counted as a factor (`Factors::passkeys` leaves it out,
+  `Factors::passkeys_disabled` counts it), and the settings page shows it as "Disabled:
+  suspected copy" with its Remove button. Every session of the account ends in the same
+  transaction (its session epoch moves on, as at a password change), so a session the copy
+  opened ends too; the owner signs in again with another factor or a recovery code.
+  `MfaError::event` gives the audit event,
+  `mfa.passkey.clone_suspected` (`MfaPages` records it), and the same event goes to the
+  notifier below, to tell the owner. The other events are `mfa.passkey.enrolled`,
+  `mfa.passkey.renamed`, `mfa.passkey.removed` and `mfa.challenge.passed` with
+  `Event::passkey` naming the row.
+- **A disabled passkey does not turn the second factor off.** An account whose only factor
+  was the disabled passkey is still challenged while it has recovery codes left
+  (`Factors::any`, and the layer's gate, count a disabled passkey with codes left), and
+  signs in with a recovery code, then removes the copy and adds a new factor. With no codes
+  left, what follows is the app's choice, `Mfa::after_suspected_copy` (below).
+- **Passkey failures do not count toward `Mfa::lockout`.** That lockout protects six-digit
+  codes, which can be guessed; a passkey answer is a signature over a fresh challenge, which
+  cannot. Every passkey answer is still charged to the throttle (`Key::SecondFactor`) as a
+  code is, and a suspected copy disables the passkey instead of locking the account.
+- **Passkeys are counted whether or not they are on**, so turning `PASSKEY_RP_ID` off never
+  lets a password alone through for an account that has one: it signs in with its
+  authenticator or a recovery code until passkeys are on again.
+
+The owner hears of a suspected copy through the notifier the app gives `Mfa`, wired to its
+mailer (`owt-mail`, say). It is handed each event that warrants telling the owner, whichever
+page or handler caused it, after the change is committed; a failure is logged at `error`
+and changes nothing. Without one, the event is logged at `warn` and still returned.
+
+```rust
+use std::future::Future;
+use std::pin::Pin;
+use owt_accounts::mfa::{Event, Mfa, Notifier};
+
+struct EmailOwner; // holds the app's mailer and pool
+
+impl Notifier for EmailOwner {
+    fn notify<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // Look up `event.account`'s email; send "a passkey on your account was
+            // disabled" when `event.name()` is "mfa.passkey.clone_suspected", and how to
+            // recover the account when it is "mfa.account.recovery_locked".
+            let _ = (event.account, event.name(), event.passkey);
+            Ok(())
+        })
+    }
+}
+
+let mfa = Mfa::new("My App").on_security_event(EmailOwner);
+# let _ = mfa;
+```
+
+When a suspected copy leaves an account with no usable factor and no recovery code, the
+app chooses what follows with `Mfa::after_suspected_copy`:
+
+- **`AfterSuspectedCopy::LockUntilRecovery`, the default.** The disable records the lock on
+  the account (`accounts.mfa_recovery_locked_at`, in migration 0011) in the same
+  transaction as the disable and the epoch bump, so it survives restarts. Every sign-in is
+  refused, by any door: `Mfa::password_sign_in` answers `Next::Locked` (send it to
+  `{base}/challenge` as a challenge), and the layer holds a link, a provider or a password
+  gate the same way, even without `require_mfa`. `MfaPages`' challenge route shows a page
+  that says the account is locked pending recovery (`Views::locked`, `LockedView`: tell the
+  person how the app recovers accounts). The notifier hears `mfa.account.recovery_locked`
+  after `mfa.passkey.clone_suspected`; `Factors::recovery_locked` reads the state.
+- **`AfterSuspectedCopy::AllowReenrolment`.** The account signs in on what remains: a
+  password alone under an optional policy, a forced enrollment under a required one.
+
+Whoever holds the copy may hold the password too, so the lock is the safer default. While
+another factor or a recovery code remains, neither choice changes anything: the account is
+challenged. A lock already recorded stands if the app later allows re-enrolment.
+
+The app's recovery is its own: staff, or a flow that proves the owner by the app's own
+means (identity documents, a call back to a number on file). Once it has, it calls
+`Mfa::clear_recovery_lock(pool, account, actor)`, where `actor` is the member of staff or
+the account itself. It returns the `mfa.account.recovery_lock_cleared` event for the audit
+log (`None` if the account was not locked), tells the notifier, and the account then signs
+in as one without a factor does, adding a new passkey or authenticator. Whoever holds the
+copy may hold the password too, and the first sign-in after the lock clears is the one that
+enrolls a factor: replace the password first (`store::set_password`, with one the owner
+chose through the recovery), or turn password sign-in off and let the owner in by a link
+or a provider the recovery proved.
+
+```rust
+use owt_accounts::mfa::{AfterSuspectedCopy, Mfa};
+
+// The default: locked until recovery.
+let strict = Mfa::new("My App");
+// Opting in to re-enrolment instead.
+let lenient = Mfa::new("My App").after_suspected_copy(AfterSuspectedCopy::AllowReenrolment);
+# let _ = (strict, lenient);
+
+async fn recover(mfa: &Mfa, pool: &sqlx::PgPool, account: i64, staff: i64) -> anyhow::Result<()> {
+    if let Some(event) = mfa.clear_recovery_lock(pool, account, staff).await? {
+        // Record `event.name()` in the app's audit log.
+        let _ = event;
+    }
+    Ok(())
+}
+# let _ = recover;
+```
 
 #### Roles
 
@@ -3272,7 +3722,7 @@ refuses an authentication key that holds `export-wrapped`, `import-wrapped`,
 `put-wrap-key`, `generate-wrap-key` or `delete-wrap-key`. An unwrap is `Refused` only
 when the device reports the message as invalid or unauthentic; connection, session
 and every other device error are `Unavailable`. These checks are unit-tested against
-`MockHsm` and a fake device; `tests/yubihsm.rs` runs them against real hardware when
+`MockHsm` and a fake device; `tests/it/yubihsm.rs` runs them against real hardware when
 `OWT_YUBIHSM_CONNECTOR` is set:
 
 ```rust,no_run
@@ -3427,6 +3877,93 @@ let url = storage.presign_get("public/logo.png", Duration::from_mins(10)).await?
 - `Storage::from_store` takes any `object_store` store: `InMemory` in tests, a
   directory in development (neither presigns).
 
+### Outgoing email
+
+`owt-mail` sends an app's email (sign-in links, invitations, notices) through one
+handle, `Mail`, kept in the app's state. The transport comes from the environment:
+
+| Variables | Transport |
+|---|---|
+| `MAIL_URL=smtps://user:pass@host:465` (TLS) or `smtp://user:pass@host:587` (STARTTLS, required), and `MAIL_FROM` | any provider's SMTP relay, through lettre |
+| `RESEND_API_KEY` and `MAIL_FROM` | Resend's HTTP API |
+| `SES_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `MAIL_FROM` (`AWS_SESSION_TOKEN`, `SES_ENDPOINT` optional) | SES's v2 `SendEmail`, signed with SigV4 |
+| `MAIL_URL=memory:` | the outbox: kept in memory, delivered to nobody |
+| none of them | what the app passes: `Unconfigured::Off` (nothing is sent; `send` answers `Delivery::NotConfigured`) or `Unconfigured::Outbox` (the outbox, logging each text so a workstation reads its links from the log) |
+
+SMTP credentials never travel in plaintext. `smtps://` is TLS from the first byte;
+`smtp://` is STARTTLS, required (lettre itself reads a bare `smtp://` as plaintext,
+so owt-mail adds `?tls=required`), and a relay that doesn't offer STARTTLS fails the
+delivery. A local mail catcher (Mailpit and the like) takes `smtp://host:1025?tls=none`,
+with no credentials or credentials towards `localhost`, `127.0.0.1` or `::1` only.
+`tls=opportunistic`, which falls back to plaintext, and any other `tls` value fail
+start-up; `Smtp::tls` answers which `SmtpTls` mode a transport uses.
+
+Two transports configured at once fail start-up, as do a `MAIL_FROM` that is not an
+address and a `MAIL_URL` lettre can't read (the error never quotes the URL, which
+carries the relay's password). Each delivery, over SMTP or HTTP, is bounded by
+`DEFAULT_TIMEOUT` (10 s).
+Every recipient is parsed as one mailbox and a subject may not hold a line break, so
+no caller's input becomes a header. An `Email`'s `Debug` shows its subject only.
+
+```rust,no_run
+use owt_mail::{Delivery, Email, Mail, MailAllow, Unconfigured};
+
+# async fn demo(link: &str) -> anyhow::Result<()> {
+let mut mail = Mail::from_env(Unconfigured::Off)?;
+// A demo deployment mails only its testers.
+if let Some(list) = owt_runtime::env::var("MYAPP_MAIL_ALLOW") {
+    mail = mail.allow_only(MailAllow::parse(&list)?);
+}
+// A deployment that sends sign-in links refuses to start without delivery.
+anyhow::ensure!(mail.delivers() || !owt_runtime::env::flag("MYAPP_REQUIRE_MAIL", false)?, "set MAIL_URL, RESEND_API_KEY or SES_REGION");
+
+let email = Email::new("Ana <ana@example.com>", "Your sign-in link", format!("Sign in: {link}"))
+    .with_html(format!("<p><a href=\"{link}\">Sign in</a></p>"));
+if mail.send(&email).await? == Delivery::NotConfigured {
+    tracing::warn!("no email sent: mail isn't configured");
+}
+# Ok(()) }
+```
+
+`send` fails with `Error::Address` or `Error::Header` for input it refuses,
+`Error::Refused` for an address off the allowlist, `Error::Rejected` when the
+provider answered no (its own words, clipped to 300 characters, never the key), and
+`Error::Unreachable` when it could not be reached in time. A transport of the app's
+own implements `Mailer`; `Mail::new` takes it.
+
+In tests, `Mail::outbox()` returns the handle and its `Outbox`, and `first_link`
+pulls the link out of a message's text; `Mail::new(Failing)` is a provider that
+refuses everything:
+
+```rust
+use owt_mail::{Delivery, Email, Mail, first_link};
+
+# #[tokio::main(flavor = "current_thread")] async fn main() {
+let (mail, outbox) = Mail::outbox();
+let sent = mail.send(&Email::new("ana@example.com", "Sign in", "Go to https://myapp.example/l/abc")).await.unwrap();
+assert_eq!(sent, Delivery::Kept);
+let last = outbox.last_to("ana@example.com").unwrap();
+assert_eq!(first_link(&last.text), Some("https://myapp.example/l/abc"));
+# }
+```
+
+**Adopting it in an app with a mailer of its own.** Add the dependency, then:
+
+1. Replace the app's mail configuration with `Mail::from_env(...)` at start-up
+   (`Unconfigured::Off` where the app reports "mail isn't configured",
+   `Unconfigured::Outbox` where it printed links offline). The variable names are
+   the ones above; an app whose names differ renames them in its deployment's
+   Secret, or builds `Smtp`, `Resend` or `Ses` itself and passes it to `Mail::new`.
+2. Swap its message type for `Email` (`text`, and `html` where it sent both) and its
+   `Mailer` trait or `send(to, subject, body)` for `Mail::send`. Code that checked
+   `Ok(false)` matches `Delivery::NotConfigured`; code that asked for the outbox
+   calls `Mail::outbox_ref` or `Mail::sent`, and "does mail reach anyone"
+   becomes `Mail::delivers`.
+3. A demo allowlist moves to `MailAllow` and `Mail::allow_only`; the app keeps its
+   own refusal text and maps `Error::Refused` to it.
+4. Tests take `Mail::outbox()` (or `MAIL_URL=memory:`) and `first_link`; a test of a
+   provider's refusal takes `Failing`. Delete the app's mail module.
+
 ### Audit log
 
 `owt-audit` records who did what to which record, why, and how it went, in an
@@ -3469,12 +4006,20 @@ let signed = Event::new(ActorKind::Account, "17", "note.sign", "note")
 owt_audit::record_in(&mut tx, &signed).await?;
 tx.commit().await?;
 
-// Refusals are events too.
+// A refused request: undo its work, then record the refusal on its own connection.
+let mut tx = pool.begin().await?;
+// ... the request's reads and writes in `tx`, then the access check refuses ...
 let denied = Event::new(ActorKind::Account, "23", "record.view", "chart")
     .tenant("practice-3")
     .subject("patient:4821")
     .outcome(Outcome::Denied);
-audit.record(&denied).await?;
+owt_audit::record_refusal(&mut tx, &denied).await?;
+drop(tx); // a fresh, empty transaction: nothing to roll back
+
+// A failure outside any request (a job): a transaction of its own.
+let failed = Event::new(ActorKind::System, "system", "key.rotate", "kek")
+    .outcome(Outcome::Failure);
+audit.record(&failed).await?;
 # Ok(()) }
 ```
 
@@ -3500,10 +4045,39 @@ event).
   waits for your transaction's lock while your task waits for `record`. Postgres
   cannot see that wait, so it lasts until a statement timeout ends it, or forever
   without one.
-- Record refusals and failures (`Outcome::Denied`, a failed attempt) with
-  `audit.record`, in a transaction of their own, as in the example above. An event
-  recorded with `record_in` rolls back with its transaction, and the transaction of
-  a refused or failed request is usually the one that rolls back.
+- Record a refused request (`Outcome::Denied`) with `owt_audit::record_refusal`
+  on the request's own transaction, as in the example above. An event recorded with
+  `record_in` rolls back with its transaction, and a refused request's transaction
+  rolls back. `record_refusal` rolls the request's work back whole (`ROLLBACK AND
+  CHAIN`), appends the event and commits it (`COMMIT AND CHAIN`) on the same
+  connection, and leaves `tx` a fresh, empty transaction. So it takes no second
+  connection (a burst of refused requests holds no more than the requests do), and
+  it never waits on the request's own chain lock, which the rollback releases. The
+  rollback also discards `SET LOCAL` settings: when the app's role or row-level
+  security needs them for the insert, use `record_refusal_with`, whose closure sets
+  them, calls `record_in` and writes any rows of the app's own that belong with the
+  event, all on the request's connection:
+
+  ```rust,no_run
+  # async fn demo(
+  #     mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+  #     denied: owt_audit::Event,
+  # ) -> Result<(), owt_audit::RecordError> {
+  use sqlx::Executor;
+  owt_audit::record_refusal_with(&mut tx, async |conn: &mut sqlx::PgConnection| {
+      conn.execute("SET LOCAL ROLE myapp_app").await?;
+      owt_audit::record_in(&mut *conn, &denied).await?;
+      Ok::<_, owt_audit::RecordError>(())
+  })
+  .await?;
+  # Ok(()) }
+  ```
+
+  If the refusal cannot be recorded, it returns the error with nothing recorded and
+  `tx` again a fresh transaction; the request is still refused, and the app decides
+  how that failure shows (an error log, a metric, a 5xx).
+- Record failures outside a request (a job, a failure with no request transaction)
+  with `audit.record`, in a transaction of their own.
 
 **Roles.** Run the migrations as the role that owns the schema. Give the app's role
 `INSERT` and `SELECT` on the events and `SELECT` on the anchors; it then cannot drop
@@ -3943,6 +4517,15 @@ run, and graceful shutdown:
   lease renewed while held; on shutdown it is released, so another replica takes over
   at once.
 
+A job registered at run time (a singleton per live channel or tenant) goes on a
+`jobs.child()`: cancelling the child's `shutdown()` token stops its loops and nothing
+else, the parent's shutdown stops it too, and the parent's `stopped()` waits for it.
+Keep the child beside what it serves, and give the family one `&'static str` name, not
+one leaked name per instance: the name is the metrics' `job` label, so a per-instance
+name grows the label set without bound. A run that lasts longer than a tick belongs on
+`singleton_with`, so it never holds a slot of the app's pool; a long task that should
+stop at removal, not at its end, watches the child's `shutdown()` itself.
+
 Choosing: `singleton` for periodic work that one replica at a time does and that
 needs only Postgres; `leased` when the work wants a sticky owner and a fast handover
 at shutdown, or the app sits behind a transaction-mode pooler; the durable queue
@@ -3970,6 +4553,15 @@ jobs.singleton("bots", Every::new(Duration::from_secs(30)), pool.clone(), 7_210_
 // A long singleton on a connection of its own, outside the app's pool.
 let opts = pool.connect_options().as_ref().clone();
 jobs.singleton_with("rebuild", Every::new(Duration::from_hours(1)), opts, 7_210_003, || async { Ok(()) });
+
+// A singleton per live channel, removed when the channel ends: its own child of `jobs`.
+// One static name for the family (the metrics' `job` label); the lock id tells them apart.
+let channel_id: i64 = 42;
+let channel = jobs.child();
+channel.singleton_with("channel_run", Every::new(Duration::from_secs(5)), pool.connect_options().as_ref().clone(), 7_220_000 + channel_id, || async { Ok(()) });
+// ...when the channel ends: its loop stops (a run in progress finishes); the rest go on.
+channel.shutdown().cancel();
+channel.stopped().await;
 
 // One replica owns the clock; the TTL outlasts the period so ownership sticks.
 let leases = Leases::new(redis, Leases::new_holder_id(), "myapp")?;
@@ -4317,6 +4909,16 @@ the element wins.
 }
 ```
 
+**Buttons** come in four weights. `owt-button` is the primary (accent fill);
+`owt-button owt-button-secondary` is outlined; `owt-button owt-button-danger` is a
+filled red for the one destructive action a form exists for; and
+`owt-button owt-button-quiet` is a low-emphasis, underlined button in the ink colour
+for harmless actions (Pin, Hide, Cancel, Sign out). A quiet button that destroys
+something adds `owt-button-quiet-danger`, which turns it red, so red always means
+danger: `<button class="owt-button owt-button-quiet owt-button-quiet-danger">Remove</button>`.
+Every weight shows a 2 px ink outline, offset 2 px, on keyboard focus
+(`:focus-visible`); a mouse click draws none.
+
 Two forms on one page with a field of the same name give each its own `id`
 (`Field::text("email", "Email").id("invite-email")`), so labels and
 `aria-describedby` stay attached to the right input. Page links drop `?page=1`, so
@@ -4520,11 +5122,38 @@ opt-level = 3
 ```
 
 It changes nothing about the lockfile, `cargo audit` or sccache (the optimised
-artifacts are cached under their own key).
+artifacts are cached under their own key). Put `opt-level` on these packages only, never
+under `[profile.test]`: that optimises the app crate and every test binary too, so each
+edit recompiles slower.
+
+**Test layout and debug info:** every file in `tests/` is its own binary, and each one
+links the whole app crate, sqlx, the TLS stack and owt-stack. Twenty such files make
+twenty large executables, which is what fills a CI runner's disk: ARC runners have a
+10 GiB work volume, and one app's test executables went from 4.8 GiB to 0.9 GiB by
+merging them into one and trimming debug info. An app has one integration-test binary,
+`tests/it/main.rs`, with a `mod` per area (`tests/it/accounts.rs`, ...) and shared helpers
+in `tests/it/support.rs`; `cargo test --test it accounts::` runs one area. And the dev
+profile (which `cargo test` inherits) keeps line tables only, enough for a backtrace's
+file and line, not a debugger's variables. A test that needs process state of its own
+stays a file of its own: a setting that takes only once per process (owt-stack's
+`password::set_concurrency` tests), or a thread-scoped tracing subscriber that a
+concurrent test could race to a callsite (owt-web's `client_ip_log.rs`); its header
+says why.
+
+```toml
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = "line-tables-only"
+```
+
+This repository does the same in its root `Cargo.toml`, and each crate has one
+`tests/it` binary beside those exceptions.
 
 **CI:** call the reusable check workflow with the app's gate. It runs on ARC, with
 Postgres and Redis as services, installs `just` and `cargo-audit` (and `sqlx-cli`
-for an app with a `.sqlx/` or `migrations/`), migrates, then runs `check-command`.
+for an app with a `.sqlx/`, or with `migrations/` and no `migrate-command`: an app that
+migrates through its binary never needs it), migrates, then runs `check-command`.
 Without `check-command`, it runs its own fmt, audit, sqlx, clippy and test steps. The
 tools are pinned (`templates/justfile`'s `setup` installs the same versions), and
 `sqlx-cli`, which has no prebuilt binary, is built once per job image and kept in the
@@ -4581,7 +5210,7 @@ and `rustc-wrapper = "sccache"` under `[build]` in `~/.cargo/config.toml`.
 ```yaml
 jobs:
   checks:
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.12.2
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.6
     with:
       check-command: just check
       database: myapp        # empty for no Postgres
@@ -4653,7 +5282,7 @@ built.
 # .github/workflows/release.yml
 on:
   push: {branches: [main, rc]}
-  workflow_dispatch:          # promote-rc.yml starts rc releases this way
+  workflow_dispatch:          # promote-rc.yml and release.yml start rc releases this way
 # One run at a time per branch, none cancelled. The release job serialises itself;
 # this keeps a second push's ci and image jobs from running beside the first's release.
 concurrency: {group: "release-${{ github.ref_name }}", cancel-in-progress: false}
@@ -4663,13 +5292,13 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    permissions: {contents: write, issues: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # v0.12.2
+    permissions: {contents: write, issues: write, pull-requests: write, actions: write}
+    uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # v0.14.6
   image:
     needs: release
     if: needs.release.outputs.version != ''
     permissions: {contents: read, packages: write, id-token: write}
-    uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.12.2
+    uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.14.6
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
@@ -4707,12 +5336,12 @@ jobs:
   on:
     workflow_dispatch:
       inputs:
-        version: {description: "The released version (0.12.2, v0.2.0-rc.1)", required: true}
+        version: {description: "The released version (0.14.6, v0.2.0-rc.1)", required: true}
         floating-tags: {description: "Also move the channel's floating tags", type: boolean, default: false}
   jobs:
     image:
       permissions: {contents: read, packages: write, id-token: write}
-      uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.12.2
+      uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.14.6
       with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   ```
@@ -4726,18 +5355,21 @@ jobs:
   can pull `rc`'s tree toward `main` where an in-flight feature edits the same lines,
   and an app whose release commits `chore(release)` files back to `main` has a
   changed tree at every sync. Such a release run publishes nothing (no releasable
-  commit, no image) and costs one run. A release run on `rc` that failed and is
-  re-run after `rc` moved publishes nothing either, since semantic-release will not
-  release from a commit behind its branch. The next release run releases everything
-  since the last tag, the failed run's commits included, but a history-only sync
-  starts none, so those commits wait for the next promotion or tree-changing sync.
-  An app that passed `dispatch-release: false` to `sync-rc` drops it to get the
-  rule. A PR's checks run on the PR alone, so two
-  PRs in flight can each pass and break `rc` together: two migrations taking one
-  number merge without a conflict. Checking the merge first closes that. The merge
-  goes to `rc-candidate`, the app's checks run on it, and `rc` fast-forwards to it
-  only if they pass and `rc` hasn't moved since. `rust-ci.yml` also fails on two
-  migrations with one version.
+  commit, no image) and costs one run. Every sync, even one that finds `rc` already
+  holding `main`, also releases `rc` when its tree differs from the newest `rc`
+  prerelease tag it contains: `rc` left unreleased by a release run that failed is
+  released by the next stable release's sync. A release run that is behind its
+  branch when it runs (re-run after the branch moved, or queued while it moved)
+  can't release, since semantic-release will not release from a commit behind its
+  branch; on `rc` it dispatches the release workflow again so a fresh run releases
+  the head (which is why `release` grants `actions: write`), and on `main` it says
+  so in a notice, since the push that moved `main` started its own run. An app that
+  passed `dispatch-release: false` to `sync-rc` drops it to get the rule. A PR's
+  checks run on the PR alone, so two PRs in flight can each pass and break `rc`
+  together: two migrations taking one number merge without a conflict. Checking the
+  merge first closes that. The merge goes to `rc-candidate`, the app's checks run on
+  it, and `rc` fast-forwards to it only if they pass and `rc` hasn't moved since.
+  `rust-ci.yml` also fails on two migrations with one version.
 - **The candidate check is skipped when it would repeat the PR's.** When `rc` holds
   nothing beyond `main` (no other PR in flight, `main` unmoved), the candidate merge
   has the same tree as the PR's merge commit, which `ci` checked earlier in the same
@@ -4749,12 +5381,13 @@ jobs:
   required check on the skipped names counts as passing. A different tree, a failed
   lookup or a re-run attempt runs the checks. `check-rc` must pass the same inputs as
   `ci` (only `ref` may differ), or nothing matches. It
-  needs `candidate` to need `ci` in one workflow, as above; an app that checks the
-  candidate in a workflow of its own gets no skip. Nothing to adopt beyond the pin;
+  needs the promotion to need `ci` in one workflow run, as below (a reusable workflow
+  the run calls is the same run); an app that checks the candidate in a workflow run of
+  its own gets no skip. Nothing to adopt beyond the pin;
   `reuse-passed: false` on the call turns it off.
 - **A promotion can be lost** in the candidate flow, two ways. GitHub keeps one
-  *pending* run per concurrency group, so a third PR updated while one promotion runs
-  and another waits cancels the waiting one, not queues it. And `publish-rc.yml`
+  *pending* run or job per concurrency group, so a third PR updated while one promotion
+  runs and another waits cancels the waiting one, not queues it. And `publish-rc.yml`
   refuses a candidate when `rc` moved while it was checked (a `sync-rc`, say): that
   run fails at "Move rc to the candidate" rather than publish a merge nobody checked.
   Either way the PR is left out of `rc` until it is pushed again, unless
@@ -4764,7 +5397,8 @@ jobs:
   one at a time and only while no run is waiting (a re-run is itself a new arrival in
   the group; a waiting run a bot started is the exception). A run that succeeded
   without running "Merge into rc" (an `edited` or `labeled` trigger whose candidate
-  job was skipped) doesn't count, so it
+  job was skipped, or a PR that merged or closed, or whose branch was deleted, while its
+  checks ran: promote-rc.yml skips the merge with a notice and posts no comment) doesn't count, so it
   can't hide a lost promotion of the same head. A cancelled run always counts, since
   one cancelled before its candidate job ran can't be told from one that would have
   skipped it: a non-promoting one is re-run, succeeds having merged nothing, and the
@@ -4782,9 +5416,18 @@ jobs:
   again), is logged and passes, whatever the refusal's wording; a run deleted in
   between is skipped. Any other refusal of a run (one over a
   month old, say) is a warning, and the next PR is tried; a refusal for want of
-  `actions: write` fails the job once every PR is walked. It sees waiting *runs*, not
-  waiting jobs, so put the `promote-rc` concurrency group on the workflow, as below:
-  on a job, a re-run can cancel that job while it waits (a later requeue picks it up).
+  `actions: write` fails the job once every PR is walked.
+
+  Put the `promote-rc` concurrency group on one job, `rc` below, that calls a
+  workflow of the app's own holding the candidate, its check and the publish, and pass
+  that job's id as `requeue-rc.yml`'s `job`. Not on the workflow: there a waiting
+  run is cancelled whole, so a burst of PRs on busy runners cancels other PRs' `ci`
+  and `commits` and leaves them with no checks until a re-run. On the job, only the
+  promotion is cancelled; `requeue-rc.yml` then also treats a run in progress whose
+  `rc` job (or a job it calls, "rc / ...") is held or queued as waiting, and a failed
+  run whose `rc` job was cancelled as lost, so a promotion cancelled beside an
+  unrelated failing check (an image check, say) is still re-run. The cost is a
+  second workflow file, and that a re-run repeats the run's checks, as before.
 
   **Dependabot on the rc channel.** A Dependabot pull request is promoted like any
   other, and `rc` is where a bump is tried: merged into `rc`, released as a
@@ -4801,7 +5444,7 @@ jobs:
   checks without its secrets, and the PR waits for a person.
 
   Dependabot opens its pull requests in bursts, and the group admits one promotion
-  with one waiting, so a burst cancels waiting runs. A person's pull request is not
+  with one waiting, so a burst cancels waiting promotions. A person's pull request is not
   left behind it: `requeue-rc.yml` re-runs every person's lost promotion before any
   bot's, and a person's re-run may cancel a run *pending* in the group that a bot
   started (that PR is requeued after every person's); a bot's re-run cancels nothing.
@@ -4816,39 +5459,53 @@ on:
     # The defaults plus ready_for_review: a draft marked ready is promoted then, not
     # at its next push. Not `edited` (see "A promotion can be lost" above).
     types: [opened, synchronize, reopened, ready_for_review]
-concurrency: {group: promote-rc, cancel-in-progress: false}
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml   # the app's own
     secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
     permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
-    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.12.2, and "commits / commits"
+    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.6, and "commits / commits"
     # with: {title: false}   # an app that checks titles another way: only "commits / commits" runs (the skipped
     # "commits / title" counts as passing for a required check)
-  candidate:
+  rc:   # one promotion at a time; only this job waits in the group, never the checks
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    concurrency: {group: promote-rc, cancel-in-progress: false}
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.12.2
-    with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}", candidate: true}
+    uses: ./.github/workflows/rc.yml
+    with: {source: "${{ github.event.pull_request.head.ref }}", pr: "${{ github.event.pull_request.number }}"}
+    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
+  requeue:
+    needs: rc
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    permissions: {actions: write, contents: read, pull-requests: read}
+    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # v0.14.6
+    with: {workflow: pr.yml, job: rc}  # this file, and the job holding the group
+# rc.yml
+on:
+  workflow_call:
+    inputs:
+      source: {type: string, required: true}
+      pr: {type: string, required: true}
+    secrets:
+      SCCACHE_REDIS_PASSWORD: {required: false}
+jobs:
+  candidate:
+    permissions: {contents: write, actions: write, pull-requests: write}
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.14.6
+    with: {source: "${{ inputs.source }}", pr: "${{ inputs.pr }}", candidate: true}
   check-rc:
     needs: candidate
     if: needs.candidate.outputs.changed == 'true'
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.12.2
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.6
     with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   promote:
     needs: [candidate, check-rc]
     permissions: {contents: write, actions: write}
-    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.12.2
+    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.14.6
     with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
-  requeue:
-    needs: promote
-    if: always() && github.event.pull_request.head.repo.full_name == github.repository
-    permissions: {actions: write, contents: read, pull-requests: read}
-    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # v0.12.2
-    with: {workflow: pr.yml}  # this file
 # in requeue-rc.yml, on {schedule: [{cron: "*/30 * * * *"}], workflow_dispatch: {}}:
 # the requeue job above, without its needs and if
 # in release.yml
@@ -4856,7 +5513,7 @@ jobs:
     needs: release
     if: github.ref_name == 'main'
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.12.2
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.14.6
     with: {source: main}
 ```
 <!-- x-release-please-end -->
@@ -4894,7 +5551,7 @@ the template's:
 | `node-version` / `node-version-file` | `22` / none | the assets stage's `hi/nodejs` |
 | `files` | `static` | `COPY` into the work directory |
 | `files-owner` | `65532:0` | `--chown` |
-| `base-image` | `registry.access.redhat.com/hi/core-runtime:2` | the runtime `FROM` (a digest is used as given) |
+| `base-image` | `registry.access.redhat.com/hi/core-runtime:2` | the runtime `FROM` (a digest is used as given, also as `name:tag@sha256:…`) |
 | `base-requires` | `/usr/bin/sh /usr/bin/env /usr/bin/timeout` | `RUN timeout 5 env` |
 | `workdir` / `user` | `/app` / `65532` | `WORKDIR` / `USER` |
 | `workdir-owner` | `65532:65532` | `WORKDIR` made as core-runtime's user |
@@ -4946,7 +5603,7 @@ the template's:
   tag instead uses `@refs/tags/vX.Y.Z`. Never match a pattern that ends at `@`: it
   also verifies an image signed by a workflow run from an unreviewed branch.
 - **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
-  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact and attaches
+  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact (kept 7 days) and attaches
   it to the image as a signed attestation (`cosign verify-attestation --type
   spdxjson ...`, with the same identity flags).
 
@@ -4961,7 +5618,9 @@ the SBOM, not the scan.
 without a bot bumping pins. Two builds of one commit can therefore differ. What a
 given image was built from is still on record: the signature binds its digest, and
 the SBOM attestation lists the base's packages and versions. An app that needs a
-rebuild to be byte-reproducible passes `base-image` as a digest (used as given).
+rebuild to be byte-reproducible passes `base-image` as a digest (used as given). An
+app deployed with GitOps pins it as `name:tag@sha256:…` and lets Renovate move the
+digest ("Deploying with GitOps": "Base images").
 
 The two builders make equivalent images, not byte-identical ones. The binary differs in
 bytes and in size, by a few percent: the crane builder compiles it in Debian's Rust
@@ -5022,7 +5681,8 @@ cluster already pulls the app's images, and two things show the whole image:
 - Its files: the build job's `image-layer` artifact is the exact layer pushed
   (`gh run download <run-id> --repo <the app's repository> -n image-layer && tar -tvf
   layer.tar` lists paths, owners and modes, with `actions: read` there). It is kept
-  for a day.
+  for a day, or until `actions-cleanup.yml` deletes it ("Actions storage"): download it
+  from a failed run, or before the app's housekeeping runs.
 
 The binary is built in Debian's Rust image, not Hummingbird's (which has no `tar`
 for the setup actions), so the verify job checks the newest `GLIBC_` version the
@@ -5092,7 +5752,7 @@ jobs:
     # A fork's pull request is not built here (image-check.yml refuses it too).
     if: github.event.pull_request.head.repo.full_name == github.repository
     permissions: {contents: read}
-    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.12.2
+    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.14.6
     with: {bin: myapp}   # as the release's image job
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
@@ -5109,7 +5769,98 @@ theirs under tag refs, so none is read (a cold BuildKit build of a Rust app take
 ten minutes or more). Keep the `paths:` list to the files the image reads, and leave
 the check out of an app whose Dockerfile rarely changes.
 
-**OpenShift:** the app keeps its copies of the templates in `deploy/openshift/`, with
+**Actions storage.** An account's Actions storage is its artifacts, billed by the hour
+(GB-hours) against the plan's allowance; the Actions cache is a separate 10 GB per
+repository, billed only when a repository's cache limit is raised past it. The large
+artifact is `image-layer`: the crane build's job hands its layer (15 to 45 MB) to the
+jobs after it, and the jobs stay apart so the one running the app's code never holds a
+write token. It is kept a day; `actions-cleanup.yml` deletes it as soon as its run has
+succeeded (a failed run keeps it, for "Re-run failed jobs"). The SBOM artifact is kept
+a week (the image's attestation is the SBOM of record), and the docker builder uploads
+no build record. `ghcr-prune.yml` keeps the package itself in bounds. One caller does
+both, `.github/workflows/housekeeping.yml`, with the release and image-check workflows'
+`name:`s:
+
+<!-- x-release-please-start-version -->
+```yaml
+name: Housekeeping
+on:
+  workflow_run:
+    workflows: [Release, Image check]
+    types: [completed]
+  schedule:
+    - cron: "41 */6 * * *"   # the artifact sweep
+    - cron: "17 5 * * 1"     # the ghcr prune, weekly
+  pull_request:
+    paths: [.github/workflows/housekeeping.yml]   # a dry run of the prune
+  workflow_dispatch:
+    inputs:
+      delete: {type: boolean, default: false, description: Delete the listed versions}
+permissions: {}
+jobs:
+  artifacts:
+    if: github.event_name == 'workflow_run' || github.event.schedule == '41 */6 * * *'
+    permissions: {actions: write}
+    uses: onewaytek/owt-stack/.github/workflows/actions-cleanup.yml@<commit>  # v0.14.6
+    with:
+      run-id: ${{ github.event.workflow_run.id || '' }}
+  ghcr:   # a dry run: read-only, and the only one a pull request or the schedule runs
+    if: >-
+      (github.event_name == 'workflow_dispatch' && !inputs.delete)
+      || github.event.schedule == '17 5 * * 1'
+      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    permissions: {contents: read, packages: read}
+    uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.6
+    secrets:
+      DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
+      DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
+  ghcr-delete:   # the only job holding packages: write
+    if: github.event_name == 'workflow_dispatch' && inputs.delete
+    permissions: {contents: read, packages: write}
+    uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.6
+    with:
+      delete: true
+    secrets:
+      DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
+      DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
+```
+<!-- x-release-please-end -->
+
+Two guards keep a bad run harmless. The artifact cleanup treats a 404 on a delete as
+success (the sweep and a `workflow_run` cleanup can reach the same artifact, and the
+second finds it gone), any other error fails the job, and its jobs queue per repository
+and run id without cancelling one another. The prune refuses to delete when the
+deployments checkout yields no pins (no digest and no `version:` tag): with
+`delete: true` it fails with "pins read: 0 digests", and a dry run warns and proceeds.
+It also reads the `version:` of each `apps/*/*/image.yaml`, so an rc a pin names by
+tag, not digest, keeps the version carrying that tag. Digests and `version:` tags in
+the diffs of the deployments repository's open pull requests (pins in flight, rollback
+targets) are pins too, so the deployments app needs `pull requests: read` beside
+`contents: read`; a deletion run that cannot list them fails. A manifest it cannot read
+fails closed: a deletion run stops before deleting anything, a dry run keeps the
+version. Each version's tags are read again just before its deletion, and a version
+that has since gained a kept tag is skipped. Only the `ghcr-delete` job holds
+`packages: write`; the pull request and the schedule run read-only.
+
+The prune deletes untagged versions and versions tagged only `scan-<run>` older than a
+day, rc versions but the newest 10 of each variant (`keep-rc`), and cosign signature
+versions whose image is gone. It never deletes a version with any other tag (a
+release, `latest`, `rc`, `X.Y`, a test tag), a digest named anywhere in the
+deployments repository's default branch (read with a contents-read token from
+`DEPLOY_APP_CLIENT_ID`), or what a kept version needs: an index's children, its signature
+and attestation, a manifest whose `subject` it is. It lists what it would delete in the
+job summary and deletes only with `delete: true`: leave the schedule a dry run until a
+listing has been read, then run it from `workflow_dispatch` with `delete` ticked (or set
+`delete: true` for the schedule). It needs `packages: write`, and the package's
+"Manage Actions access" giving the repository Admin, which ghcr gives the repository
+that first pushed it. Neither reusable workflow names permissions of its own: each
+takes the caller's grant, so a Dependabot pull request that edits the caller still
+starts. The jobs run on `RUNS_ON` (the ARC scale set by default), so they bill no
+GitHub-hosted minutes.
+
+**OpenShift:** the templates are deprecated: a new deploy uses `charts/owt-app` through
+Argo CD ("Deploying with GitOps"), and an existing one moves to it. Until it does,
+the app keeps its copies of the templates in `deploy/openshift/`, with
 `apply.sh` beside them and its parameters in `params.env`, one `KEY=VALUE` a line
 (`NAME`, `NAMESPACE`, `IMAGE`, `CHANNEL`, `PORT`, `POSTGRES_MAJOR`, and whatever else
 it sets). The script renders each template present with the parameters it declares,
@@ -5233,7 +5984,9 @@ optional: until it exists, the app starts without it. A variable the template se
 (`DATABASE_URL`, `PGSSLMODE`, `BIND_ADDR`, `RUST_LOG`, …) wins over the Secret's;
 `RUST_LOG` is the template's `RUST_LOG` parameter (default `info`), so a narrower
 filter goes in `params.env` (`RUST_LOG=info,myapp=debug`), or in a task's
-`jobs/<JOB>.env` for that task alone. A
+`jobs/<JOB>.env` for that task alone. `SESSION_IDLE_TIMEOUT` is a parameter too
+(default `30m`): a low-risk app sets `SESSION_IDLE_TIMEOUT=14d` or `off` in
+`params.env`. A
 Secret's change reaches pods only when they start, so restart after one.
 
 `env.sh`, beside `apply.sh`, makes the Secret idempotently from `env.env`, one
@@ -5303,9 +6056,9 @@ before step 3 and `oc rollout resume deployment/myapp` after step 4 make them on
 Removing the entries before step 3 starts pods with neither.
 
 **Redis** is a template of its own, for an app that uses the cache, the bus across
-replicas or leases. It runs as compose does: nothing on disk, `MAXMEMORY` (128mb)
-with `MAXMEMORY_POLICY` (`allkeys-lru`), one pod replaced rather than surged so the
-replicas never split across two. A password protects it, and a NetworkPolicy admits
+replicas, leases or the shared sign-in throttle. It runs as compose does: nothing on
+disk, `MAXMEMORY` (128mb) with `MAXMEMORY_POLICY` (`allkeys-lru`), one pod replaced
+rather than surged so the replicas never split across two. A password protects it, and a NetworkPolicy admits
 the app's pods alone. The password is a Secret made once by hand, since a generated
 one would change on every apply. The Deployment reads `REDIS_URL` from that Secret
 when it exists, so the app picks Redis up at its next restart:
@@ -5318,8 +6071,14 @@ oc process -f templates/openshift/redis.yaml -p NAME=myapp -p NAMESPACE=myapp | 
 oc rollout restart deployment/myapp
 ```
 
-An app whose leased work must never run twice gives it `-p MAXMEMORY_POLICY=noeviction`
-("Background jobs"): a full Redis then refuses writes instead of dropping a lease.
+**Eviction defeats leases and the shared throttle.** An evicted lease lets leased work
+run twice ("Background jobs"), and an evicted `SharedThrottle` counter hands a password
+guesser a fresh budget. An app using either gives its Redis
+`-p MAXMEMORY_POLICY=noeviction`, so a full Redis refuses writes instead (the throttle
+then fails closed). Under `noeviction` the cache's `Expiry::Lru` entries, which carry no
+TTL, never leave and fill it: such an app caches only with `Expiry::For` or `Expiry::At`,
+or gives the cache a Redis of its own. `allkeys-lru`, the default, suits a Redis that
+holds only the cache and the bus.
 
 **Scheduled tasks** run the app's image with other arguments, one `cronjob.yaml` per
 task. The image's entrypoint is the binary, so `ARGS` picks the subcommand:
@@ -5489,11 +6248,11 @@ the Secret named in `secret:` to the database's owner at once, but never rewrite
 `uri`.
 
 The Route sends traffic through the router (HAProxy), which keeps idle connections to
-the pod for reuse longer than the app's default 30-second keep-alive (its
-`timeout http-keep-alive` is 300 s). Serve with a `header_read_timeout` above that, as
-"Wiring an app" does, or requests on a connection the app has just closed fail with
-an occasional 502. Each rollout also cuts the app's SSE streams after the 20-second
-drain; their clients reconnect to the new pods ("Bounds" under "Wiring an app").
+the pod for reuse for up to 300 s (`timeout http-keep-alive`). `ServeOptions`' default
+`header_read_timeout` (310 s) is above that; an app that lowers it below the router's
+gets an occasional 502 on a connection the app has just closed. Each rollout also cuts
+the app's SSE streams after the 20-second drain; their clients reconnect to the new pods
+("Bounds" under "Wiring an app").
 The router also cuts a response that sends nothing for `ROUTE_TIMEOUT` (its
 `timeout server`, set by the Route's `haproxy.router.openshift.io/timeout`; default
 `30s`, the router's own), so a quiet SSE stream sends `sse::HEARTBEAT` more often
@@ -5548,7 +6307,12 @@ oc get istag cli:latest -n openshift
 and, after the first night, that a prune succeeded
 (`oc get cronjob myapp-backup-prune -o jsonpath='{.status.lastSuccessfulTime}'` prints
 a time). A cluster without the registry passes `-p PRUNE_IMAGE=<image>`: any image the
-namespace can pull that has `bash`, `oc` and `python3`.
+namespace can pull that has `bash`, `oc` and `python3`. The default names the image
+by digest (`…/openshift/cli:latest@sha256:…`, the tag is for reading), as the chart's
+`redis.image` does for Redis (`mirror.gcr.io/library/redis:8-alpine@sha256:…`, kept
+current by the Renovate preset). Renovate cannot read the internal registry, so after
+a cluster upgrade set the new `cli` digest by hand
+(`oc get istag cli:latest -n openshift -o jsonpath='{.image.metadata.name}'`).
 
 These snapshots live in the same volume group, on the same node: they undo a bad
 migration or a dropped table, not the loss of the disk. Off-node copies need object
@@ -5700,7 +6464,7 @@ the exporter's port to Prometheus alone.
 
 <!-- x-release-please-start-version -->
 ```json
-"devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.12.2" }
+"devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.14.6" }
 ```
 <!-- x-release-please-end -->
 
@@ -5727,6 +6491,244 @@ https://github.com/onewaytek/owt-stack vX.Y.Z 'vX.Y.Z^{}'`: the `^{}` line if th
 one, otherwise the only line).
 Dependabot leaves this dependency alone (`templates/dependabot.yml` ignores it), so
 this command, run when the app adopts a release, is the only thing that moves it.
+
+## Deploying with GitOps
+
+`charts/owt-app` is the app's deploy as a Helm chart, for Argo CD to render and sync
+from a deployments repository. It renders what `templates/openshift` renders, with
+three differences on purpose:
+
+- **The image is pinned by digest.** The app container, the `migrate` init container
+  and every job run `image.repository@image.digest`. There is no ImageStream and no
+  `image.openshift.io/triggers` annotation: a release reaches the cluster when CI
+  writes its digest into the deployments repository, and Argo syncs the commit.
+- **Stateful objects are never pruned or deleted by Argo.** The CNPG `Cluster`, the
+  app's PersistentVolumeClaims, the ExternalSecrets and the Secrets they write carry
+  `argocd.argoproj.io/sync-options: Prune=false,Delete=false`.
+- **Secrets can come from OpenBao** through External Secrets' `vault` provider, in
+  place of `env.sh`, `set-secret.sh` and Secrets made by hand.
+
+Argo renders the chart with `helm template`, so there is no Helm release state in the
+cluster, and nothing installs it with `helm install`. An Application names the chart
+at an owt-stack tag and takes its values from the deployments repository:
+
+```yaml
+sources:
+  - repoURL: https://github.com/onewaytek/owt-stack.git
+    targetRevision: vX.Y.Z
+    path: charts/owt-app
+    helm:
+      releaseName: myapp
+      valueFiles:
+        - $values/apps/myapp/common.yaml
+        - $values/apps/myapp/rc/values.yaml
+        - $values/apps/myapp/rc/image.yaml   # written by CI: repository, digest, version
+  - repoURL: git@github.com:onewaytek/deployments.git
+    targetRevision: main
+    ref: values
+```
+
+`values.schema.json` checks every key, and a render without `name`,
+`image.repository`, `image.digest` (`sha256:` and 64 hex digits, never a tag) or
+`postgresMajor` fails, as does a tunnel host without its id, a route timeout without
+a unit or a role prefix Postgres would need quoted. The chart has no default for
+`postgresMajor`: a wrong one changes the Cluster's `imageName`, which CNPG carries out
+as an in-place major upgrade, so each environment states the major it runs.
+
+**Values.** Each key replaces the `params.env` parameter in the comment beside it in
+`charts/owt-app/values.yaml`:
+
+| Value | Default | params.env |
+|---|---|---|
+| `name` | required | `NAME` |
+| `namespace` | the Application's destination | `NAMESPACE` |
+| `image.repository`, `image.digest` | required | `IMAGE` (with `CHANNEL`, which the chart no longer needs) |
+| `image.version` | (not rendered) | the release the digest names |
+| `port`, `replicas` | `8000`, `1` | `PORT`, `REPLICAS` |
+| `routeTimeout` | `30s` | `ROUTE_TIMEOUT` |
+| `memoryLimit`, `cpuLimit` | `512Mi`, none | `MEMORY_LIMIT` |
+| `rustLog`, `sessionIdleTimeout` | `info`, `30m` | `RUST_LOG`, `SESSION_IDLE_TIMEOUT` |
+| `metricsNamespace`, `cnpgNamespace` | `openshift-user-workload-monitoring`, `openshift-operators` | `METRICS_NAMESPACE`, `CNPG_NAMESPACE` |
+| `postgresMajor` | required | `POSTGRES_MAJOR` |
+| `database.suffix`, `.instances`, `.size`, `.storageClass` | `db`, `1`, `2Gi`, `lvms-vg1` | `DB_SUFFIX`, `DB_INSTANCES`, `DB_SIZE`, `STORAGE_CLASS` |
+| `database.rolePrefix` | `name` with `-` as `_` | `DB_ROLE_PREFIX` |
+| `backup.snapshotClass`, `.schedule`, `.keepDays`, `.keepAtLeast`, `.pruneSchedule`, `.online`, `.pruneImage` | as app.yaml's | `SNAPSHOT_CLASS`, `BACKUP_SCHEDULE`, `BACKUP_KEEP_DAYS`, `BACKUP_KEEP_AT_LEAST`, `PRUNE_SCHEDULE`, `BACKUP_ONLINE`, `PRUNE_IMAGE` |
+| `redis.enabled`, `.image`, `.maxmemory`, `.maxmemoryPolicy`, `.memoryLimit` | off | `redis.yaml` present; `REDIS_IMAGE`, `MAXMEMORY`, `MAXMEMORY_POLICY`, `REDIS_MEMORY_LIMIT` |
+| `tunnel.host`, `.id`, `.credentialsSecret`, `.image`, `.memoryLimit` | no tunnel | `TUNNEL_HOST`, `TUNNEL_ID`, `CREDENTIALS_SECRET`, `CLOUDFLARED_IMAGE`, `TUNNEL_MEMORY_LIMIT` |
+| `egress.enabled`, `.internetCIDR` | off, `0.0.0.0/0` | `egress.yaml` present; `INTERNET_CIDR` |
+| `dns.namespace`, `dns.port` | `openshift-dns`, `5353` | `DNS_NAMESPACE`, `DNS_PORT` |
+| `jobs[]`: `name`, `schedule`, `args`, `dbRole`, `memoryLimit`, `rustLog`, `internetCIDR` | none | one `jobs/<JOB>.env` each: `JOB`, `SCHEDULE`, `ARGS` (a list here, not JSON text), `DB_ROLE`, `MEMORY_LIMIT`, `RUST_LOG`, `INTERNET_CIDR` |
+| `monitoring.enabled`, `.interval` | off, `30s` | `--monitoring`; `INTERVAL` |
+
+A job's `memoryLimit` defaults to `256Mi` and its `rustLog` to the app's. Under
+`apply.sh`, params.env's `MEMORY_LIMIT` reached the jobs too, so an app that set it
+there and kept no `MEMORY_LIMIT` in a job's file sets the job's `memoryLimit` to the
+same value. A `pre-render` hook's computed parameters become plain values (a checksum
+the chart computes itself, as the tunnel's, needs nothing).
+
+What only the chart has:
+
+- `extraEnv`, `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts` and
+  `probes.{startupPath,readinessPath,livenessPath}`: the app container's additions,
+  for an app whose copy of app.yaml added variables, a mounted CA or other health
+  paths. Variables come after the template's own; Secrets and ConfigMaps read whole
+  come after `<name>-env`.
+- `persistence[]` (`name`, `size`, `storageClass`, `accessModes`, `mountPath`): a
+  PersistentVolumeClaim `<name>-<entry>`, mounted in the app container at
+  `mountPath` when one is given.
+- `podAnnotations`: annotations on the app's pod template. Bump
+  `podAnnotations.rotation` in git to roll the pods after rotating a secret, since a
+  Secret's change reaches pods only when they start.
+- `settings.configMap` and `settings.values`: plain settings in a ConfigMap
+  `<name>-settings`, read last (after `<name>-env`) by the app, the `migrate` init
+  container and every job, so git wins over the Secret. Off by default; turning it on
+  changes the pod template and rolls the pods once.
+- `externalSecrets`: below.
+
+Anything else the app deploys (a second Deployment, an extra Route, an
+EgressFirewall) stays plain manifests in a second source of the Application.
+
+**Secrets from OpenBao.** With `externalSecrets.enabled`, the chart adds a
+ServiceAccount `eso-openbao`, a namespaced SecretStore `openbao` (the `vault`
+provider, KV v2 at `externalSecrets.store.mount`, Kubernetes auth as `eso-openbao`
+with the role `externalSecrets.store.role`, by default the namespace's name, and
+OpenBao's certificate trusted through the namespace's `openshift-service-ca.crt`),
+and one ExternalSecret per Secret, each read whole from `<path>/<key>`:
+
+| Secret | From (`externalSecrets.path` = `apps/<app>/<env>`) | When |
+|---|---|---|
+| `<name>-env` | `<path>/env` | `externalSecrets.env` (on) |
+| `<name>-<suffix>-runtime` | `<path>/db-runtime`, typed `kubernetes.io/basic-auth`, labelled `cnpg.io/reload: "true"` | `externalSecrets.dbRuntime` (on) |
+| `<name>-redis` | `<path>/redis` (`password`, `url`) | `redis.enabled` |
+| the tunnel's credentials Secret | `<path>/tunnel` (`credentials.json`) | a tunnel |
+| `externalSecrets.extra[].secret` | `<path>/<extra[].key>`, with an optional `type` and `labels` | listed |
+
+`externalSecrets.adopt` (on by default) is for Secrets that already exist: ESO merges
+into them (`creationPolicy: Merge`) and leaves them in place if the ExternalSecret
+goes (`deletionPolicy: Retain`). Off, ESO owns the Secret it creates
+(`creationPolicy: Owner`). CNPG's own Secrets (`<name>-<suffix>-app`,
+`<name>-<suffix>-ca`) stay CNPG's.
+
+**Moving an app from apply.sh to the chart:**
+
+1. Translate `params.env` (and each `jobs/<JOB>.env`) into values with the table
+   above, `postgresMajor` set to the major the cluster runs (`oc get
+   cluster.postgresql.cnpg.io <name>-db -o jsonpath='{.spec.imageName}'`), and
+   `image.digest` to the digest the Deployment runs now (`oc get deployment <name>
+   -o jsonpath='{.spec.template.spec.containers[0].image}'`), so the first sync rolls
+   nothing.
+2. Compare the two renders: `oc process --local` of the app's templates against
+   `helm template <name> charts/owt-app -f values.yaml`. `just chart` does exactly
+   this for owt-stack's fixtures (`charts/owt-app/tests/`); the only differences are
+   the three above. Differences in an app's own copy of app.yaml go into the
+   `extra*` values or a second source.
+3. Put the values and the Application in the deployments repository with manual
+   sync first, read Argo's diff (the trigger annotation's removal, the image moving to
+   Argo's field manager with the same digest, the new SecretStore and
+   ExternalSecrets, nothing on the Cluster's `bootstrap`, `imageName` or `storage`,
+   a selector or pod labels), then turn on automated sync with `prune: false`.
+4. After it has run on GitOps for a while, delete the ImageStream, turn on
+   `settings.configMap`, and replace the app's `deploy/openshift/` with a pointer to
+   the deployments repository.
+
+To go back, delete the Application without its finalizer (the objects stay), delete
+the ExternalSecrets (adopted Secrets stay), and run `deploy/openshift/apply.sh --apply`
+again, which restores the ImageStream and the trigger.
+
+**Rollout: `deploy-pin.yml`.** The release workflow's last job pins the image it
+pushed in the deployments repository, and Argo CD syncs the commit:
+
+```yaml
+  deploy:
+    needs: [release, image]
+    if: needs.release.outputs.version != ''
+    permissions: {contents: read}
+    uses: onewaytek/owt-stack/.github/workflows/deploy-pin.yml@<commit>  # vX.Y.Z
+    with:
+      app: myapp
+      channel: ${{ needs.release.outputs.channel }}   # rc | stable
+      version: ${{ needs.release.outputs.version }}
+      digest: ${{ needs.image.outputs.digest }}
+    secrets:
+      DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
+      DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
+```
+
+It reads every `apps/*/*/target.yaml` in the deployments repository (`app`,
+`channel`, `promote`, and `variant` for a second build of the same app), rewrites the
+matching environments' `image.yaml` (`repository`, `digest`, `version`), and opens a
+pull request: one with auto-merge on for `promote: auto` environments, which merges
+once the deployments repository's checks pass, and one labelled `production` for
+`promote: pr` environments, whose merge by the owner is the release. It never pushes
+to the deployments repository's default branch, and it closes an older open pin of
+the same stream as superseded. It never pins backwards: a version that is semver-lower
+than the one the matching environments run, or than an open pin of the same stream (app,
+channel, variant and mode), is a notice that opens, pushes and closes nothing, so a rerun
+of an old release job or an older release's job that finishes last cannot roll an
+environment back or close the newer pin (`rc.10` outranks `rc.9`, a release outranks its
+rcs, and a variant's `-hsm` suffix is ignored). An environment's `image.version` is read
+with one leading `v` removed (a hand-written `v1.4.0` compares as `1.4.0`); any other value
+that is not `N.N.N` with an optional `-suffix` fails the job with an error naming the file
+and pins nothing, so a hand edit cannot switch the guard off. A rollback is a pull request
+written by hand in the deployments repository. A rerun (a retried release job) is idempotent: the
+same digest changes nothing and reuses the open pull request, another digest for the
+same version adds a commit to the bot's branch (never a force push), and a pin the
+base already holds opens nothing. No matching environment is a notice: an app can add
+the job before the deployments repository lists it.
+
+The token comes from a GitHub App (the `DEPLOY_APP_CLIENT_ID`, the App's client ID, and
+`DEPLOY_APP_KEY` secrets, an org secret limited to the app repositories) installed on the deployments
+repository alone with contents and pull-requests write; the job asks for nothing
+more. `variant` pins only environments whose target.yaml names the same variant, and
+its version must end in `-<variant>`: a second build published as tags of the same
+repository (`1.4.2-hsm`) reaches only the environments that run it. `repository`
+overrides `ghcr.io/onewaytek/<app>` for an image of its own.
+
+**Base images.** The app pins its runtime base by digest in both places it is named,
+the Dockerfile's `FROM` and release.yml's `base-image:` input, with the tag kept for
+reading (`registry.access.redhat.com/hi/core-runtime:2@sha256:…`), and the builders
+the same way. A self-hosted Renovate keeps them current with this preset, in the
+app's `renovate.json`:
+
+```json
+{"extends": ["github>onewaytek/owt-stack//renovate/base-images#vX.Y.Z"]}
+```
+
+It groups every `registry.access.redhat.com/hi/*` image into one `fix(deps)` pull
+request, so builder and runtime glibc move together, on Monday and Thursday mornings
+(UTC). The pull request ships on rc through promote-rc like any other. A digest-only
+bump (same tag) automerges to `main` on Renovate's next scheduled run once its checks
+pass and the digest is 24 hours old. That age counts from the registry's
+publication of the digest, not from the pull request: a digest older than a day
+can merge on the run that opens its pull request, so time on rc is not guaranteed.
+A tag change never automerges.
+The preset also reads the `image:` lines of `charts/owt-app/values.yaml` and the `value:`
+lines of `templates/openshift/redis.yaml` and `tunnel.yaml` (the Redis and cloudflared
+defaults, `name:tag@sha256:…`), so those digests are bumped like the base images and
+the chart and the templates move together; it matches those paths in the repository it
+runs on. `just ci-config` runs `scripts/renovate-test.sh`, which checks that each
+pattern matches its files and that every digest pin in them is read (the pruner image,
+which names the cluster's internal registry, is updated by hand). An app that must not automerge at all (regulated data)
+adds `"packageRules": [{"matchPackageNames": ["*"], "automerge": false}]` after the
+`extends`.
+
+**Secrets: `scripts/bao-set.sh`.** `env.sh`'s counterpart for OpenBao. It reads the
+same `env.env` (literals, `@generate`, `@env`, and `@prompt` for a value typed at a
+hidden prompt) and writes `kv/apps/<app>/<env>/env`, or another key with
+`KEY=db-runtime|redis|tunnel|…`:
+
+```bash
+scripts/bao-set.sh myapp rc deploy/openshift/env.env            # what would change
+scripts/bao-set.sh myapp rc deploy/openshift/env.env --apply    # write it
+```
+
+Values are never printed, and every value and the OpenBao token reach the OpenBao
+pod on stdin (`oc exec -i`). A key OpenBao holds and the file does not list is left
+alone. ESO refreshes the Secret within its `refreshInterval`; bump
+`podAnnotations.rotation` in the deployments repository to restart the pods on it.
+
+**`templates/openshift` is deprecated.** It stays supported, and `apply.sh` keeps
+working, until a later release removes it; new deploys use the chart.
 
 ## Decisions
 
@@ -5763,13 +6765,15 @@ this command, run when the app adopts a release, is the only thing that moves it
   account and epoch, and sensitive actions ask for a recent proof (`Recent`, `RecentMfa`);
   a sign-in that records nothing counts as stale. Factor changes need a `ChangeProof` from
   `Mfa::authorize_change`, move the account's session epoch on and reseal the current
-  session. Ten wrong codes lock the authenticator (persisted). The TOTP secret is stored
+  session. Ten wrong codes lock the authenticator (persisted; `Mfa::lockout` tunes it
+  within 3 to 100, never off). The TOTP secret is stored
   with a format and key id by an app-supplied `SecretSealer`. Enrolling from a pending
   sign-in is allowed under `Required` and flagged (`while_pending`) so the owner is told;
   the library does not require an emailed link.
 - **The shared throttle fails closed.** If Redis is unreachable, sign-in is refused
   (`Refusal::Unavailable`) rather than allowed unthrottled: the throttle is the only
-  bound on online guessing. `FailMode::Open` is the app's choice to make.
+  bound on online guessing. `FailMode::Local` (count per replica during the outage) and
+  `FailMode::Open` are the app's choice to make.
 - **Library code holds no `query!` macros**, so it needs no `.sqlx/` metadata and builds
   offline anywhere.
 - **Metric names belong to the app.** The library takes them as arguments, so an app's
@@ -5849,6 +6853,63 @@ The router example under "Wiring an app" composes the layers; beyond it:
   // `<div class="bar" style="width: {{ percent }}%">` renders as written.
   let _csp = Csp::new().allow_style_attributes().report_only(true);
   ```
+- A CSP is always sent (`Stack` installs one; `report_only(true)` is the escape hatch
+  while a page is fixed). Its nonce is not: `Csp::static_policy()` drops every
+  `{nonce}` source (the default `'nonce-{nonce}'` in `script-src` and `style-src`),
+  mints no `Nonce`, and sends one precomputed header on every response. Use it for an
+  app whose templates have no inline `<script>` or `<style>` (scripts and styles come
+  from files) and whose pages are cached for everyone, where a per-request nonce would
+  be replayed to every viewer anyway. Every other directive stays, and a `directive()`
+  naming `{nonce}` after it panics at startup. The default keeps the nonce, and either
+  way the header is rendered once when the policy is built, not per request.
+
+  ```rust
+  use owt_web::headers::Csp;
+  // Pages cached at the edge, scripts and styles from /static only.
+  let _csp = Csp::new()
+      .directive("img-src", "'self' data: https://cdn.example")
+      .static_policy();
+  ```
+
+## Upgrading from 0.13
+
+- **`StepUpGate` checks who for every request.** `.staff()`, `.role(ROLE)` and the
+  default signed-in check now cover reads (`GET`, `HEAD`, `OPTIONS`) as well as
+  changes; `.reads()` decides only whether reads also need a fresh proof. Under a
+  `.staff()` gate an anonymous page load meets the sign-in wall and a signed-in
+  non-staff one a 403, where both used to pass through. An app that relied on the gate
+  letting reads through to everyone moves those routes out from under it; one that
+  kept `Staff` or `Holds` on its handlers for reads may keep them or drop them.
+- **`MAIL_URL=smtp://…` is STARTTLS, required.** owt-mail adds `?tls=required` to a
+  bare `smtp://` (lettre alone reads it as plaintext), so the relay must offer
+  STARTTLS. A local mail catcher without TLS takes `smtp://host:1025?tls=none` (with
+  credentials only towards a loopback host); `?tls=opportunistic` and any other `tls`
+  value fail start-up ("Outgoing email").
+
+## Upgrading from 0.12
+
+- **The `release` job grants `actions: write`.** `release.yml` dispatches a fresh run
+  on `rc` when it finds itself behind the branch, so the calling job's permissions
+  become `{contents: write, issues: write, pull-requests: write, actions: write}`.
+  Without it the release workflow fails to start once its pin moves. The caller needs
+  its `workflow_dispatch` trigger, which `promote-rc.yml`'s dispatch already
+  requires. Nothing changes for `sync-rc` beyond the pin: it starts releasing `rc`
+  when `rc` holds code no `rc` prerelease has.
+- `ServeOptions::default()`'s `header_read_timeout` is 310 s (it was 30 s), above the
+  OpenShift router's 300 s keep-alive. An app that set 310 s itself can drop the line;
+  one served without such a proxy and wanting the short wait sets it back.
+- `PoolConfig::from_env()` reads the pool size from `DB_POOL_MAX`. An app that reads
+  another variable switches to it and renames the variable in its deployment.
+- An app with job leases or `SharedThrottle` on the Redis template's default
+  `allkeys-lru` switches it to `-p MAXMEMORY_POLICY=noeviction` (and its `Expiry::Lru`
+  cache entries to `Expiry::For`, or the cache to a Redis of its own): see "Eviction
+  defeats leases and the shared throttle".
+- An app that registers singletons at run time (one per channel or tenant) and leaks a
+  name for each puts each on its own `jobs.child()`, under one static name, and
+  cancels the child when its channel ends ("Background jobs").
+- Add the dev profile's `debug = "line-tables-only"` and merge `tests/*.rs` into one
+  `tests/it` binary, all but a test that needs a process of its own ("Test layout and debug info" under "Commands, CI,
+  releases and deployment").
 
 ## Upgrading from 0.9
 
@@ -6046,7 +7107,8 @@ The router example under "Wiring an app" composes the layers; beyond it:
 `just check` is the gate (fmt, clippy over every crate and feature and over
 `owt-change` and `owt-auth` without their defaults, `dev-only`, the tests with the README
 doctests, `cargo audit`, the template tests, the commitlint configuration and `image-check`), and CI
-runs the same command. The Redis tests run when
+runs the same command. `just chart` (needs oc, helm, yq and jq) proves `charts/owt-app`
+against the templates; CI's `chart.yml` runs it. The Redis tests run when
 `REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
 `DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL
 whose certificate the system trusts (`SSL_CERT_FILE=ca.crt` for a test CA; the test's
@@ -6055,11 +7117,11 @@ header says how to run such a Redis). Each is skipped otherwise; CI sets the fir
 **Tests come in five kinds**, and a change to anything that reads what a client sent
 adds to the first:
 
-- *Properties* (`crates/*/tests/properties.rs`, `owt-bus/tests/model.rs`): what must
+- *Properties* (`properties.rs` and `owt-bus`'s `model.rs`, under `crates/*/tests/`): what must
   hold for every input, with proptest looking for the one where it does not. A
   failure writes its seed to a `.proptest-regressions` file beside the test; commit
   it, so the case is retried for ever.
-- *The composed app* (`owt-web/tests/hardened_app.rs`): the layers in the README's
+- *The composed app* (`owt-web/tests/it/hardened_app.rs`): the layers in the README's
   order, and the sign-in story end to end (fixation, revocation, an outage, a
   replayed cookie).
 - *Unit tests* beside the code, for what needs its private parts.
@@ -6084,8 +7146,15 @@ the same pull request. The Rust examples are doctests, so a stale example fails
 starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `ClientIp`, `Sessions::from_env`, or anything in backticks), so
 `fix(deploy): PUBLIC_URL comes only from the params file` passes and
-`fix(web): Drop the cache` does not; an app without a commitlint configuration of
-its own is checked by the same rules (`commitlint.config.mjs`). Scopes
+`fix(web): Drop the cache` does not. The first line runs to 120 characters at most;
+the body and the footers have no line-length limit, so a log, a link or quoted output
+goes in as it is. An app without a commitlint configuration of its own is checked by
+the same rules (`commitlint.config.mjs`). The title job checks the title's form (a
+type, an optional scope, a subject), not its length. Every commit is
+linted but a merge of the base whose first line is exactly git's wording (`Merge
+branch 'main' of …`, `Merge remote-tracking branch 'origin/main' into …`, `Merge
+origin/main`, `Merge main into …`); commitlint's broader defaults (any `Merge … into
+…`, `Revert …`, `fixup!`) are off, so a revert is written `revert: …`. Scopes
 name the crate or area: `web`, `auth`, `runtime`, `bus`, `test`, `ci`, `templates`,
 `accounts`, `audit`, `change`, `crypt`, `storage`, `tailwind`, `deps`, `release` (release-please and its configuration).
 

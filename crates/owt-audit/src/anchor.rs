@@ -171,15 +171,13 @@ pub async fn anchor<A: Anchor>(pool: &PgPool, to: &A) -> anyhow::Result<Anchored
         .execute(&mut *tx)
         .await?;
     let previous = latest_in(&mut tx).await?;
-    let prev_heads: std::collections::HashMap<String, (i64, Hash)> = previous
-        .as_ref()
-        .map(|(m, _)| {
+    let prev_heads: std::collections::HashMap<String, (i64, Hash)> =
+        previous.as_ref().map_or_default(|(m, _)| {
             m.heads
                 .iter()
                 .filter_map(|h| Some((h.tenant.clone(), (h.seq, unhex(&h.hash)?))))
                 .collect()
-        })
-        .unwrap_or_default();
+        });
     let mut heads = Vec::new();
     for head in crate::heads(pool).await? {
         let (seq, hash) = prev_heads

@@ -45,11 +45,16 @@ name: Image
 # tags only once it passes.
 # The `attest` job then signs the pushed digest with cosign, keyless through the
 # run's OIDC token, and attaches a syft SBOM (SPDX JSON) to the image as an
-# attestation and to the run as an artifact. The caller grants `id-token: write` and
+# attestation and to the run as an artifact kept for 7 days. The caller grants `id-token: write` and
 # `packages: write`; `attest: false` skips the signing and the SBOM.
 #
 # image-check.yml builds and verifies the same image on a pull request, pushing
 # nothing, for a caller that grants no write permission.
+#
+# The build job hands the layer to the jobs after it as the `image-layer` artifact
+# (kept a day at most). The jobs stay apart so the job that runs the app's code never
+# holds a write token, so the hand-off stays; actions-cleanup.yml, called by the app on
+# `workflow_run`, deletes the artifact once the run has succeeded.
 #
 # The jobs run only for the repository's own events: a push, a dispatch, a schedule
 # or a pull request from a branch of the repository. A fork's pull request,
@@ -134,7 +139,8 @@ on:
       base-image:
         description: >-
           The runtime base. A tag is resolved once to its linux/amd64 digest; a digest
-          is used as given. Either way the digest is recorded in the
+          is used as given, also with the tag kept before it (`name:tag@sha256:…`, the
+          form Renovate keeps current). Either way the digest is recorded in the
           org.opencontainers.image.base.digest label.
         type: string
         default: registry.access.redhat.com/hi/core-runtime:2
@@ -316,7 +322,7 @@ jobs:
           fi
       - name: Install sccache
         if: ${{ steps.sccache.outputs.enabled == 'true' }}
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: sccache@0.18.0
           fallback: none
@@ -576,7 +582,15 @@ jobs:
           name="${BASE%@*}"
           # A tag after the last slash, if any.
           if [[ "${name##*/}" == *:* ]]; then name="${name%:*}"; fi
-          digest="$(crane digest --platform linux/amd64 "$BASE")"
+          if [[ "$BASE" == *@* ]]; then
+            # Pinned, with or without its tag: the tag is only a label for Renovate, so
+            # the digest alone is resolved (an index to its linux/amd64 manifest).
+            pinned="${BASE##*@}"
+            [[ "$pinned" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "::error::base-image digest '$pinned' is malformed"; exit 1; }
+            digest="$(crane digest --platform linux/amd64 "${name}@${pinned}")"
+          else
+            digest="$(crane digest --platform linux/amd64 "$BASE")"
+          fi
           ref="${name}@${digest}"
           echo "base ${BASE} is ${ref} for linux/amd64"
           fs="$RUNNER_TEMP/base"
@@ -967,7 +981,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -999,8 +1013,11 @@ jobs:
       # Pushed once, under a temporary tag no app follows (not the version, not a
       # floating tag), and scanned by digest there. The tags an app deploys from are
       # added to that same digest only after the scan passes, and attest signs it.
+      # No build record artifact: it would count against the Actions storage for days.
       - id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
@@ -1031,8 +1048,8 @@ jobs:
           docker buildx imagetools create "${args[@]}" "$IMAGE"
           printf 'tagged %s\n' "$IMAGE" "${args[@]}"
 
-  # The pushed image, by digest: an SBOM (syft, SPDX JSON) kept as a workflow artifact and
-  # attached to the image as a cosign attestation, and a keyless cosign signature (the
+  # The pushed image, by digest: an SBOM (syft, SPDX JSON) attached to the image as a cosign
+  # attestation (and kept as a workflow artifact for 7 days), and a keyless cosign signature (the
   # runner's OIDC token, recorded in the Sigstore transparency log). It runs only after the
   # image passed its vulnerability scan, and signs the digest, never a tag. The one job
   # with `id-token: write`; it runs none of the app's code.
@@ -1081,6 +1098,8 @@ jobs:
           format: spdx-json
           output-file: ${{ runner.temp }}/sbom.spdx.json
           artifact-name: sbom.spdx.json
+          # The attestation is the SBOM of record; the run's copy is kept a week.
+          upload-artifact-retention: 7
           upload-release-assets: false
           dependency-snapshot: false
       - name: Sign and attest

@@ -104,8 +104,7 @@ fn host_name() -> String {
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
         .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .map(|h| h.trim().to_owned())
-        .unwrap_or_default()
+        .map_or_default(|h| h.trim().to_owned())
 }
 
 /// The process of a schema of checkout `tag`, or `None` when `name` is not one.
@@ -388,6 +387,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn admin() -> Option<PgConnectOptions> {
         let url = std::env::var("DATABASE_URL")
             .ok()

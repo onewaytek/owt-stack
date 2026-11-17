@@ -129,8 +129,7 @@ impl<T: SessionData + HasFlashes, X> PageCtx<T, X> {
             self.flashes
                 .session
                 .as_ref()
-                .map(Session::take_flashes)
-                .unwrap_or_default()
+                .map_or_default(Session::take_flashes)
         })
     }
 }

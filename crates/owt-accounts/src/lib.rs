@@ -16,7 +16,8 @@
 //!   messages shown once, nonce.
 //! - [`identities`]: provider identities (OAuth) linked to accounts, and the app's
 //!   own local ones.
-//! - [`links`]: one-time sign-in links.
+//! - [`links`]: one-time sign-in links; [`confirmed_emails`], the addresses an
+//!   account proved by redeeming one emailed to it or through a provider.
 //! - [`mfa`]: a second factor (an authenticator app, recovery codes), the challenge
 //!   after the password, a policy that requires it, and step-up re-authentication;
 //!   [`mfa::pages`] mounts the pages for them.
@@ -54,7 +55,7 @@ pub mod store;
 
 pub use layer::{Accounts, Maybe, MaybeWith, Signed, SignedWith, Staff};
 pub use page::PageCtx;
-pub use store::{Account, New, normalize};
+pub use store::{Account, New, confirmed_emails, normalize};
 
 /// Why an account operation did not happen. Each message is written for the person
 /// who filled the form. A refusal may be added without a breaking release, so a `match` on

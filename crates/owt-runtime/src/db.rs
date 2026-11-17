@@ -5,6 +5,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use time::OffsetDateTime;
 
 /// Pool sizing and the server-side limits each connection carries. The defaults suit
 /// a small app on one replica; size a busy one from measurement (connections are the
@@ -30,6 +31,12 @@ pub struct PoolConfig {
     /// default): a transaction left open while its task awaits something else ends,
     /// and so do its locks and its connection. `None` leaves the server's setting.
     pub idle_in_transaction_timeout: Option<Duration>,
+    /// Whether the pool pings a connection before handing it out (`false` by default).
+    /// The ping is a round trip on every acquire, doubling the cost of a request's
+    /// single query; without it a connection that died while idle fails its query
+    /// instead, which a request answers as a 503 and the pool replaces. `true` trades
+    /// that round trip for fewer such errors after a database restart.
+    pub test_before_acquire: bool,
 }
 
 impl Default for PoolConfig {
@@ -40,16 +47,46 @@ impl Default for PoolConfig {
             acquire_timeout: Duration::from_secs(5),
             statement_timeout: Some(Duration::from_secs(30)),
             idle_in_transaction_timeout: Some(Duration::from_secs(60)),
+            test_before_acquire: false,
         }
     }
 }
 
+/// The variable [`PoolConfig::from_env`] reads the pool's size from.
+pub const POOL_MAX_VAR: &str = "DB_POOL_MAX";
+
 impl PoolConfig {
+    /// The defaults, with [`max`](Self::max) from `DB_POOL_MAX` ([`POOL_MAX_VAR`]) when
+    /// it is set: one name for every app, so a deployment sizes any app's pool the
+    /// same way.
+    ///
+    /// # Errors
+    /// `DB_POOL_MAX` is set but is not a whole number above zero.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_vars(&crate::env::Vars::Process)
+    }
+
+    /// [`from_env`](Self::from_env), reading `vars`: for tests.
+    ///
+    /// # Errors
+    /// As [`from_env`](Self::from_env).
+    pub fn from_vars(vars: &crate::env::Vars) -> anyhow::Result<Self> {
+        let defaults = Self::default();
+        let max = vars.parse_or(POOL_MAX_VAR, defaults.max)?;
+        anyhow::ensure!(max > 0, "{POOL_MAX_VAR} must be above zero");
+        Ok(Self {
+            max,
+            min: defaults.min.min(max),
+            ..defaults
+        })
+    }
+
     fn options(&self) -> PgPoolOptions {
         PgPoolOptions::new()
             .max_connections(self.max)
             .min_connections(self.min)
             .acquire_timeout(self.acquire_timeout)
+            .test_before_acquire(self.test_before_acquire)
     }
 
     /// `opts` with this config's server-side limits as startup parameters, which win
@@ -122,6 +159,30 @@ impl PoolConfig {
         let opts = self.limits((*pool.connect_options()).clone());
         self.options().connect_lazy_with(opts)
     }
+}
+
+/// The database's clock: `clock_timestamp()`, the moment the query runs, in UTC.
+///
+/// Read it for a comparison that decides an outcome (a window still open, a cut-off
+/// passed, a link expired) where the rows it is compared with were stamped by the
+/// database (`DEFAULT now()`, `SET closed_at = clock_timestamp()`). Every replica then
+/// reads one clock, so two pods whose clocks drift apart cannot decide the same case
+/// two ways, and the app's reading agrees with the stamps.
+///
+/// `clock_timestamp()` rather than `now()`: `now()` is the start of the transaction,
+/// fixed for its length, so inside a transaction that has waited on a lock it reads a
+/// time before the wait, and a cut-off that passed during the wait would not have
+/// passed yet. `clock_timestamp()` is the time of the reading, as
+/// [`OffsetDateTime::now_utc`] is in the app; read it after taking the locks the
+/// decision depends on. On a pool (one statement per transaction) the two agree.
+/// SQL that wants the transaction's own time writes `now()` itself.
+///
+/// # Errors
+/// The query fails (the connection is lost, the transaction has aborted).
+pub async fn now<'e, E: sqlx::PgExecutor<'e>>(executor: E) -> sqlx::Result<OffsetDateTime> {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(executor)
+        .await
 }
 
 /// How long [`PoolConfig::connect`] keeps trying an unreachable database at start: an
@@ -315,6 +376,19 @@ pub async fn grant_runtime(pool: &PgPool, role: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_pool_size_comes_from_db_pool_max() {
+        use crate::env::Vars;
+        let config = |pairs: &[(&str, &str)]| {
+            super::PoolConfig::from_vars(&pairs.iter().copied().collect::<Vars>())
+        };
+        assert_eq!(config(&[]).unwrap().max, 10);
+        assert_eq!(config(&[("DB_POOL_MAX", "25")]).unwrap().max, 25);
+        assert_eq!(config(&[("DB_POOL_MAX", "1")]).unwrap().min, 1);
+        assert!(config(&[("DB_POOL_MAX", "0")]).is_err());
+        assert!(config(&[("DB_POOL_MAX", "ten")]).is_err());
+    }
+
+    #[test]
     fn a_role_name_is_quoted_and_anything_else_refused() {
         assert_eq!(
             super::quoted_role("myapp_runtime").unwrap(),
@@ -342,6 +416,16 @@ mod tests {
         }
         .limits(opts);
         assert_eq!(none.get_options(), None);
+    }
+
+    #[test]
+    fn the_pool_does_not_ping_before_acquire_unless_told_to() {
+        assert!(!PoolConfig::default().options().get_test_before_acquire());
+        let pinging = PoolConfig {
+            test_before_acquire: true,
+            ..PoolConfig::default()
+        };
+        assert!(pinging.options().get_test_before_acquire());
     }
 
     #[test]

@@ -1,0 +1,16 @@
+<section class="owt-section">
+<h1>Add a passkey</h1>
+{% if v.pending %}<p>This account needs a second factor before you can sign in.</p>
+{% endif %}<p class="owt-hint">Name this passkey so you can tell it apart later, then follow your device's prompt.</p>
+{% if let Some(e) = v.error %}<div class="owt-alert owt-alert-error" role="alert">{{ e }}</div>
+{% endif %}<div class="owt-alert owt-alert-error" role="alert" data-owt-passkey-error hidden></div>
+<form class="owt-form" method="post" action="{{ v.action }}">
+<div class="owt-field"><label class="owt-label" for="passkey-name">Name</label>
+<input class="owt-input" id="passkey-name" name="name" maxlength="64" placeholder="My laptop" required autofocus></div>
+<input type="hidden" name="passkey_token" value="{{ v.token }}"><input type="hidden" name="passkey_credential" value="">
+<input type="hidden" name="next" value="{{ v.next }}">
+<div class="owt-actions"><button class="owt-button" type="button" data-owt-passkey="create" data-options="{{ v.options }}">Create the passkey</button></div>
+<noscript><p class="owt-hint">Creating a passkey needs JavaScript.</p></noscript>
+</form>
+<script src="{{ v.script }}" defer></script>
+</section>

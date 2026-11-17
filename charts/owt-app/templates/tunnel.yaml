@@ -1,0 +1,134 @@
+{{- /*
+tunnel.yaml's Cloudflare named tunnel: two cloudflared connectors in the app's
+namespace forwarding tunnel.host to the app's Service. A checksum of the config in
+the pod template rolls the connectors when it changes.
+*/ -}}
+{{- if include "owt.tunnel" . }}
+{{- $name := include "owt.name" . -}}
+{{- $ns := include "owt.namespace" . -}}
+{{- $config := include "owt.tunnelConfig" . -}}
+{{- if not (regexMatch "^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$" .Values.tunnel.id) }}
+{{- fail (printf "tunnel.id %q is not a tunnel's UUID (cloudflared tunnel list)" .Values.tunnel.id) }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: {{ $ns }}
+  labels: {app: cloudflared}
+data:
+  config.yaml: |
+    {{- $config | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: {{ $ns }}
+  labels: {app: cloudflared}
+spec:
+  # Two: a WebSocket dies with the connector that accepted it.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app: cloudflared}
+  template:
+    metadata:
+      labels: {app: cloudflared}
+      annotations:
+        checksum/config: {{ $config | trimSuffix "\n" | sha256sum | trunc 16 | quote }}
+    spec:
+      automountServiceAccountToken: false
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: cloudflared}
+      # Outlasts cloudflared's 30-second grace for requests in flight.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: cloudflared
+          image: {{ .Values.tunnel.image }}
+          args: [tunnel, --config, /etc/cloudflared/config.yaml, run]
+          env:
+            # restricted-v2 runs this under an arbitrary UID with no home.
+            - {name: HOME, value: /tmp}
+          ports:
+            - {name: metrics, containerPort: 2000}
+          volumeMounts:
+            - {name: config, mountPath: /etc/cloudflared/config.yaml, subPath: config.yaml, readOnly: true}
+            - {name: creds, mountPath: /etc/cloudflared/creds, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+          readinessProbe:
+            httpGet: {path: /ready, port: metrics}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /ready, port: metrics}
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 10
+          resources:
+            requests: {cpu: 10m, memory: 48Mi}
+            limits: {memory: {{ .Values.tunnel.memoryLimit | quote }}}
+          securityContext:
+            {{- include "owt.securityContext" . | nindent 12 }}
+      volumes:
+        - name: config
+          configMap: {name: cloudflared-config}
+        - name: creds
+          secret: {secretName: "{{ include "owt.tunnelSecret" . }}"}
+        - name: tmp
+          emptyDir: {medium: Memory, sizeLimit: 16Mi}
+---
+# The app's policy admits the router alone; this one admits the connectors too.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-from-tunnel
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  podSelector:
+    matchLabels: {app: "{{ $name }}"}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: cloudflared}
+      ports: [{port: http}]
+---
+# The connectors take no connections and open only the cluster's DNS, Cloudflare's
+# edge on 7844, HTTPS, and the app's HTTP port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloudflared
+  namespace: {{ $ns }}
+  labels: {app: cloudflared}
+spec:
+  podSelector:
+    matchLabels: {app: cloudflared}
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: "{{ .Values.dns.namespace }}"}
+      ports:
+        - {protocol: UDP, port: {{ .Values.dns.port }}}
+        - {protocol: TCP, port: {{ .Values.dns.port }}}
+    - to:
+        - ipBlock: {cidr: 0.0.0.0/0}
+        - ipBlock: {cidr: "::/0"}
+      ports:
+        - {protocol: UDP, port: 7844}
+        - {protocol: TCP, port: 7844}
+        - {protocol: TCP, port: 443}
+    - to:
+        - podSelector:
+            matchLabels: {app: "{{ $name }}"}
+      ports: [{port: http}]
+{{- end }}

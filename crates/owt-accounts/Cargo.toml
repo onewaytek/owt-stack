@@ -40,6 +40,7 @@ tracing.workspace = true
 unicode-normalization.workspace = true
 unicode-security.workspace = true
 url.workspace = true
+webauthn-rs.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
@@ -50,6 +51,7 @@ owt-test.workspace = true
 tokio.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true
+webauthn-authenticator-rs.workspace = true
 
 [lints]
 workspace = true

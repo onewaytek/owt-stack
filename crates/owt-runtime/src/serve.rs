@@ -59,12 +59,13 @@ pub fn raise_open_files_limit() {
 pub struct ServeOptions {
     /// How long a connection may take to send a request's head (the request line
     /// and headers), for its first request and each one after on a kept-alive
-    /// connection, so also how long a kept-alive connection may sit idle. Default 30
-    /// seconds: keep it above the idle time of whatever proxy reuses connections to
-    /// the app, or a request it sends just as the app closes one fails (a 502).
-    /// The `OpenShift` router's is 300 seconds by default (`HAProxy`'s
-    /// `timeout http-keep-alive`); it reads request heads itself, so a longer wait
-    /// here costs an idle socket, not slow-client protection.
+    /// connection, so also how long a kept-alive connection may sit idle. Default 310
+    /// seconds, above the `OpenShift` router's 300 (`HAProxy`'s `timeout
+    /// http-keep-alive`): it must stay above the idle time of whatever proxy reuses
+    /// connections to the app, or a request it sends just as the app closes one fails
+    /// (a 502). The router reads request heads itself, so the long wait costs an idle
+    /// socket, not slow-client protection. An app reached without such a proxy lowers
+    /// it.
     pub header_read_timeout: Duration,
     /// How long a stop waits for open connections to finish before closing them.
     /// Default 20 seconds, inside Kubernetes' default 30-second grace period. An
@@ -94,7 +95,7 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
-            header_read_timeout: Duration::from_secs(30),
+            header_read_timeout: Duration::from_secs(310),
             drain: Duration::from_secs(20),
             max_connections: 4096,
             max_connection_age: None,

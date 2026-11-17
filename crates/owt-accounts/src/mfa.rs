@@ -1,9 +1,12 @@
 //! A second factor after the password, a policy that can require it, and step-up
 //! re-authentication for sensitive actions.
 //!
-//! Two factors exist: an **authenticator app** (TOTP, [`owt_auth::totp`]) and, behind it,
-//! **recovery codes** ([`owt_auth::recovery`]) for the day the phone is lost. (Passkeys
-//! are not here yet.) Everything is a function an app wires to routes, in the style of
+//! Three factors exist: an **authenticator app** (TOTP, [`owt_auth::totp`]),
+//! **passkeys** (Web Authentication, [`passkey`]; on once [`Mfa::passkeys`] names the site) and,
+//! behind them, **recovery codes** ([`owt_auth::recovery`]) for the day the phone is
+//! lost. An account may hold an authenticator and any number of passkeys; any one of
+//! them answers a challenge, and the recovery codes stay while one of them remains.
+//! Everything is a function an app wires to routes, in the style of
 //! [`crate::session::password_sign_in`]; [`Mfa`] holds the configuration they share.
 //!
 //! # The sign-in
@@ -27,11 +30,17 @@
 //!   whenever one does** (and when turning on [`MfaPolicy::Required`], roll it out by
 //!   groups). The policy protects accounts that have a factor from a password alone, not
 //!   a never-enrolled account from one.
+//! * [`Next::Locked`]: a passkey was disabled as a suspected copy and left the account with
+//!   no usable factor and no recovery code, under
+//!   [`AfterSuspectedCopy::LockUntilRecovery`] (the default). Nothing signs it in until
+//!   [`Mfa::clear_recovery_lock`] clears the lock; the pending sign-in shows a page that
+//!   says so.
 //!
 //! A pending sign-in expires ([`Mfa::pending_ttl`], ten minutes). Every wrong answer is
 //! charged to the throttle under a key of the account's ([`Key`]), so six digits cannot be
 //! guessed; and [`LOCK_AFTER`] wrong authenticator codes in a row (counted in the
-//! database, so across replicas and over days) lock it, until a recovery code or staff
+//! database, so across replicas and over days; [`Mfa::lockout`] tunes the count and
+//! the lock's length, never off) lock it, until a recovery code or staff
 //! ([`Mfa::unlock_totp`]) unlock it ([`MfaError::Locked`]: tell the owner).
 //!
 //! # Every door
@@ -95,6 +104,7 @@ use crate::store::{self, Account};
 
 mod challenge;
 pub mod pages;
+pub mod passkey;
 mod state;
 mod step_up;
 
@@ -102,7 +112,7 @@ pub use challenge::Answer;
 pub use state::{Auth, Kind, MfaSession, Pending, State};
 pub(crate) use step_up::guard_to;
 pub use step_up::{
-    Recent, RecentMfa, StepUp, require_recent, require_recent_at, require_recent_mfa,
+    Recent, RecentMfa, StepUp, StepUpGate, require_recent, require_recent_at, require_recent_mfa,
     require_recent_mfa_for,
 };
 
@@ -135,6 +145,8 @@ pub enum Factor {
     Totp,
     /// A single-use recovery code.
     RecoveryCode,
+    /// A passkey (Web Authentication).
+    Passkey,
 }
 
 impl Factor {
@@ -144,6 +156,7 @@ impl Factor {
         match self {
             Self::Totp => "totp",
             Self::RecoveryCode => "recovery_code",
+            Self::Passkey => "passkey",
         }
     }
 }
@@ -161,6 +174,9 @@ pub struct Event {
     /// required a factor and the account had none). Whoever holds the password can do
     /// this, so tell the account's owner by email whenever it is true.
     pub while_pending: bool,
+    /// The passkey (its row id, as [`Mfa::list_passkeys`] lists it) the event is about,
+    /// for the events of one.
+    pub passkey: Option<i64>,
 }
 
 impl Event {
@@ -169,6 +185,7 @@ impl Event {
             account,
             kind,
             while_pending: false,
+            passkey: None,
         }
     }
 }
@@ -197,26 +214,69 @@ pub enum EventKind {
     /// A second-factor challenge was passed: a sign-in completed, or a session was
     /// re-authenticated.
     ChallengePassed(Factor),
+    /// A factor was renamed (a passkey).
+    Renamed(Factor),
+    /// A passkey answered with a signature counter at or below the one stored: the
+    /// credential may have been copied. The answer was refused; tell the owner.
+    CloneSuspected(Factor),
+    /// The account was locked until recovery ([`AfterSuspectedCopy::LockUntilRecovery`]):
+    /// a passkey disabled as a suspected copy left it with no usable factor and no
+    /// recovery code. Every sign-in is refused until [`Mfa::clear_recovery_lock`]; tell the
+    /// owner how to recover it.
+    RecoveryLocked,
+    /// The recovery lock was cleared ([`Mfa::clear_recovery_lock`]).
+    RecoveryLockCleared {
+        /// Who cleared it: a member of staff, or the account itself through the app's
+        /// own recovery flow.
+        actor: i64,
+    },
 }
 
 impl Event {
     /// A stable, dotted name for the audit log: `mfa.totp.enrolled`,
     /// `mfa.totp.removed`, `mfa.recovery_codes.issued`, `mfa.recovery_code.used`,
-    /// `mfa.challenge.passed`.
+    /// `mfa.challenge.passed`, `mfa.passkey.enrolled`, `mfa.passkey.removed`,
+    /// `mfa.passkey.renamed`, `mfa.passkey.clone_suspected`, `mfa.account.recovery_locked`,
+    /// `mfa.account.recovery_lock_cleared`.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self.kind {
             EventKind::Enrolled(Factor::Totp) => "mfa.totp.enrolled",
+            EventKind::Enrolled(Factor::Passkey) => "mfa.passkey.enrolled",
             EventKind::Enrolled(_) => "mfa.factor.enrolled",
             EventKind::Removed(Factor::Totp) => "mfa.totp.removed",
+            EventKind::Removed(Factor::Passkey) => "mfa.passkey.removed",
             EventKind::Removed(_) => "mfa.factor.removed",
             EventKind::RecoveryCodesIssued => "mfa.recovery_codes.issued",
             EventKind::RecoveryCodeUsed { .. } => "mfa.recovery_code.used",
             EventKind::Locked(_) => "mfa.factor.locked",
             EventKind::Unlocked(_) => "mfa.factor.unlocked",
             EventKind::ChallengePassed(_) => "mfa.challenge.passed",
+            EventKind::Renamed(_) => "mfa.passkey.renamed",
+            EventKind::CloneSuspected(_) => "mfa.passkey.clone_suspected",
+            EventKind::RecoveryLocked => "mfa.account.recovery_locked",
+            EventKind::RecoveryLockCleared { .. } => "mfa.account.recovery_lock_cleared",
         }
     }
+}
+
+/// What follows when a passkey is disabled as a suspected copy
+/// ([`MfaError::PasskeyCloned`]) and the account is left with no usable second factor and
+/// no recovery code ([`Mfa::after_suspected_copy`]). While another factor or a recovery
+/// code remains, the account is challenged as before under either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AfterSuspectedCopy {
+    /// Lock the account until recovery: the disable records the lock on the account
+    /// (`accounts.mfa_recovery_locked_at`) in its own transaction, and every sign-in,
+    /// by any door, is refused with a page that says the account is locked pending
+    /// recovery, until staff or the app's recovery flow call
+    /// [`Mfa::clear_recovery_lock`]. Whoever holds the copy may hold the password too.
+    #[default]
+    LockUntilRecovery,
+    /// Let the account in on what remains: a password alone under an optional policy,
+    /// or a forced enrollment of a new factor under a required one.
+    AllowReenrolment,
 }
 
 /// Which accounts must have a second factor.
@@ -442,6 +502,11 @@ pub enum Next {
     /// The policy requires a factor and the account has none: send the person to
     /// enrollment ([`Mfa::begin_totp`]).
     Enroll,
+    /// The account is locked until recovery ([`AfterSuspectedCopy::LockUntilRecovery`]):
+    /// nothing signs it in. Show that it is locked pending recovery (the
+    /// [`MfaPages`](pages::MfaPages) challenge route does) until
+    /// [`Mfa::clear_recovery_lock`] clears it.
+    Locked,
 }
 
 /// Why an operation did nothing. Each message is written for the person. A variant may
@@ -457,7 +522,8 @@ pub enum MfaError {
     /// Answer 503.
     #[error("Signing in is unavailable for a moment. Please try again shortly.")]
     Unavailable,
-    /// The authenticator is locked for [`LOCK_FOR`] after too many wrong codes in a row.
+    /// The authenticator is locked for [`LOCK_FOR`] (or [`Mfa::lockout`]'s length) after
+    /// too many wrong codes in a row.
     /// A recovery code unlocks it at once, or staff do ([`Mfa::unlock_totp`]).
     #[error(
         "Too many wrong codes. Use a recovery code to unlock the authenticator, or try again in a few minutes."
@@ -496,6 +562,31 @@ pub enum MfaError {
     /// Re-authenticating needs a password or a factor, and the account has neither.
     #[error("There is nothing to confirm your identity with. Sign in again.")]
     NothingToProve,
+    /// Passkeys are not turned on ([`Mfa::passkeys`]).
+    #[error("Passkeys are not available on this site.")]
+    PasskeysOff,
+    /// The passkey ceremony the answer names does not exist, has expired (five
+    /// minutes) or was used: begin again.
+    #[error("That passkey request has expired. Please try again.")]
+    PasskeyExpired,
+    /// The browser answered for another origin or relying-party id than the
+    /// configuration names ([`passkey::RelyingParty`]); the log says which.
+    #[error("That passkey was made for another site address.")]
+    PasskeyOrigin,
+    /// The credential is registered already (to this account or another).
+    #[error("That passkey is already registered.")]
+    PasskeyTaken,
+    /// The passkey's signature counter went backwards: the credential may have been
+    /// copied. The answer was refused; [`MfaError::event`] gives the audit event.
+    #[error("That passkey was refused because it may have been copied. Use another factor.")]
+    PasskeyCloned {
+        /// The passkey's row id.
+        passkey: i64,
+    },
+    /// A passkey's name is empty, longer than 64 characters or holds control
+    /// characters.
+    #[error("Give the passkey a name of 1 to 64 characters.")]
+    BadName,
     /// A fault: the database, the random source or the sealer. Its source may name
     /// tables; log it and never show it.
     #[error("The check could not be made. Try again in a moment.")]
@@ -546,6 +637,21 @@ impl MfaError {
             }
         )
         .then(|| Event::new(account, EventKind::Locked(Factor::Totp)))
+    }
+
+    /// The audit event a refusal carries, to record and email the owner about: the
+    /// lock this answer just caused ([`locked_event`](Self::locked_event)), or a
+    /// passkey suspected of being copied ([`MfaError::PasskeyCloned`]). `None` for any
+    /// other answer.
+    #[must_use]
+    pub fn event(&self, account: i64) -> Option<Event> {
+        match self {
+            Self::PasskeyCloned { passkey } => Some(Event {
+                passkey: Some(*passkey),
+                ..Event::new(account, EventKind::CloneSuspected(Factor::Passkey))
+            }),
+            _ => self.locked_event(account),
+        }
     }
 
     /// The status a form answers with: 429 throttled, 503 unavailable, 422 a code or
@@ -608,6 +714,7 @@ pub struct Confirmed {
 
 /// An account's factors, as the settings page lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Factors {
     /// When the authenticator was confirmed (Unix seconds), if one is set up.
     pub totp_confirmed_at: Option<i64>,
@@ -615,38 +722,75 @@ pub struct Factors {
     pub recovery_codes_left: i64,
     /// The authenticator is locked after too many wrong codes ([`MfaError::Locked`]).
     pub totp_locked: bool,
+    /// Passkeys registered and usable (not disabled).
+    pub passkeys: i64,
+    /// Passkeys disabled as suspected copies ([`MfaError::PasskeyCloned`]): no factor,
+    /// listed until the owner removes them.
+    pub passkeys_disabled: i64,
+    /// The account is locked until recovery ([`AfterSuspectedCopy::LockUntilRecovery`]):
+    /// every sign-in is refused until [`Mfa::clear_recovery_lock`].
+    pub recovery_locked: bool,
 }
 
 impl Factors {
-    /// How many second factors the account holds (recovery codes are a way back from
-    /// losing one, not a factor of their own).
+    /// How many usable second factors the account holds (recovery codes are a way back
+    /// from losing one, not a factor of their own, and a disabled passkey is none).
     #[must_use]
     pub fn count(&self) -> usize {
-        usize::from(self.totp_confirmed_at.is_some())
+        usize::from(self.totp_confirmed_at.is_some()) + usize::try_from(self.passkeys).unwrap_or(0)
     }
 
-    /// Whether the account has a second factor to challenge.
+    /// Whether the account has a second factor to challenge: a usable one, or a
+    /// disabled passkey with recovery codes left. Disabling a suspected copy does not
+    /// turn the second factor off: until the owner removes it or adds another factor,
+    /// the challenge takes a recovery code.
     #[must_use]
     pub fn any(&self) -> bool {
-        self.count() > 0
+        self.count() > 0 || (self.passkeys_disabled > 0 && self.recovery_codes_left > 0)
     }
 }
 
-/// Wrong authenticator codes in a row after which the factor is locked.
+/// Wrong authenticator codes in a row after which the factor is locked, unless
+/// [`Mfa::lockout`] says otherwise.
 pub const LOCK_AFTER: i32 = 10;
 
-/// How long a lock lasts if no recovery code or staff lifts it sooner.
+/// How long a lock lasts if no recovery code or staff lifts it sooner, unless
+/// [`Mfa::lockout`] says otherwise.
 pub const LOCK_FOR: Duration = Duration::from_mins(15);
+
+/// The fewest and most wrong codes in a row [`Mfa::lockout`] takes. NIST SP
+/// 800-63B-4 caps consecutive failed attempts at 100.
+pub const LOCK_AFTER_RANGE: std::ops::RangeInclusive<u32> = 3..=100;
+
+/// The shortest lock [`Mfa::lockout`] takes.
+pub const LOCK_FOR_MIN: Duration = Duration::from_mins(1);
 
 /// Proof that the person may change their factors now: made by [`Mfa::authorize_change`]
 /// and nothing else, and asked for by every function that changes them
 /// ([`Mfa::begin_totp`], [`Mfa::confirm_totp`], [`Mfa::remove_totp`],
-/// [`Mfa::regenerate_recovery_codes`]), so a handler that forgets the step-up does not
+/// [`Mfa::regenerate_recovery_codes`], and for passkeys
+/// [`Mfa::begin_passkey_registration`], [`Mfa::finish_passkey_registration`] and
+/// [`Mfa::remove_passkey`]), so a handler that forgets the step-up does not
 /// compile.
 #[derive(Debug)]
 pub struct ChangeProof {
     account: i64,
     pending: bool,
+}
+
+/// Tells an account's owner about a security event on their account
+/// ([`Mfa::on_security_event`]), typically by email. It is called after the change the
+/// event records is committed, so a failure is logged and changes nothing.
+pub trait Notifier: Send + Sync + 'static {
+    /// Tell the owner of `event.account` about `event`.
+    ///
+    /// # Errors
+    ///
+    /// When the owner cannot be told.
+    fn notify<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 }
 
 /// The configuration the second-factor functions share. Build one at start, keep it
@@ -659,6 +803,11 @@ pub struct Mfa {
     pending_ttl: Duration,
     recovery_codes: usize,
     accept_plaintext: bool,
+    lock_after: i32,
+    lock_for: Duration,
+    passkeys: Option<passkey::RelyingParty>,
+    notifier: Option<Arc<dyn Notifier>>,
+    after_suspected_copy: AfterSuspectedCopy,
 }
 
 impl std::fmt::Debug for Mfa {
@@ -667,6 +816,9 @@ impl std::fmt::Debug for Mfa {
             .field("issuer", &self.issuer)
             .field("policy", &self.policy)
             .field("pending_ttl", &self.pending_ttl)
+            .field("lock_after", &self.lock_after)
+            .field("lock_for", &self.lock_for)
+            .field("after_suspected_copy", &self.after_suspected_copy)
             .finish_non_exhaustive()
     }
 }
@@ -688,6 +840,91 @@ impl Mfa {
             pending_ttl: Duration::from_secs(600),
             recovery_codes: recovery::DEFAULT_COUNT,
             accept_plaintext: true,
+            lock_after: LOCK_AFTER,
+            lock_for: LOCK_FOR,
+            passkeys: None,
+            notifier: None,
+            after_suspected_copy: AfterSuspectedCopy::default(),
+        }
+    }
+
+    /// What follows when a passkey disabled as a suspected copy leaves an account with no
+    /// usable factor and no recovery code: [`AfterSuspectedCopy::LockUntilRecovery`]
+    /// unless this says otherwise. A lock already recorded stands whatever this says
+    /// later; only [`clear_recovery_lock`](Self::clear_recovery_lock) clears it.
+    #[must_use]
+    pub fn after_suspected_copy(mut self, after: AfterSuspectedCopy) -> Self {
+        self.after_suspected_copy = after;
+        self
+    }
+
+    /// Clear the recovery lock of `account` ([`AfterSuspectedCopy::LockUntilRecovery`]),
+    /// for staff, or for the app's own recovery flow once it has proved the owner by its
+    /// own means. `actor` is the member of staff, or `account` itself. The account then
+    /// signs in as an account without a factor does: a password alone under an optional
+    /// policy, an enrollment under a required one. The owner hears of it through the
+    /// notifier, and the event is returned for the app's audit log; `None` if the account
+    /// was not locked.
+    ///
+    /// Whoever holds the copy may hold the password too, and the first sign-in after the
+    /// lock clears is the one that enrolls a factor. Replace the password first
+    /// ([`store::set_password`](crate::store::set_password), with one the owner chose
+    /// through the recovery), or turn password sign-in off for the account and let the
+    /// owner in by a link or a provider the recovery proved.
+    ///
+    /// # Errors
+    /// A fault.
+    pub async fn clear_recovery_lock(
+        &self,
+        pool: &PgPool,
+        account: i64,
+        actor: i64,
+    ) -> Result<Option<Event>, MfaError> {
+        let done = sqlx::query(
+            "UPDATE accounts SET mfa_recovery_locked_at = NULL
+             WHERE id = $1 AND mfa_recovery_locked_at IS NOT NULL",
+        )
+        .bind(account)
+        .execute(pool)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Ok(None);
+        }
+        tracing::info!(account, actor, "the account's recovery lock was cleared");
+        let event = Event::new(account, EventKind::RecoveryLockCleared { actor });
+        self.notify(&event).await;
+        Ok(Some(event))
+    }
+
+    /// Hand `notifier` each event the account's owner must hear about whatever page or
+    /// handler made it: today a passkey disabled as a suspected copy
+    /// (`mfa.passkey.clone_suspected`), the recovery lock that may follow it
+    /// (`mfa.account.recovery_locked`) and its clearing
+    /// (`mfa.account.recovery_lock_cleared`). Wire it to the app's mailer. Without one, the
+    /// event is only logged and returned (record it from [`MfaError::event`]).
+    #[must_use]
+    pub fn on_security_event(mut self, notifier: impl Notifier) -> Self {
+        self.notifier = Some(Arc::new(notifier));
+        self
+    }
+
+    /// Tell the notifier, if there is one, about `event`; a failure is logged.
+    async fn notify(&self, event: &Event) {
+        let Some(notifier) = &self.notifier else {
+            tracing::warn!(
+                account = event.account,
+                event = event.name(),
+                "no notifier to tell the owner: set Mfa::on_security_event"
+            );
+            return;
+        };
+        if let Err(e) = notifier.notify(event).await {
+            tracing::error!(
+                error = %e,
+                account = event.account,
+                event = event.name(),
+                "the owner could not be told of a second-factor event"
+            );
         }
     }
 
@@ -723,6 +960,25 @@ impl Mfa {
     pub fn pending_ttl(mut self, ttl: Duration) -> Self {
         self.pending_ttl = ttl;
         self
+    }
+
+    /// Lock the authenticator after `after` wrong codes in a row, for `for_` (by default
+    /// [`LOCK_AFTER`], 10, and [`LOCK_FOR`], 15 minutes). The lockout cannot be turned
+    /// off: `after` is clamped to [`LOCK_AFTER_RANGE`] (3 to 100) and `for_` to at least
+    /// [`LOCK_FOR_MIN`] (a minute). A recovery code or [`unlock_totp`](Self::unlock_totp)
+    /// still lifts a lock at once.
+    #[must_use]
+    pub fn lockout(mut self, after: u32, for_: Duration) -> Self {
+        let after = after.clamp(*LOCK_AFTER_RANGE.start(), *LOCK_AFTER_RANGE.end());
+        self.lock_after = i32::try_from(after).unwrap_or(LOCK_AFTER);
+        self.lock_for = for_.max(LOCK_FOR_MIN);
+        self
+    }
+
+    /// The lockout in force: wrong codes in a row, and how long the lock lasts.
+    #[must_use]
+    pub fn lockout_policy(&self) -> (u32, Duration) {
+        (self.lock_after.unsigned_abs(), self.lock_for)
     }
 
     /// How many recovery codes to issue (ten by default; at least one).
@@ -852,14 +1108,27 @@ impl Mfa {
     /// # Errors
     /// The database.
     pub async fn factors(&self, pool: &PgPool, account: i64) -> sqlx::Result<Factors> {
-        let (confirmed_at, locked, left): (Option<i64>, bool, i64) = sqlx::query_as(
+        let (confirmed_at, locked, left, passkeys, disabled, recovery_locked): (
+            Option<i64>,
+            bool,
+            i64,
+            i64,
+            i64,
+            bool,
+        ) = sqlx::query_as(
             "SELECT
                (SELECT EXTRACT(EPOCH FROM confirmed_at)::bigint FROM account_totp
                  WHERE account_id = $1 AND confirmed_at IS NOT NULL),
                COALESCE((SELECT locked_until > now() FROM account_totp
                  WHERE account_id = $1 AND confirmed_at IS NOT NULL), false),
                (SELECT count(*) FROM account_recovery_codes
-                 WHERE account_id = $1 AND used_at IS NULL)",
+                 WHERE account_id = $1 AND used_at IS NULL),
+               (SELECT count(*) FROM account_passkeys
+                 WHERE account_id = $1 AND disabled_at IS NULL),
+               (SELECT count(*) FROM account_passkeys
+                 WHERE account_id = $1 AND disabled_at IS NOT NULL),
+               COALESCE((SELECT mfa_recovery_locked_at IS NOT NULL FROM accounts
+                 WHERE id = $1), false)",
         )
         .bind(account)
         .fetch_one(pool)
@@ -868,6 +1137,9 @@ impl Mfa {
             totp_confirmed_at: confirmed_at,
             recovery_codes_left: left,
             totp_locked: locked,
+            passkeys,
+            passkeys_disabled: disabled,
+            recovery_locked,
         })
     }
 
@@ -1096,15 +1368,10 @@ impl Mfa {
             .await
             .map_err(MfaError::fault)?;
         let mut tx = pool.begin().await?;
-        // Held for the swap, and gone if the authenticator was removed meanwhile.
-        let held: Option<(i64,)> = sqlx::query_as(
-            "SELECT account_id FROM account_totp
-             WHERE account_id = $1 AND confirmed_at IS NOT NULL FOR UPDATE",
-        )
-        .bind(account.id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if held.is_none() {
+        // The account is held for the swap, and refused if its last factor was removed
+        // meanwhile.
+        passkey::lock_account(&mut tx, account.id).await?;
+        if passkey::factor_count(&mut tx, account.id).await? == 0 {
             return Err(MfaError::NotEnrolled);
         }
         replace_codes(&mut tx, account.id, &codes).await?;
@@ -1127,9 +1394,10 @@ impl Mfa {
         ))
     }
 
-    /// Remove the authenticator and the recovery codes behind it. Refused with
-    /// [`MfaError::LastFactor`] when the policy requires `account` to have a factor and
-    /// this is its last. Moves the session epoch on (other sessions end) and reseals
+    /// Remove the authenticator, and the recovery codes behind it when it is the
+    /// account's last factor (an account that keeps a passkey, even a disabled one, keeps
+    /// its codes). Refused with [`MfaError::LastFactor`] when the policy requires
+    /// `account` to have a factor and this is its last usable one. Moves the session epoch on (other sessions end) and reseals
     /// this one. Tell the owner.
     ///
     /// # Errors
@@ -1146,6 +1414,7 @@ impl Mfa {
             return Err(MfaError::NotEnrolled);
         }
         let mut tx = pool.begin().await?;
+        passkey::lock_account(&mut tx, account.id).await?;
         let held: Option<(Option<i64>,)> = sqlx::query_as(
             "SELECT EXTRACT(EPOCH FROM confirmed_at)::bigint FROM account_totp
              WHERE account_id = $1 FOR UPDATE",
@@ -1158,18 +1427,24 @@ impl Mfa {
             // An enrollment never confirmed is not a factor: there is nothing to remove.
             _ => return Err(MfaError::NotEnrolled),
         }
-        // Other factors would be counted here; there are none yet.
-        if self.requires(account) {
+        // The authenticator is one of the factors counted: it is the last usable one when
+        // the count is one. The codes go only when no passkey of any kind is left either,
+        // as when a passkey is removed: a disabled one with codes left is still challenged.
+        let count = passkey::factor_count(&mut tx, account.id).await?;
+        if count <= 1 && self.requires(account) {
             return Err(MfaError::LastFactor);
         }
+        let last = count + passkey::disabled_count(&mut tx, account.id).await? <= 1;
         sqlx::query("DELETE FROM account_totp WHERE account_id = $1")
             .bind(account.id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM account_recovery_codes WHERE account_id = $1")
-            .bind(account.id)
-            .execute(&mut *tx)
-            .await?;
+        if last {
+            sqlx::query("DELETE FROM account_recovery_codes WHERE account_id = $1")
+                .bind(account.id)
+                .execute(&mut *tx)
+                .await?;
+        }
         let epoch = bump_epoch(&mut tx, account.id, account.session_epoch).await?;
         tx.commit().await?;
         let account_now = Account {
@@ -1186,7 +1461,7 @@ impl Mfa {
         Ok(Event::new(account.id, EventKind::Removed(Factor::Totp)))
     }
 
-    /// Unlock the authenticator after too many wrong codes ([`LOCK_AFTER`]): for staff
+    /// Unlock the authenticator after too many wrong codes ([`lockout`](Self::lockout)): for staff
     /// answering the owner. (A recovery code unlocks it by itself.)
     ///
     /// # Errors
@@ -1220,8 +1495,8 @@ impl Mfa {
         account: &Account,
     ) -> Result<Next, MfaError> {
         let now = SystemTime::now();
-        let has = self.factors(pool, account.id).await?.any();
-        let Some(kind) = self.pending_kind(account, has) else {
+        let factors = self.factors(pool, account.id).await?;
+        let Some(kind) = self.pending_kind(account, factors.any(), factors.recovery_locked) else {
             session::sign_in(session, account);
             state::record(session, account, false, now);
             store::signed_in(pool, account.id).await?;
@@ -1230,13 +1505,17 @@ impl Mfa {
         Self::make_pending(session, account, kind, now);
         Ok(match kind {
             Kind::Enroll => Next::Enroll,
+            Kind::Locked => Next::Locked,
             _ => Next::Challenge,
         })
     }
 
-    /// What `account` must pass before it is signed in, given whether it `has` a factor.
-    fn pending_kind(&self, account: &Account, has: bool) -> Option<Kind> {
-        if has {
+    /// What `account` must pass before it is signed in, given whether it `has` a factor
+    /// and is `locked` until recovery (which nothing passes).
+    fn pending_kind(&self, account: &Account, has: bool, locked: bool) -> Option<Kind> {
+        if locked {
+            Some(Kind::Locked)
+        } else if has {
             Some(Kind::Challenge)
         } else if self.requires(account) {
             Some(Kind::Enroll)
@@ -1273,15 +1552,21 @@ impl Mfa {
     /// passed for this account and epoch, or if the account has none and the policy does
     /// not require one. Otherwise the session becomes the pending sign-in it should have
     /// been (so a challenge or enrollment form can follow), and the request is
-    /// anonymous. `has` is whether the account holds a factor ([`Factors::any`]), which
-    /// the layer reads in the query that loads the account. `Some(has_factor)` when it
-    /// stands.
+    /// anonymous. `has` is whether the account holds a factor ([`Factors::any`]) and
+    /// `locked` whether it is locked until recovery ([`Factors::recovery_locked`]), which
+    /// the layer reads in the query that loads the account; a locked account never
+    /// stands. `Some(has_factor)` when it stands.
     pub(crate) fn gate<T: MfaSession>(
         &self,
         session: &Session<T>,
         account: &Account,
         has: bool,
+        locked: bool,
     ) -> Option<bool> {
+        if locked {
+            Self::make_pending(session, account, Kind::Locked, SystemTime::now());
+            return None;
+        }
         let passed = session.read(|d| {
             d.signature()
                 .and_then(|s| state::auth_for(d.mfa(), s))
@@ -1290,7 +1575,7 @@ impl Mfa {
         if passed {
             return Some(true);
         }
-        match self.pending_kind(account, has) {
+        match self.pending_kind(account, has, false) {
             None => Some(false),
             Some(kind) => {
                 Self::make_pending(session, account, kind, SystemTime::now());

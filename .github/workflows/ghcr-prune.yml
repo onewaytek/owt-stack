@@ -1,0 +1,373 @@
+name: ghcr prune
+
+# Reusable: delete the app's ghcr image versions nothing deploys or verifies, so the
+# package does not grow without bound. A dry run unless the caller passes
+# `delete: true`: it lists what it would delete, in the job summary and the log, and
+# deletes nothing.
+#
+# What it deletes, from the package `package` (the repository's name by default):
+#   - untagged versions (a crane push before its tags, a buildx child, an old
+#     signature) older than `min-age-hours`;
+#   - rc versions (X.Y.Z-rc.N, with a variant suffix such as -hsm counted apart) but
+#     the newest `keep-rc` of each variant;
+#   - versions tagged only `scan-<run>` (the docker builder's image that failed its
+#     scan) older than `min-age-hours`;
+#   - cosign's `sha256-<hex>.sig`/`.att` versions whose image is deleted or gone.
+#
+# What it never deletes:
+#   - a version with any other tag: a release (X.Y.Z), `latest`, `rc`, X.Y, X, a test
+#     tag;
+#   - a digest named anywhere in `deployments-repo`'s default branch or in the diff of
+#     one of its open pull requests (a GitOps pin, one in flight, a rollback target),
+#     read with a token minted from DEPLOY_APP_CLIENT_ID/DEPLOY_APP_KEY for contents: read and
+#     pull requests: read on that repository alone;
+#   - what a kept version needs: an image index's children, its cosign signature and
+#     attestation versions (and their children), and any manifest whose `subject` is
+#     a kept digest.
+# With `delete: true` it fails when the checkout yields no pins at all (no digest and no
+# `version:` tag), and a dry run warns. A pin that names an rc by tag (`version:` in an
+# `apps/*/*/image.yaml`) protects the version carrying that tag, as a digest pin does.
+# A manifest it cannot read for a kept digest stops the run before any deletion. With
+# `deployments-repo` set and no DEPLOY_APP_CLIENT_ID secret, a dry run warns that it read no
+# pins and a deletion run fails.
+#
+# The job takes the caller's token permissions (it names none of its own, so a caller
+# that grants less, such as a Dependabot pull request, still starts): grant
+# `packages: write` for `delete: true`, `packages: read` for a dry run. The token can
+# list and delete the versions of a package whose "Manage Actions access" gives the
+# repository the Admin role; ghcr gives that to the repository that first pushed it.
+#
+#   jobs:
+#     ghcr:
+#       permissions: {contents: read, packages: write}
+#       uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # vX.Y.Z
+#       with:
+#         delete: false   # true deletes; review a dry run's list first
+#       secrets:
+#         DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
+#         DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      delete:
+        description: Delete the listed versions. False (the default) is a dry run.
+        type: boolean
+        default: false
+      package:
+        description: The container package, ghcr.io/<owner>/<package>; empty for the repository's name.
+        type: string
+        default: ""
+      keep-rc:
+        description: The newest rc versions kept, per variant.
+        type: number
+        default: 10
+      min-age-hours:
+        description: Untagged and scan-only versions younger than this are kept (a push in flight).
+        type: number
+        default: 24
+      deployments-repo:
+        description: The GitOps repository whose digests are never deleted, owner/name; empty for none.
+        type: string
+        default: onewaytek/deployments
+    secrets:
+      DEPLOY_APP_CLIENT_ID:
+        required: false
+      DEPLOY_APP_KEY:
+        required: false
+    outputs:
+      candidates:
+        description: How many versions the run deleted, or would delete in a dry run.
+        value: ${{ jobs.prune.outputs.candidates }}
+
+jobs:
+  prune:
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    timeout-minutes: 15
+    concurrency:
+      group: ghcr-prune-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      candidates: ${{ steps.prune.outputs.candidates }}
+    steps:
+      - name: Check the inputs
+        id: inputs
+        env:
+          PACKAGE: ${{ inputs.package }}
+          DEPLOYMENTS: ${{ inputs.deployments-repo }}
+          HAVE_APP: ${{ secrets.DEPLOY_APP_CLIENT_ID != '' && secrets.DEPLOY_APP_KEY != '' }}
+          DELETE: ${{ inputs.delete }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          pkg="${PACKAGE:-${GITHUB_REPOSITORY#*/}}"
+          pkg="${pkg,,}"
+          [[ $pkg =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$ ]] || fail "package '$pkg' is not a name"
+          echo "package=$pkg" >> "$GITHUB_OUTPUT"
+          pins=false
+          if [[ -n $DEPLOYMENTS ]]; then
+            [[ $DEPLOYMENTS =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || fail "deployments-repo '$DEPLOYMENTS' is not owner/name"
+            if [[ $HAVE_APP == true ]]; then
+              pins=true
+              echo "owner=${DEPLOYMENTS%%/*}" >> "$GITHUB_OUTPUT"
+              echo "name=${DEPLOYMENTS#*/}" >> "$GITHUB_OUTPUT"
+            elif [[ $DELETE == true ]]; then
+              fail "deployments-repo is set but DEPLOY_APP_CLIENT_ID/DEPLOY_APP_KEY are not: no deletion without the pins"
+            else
+              echo "::warning::no DEPLOY_APP_CLIENT_ID/DEPLOY_APP_KEY: this dry run read no pins from $DEPLOYMENTS"
+            fi
+          fi
+          echo "pins=$pins" >> "$GITHUB_OUTPUT"
+
+      - name: Mint a read token for the deployments repository
+        id: token
+        if: ${{ steps.inputs.outputs.pins == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_KEY }}
+          owner: ${{ steps.inputs.outputs.owner }}
+          repositories: ${{ steps.inputs.outputs.name }}
+          permission-contents: read
+          permission-pull-requests: read
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ steps.inputs.outputs.pins == 'true' }}
+        with:
+          repository: ${{ inputs.deployments-repo }}
+          token: ${{ steps.token.outputs.token }}
+          path: deployments
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Read the pins
+        id: pins
+        if: ${{ steps.inputs.outputs.pins == 'true' }}
+        env:
+          DELETE: ${{ inputs.delete }}
+          TOKEN: ${{ steps.token.outputs.token }}
+          DEPLOYMENTS: ${{ inputs.deployments-repo }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/ghcr-prune"; mkdir -p "$work"
+          # Digests: every one named anywhere in the deployments repository.
+          grep -rhoE --exclude-dir=.git 'sha256:[a-f0-9]{64}' deployments | sort -u > "$work/pins" || true
+          # Tags: the `version:` of each apps/*/*/image.yaml, which protects the version
+          # carrying that tag when a pin names an rc by tag and not by digest.
+          : > "$work/pin-tags"
+          if [ -d deployments/apps ]; then
+            find deployments/apps -name image.yaml -exec sed -nE \
+              's/^[[:space:]]*version:[[:space:]]*["'"'"']?([^"'"'"'[:space:]#]+).*/\1/p' {} + \
+              | sort -u > "$work/pin-tags" || true
+          fi
+          # Open pull requests to the deployments repository: pins in flight and rollback
+          # targets. The changed lines of each diff name digests and `version:` tags.
+          prs=0
+          if ! plist="$(curl -sSf --retry 3 -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${DEPLOYMENTS}/pulls?state=open&per_page=100" \
+                | jq -r '.[].number')"; then
+            if [ "$DELETE" = true ]; then
+              echo "::error::cannot list the open pull requests of $DEPLOYMENTS: no deletion without them"
+              exit 1
+            fi
+            echo "::warning::cannot list the open pull requests of $DEPLOYMENTS: a deletion run would fail"
+            plist=""
+          fi
+          for n in $plist; do
+            if ! diff="$(curl -sSf --retry 3 -H "Authorization: Bearer $TOKEN" \
+                  -H "Accept: application/vnd.github.diff" \
+                  "https://api.github.com/repos/${DEPLOYMENTS}/pulls/${n}")"; then
+              [ "$DELETE" = true ] && { echo "::error::cannot read pull request #${n} of $DEPLOYMENTS"; exit 1; }
+              echo "::warning::cannot read pull request #${n} of $DEPLOYMENTS"; continue
+            fi
+            grep -E '^[+-]' <<<"$diff" | grep -oE 'sha256:[a-f0-9]{64}' >> "$work/pins" || true
+            grep -E '^[+-][[:space:]]*version:' <<<"$diff" \
+              | sed -E 's/^[+-][[:space:]]*version:[[:space:]]*["'"'"']?([^"'"'"'[:space:]#]+).*/\1/' >> "$work/pin-tags" || true
+            prs=$((prs + 1))
+          done
+          sort -u -o "$work/pins" "$work/pins"; sort -u -o "$work/pin-tags" "$work/pin-tags"
+          echo "open pull requests read: ${prs}"
+          digests="$(wc -l < "$work/pins")"; tags="$(wc -l < "$work/pin-tags")"
+          echo "pins read from the deployments repository: ${digests} digests, ${tags} version tags"
+          if [ "$digests" -eq 0 ] && [ "$tags" -eq 0 ]; then
+            if [ "$DELETE" = true ]; then
+              echo "::error::pins read: 0 digests and 0 version tags from the deployments checkout: no deletion without the pins"
+              exit 1
+            fi
+            echo "::warning::pins read: 0 digests and 0 version tags from the deployments checkout: a deletion run would fail"
+          fi
+
+      - name: Prune
+        id: prune
+        env:
+          TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE: ${{ steps.inputs.outputs.package }}
+          KEEP_RC: ${{ inputs.keep-rc }}
+          MIN_AGE_HOURS: ${{ inputs.min-age-hours }}
+          DELETE: ${{ inputs.delete }}
+          PINS: ${{ steps.inputs.outputs.pins }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [[ $KEEP_RC =~ ^[0-9]+$ ]] || fail "keep-rc '$KEEP_RC' is not a whole number"
+          [[ $MIN_AGE_HOURS =~ ^[0-9]+$ ]] || fail "min-age-hours '$MIN_AGE_HOURS' is not a whole number"
+          owner="${OWNER,,}"
+          work="$RUNNER_TEMP/ghcr-prune"; mkdir -p "$work"
+          api="https://api.github.com/orgs/${owner}/packages/container/${PACKAGE}/versions"
+          gh_api() {
+            curl -sSf --retry 3 -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+          }
+
+          # Every version: id, digest, created_at, tags.
+          : > "$work/versions.json"
+          page=1
+          while :; do
+            batch="$(gh_api "${api}?per_page=100&page=${page}")" \
+              || fail "cannot list ghcr.io/${owner}/${PACKAGE} (does the repository have Admin in the package's Actions access?)"
+            [ "$(jq length <<<"$batch")" -gt 0 ] || break
+            jq -c '.[] | {id, digest: .name, created: .created_at, tags: (.metadata.container.tags // [])}' \
+              <<<"$batch" >> "$work/versions.json"
+            page=$((page + 1))
+          done
+          jq -s . "$work/versions.json" > "$work/all.json"
+          echo "ghcr.io/${owner}/${PACKAGE}: $(jq length "$work/all.json") versions"
+
+          # Registry reads, for manifests (children, subjects).
+          rtoken="$(curl -sSf --retry 3 -u "x-access-token:${TOKEN}" \
+            "https://ghcr.io/token?scope=repository:${owner}/${PACKAGE}:pull&service=ghcr.io" | jq -r .token)"
+          [ -n "$rtoken" ] && [ "$rtoken" != null ] || fail "no registry token for ghcr.io/${owner}/${PACKAGE}"
+          manifest() {
+            curl -sSf --retry 3 -H "Authorization: Bearer $rtoken" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${owner}/${PACKAGE}/manifests/$1"
+          }
+
+          # The pins: the digests and version tags the "Read the pins" step wrote.
+          [ -e "$work/pins" ] || : > "$work/pins"
+          [ -e "$work/pin-tags" ] || : > "$work/pin-tags"
+
+          # Classify. kind: keep (another tag), rc, cosign, scan, untagged.
+          now="$(date -u +%s)"
+          jq --argjson now "$now" --argjson age "$((MIN_AGE_HOURS * 3600))" --argjson keeprc "$KEEP_RC" '
+            def rc: test("^v?[0-9]+\\.[0-9]+\\.[0-9]+-rc\\.[0-9]+(-[0-9A-Za-z]+)?$");
+            def cosign: test("^sha256-[a-f0-9]{64}(\\.[a-z]+)?$");
+            def scan: test("^scan-[0-9]+");
+            map(. + {young: (($now - (.created | fromdateiso8601)) < $age)}
+              | . + {kind: (
+                  if (.tags | length) == 0 then "untagged"
+                  elif any(.tags[]; (rc or cosign or scan) | not) then "keep"
+                  elif any(.tags[]; rc) then "rc"
+                  elif all(.tags[]; cosign) then "cosign"
+                  else "scan" end)})
+            | (map(select(.kind == "rc")
+                | . + {variant: ([.tags[] | select(rc) | capture("-rc\\.[0-9]+(?<v>.*)$").v] | first)})
+               | group_by(.variant)
+               | map(sort_by(.created) | reverse | to_entries
+                     | map(.value + {newest: (.key < $keeprc)})) | add // []) as $rcs
+            | map(if .kind == "rc" then (. as $v | $rcs[] | select(.id == $v.id)) else . end)
+            | map(. + {kept: (
+                if .kind == "keep" then "tag"
+                elif .kind == "rc" and .newest then "newest rc"
+                elif (.kind == "untagged" or .kind == "scan") and .young then "young"
+                else null end)})
+          ' "$work/all.json" > "$work/classified.json"
+
+          # A pin by tag protects the version carrying that tag (X.Y.Z, or vX.Y.Z).
+          # resolve-begin
+          if [ -s "$work/pin-tags" ]; then
+            jq -r --rawfile t "$work/pin-tags" '
+              ($t | split("\n") | map(select(. != "") | ltrimstr("v"))) as $tags
+              | .[] | select(any(.tags[]; ltrimstr("v") as $x | $tags | index($x))) | .digest' \
+              "$work/classified.json" >> "$work/pins"
+            sort -u -o "$work/pins" "$work/pins"
+          fi
+          # resolve-end
+
+          # Protect: kept versions and pins, then everything they reach, to a fixed point.
+          jq -r '.[] | select(.kept) | .digest' "$work/classified.json" | sort -u > "$work/protected"
+          if [ -s "$work/pins" ]; then
+            jq -r '.[].digest' "$work/classified.json" | sort -u | comm -12 - "$work/pins" >> "$work/protected"
+            sort -u -o "$work/protected" "$work/protected"
+          fi
+          jq -r '.[].digest' "$work/classified.json" | sort -u > "$work/existing"
+          : > "$work/expanded"
+          for _ in $(seq 1 20); do
+            before="$(wc -l < "$work/protected")"
+            # An index's children (of the versions still in the package).
+            for d in $(comm -23 "$work/protected" "$work/expanded" | comm -12 - "$work/existing"); do
+              m="$(manifest "$d")" || fail "cannot read the manifest of kept ${d}: deleting nothing"
+              jq -r '.manifests[]?.digest' <<<"$m" >> "$work/protected"
+              echo "$d" >> "$work/expanded"
+            done
+            sort -u -o "$work/expanded" "$work/expanded"
+            # cosign's tag-addressed signatures and attestations of a kept digest.
+            jq -r --rawfile p "$work/protected" '
+              ($p | split("\n") | map(select(. != "") | sub(":"; "-"))) as $hex
+              | .[] | select(.kind == "cosign")
+              | select(any(.tags[]; (split(".")[0]) as $t | $hex | index($t)))
+              | .digest' "$work/classified.json" >> "$work/protected"
+            sort -u -o "$work/protected" "$work/protected"
+            [ "$(wc -l < "$work/protected")" -eq "$before" ] && break
+          done
+          # Referrers by subject: an untagged manifest that names a kept digest.
+          for d in $(jq -r '.[] | select(.kind == "untagged" and (.kept | not)) | .digest' "$work/classified.json" \
+                     | sort -u | comm -23 - "$work/protected"); do
+            # An unreadable manifest fails closed: kept, and a deletion run stops here.
+            if ! m="$(manifest "$d")"; then
+              [ "$DELETE" = true ] && fail "cannot read the manifest of untagged ${d}: deleting nothing"
+              echo "::warning::cannot read the manifest of untagged ${d}: kept"
+              echo "$d" >> "$work/protected"
+              continue
+            fi
+            s="$(jq -r '.subject.digest // empty' <<<"$m")"
+            if [ -n "$s" ] && grep -qxF "$s" "$work/protected"; then
+              echo "$d" >> "$work/protected"
+              jq -r '.manifests[]?.digest' <<<"$m" >> "$work/protected"
+            fi
+          done
+          sort -u -o "$work/protected" "$work/protected"
+
+          jq --rawfile p "$work/protected" '
+            ($p | split("\n") | map(select(. != ""))) as $keep
+            | map(select(.digest as $d | $keep | index($d) | not))
+            | sort_by(.created)' "$work/classified.json" > "$work/candidates.json"
+          n="$(jq length "$work/candidates.json")"
+          echo "candidates=$n" >> "$GITHUB_OUTPUT"
+
+          mode="dry run: nothing deleted"
+          [ "$DELETE" = true ] && mode="deleting"
+          {
+            echo "### ghcr.io/${owner}/${PACKAGE}: ${n} of $(jq length "$work/all.json") versions to delete (${mode})"
+            echo
+            echo "Kept: $(jq '[.[] | select(.kept == "tag")] | length' "$work/classified.json") tagged," \
+              "$(jq '[.[] | select(.kept == "newest rc")] | length' "$work/classified.json") newest rc," \
+              "$(wc -l < "$work/pins") pinned digests read, $(wc -l < "$work/protected") digests protected in all."
+            echo
+            echo "By kind: $(jq -r 'group_by(.kind) | map("\(.[0].kind) \(length)") | join(", ")' "$work/candidates.json")"
+            echo
+            echo '| created | kind | digest | tags |'
+            echo '|---|---|---|---|'
+            jq -r '.[] | "| \(.created) | \(.kind) | `\(.digest)` | \(.tags | join(" ")) |"' "$work/candidates.json"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+          [ "$DELETE" = true ] || exit 0
+          deleted=0
+          for id in $(jq -r '.[].id' "$work/candidates.json"); do
+            # The tags now: a tag put on it since the listing keeps it.
+            now_tags="$(gh_api "${api}/${id}" | jq -c '.metadata.container.tags // []')" \
+              || fail "cannot re-read version ${id} after ${deleted} deletions"
+            if jq -e 'any(.[]; test("^v?[0-9]+\\.[0-9]+\\.[0-9]+-rc\\.[0-9]+(-[0-9A-Za-z]+)?$|^sha256-[a-f0-9]{64}(\\.[a-z]+)?$|^scan-[0-9]+") | not)' \
+                 <<<"$now_tags" > /dev/null; then
+              echo "skipping version ${id}: it is now tagged ${now_tags}"
+              continue
+            fi
+            gh_api -X DELETE "${api}/${id}" > /dev/null || fail "deleting version ${id} failed after ${deleted} deletions"
+            deleted=$((deleted + 1))
+          done
+          echo "deleted ${deleted} versions" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -20,6 +20,7 @@ owt-bus.workspace = true
 owt-change.workspace = true
 owt-crypt = { workspace = true, features = ["yubihsm"] }
 owt-storage.workspace = true
+owt-mail.workspace = true
 owt-runtime = { workspace = true, features = ["redis"] }
 owt-test.workspace = true
 owt-web.workspace = true
@@ -28,7 +29,7 @@ reqwest.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
-tower-http = { workspace = true, features = ["fs"] }
+time.workspace = true
 tracing.workspace = true
 
 [lints]

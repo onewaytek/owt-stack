@@ -24,6 +24,11 @@ pub enum Kind {
     /// and the account's second factor must be answered.
     #[serde(rename = "r")]
     Reauth,
+    /// The first factor was checked and the account is locked until recovery
+    /// ([`AfterSuspectedCopy::LockUntilRecovery`](super::AfterSuspectedCopy::LockUntilRecovery)):
+    /// nothing answers it; the pages say the account is locked pending recovery.
+    #[serde(rename = "l")]
+    Locked,
 }
 
 /// A sign-in or re-authentication part way through. It is not a [`Signature`]: nothing

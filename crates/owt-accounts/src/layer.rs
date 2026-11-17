@@ -51,8 +51,9 @@ pub struct Accounts {
 }
 
 /// The second-factor gate [`Accounts::require_mfa`] fixes for one session data type:
-/// it reads the session, the account and whether the account holds a factor.
-type GateFn<T> = dyn Fn(&Session<T>, &Account, bool) -> Gate + Send + Sync;
+/// it reads the session, the account, whether the account holds a factor and whether it
+/// is locked until recovery.
+type GateFn<T> = dyn Fn(&Session<T>, &Account, bool, bool) -> Gate + Send + Sync;
 
 #[derive(Clone, Debug)]
 struct MfaGate {
@@ -90,20 +91,24 @@ impl Accounts {
     /// request is anonymous, and the session becomes the pending sign-in a challenge or
     /// enrollment page continues ([`Mfa::pending_account`]). A password sign-in, a link, a
     /// provider and [`session::password_gate`](crate::session::password_gate) are all
-    /// closed by it, including an old `/login` route left in place.
+    /// closed by it, including an old `/login` route left in place. An account locked
+    /// until recovery ([`AfterSuspectedCopy`](crate::mfa::AfterSuspectedCopy)) never
+    /// stands: its session becomes a pending sign-in the challenge page shows as locked.
+    /// Without `require_mfa`, the layer still refuses a locked account's signature.
     ///
     /// `T` is the session data type, and must be the one `load::<T>` is installed with:
     /// `load::<Other>` on an `Accounts` that requires MFA for `T` logs an error and answers
     /// 503 to anyone signed in, rather than run single-factor.
     #[must_use]
     pub fn require_mfa<T: MfaSession>(mut self, mfa: Mfa) -> Self {
-        let gate: Arc<GateFn<T>> =
-            Arc::new(move |session: &Session<T>, account: &Account, has: bool| {
-                match mfa.gate(session, account, has) {
-                    Some(has) => Gate::Open(Some(has)),
-                    None => Gate::Held,
-                }
-            });
+        let gate: Arc<GateFn<T>> = Arc::new(
+            move |session: &Session<T>, account: &Account, has: bool, locked: bool| match mfa
+                .gate(session, account, has, locked)
+            {
+                Some(has) => Gate::Open(Some(has)),
+                None => Gate::Held,
+            },
+        );
         self.mfa = Some(MfaGate {
             data: std::any::TypeId::of::<T>(),
             gate: Arc::new(gate),
@@ -159,14 +164,22 @@ impl Accounts {
     }
 
     /// What the second-factor gate, if one is required, makes of this signature for
-    /// `account`, which holds a factor if `has_factor`.
+    /// `account`, as `standing` describes it.
     fn hold<T: SignedData>(
         &self,
         session: Option<&Session<T>>,
         account: &Account,
-        has_factor: bool,
+        standing: &Standing,
     ) -> sqlx::Result<Gate> {
         let (Some(required), Some(session)) = (&self.mfa, session) else {
+            // Without the second-factor gate a locked account is still refused: its
+            // signature is dropped, and the request is anonymous.
+            if standing.recovery_locked {
+                if let Some(session) = session {
+                    session.update(|data| data.set_signature(None));
+                }
+                return Ok(Gate::Held);
+            }
             return Ok(Gate::Open(None));
         };
         let gate = (required.data == std::any::TypeId::of::<T>())
@@ -182,7 +195,12 @@ impl Accounts {
                 "require_mfa and load name different session data types".into(),
             ));
         };
-        Ok(gate(session, account, has_factor))
+        Ok(gate(
+            session,
+            account,
+            standing.has_factor,
+            standing.recovery_locked,
+        ))
     }
 
     /// The middleware, with `read` asking for the session's account (by id, in its
@@ -201,7 +219,7 @@ impl Accounts {
                 let id = session.as_ref().and_then(Session::id);
                 match read(self.pool.clone(), signature.account, signature.epoch, id).await {
                     Ok(Some((account, extra, standing))) => {
-                        let held = self.hold::<T>(session.as_ref(), &account, standing.has_factor);
+                        let held = self.hold::<T>(session.as_ref(), &account, &standing);
                         match held {
                             Ok(Gate::Open(has_factor)) => {
                                 req.extensions_mut().insert(LoadedExtra(extra));

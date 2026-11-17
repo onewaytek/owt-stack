@@ -4,12 +4,11 @@ members = ["crates/*"]
 exclude = ["fuzz", "tests/image-sample"]
 
 [workspace.package]
-version = "0.12.2"
+version = "0.14.6"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 publish = false
-repository = "https://github.com/onewaytek/owt-stack"
 
 # The versions every consumer is pinned to. An app depends on these through the
 # owt-* crates and, for the crates it also names directly, at the same major: a
@@ -26,10 +25,9 @@ cookie = { version = "0.18", features = ["private", "percent-encode"] }
 futures = "0.3"
 hkdf = "0.13"
 hmac = "0.13"
-getrandom = "0.3"
+getrandom = "0.4"
 governor = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
 html-escape = "0.3"
-http = "1"
 http-body-util = "0.1"
 hyper = { version = "1.11", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
@@ -59,6 +57,7 @@ sha2 = "0.11"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "migrate"] }
 subtle = "2"
 thiserror = "2"
+time = "0.3"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7", default-features = false }
 tower = { version = "0.5", features = ["util"] }
@@ -71,6 +70,10 @@ unicode-normalization = "0.1"
 unicode-security = "0.1.2"
 url = "2.5"
 zeroize = "1"
+webauthn-rs = { version = "0.6.2", default-features = false, features = ["danger-allow-state-serialisation"] }
+# A dev-dependency of owt-accounts only: SoftPasskey stands in for the browser in tests.
+# kanidm/webauthn-rs#604 concerns `authenticator_hashed.rs`, which `softpasskey` does not use.
+webauthn-authenticator-rs = { version = "0.6.2", default-features = false, features = ["softpasskey"] }
 
 owt-web = { path = "crates/owt-web" }
 owt-runtime = { path = "crates/owt-runtime" }
@@ -83,6 +86,7 @@ owt-change = { path = "crates/owt-change" }
 owt-crypt = { path = "crates/owt-crypt" }
 owt-storage = { path = "crates/owt-storage" }
 owt-audit = { path = "crates/owt-audit" }
+owt-mail = { path = "crates/owt-mail" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -92,6 +96,13 @@ missing_docs = "warn"
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
+
+# Line tables only, in the dev profile `cargo test` inherits: a backtrace still names
+# file and line, and each test binary is a fraction of its full-debug size.
+[profile.dev]
+debug = "line-tables-only"
+[profile.dev.package."*"]
+debug = "line-tables-only"
 
 # Cryptography dominates a debug test run: argon2 hashing, AES-GCM sealing and SHA-2
 # digesting run 20-50x slower unoptimised. These dependencies are built optimised in the

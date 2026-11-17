@@ -18,6 +18,10 @@ name: Image check
 # runner's daemon. Nothing is signed and no SBOM is made here: that needs a pushed image
 # and `id-token: write`.
 #
+# The crane build hands its layer to `verify` and `scan` as the `image-layer` artifact,
+# kept a day at most; actions-cleanup.yml, called by the app on `workflow_run`, deletes
+# it once the run has succeeded (no job here can, holding no write permission).
+#
 # It is a workflow of its own because no job in it can write: a caller's token needs
 # only `contents: read`. A reusable workflow whose jobs ask for `packages: write` (as
 # image.yml's push does) fails to start for a caller that grants less, even when the
@@ -241,7 +245,7 @@ jobs:
           fi
       - name: Install sccache
         if: ${{ steps.sccache.outputs.enabled == 'true' }}
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: sccache@0.18.0
           fallback: none
@@ -501,7 +505,15 @@ jobs:
           name="${BASE%@*}"
           # A tag after the last slash, if any.
           if [[ "${name##*/}" == *:* ]]; then name="${name%:*}"; fi
-          digest="$(crane digest --platform linux/amd64 "$BASE")"
+          if [[ "$BASE" == *@* ]]; then
+            # Pinned, with or without its tag: the tag is only a label for Renovate, so
+            # the digest alone is resolved (an index to its linux/amd64 manifest).
+            pinned="${BASE##*@}"
+            [[ "$pinned" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "::error::base-image digest '$pinned' is malformed"; exit 1; }
+            digest="$(crane digest --platform linux/amd64 "${name}@${pinned}")"
+          else
+            digest="$(crane digest --platform linux/amd64 "$BASE")"
+          fi
           ref="${name}@${digest}"
           echo "base ${BASE} is ${ref} for linux/amd64"
           fs="$RUNNER_TEMP/base"
@@ -618,7 +630,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # No build record artifact: it would count against the Actions storage for days.
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}

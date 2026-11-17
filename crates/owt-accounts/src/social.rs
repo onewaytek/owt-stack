@@ -940,7 +940,7 @@ struct ButtonsHtml<'a, 'b> {
 #[template(
     source = r#"{% if v.connections.is_empty() %}<p class="owt-hint">{{ v.words.none }}</p>
 {% else %}<table class="owt-table"><thead><tr><th scope="col">{{ v.words.provider }}</th><th scope="col">{{ v.words.account }}</th><th scope="col"><span class="owt-sr">{{ v.words.actions }}</span></th></tr></thead><tbody>
-{% for r in v.connections %}<tr><td>{{ r.provider }}</td><td>{{ r.label }}</td><td><form method="post" action="{{ r.remove }}"><button class="owt-button owt-button-quiet" type="submit">{{ v.words.remove }}</button></form></td></tr>
+{% for r in v.connections %}<tr><td>{{ r.provider }}</td><td>{{ r.label }}</td><td><form method="post" action="{{ r.remove }}"><button class="owt-button owt-button-quiet owt-button-quiet-danger" type="submit">{{ v.words.remove }}</button></form></td></tr>
 {% endfor %}</tbody></table>
 {% endif %}{% if !v.buttons.is_empty() %}<div class="owt-actions">{% for b in v.buttons %}<form method="post" action="{{ b.action }}"><input type="hidden" name="connect" value="1"><button class="owt-button owt-button-secondary" type="submit">{{ b.label }}</button></form>{% endfor %}</div>
 {% endif %}"#,

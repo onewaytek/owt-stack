@@ -1,0 +1,52 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Base images pinned by digest in an app's Dockerfile and its release workflow's base-image input, kept current by the self-hosted Renovate. Digest-only bumps (same tag, new digest) automerge to main once their checks pass, the digest is 24 h old upstream (minimumReleaseAge counts from the registry's publication, not from the pull request or its time on rc), and Renovate's next scheduled run comes round. Tag changes (a new major) never automerge.",
+  "extends": ["docker:pinDigests", ":semanticCommits", ":disableDependencyDashboard"],
+  "enabledManagers": ["dockerfile", "custom.regex"],
+  "semanticCommitType": "fix",
+  "semanticCommitScope": "deps",
+  "timezone": "UTC",
+  "schedule": ["* 0-6 * * 1,4"],
+  "prCreation": "immediate",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "base-image: name:tag@sha256:digest, the image.yml input in a release workflow",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "base-image:\\s*\"?(?<depName>[^:@\\s\"]+):(?<currentValue>[^@\\s\"]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "image: or value: name:tag@sha256:digest in the owt-app chart's default values and the OpenShift templates' parameter defaults (Redis, cloudflared); the pruner image names the cluster's internal registry, which Renovate cannot read",
+      "managerFilePatterns": ["/^charts/owt-app/values\\.yaml$/", "/^templates/openshift/(redis|tunnel)\\.yaml$/"],
+      "matchStrings": [
+        "\\s(?:image|value):\\s*(?<depName>[^:@\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Builders and runtime move together, so the binary's glibc matches the base's.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["registry.access.redhat.com/hi/**"],
+      "groupName": "Red Hat hardened images",
+      "groupSlug": "rh-hardened-images"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["digest"],
+      "minimumReleaseAge": "24 hours",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": false
+    },
+    {
+      "matchUpdateTypes": ["major", "minor", "patch", "pinDigest"],
+      "automerge": false
+    }
+  ]
+}

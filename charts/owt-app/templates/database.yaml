@@ -1,0 +1,217 @@
+{{- /*
+The app's CloudNativePG database (templates/openshift/app.yaml's): the Cluster, its
+nightly volume-snapshot backups and their pruning, and the NetworkPolicies of the app
+and its database. The Cluster is never pruned or deleted by Argo.
+*/ -}}
+{{- $name := include "owt.name" . -}}
+{{- $ns := include "owt.namespace" . -}}
+{{- $db := include "owt.db" . -}}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $db }}
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+  annotations:
+    {{- include "owt.keep" . | nindent 4 }}
+spec:
+  instances: {{ .Values.database.instances }}
+  # CNPG's image, not docker.io/postgres. Changing the major here upgrades the
+  # running cluster in place (postgresMajor).
+  imageName: ghcr.io/cloudnative-pg/postgresql:{{ required "postgresMajor is required: the major the cluster runs" .Values.postgresMajor }}
+  primaryUpdateStrategy: unsupervised
+  bootstrap:
+    initdb:
+      database: {{ $name }}
+      owner: {{ $name }}
+  storage:
+    size: {{ .Values.database.size }}
+    storageClass: {{ .Values.database.storageClass }}
+  enableSuperuserAccess: false
+  # The app's runtime role: it logs in and owns nothing.
+  managed:
+    roles:
+      - name: {{ include "owt.rolePrefix" . }}_runtime
+        ensure: present
+        login: true
+        inherit: true
+        passwordSecret: {name: "{{ $db }}-runtime"}
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 512Mi}
+  backup:
+    volumeSnapshot:
+      className: {{ .Values.backup.snapshotClass }}
+      # Offline by default: with no WAL archive, an online snapshot lacks the WAL
+      # needed to make it consistent.
+      online: {{ .Values.backup.online }}
+      # Deleting a Backup takes its VolumeSnapshot with it.
+      snapshotOwnerReference: backup
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ $db }}-nightly
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  immediate: true
+  # The Backup outlives the ScheduledBackup that made it.
+  backupOwnerReference: none
+  cluster:
+    name: {{ $db }}
+  method: volumeSnapshot
+---
+# Retention is a job: CNPG's `retentionPolicy` is barman-only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-backup-prune
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-backup-prune
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+rules:
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["backups"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-backup-prune
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-backup-prune
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}-backup-prune
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-backup-prune
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  # After the nightly backup, so the floor counts tonight's.
+  schedule: {{ .Values.backup.pruneSchedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: {{ $name }}-backup-prune
+          restartPolicy: Never
+          containers:
+            - name: prune
+              image: {{ .Values.backup.pruneImage }}
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {cpu: 200m, memory: 256Mi}
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+                seccompProfile: {type: RuntimeDefault}
+              env:
+                - {name: CLUSTER, value: "{{ $db }}"}
+                - {name: KEEP_DAYS, value: "{{ .Values.backup.keepDays }}"}
+                - {name: KEEP_AT_LEAST, value: "{{ .Values.backup.keepAtLeast }}"}
+              # A prune that fails (RBAC, the API, a parse error) fails the Job.
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  set -euo pipefail
+                  oc get backups.postgresql.cnpg.io -o json > /tmp/backups.json
+                  python3 - /tmp/backups.json > /tmp/doomed <<'PY'
+                  import datetime, json, os, sys
+                  keep_days = int(os.environ["KEEP_DAYS"])
+                  keep_at_least = int(os.environ["KEEP_AT_LEAST"])
+                  cluster = os.environ["CLUSTER"]
+                  now = datetime.datetime.now(datetime.timezone.utc)
+                  with open(sys.argv[1]) as f:
+                      items = json.load(f)["items"]
+                  mine = [b for b in items
+                          if ((b.get("spec") or {}).get("cluster") or {}).get("name") == cluster]
+                  # A failed backup holds nothing, so it never counts towards
+                  # the floor: three failures must not let the last good one go.
+                  done = sorted(
+                      (b for b in mine if (b.get("status") or {}).get("phase") == "completed"),
+                      key=lambda b: b["metadata"]["creationTimestamp"], reverse=True)
+                  protected = {b["metadata"]["name"] for b in done[:keep_at_least]}
+                  for b in mine:
+                      if b["metadata"]["name"] in protected:
+                          continue
+                      # The image runs python 3.9, whose fromisoformat reads no Z.
+                      stamp = b["metadata"]["creationTimestamp"].replace("Z", "+00:00")
+                      if (now - datetime.datetime.fromisoformat(stamp)).days >= keep_days:
+                          print(b["metadata"]["name"])
+                  PY
+                  echo "pruning $(wc -l < /tmp/doomed) of $CLUSTER's backups"
+                  while read -r doomed; do
+                    [ -n "$doomed" ] || continue
+                    echo "deleting $doomed"
+                    oc delete backups.postgresql.cnpg.io "$doomed"
+                  done < /tmp/doomed
+---
+# Who may connect. A pod selected by a policy accepts only what some policy allows.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  podSelector:
+    matchLabels: {app: "{{ $name }}"}
+  policyTypes: [Ingress]
+  ingress:
+    # The router.
+    - from:
+        - namespaceSelector:
+            matchLabels: {policy-group.network.openshift.io/ingress: ""}
+      ports: [{port: http}]
+    # Prometheus.
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: "{{ .Values.metricsNamespace }}"}
+      ports: [{port: metrics}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $db }}
+  namespace: {{ $ns }}
+  labels: {app: "{{ $name }}"}
+spec:
+  podSelector:
+    matchLabels: {cnpg.io/cluster: "{{ $db }}"}
+  policyTypes: [Ingress]
+  ingress:
+    # Postgres: the app, and the cluster's own instances (replication).
+    - from:
+        - podSelector:
+            matchLabels: {app: "{{ $name }}"}
+        - podSelector:
+            matchLabels: {cnpg.io/cluster: "{{ $db }}"}
+      ports: [{port: 5432}]
+    # The instance manager's status port, which the CNPG operator calls.
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: "{{ .Values.cnpgNamespace }}"}
+      ports: [{port: 8000}]

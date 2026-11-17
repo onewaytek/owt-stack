@@ -36,7 +36,7 @@
 //! the data (at sign-out). An app may use the id as a guest's identity.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRequestParts, Request, State};
@@ -222,7 +222,43 @@ struct Config {
     idle: Option<Duration>,
     /// The least time between two reseals of the last-active time.
     idle_refresh: Option<Duration>,
+    /// What set [`Self::idle`].
+    idle_source: Source,
+    /// What set [`Self::absolute`].
+    absolute_source: Source,
+    /// Logs the idle timeout and absolute lifetime once, on the first request through [`Sessions::layer`].
+    idle_logged: Arc<Once>,
     secure: bool,
+}
+
+/// What set a [`Sessions`]'s idle timeout or absolute lifetime, for the lines logged at
+/// the first request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    /// Nothing did: [`IDLE_TIMEOUT`] or [`ABSOLUTE_LIFETIME`].
+    Default,
+    /// `SESSION_IDLE_TIMEOUT` or `SESSION_ABSOLUTE_LIFETIME`, through
+    /// [`Sessions::from_vars`].
+    Variable,
+    /// [`Sessions::idle_timeout`], [`Sessions::without_idle_timeout`] or
+    /// [`Sessions::absolute_lifetime`], called in code.
+    Builder,
+}
+
+impl Source {
+    /// The word the log line gives: `variable` is the one that set the value.
+    fn name(self, variable: &'static str) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Variable => variable,
+            Self::Builder => "builder",
+        }
+    }
+}
+
+/// `idle` as the startup line writes it: whole seconds, or `off`.
+fn idle_text(idle: Option<Duration>) -> String {
+    idle.map_or_else(|| "off".to_owned(), |d| format!("{}s", d.as_secs()))
 }
 
 /// A request header that, set to `1`, marks the request as passive: not the person's
@@ -244,16 +280,82 @@ fn oversized(encoded_len: usize) -> bool {
 }
 
 /// The longest a session lasts, however often it is re-sealed, unless
+/// `SESSION_ABSOLUTE_LIFETIME` (read by [`Sessions::from_env`]) or
 /// [`Sessions::absolute_lifetime`] says otherwise (or `max_age` is longer): 24 hours,
 /// NIST SP 800-63B-4's reauthentication bound at AAL2, so a copied cookie is good for
 /// a day at most.
 pub const ABSOLUTE_LIFETIME: Duration = Duration::from_hours(24);
 
-/// How long a session lasts without activity, unless [`Sessions::idle_timeout`] says
-/// otherwise or [`Sessions::without_idle_timeout`] turns it off: 30 minutes, NIST SP
-/// 800-63B-4's inactivity bound at AAL2. A workforce app handling health data sets
-/// less (15 minutes, AAL3's).
+/// How long a session lasts without activity, unless `SESSION_IDLE_TIMEOUT` (read by
+/// [`Sessions::from_env`]), [`Sessions::idle_timeout`] or
+/// [`Sessions::without_idle_timeout`] says otherwise: 30 minutes. That is inside
+/// NIST SP 800-63B-4's inactivity bound at AAL2 (1 hour) and OWASP's 15 to 30 minutes
+/// for low-risk applications; at AAL1 NIST requires none. A workforce app handling
+/// health data sets less (15 minutes, AAL3's).
 pub const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// The variable [`Sessions::from_env`] reads the idle timeout from.
+pub const IDLE_TIMEOUT_VAR: &str = "SESSION_IDLE_TIMEOUT";
+
+/// The variable [`Sessions::from_env`] reads the absolute lifetime from.
+pub const ABSOLUTE_LIFETIME_VAR: &str = "SESSION_ABSOLUTE_LIFETIME";
+
+/// A duration as the session variables write it: whole seconds, minutes, hours or days
+/// (`90s`, `30m`, `8h`, `14d`). `var` names the variable in the error; `extra` is
+/// what else the variable takes (" or `off`"), for the message. Zero parses.
+fn parse_duration(var: &str, value: &str, extra: &str) -> anyhow::Result<Duration> {
+    let value = value.trim();
+    let unit = value.chars().last().unwrap_or(' ');
+    let per = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => anyhow::bail!("{var} is `{value}`, not a duration (`30m`, `8h`, `14d`){extra}"),
+    };
+    let n: u64 = value[..value.len() - 1].trim().parse().map_err(|_| {
+        anyhow::anyhow!("{var} is `{value}`, not a duration (`30m`, `8h`, `14d`){extra}")
+    })?;
+    n.checked_mul(per)
+        .map(Duration::from_secs)
+        .ok_or_else(|| anyhow::anyhow!("{var} is `{value}`, too long"))
+}
+
+/// An idle timeout as `SESSION_IDLE_TIMEOUT` writes it: whole seconds, minutes, hours
+/// or days (`90s`, `30m`, `8h`, `14d`), or `off` for none. `None` is `off`.
+fn parse_idle_timeout(value: &str) -> anyhow::Result<Option<Duration>> {
+    if value.trim().eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let idle = parse_duration(IDLE_TIMEOUT_VAR, value, " or `off`")?;
+    anyhow::ensure!(
+        !idle.is_zero(),
+        "{IDLE_TIMEOUT_VAR} is zero: write `off` for no idle timeout"
+    );
+    Ok(Some(idle))
+}
+
+/// An absolute lifetime as `SESSION_ABSOLUTE_LIFETIME` writes it: a duration above
+/// zero (`12h`, `14d`), and at least `idle` when there is an idle timeout, since a
+/// session cannot idle longer than it lives.
+fn parse_absolute_lifetime(value: &str, idle: Option<Duration>) -> anyhow::Result<Duration> {
+    let lifetime = parse_duration(ABSOLUTE_LIFETIME_VAR, value, "")?;
+    anyhow::ensure!(
+        !lifetime.is_zero(),
+        "{ABSOLUTE_LIFETIME_VAR} is zero: a session would end as it began"
+    );
+    if let Some(idle) = idle {
+        anyhow::ensure!(
+            lifetime >= idle,
+            "{ABSOLUTE_LIFETIME_VAR} is `{}`, shorter than the idle timeout ({}s): \
+             the idle timeout could never lapse; lengthen the lifetime or shorten \
+             {IDLE_TIMEOUT_VAR}",
+            value.trim(),
+            idle.as_secs()
+        );
+    }
+    Ok(lifetime)
+}
 
 /// What the cookie holds, before sealing. Field names are short: they ride on every
 /// request.
@@ -300,6 +402,9 @@ impl<T: SessionData> Sessions<T> {
                 absolute: ABSOLUTE_LIFETIME.max(max_age),
                 idle: Some(IDLE_TIMEOUT),
                 idle_refresh: None,
+                idle_source: Source::Default,
+                absolute_source: Source::Default,
+                idle_logged: Arc::new(Once::new()),
                 secure,
             }),
             validator: None,
@@ -310,8 +415,26 @@ impl<T: SessionData> Sessions<T> {
     /// secret `SESSION_SECRET` (required), derived with [`key_for`] for the purpose
     /// [`purpose_from`] reads (`myapp/production`, `myapp/local`).
     ///
+    /// The idle timeout is [`IDLE_TIMEOUT`], 30 minutes, unless `SESSION_IDLE_TIMEOUT`
+    /// is set: a duration (`90s`, `30m`, `8h`, `14d`) for
+    /// [`idle_timeout`](Self::idle_timeout), or `off` for
+    /// [`without_idle_timeout`](Self::without_idle_timeout). A blank value is unset. A
+    /// builder call after `from_env` wins over the variable. The first request through
+    /// [`layer`](Self::layer) logs the idle timeout in force and what set it (`default`,
+    /// `SESSION_IDLE_TIMEOUT` or `builder`) at `info`, so a manifest's setting that code
+    /// overrode shows.
+    ///
+    /// The absolute lifetime is [`ABSOLUTE_LIFETIME`], 24 hours, unless
+    /// `SESSION_ABSOLUTE_LIFETIME` is set: a duration above zero (`12h`, `14d`) that is
+    /// at least the idle timeout in force. A builder call to
+    /// [`absolute_lifetime`](Self::absolute_lifetime) after `from_env` wins, and the
+    /// layer logs it with its source beside the idle timeout.
+    ///
     /// # Errors
     ///
+    /// `SESSION_IDLE_TIMEOUT` is set and is neither a duration above zero nor `off`.
+    /// `SESSION_ABSOLUTE_LIFETIME` is set and is not a duration above zero, or is
+    /// shorter than the idle timeout.
     /// `SESSION_SECRET` is unset or not a secret [`key_for`] takes, the purpose is not
     /// one it takes, or the app runs in a pod (`KUBERNETES_SERVICE_HOST` is set) and
     /// none of `SESSION_KEY_PURPOSE`, `SESSION_PURPOSE` and `POD_NAMESPACE` is: `local`
@@ -364,13 +487,42 @@ impl<T: SessionData> Sessions<T> {
         })?;
         let key = key_for(&secret, &purpose)
             .map_err(|e| anyhow::anyhow!("the session key from SESSION_SECRET: {e}"))?;
-        Ok(Self::new(key, cookie, max_age, secure))
+        let sessions = Self::new(key, cookie, max_age, secure);
+        let sessions = match set(IDLE_TIMEOUT_VAR)
+            .map(|v| parse_idle_timeout(&v))
+            .transpose()?
+        {
+            None => sessions,
+            Some(Some(timeout)) => sessions.idle_timeout(timeout).idle_from(Source::Variable),
+            Some(None) => sessions.without_idle_timeout().idle_from(Source::Variable),
+        };
+        match set(ABSOLUTE_LIFETIME_VAR) {
+            None => Ok(sessions),
+            Some(v) => {
+                let lifetime = parse_absolute_lifetime(&v, sessions.idle())?;
+                Ok(sessions
+                    .absolute_lifetime(lifetime)
+                    .absolute_from(Source::Variable))
+            }
+        }
     }
 
     /// End every session this long after it began, however recently it was re-sealed.
     #[must_use]
     pub fn absolute_lifetime(mut self, lifetime: Duration) -> Self {
         Arc::make_mut(&mut self.inner).absolute = lifetime;
+        self.absolute_from(Source::Builder)
+    }
+
+    /// The absolute lifetime in force.
+    #[must_use]
+    pub fn absolute(&self) -> Duration {
+        self.inner.absolute
+    }
+
+    /// Record what set the absolute lifetime.
+    fn absolute_from(mut self, source: Source) -> Self {
+        Arc::make_mut(&mut self.inner).absolute_source = source;
         self
     }
 
@@ -384,7 +536,7 @@ impl<T: SessionData> Sessions<T> {
     #[must_use]
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         Arc::make_mut(&mut self.inner).idle = Some(timeout.max(Duration::from_secs(1)));
-        self
+        self.idle_from(Source::Builder)
     }
 
     /// Never end a session for inactivity, only at its absolute lifetime: for an app
@@ -393,7 +545,31 @@ impl<T: SessionData> Sessions<T> {
     #[must_use]
     pub fn without_idle_timeout(mut self) -> Self {
         Arc::make_mut(&mut self.inner).idle = None;
+        self.idle_from(Source::Builder)
+    }
+
+    /// Record what set the idle timeout.
+    fn idle_from(mut self, source: Source) -> Self {
+        Arc::make_mut(&mut self.inner).idle_source = source;
         self
+    }
+
+    /// Log the idle timeout and the absolute lifetime in force and their sources, once per `Sessions` however many
+    /// requests or clones.
+    fn log_idle_once(&self) {
+        let config = &self.inner;
+        config.idle_logged.call_once(|| {
+            tracing::info!(
+                idle_timeout = %idle_text(config.idle),
+                source = config.idle_source.name(IDLE_TIMEOUT_VAR),
+                "session idle timeout"
+            );
+            tracing::info!(
+                absolute_lifetime = %format!("{}s", config.absolute.as_secs()),
+                source = config.absolute_source.name(ABSOLUTE_LIFETIME_VAR),
+                "session absolute lifetime"
+            );
+        });
     }
 
     /// Reseal the last-active time at most this often (see
@@ -442,9 +618,7 @@ impl<T: SessionData> Sessions<T> {
         let mut jar = cookie::CookieJar::new();
         jar.private_mut(&self.inner.key)
             .add(Cookie::new(name.clone(), plain));
-        jar.get(&name)
-            .map(|c| c.value().to_owned())
-            .unwrap_or_default()
+        jar.get(&name).map_or_default(|c| c.value().to_owned())
     }
 
     /// The last-active time a last-active cookie records for session `id`.
@@ -540,8 +714,7 @@ impl<T: SessionData> Sessions<T> {
         jar.private_mut(&self.inner.key)
             .add(Cookie::new(self.inner.cookie.clone(), plain));
         jar.get(&self.inner.cookie)
-            .map(|c| c.value().to_owned())
-            .unwrap_or_default()
+            .map_or_default(|c| c.value().to_owned())
     }
 
     /// The id and data `value` seals, if it was sealed with this key and hasn't lapsed.
@@ -659,6 +832,7 @@ impl<T: SessionData> Sessions<T> {
     /// ([`Session::flush`]) stands whatever the response: a server error after one
     /// seals an empty session, dropping anything the handler did after it.
     pub async fn layer(State(this): State<Self>, mut req: Request, next: Next) -> Response {
+        this.log_idle_once();
         let session = Session::<T>::default();
         {
             let mut inner = session.inner();
@@ -1121,6 +1295,182 @@ mod env_tests {
         assert!(moved.opens(&new));
         assert!(!moved.opens(&old), "a new purpose alone signs everyone out");
         assert!(moved.also_open_with(old.clone()).opens(&old));
+    }
+
+    #[test]
+    fn the_idle_timeout_remembers_what_set_it() {
+        let s = secret();
+        let age = Duration::from_secs(60);
+        let source = |value: Option<&str>| {
+            let mut pairs = vec![("SESSION_SECRET", s.as_str())];
+            pairs.extend(value.map(|v| (IDLE_TIMEOUT_VAR, v)));
+            Sessions::<D>::from_vars("myapp", "s", age, true, vars(&pairs)).unwrap()
+        };
+        assert_eq!(
+            source(None).inner.idle_source.name(IDLE_TIMEOUT_VAR),
+            "default"
+        );
+        assert_eq!(
+            source(Some(" ")).inner.idle_source.name(IDLE_TIMEOUT_VAR),
+            "default"
+        );
+        assert_eq!(
+            source(Some("8h")).inner.idle_source.name(IDLE_TIMEOUT_VAR),
+            "SESSION_IDLE_TIMEOUT"
+        );
+        assert_eq!(
+            source(Some("off")).inner.idle_source.name(IDLE_TIMEOUT_VAR),
+            "SESSION_IDLE_TIMEOUT"
+        );
+        let overridden = source(Some("8h")).idle_timeout(Duration::from_mins(15));
+        assert_eq!(
+            overridden.inner.idle_source.name(IDLE_TIMEOUT_VAR),
+            "builder"
+        );
+        assert_eq!(
+            source(None)
+                .without_idle_timeout()
+                .inner
+                .idle_source
+                .name(IDLE_TIMEOUT_VAR),
+            "builder"
+        );
+        assert_eq!(idle_text(Some(Duration::from_mins(30))), "1800s");
+        assert_eq!(idle_text(None), "off");
+    }
+
+    #[test]
+    fn the_absolute_lifetime_comes_from_the_environment_or_stays_a_day() {
+        let s = secret();
+        let age = Duration::from_secs(60);
+        let build = |idle: Option<&str>, value: Option<&str>| {
+            let mut pairs = vec![("SESSION_SECRET", s.as_str())];
+            pairs.extend(idle.map(|v| (IDLE_TIMEOUT_VAR, v)));
+            pairs.extend(value.map(|v| (ABSOLUTE_LIFETIME_VAR, v)));
+            Sessions::<D>::from_vars("myapp", "s", age, true, vars(&pairs))
+        };
+        let abs = |value: Option<&str>| build(None, value).map(|s| s.absolute());
+        assert_eq!(abs(None).unwrap(), ABSOLUTE_LIFETIME);
+        assert_eq!(abs(Some(" ")).unwrap(), ABSOLUTE_LIFETIME, "blank is unset");
+        assert_eq!(abs(Some("12h")).unwrap(), Duration::from_hours(12));
+        assert_eq!(abs(Some("14d")).unwrap(), Duration::from_hours(14 * 24));
+        assert_eq!(abs(Some("90m")).unwrap(), Duration::from_mins(90));
+        for bad in [
+            "0h",
+            "24",
+            "h",
+            "-1d",
+            "1.5h",
+            "forever",
+            "off",
+            "99999999999999999d",
+        ] {
+            let e = abs(Some(bad))
+                .err()
+                .unwrap_or_else(|| panic!("{bad} refused"));
+            assert!(e.to_string().contains(ABSOLUTE_LIFETIME_VAR), "{bad}: {e}");
+        }
+        let shorter = build(None, Some("10m"))
+            .err()
+            .expect("shorter than the default idle");
+        assert!(
+            shorter
+                .to_string()
+                .contains("shorter than the idle timeout"),
+            "{shorter}"
+        );
+        let shorter = build(Some("2d"), Some("24h"))
+            .err()
+            .expect("shorter than a set idle");
+        assert!(
+            shorter.to_string().contains(ABSOLUTE_LIFETIME_VAR),
+            "{shorter}"
+        );
+        assert_eq!(
+            build(Some("1h"), Some("1h")).unwrap().absolute(),
+            Duration::from_hours(1),
+            "equal is allowed"
+        );
+        assert_eq!(
+            build(Some("off"), Some("10m")).unwrap().absolute(),
+            Duration::from_mins(10),
+            "no idle timeout, nothing to undercut"
+        );
+        let source =
+            |sessions: &Sessions<D>| sessions.inner.absolute_source.name(ABSOLUTE_LIFETIME_VAR);
+        assert_eq!(source(&build(None, None).unwrap()), "default");
+        assert_eq!(
+            source(&build(None, Some("2h")).unwrap()),
+            "SESSION_ABSOLUTE_LIFETIME"
+        );
+        let pinned = build(None, Some("2h"))
+            .unwrap()
+            .absolute_lifetime(Duration::from_hours(3));
+        assert_eq!(
+            pinned.absolute(),
+            Duration::from_hours(3),
+            "the builder wins"
+        );
+        assert_eq!(source(&pinned), "builder");
+    }
+
+    #[test]
+    fn the_idle_timeout_comes_from_the_environment_or_stays_thirty_minutes() {
+        let s = secret();
+        let age = Duration::from_secs(60);
+        let idle = |value: Option<&str>| {
+            let mut pairs = vec![("SESSION_SECRET", s.as_str())];
+            pairs.extend(value.map(|v| (IDLE_TIMEOUT_VAR, v)));
+            Sessions::<D>::from_vars("myapp", "s", age, true, vars(&pairs)).map(|s| s.idle())
+        };
+        assert_eq!(
+            idle(None).unwrap(),
+            Some(IDLE_TIMEOUT),
+            "unset keeps the default"
+        );
+        assert_eq!(
+            idle(Some(" ")).unwrap(),
+            Some(IDLE_TIMEOUT),
+            "blank is unset"
+        );
+        assert_eq!(idle(Some("30m")).unwrap(), Some(Duration::from_mins(30)));
+        assert_eq!(idle(Some("90s")).unwrap(), Some(Duration::from_secs(90)));
+        assert_eq!(idle(Some("8h")).unwrap(), Some(Duration::from_hours(8)));
+        assert_eq!(
+            idle(Some("14d")).unwrap(),
+            Some(Duration::from_hours(14 * 24))
+        );
+        assert_eq!(idle(Some("off")).unwrap(), None);
+        assert_eq!(idle(Some("OFF")).unwrap(), None);
+        for bad in [
+            "0m",
+            "30",
+            "m",
+            "-5m",
+            "30 minutes",
+            "1.5h",
+            "false",
+            "99999999999999999d",
+        ] {
+            let e = idle(Some(bad))
+                .err()
+                .unwrap_or_else(|| panic!("{bad} refused"));
+            assert!(e.to_string().contains(IDLE_TIMEOUT_VAR), "{bad}: {e}");
+        }
+        let built = Sessions::<D>::from_vars(
+            "myapp",
+            "s",
+            age,
+            true,
+            vars(&[("SESSION_SECRET", &s), (IDLE_TIMEOUT_VAR, "off")]),
+        )
+        .unwrap()
+        .idle_timeout(Duration::from_mins(15));
+        assert_eq!(
+            built.idle(),
+            Some(Duration::from_mins(15)),
+            "the builder wins"
+        );
     }
 
     #[test]

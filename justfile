@@ -61,11 +61,22 @@ audit:
 templates:
     bash templates/openshift/apply-test.sh
     bash templates/openshift/env-test.sh
+    bash scripts/bao-set-test.sh
+    bash scripts/deploy-pin-test.sh
+    bash scripts/housekeeping-test.sh
+
+# charts/owt-app renders what templates/openshift renders, fixture by fixture, and its
+# schema refuses what it must (needs oc, helm, yq and jq; no cluster, no Rust). Not in
+# `check`: chart.yml runs it on GitHub-hosted runners with the tools pinned.
+chart *cases:
+    bash charts/owt-app/tests/render-equivalence.sh {{ cases }}
 
 # The commitlint rules conventional-commits.yml writes for an app without its own are
-# commitlint.config.mjs, byte for byte.
+# commitlint.config.mjs, byte for byte; the Renovate preset reads every digest pin it
+# should (scripts/renovate-test.sh).
 ci-config:
     diff -u commitlint.config.mjs <(sed -n "/<<'JS'$/,/^ *JS$/p" .github/workflows/conventional-commits.yml | sed '1d;$d' | sed 's/^          //')
+    bash scripts/renovate-test.sh
 
 # image-check.yml's `build` and `verify` jobs are image.yml's: `build` but for the
 # release's version and tag checkout, `verify` byte for byte.

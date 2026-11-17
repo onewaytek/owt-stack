@@ -11,6 +11,10 @@ permissions:
 jobs:
   ci:
     uses: ./.github/workflows/rust-ci.yml
+    # The compiler cache's password, by name (rust-ci.yml's header). The organization
+    # secret reaches this public repository; a fork's pull request gets none and runs
+    # no checks here anyway.
+    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
     with:
       # The same gate a developer runs (justfile). There is no root migrations/:
       # owt-accounts' tests apply the crate's own, owt-runtime's job tests take
@@ -26,6 +30,7 @@ jobs:
   again:
     needs: ci
     uses: ./.github/workflows/rust-ci.yml
+    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
     with:
       ref: ${{ github.sha }}
       check-command: just check

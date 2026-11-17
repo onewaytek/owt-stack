@@ -14,7 +14,7 @@
 //! | [`assets`] | content-fingerprinted static URLs with an `immutable` cache policy |
 //! | [`cache`] | `Cache-Control` as a typed policy: immutable, public (browser and edge), until a moment, no-store |
 //! | [`headers`] | security headers, a nonce-based content security policy, private-by-default caching, `noindex` |
-//! | [`redirect`] | `?next=` targets that stay on this site |
+//! | [`redirect`] | `?next=` targets that stay on this site; http(s)-only links people supply |
 //! | [`client_ip`] | the client's address behind proxies, by configuration |
 //! | [`limits`] | a response deadline and a request body cap |
 //! | [`htmx`] | `axum-htmx`'s extractors and responders, re-exported |

@@ -1,0 +1,15 @@
+{{- /*
+The app's plain settings, read after <name>-env, so a key here wins over the Secret's.
+*/ -}}
+{{- if .Values.settings.configMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "owt.name" . }}-settings
+  namespace: {{ include "owt.namespace" . }}
+  labels: {app: "{{ include "owt.name" . }}"}
+data:
+  {{- range $k, $v := .Values.settings.values }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+{{- end }}

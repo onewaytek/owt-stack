@@ -9,8 +9,9 @@ use owt_auth::totp;
 use owt_web::session::Session;
 use sqlx::PgPool;
 
+use super::passkey::PublicKeyCredential;
 use super::state::{self, Kind, MfaSession, State};
-use super::{Event, EventKind, Factor, Key, LOCK_AFTER, LOCK_FOR, Limiter, Mfa, MfaError, Next};
+use super::{Event, EventKind, Factor, Key, Limiter, Mfa, MfaError, Next};
 use crate::session::{self, Signed};
 use crate::store::{self, Account};
 
@@ -21,6 +22,15 @@ pub enum Answer<'a> {
     Totp(&'a str),
     /// A recovery code, as typed (case, hyphens and spaces do not matter).
     Recovery(&'a str),
+}
+
+/// What answers a pending sign-in: a code, or a passkey's assertion.
+enum Proof<'a> {
+    Code(Answer<'a>),
+    Passkey {
+        token: &'a str,
+        credential: &'a PublicKeyCredential,
+    },
 }
 
 /// How a session stands to an account that is enrolling.
@@ -80,6 +90,56 @@ impl Mfa {
         ip: IpAddr,
         answer: Answer<'_>,
     ) -> Result<(Account, Vec<Event>), MfaError> {
+        self.answer(pool, limiter, session, ip, Proof::Code(answer))
+            .await
+    }
+
+    /// Answer the pending sign-in (or re-authentication) with a passkey: `token` and
+    /// the browser's `credential` from the ceremony
+    /// [`begin_passkey_challenge`](Self::begin_passkey_challenge) began for the pending
+    /// account. Everything [`challenge`](Self::challenge) says holds: the attempt is
+    /// charged first, a pending sign-in becomes a signed-in session, a
+    /// re-authentication renews the times (a passkey satisfies
+    /// [`RecentMfa`](super::RecentMfa)). The ceremony answers once, only for its own
+    /// account and only in the session that began it: another account's passkey, a
+    /// disabled one, this account's for another ceremony, or a ceremony another session
+    /// began, is [`MfaError::Invalid`] or [`MfaError::PasskeyExpired`]. A suspected
+    /// copy ([`MfaError::PasskeyCloned`]) disables the passkey, ends every session of the
+    /// account, and goes to the notifier
+    /// ([`on_security_event`](Self::on_security_event)). A passkey's refusal is not
+    /// counted toward [`lockout`](Self::lockout); the throttle still charges it.
+    ///
+    /// # Errors
+    /// As [`challenge`](Self::challenge), and [`MfaError::PasskeyExpired`],
+    /// [`MfaError::PasskeyOrigin`], [`MfaError::PasskeyCloned`] (record
+    /// [`MfaError::event`]) and [`MfaError::PasskeysOff`].
+    pub async fn challenge_passkey<T: MfaSession, L: Limiter>(
+        &self,
+        pool: &PgPool,
+        limiter: &L,
+        session: &Session<T>,
+        ip: IpAddr,
+        token: &str,
+        credential: &PublicKeyCredential,
+    ) -> Result<(Account, Vec<Event>), MfaError> {
+        self.answer(
+            pool,
+            limiter,
+            session,
+            ip,
+            Proof::Passkey { token, credential },
+        )
+        .await
+    }
+
+    async fn answer<T: MfaSession, L: Limiter>(
+        &self,
+        pool: &PgPool,
+        limiter: &L,
+        session: &Session<T>,
+        ip: IpAddr,
+        proof: Proof<'_>,
+    ) -> Result<(Account, Vec<Event>), MfaError> {
         let now = SystemTime::now();
         let pending = session
             .read(|d| d.mfa().pending)
@@ -108,12 +168,20 @@ impl Mfa {
         };
 
         let mut events = Vec::new();
-        let factor = match answer {
-            Answer::Totp(code) => {
+        let mut used_passkey = None;
+        let factor = match proof {
+            Proof::Passkey { token, credential } => {
+                used_passkey = Some(
+                    self.check_passkey(pool, session, &account, token, credential)
+                        .await?,
+                );
+                Factor::Passkey
+            }
+            Proof::Code(Answer::Totp(code)) => {
                 self.check_totp(pool, &account, code, now).await?;
                 Factor::Totp
             }
-            Answer::Recovery(code) => {
+            Proof::Code(Answer::Recovery(code)) => {
                 let remaining = Self::use_recovery_code(pool, &account, code).await?;
                 if Self::unlock_by_recovery(pool, account.id).await? {
                     events.push(Event::new(account.id, EventKind::Unlocked(Factor::Totp)));
@@ -125,7 +193,10 @@ impl Mfa {
                 Factor::RecoveryCode
             }
         };
-        events.push(Event::new(account.id, EventKind::ChallengePassed(factor)));
+        events.push(Event {
+            passkey: used_passkey,
+            ..Event::new(account.id, EventKind::ChallengePassed(factor))
+        });
 
         if pending.kind == Kind::Reauth {
             session.update(|d| d.mfa_mut().pending = None);
@@ -141,7 +212,7 @@ impl Mfa {
     }
 
     /// A TOTP code against the account's confirmed authenticator, once. A wrong code is
-    /// counted; [`LOCK_AFTER`] in a row lock the authenticator.
+    /// counted; [`lockout`](Mfa::lockout)'s count in a row lock the authenticator.
     async fn check_totp(
         &self,
         pool: &PgPool,
@@ -176,7 +247,7 @@ impl Mfa {
         let (secret, reseal) = self.open(&stored, account.id)?;
         let last = last.and_then(|s| u64::try_from(s).ok());
         let Some(step) = totp::verify(&secret, code, now, last) else {
-            return Err(Self::count_failure(pool, account.id).await?);
+            return Err(self.count_failure(pool, account.id).await?);
         };
         let step = i64::try_from(step).map_err(|e| MfaError::fault(e.into()))?;
         // The check and the write are one statement: two requests with one code both
@@ -191,7 +262,7 @@ impl Mfa {
         .execute(pool)
         .await?;
         if moved.rows_affected() != 1 {
-            return Err(Self::count_failure(pool, account.id).await?);
+            return Err(self.count_failure(pool, account.id).await?);
         }
         if reseal {
             self.reseal(pool, account.id, &stored, &secret).await;
@@ -200,8 +271,8 @@ impl Mfa {
     }
 
     /// Count a wrong code; the error to answer with ([`MfaError::Locked`] when this one
-    /// locked the factor, for [`LOCK_FOR`]).
-    async fn count_failure(pool: &PgPool, account: i64) -> Result<MfaError, MfaError> {
+    /// locked the factor, for [`lockout`](Mfa::lockout)'s length).
+    async fn count_failure(&self, pool: &PgPool, account: i64) -> Result<MfaError, MfaError> {
         let (until, just): (Option<i64>, bool) = sqlx::query_as(
             "UPDATE account_totp SET failed_attempts = failed_attempts + 1,
                     locked_until = CASE WHEN failed_attempts + 1 >= $2 AND locked_until IS NULL
@@ -212,8 +283,8 @@ impl Mfa {
                        failed_attempts = $2 AND locked_until IS NOT NULL",
         )
         .bind(account)
-        .bind(LOCK_AFTER)
-        .bind(LOCK_FOR.as_secs_f64())
+        .bind(self.lock_after)
+        .bind(self.lock_for.as_secs_f64())
         .fetch_one(pool)
         .await?;
         Ok(match until {

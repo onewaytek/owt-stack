@@ -12,4 +12,5 @@
 <input type="hidden" name="next" value="{{ v.next }}">
 <div class="owt-actions"><button class="owt-button" type="submit">Turn it on</button></div>
 </form>
-</section>
+{% if let Some(add) = v.add_passkey %}<p class="owt-hint">Or <a href="{{ add }}">use a passkey instead</a>.</p>
+{% endif %}</section>

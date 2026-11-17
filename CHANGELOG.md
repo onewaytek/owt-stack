@@ -1,5 +1,121 @@
 # Changelog
 
+## [0.14.6](https://github.com/onewaytek/owt-stack/compare/v0.14.5...v0.14.6) (2026-11-17)
+
+
+### Features
+
+* **ci:** requeue-rc follows a promote-rc group held by one job ([#360](https://github.com/onewaytek/owt-stack/issues/360)) ([8aa0c25](https://github.com/onewaytek/owt-stack/commit/8aa0c252a6ce99c2ed3bdd95865d571d516e58b7))
+
+## [0.14.5](https://github.com/onewaytek/owt-stack/compare/v0.14.4...v0.14.5) (2026-11-16)
+
+
+### Features
+
+* **audit:** record a refusal on the request's own connection ([#358](https://github.com/onewaytek/owt-stack/issues/358)) ([998b47a](https://github.com/onewaytek/owt-stack/commit/998b47aef746396c63cd735d78b168fb52e2c44c))
+
+## [0.14.4](https://github.com/onewaytek/owt-stack/compare/v0.14.3...v0.14.4) (2026-11-16)
+
+
+### Bug Fixes
+
+* **deploy:** refuse downgrade pins and pin redis and pruner images by digest ([#356](https://github.com/onewaytek/owt-stack/issues/356)) ([01218cb](https://github.com/onewaytek/owt-stack/commit/01218cb27174fde2e9357030f6a15b35f73407f4))
+* **workflows:** harden actions-cleanup and ghcr-prune ([#355](https://github.com/onewaytek/owt-stack/issues/355)) ([eec9063](https://github.com/onewaytek/owt-stack/commit/eec9063ef46b623c2b5693097c61f4b0263ba106))
+
+## [0.14.3](https://github.com/onewaytek/owt-stack/compare/v0.14.2...v0.14.3) (2026-11-16)
+
+
+### Features
+
+* **ci:** actions-cleanup and ghcr-prune workflows, shorter-lived artifacts ([#352](https://github.com/onewaytek/owt-stack/issues/352)) ([4e21786](https://github.com/onewaytek/owt-stack/commit/4e21786ba53c6e9d1106afdcb81d0f7f4d12058e))
+
+
+### Bug Fixes
+
+* **ci:** ghcr-prune mints its token from DEPLOY_APP_CLIENT_ID, as deploy-pin does ([#354](https://github.com/onewaytek/owt-stack/issues/354)) ([c0ea26e](https://github.com/onewaytek/owt-stack/commit/c0ea26eee8150831969274169bda266484a6c69a))
+* **deploy:** deploy-pin reruns idempotently; client-id for the app token ([#351](https://github.com/onewaytek/owt-stack/issues/351)) ([6617ebb](https://github.com/onewaytek/owt-stack/commit/6617ebb2c76bfa21583a0ae65ea0a740bf7f1bf3))
+
+## [0.14.2](https://github.com/onewaytek/owt-stack/compare/v0.14.1...v0.14.2) (2026-11-16)
+
+
+### Features
+
+* **deploy:** deploy-pin workflow, renovate base-image preset and bao-set.sh ([#349](https://github.com/onewaytek/owt-stack/issues/349)) ([db97393](https://github.com/onewaytek/owt-stack/commit/db973936cd6d106285232936b113baed12eab459))
+
+## [0.14.1](https://github.com/onewaytek/owt-stack/compare/v0.14.0...v0.14.1) (2026-11-16)
+
+
+### Features
+
+* **deploy:** owt-app helm chart with render-equivalence tests ([#342](https://github.com/onewaytek/owt-stack/issues/342)) ([469e58c](https://github.com/onewaytek/owt-stack/commit/469e58c6d3c3ffdfd892d76db63f4cde71e78f4e))
+
+## [0.14.0](https://github.com/onewaytek/owt-stack/compare/v0.13.0...v0.14.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** mfa::Kind gains Locked; a match on it adds the arm. Apps send Next::Locked to the challenge route, as they do Next::Challenge.
+* **tailwind:** a quiet button whose action is destructive (remove, delete, withdraw, hand over) turns from red to ink. Add `owt-button-quiet-danger` to its classes to keep it red.
+* **accounts:** under a StepUpGate, reads now need the gate's account check: an anonymous GET meets the sign-in wall and a signed-in account without the gate's staff standing or role gets a 403. Routes that must stay open to everyone move out from under the gate. See "Upgrading from 0.13" in the README.
+
+### Features
+
+* 120-character commit headers, `db::now` and `redirect::web_url` ([#327](https://github.com/onewaytek/owt-stack/issues/327)) ([2846f05](https://github.com/onewaytek/owt-stack/commit/2846f059c337e5a842d9d141f7fed788280c3623))
+* **accounts:** `StepUpGate` checks who on every request; SMTP TLS; commitlint ([#326](https://github.com/onewaytek/owt-stack/issues/326)) ([54d1c94](https://github.com/onewaytek/owt-stack/commit/54d1c94906cf3e94461e0233c314d98044e874a7))
+* **accounts:** Mfa::lockout to tune the authenticator lockout ([#335](https://github.com/onewaytek/owt-stack/issues/335)) ([0beea52](https://github.com/onewaytek/owt-stack/commit/0beea525fd6a2c54738a1326a0ca43ed177b1668))
+* **accounts:** passkeys (webauthn) as a second factor and step-up proof ([#344](https://github.com/onewaytek/owt-stack/issues/344)) ([e4f1159](https://github.com/onewaytek/owt-stack/commit/e4f115998fcd6a05348447b29247562a655a383f))
+* **auth:** FailMode::Local counts in process when Redis is down ([#338](https://github.com/onewaytek/owt-stack/issues/338)) ([1b02a1c](https://github.com/onewaytek/owt-stack/commit/1b02a1c2d3b5eb52d05301faabd726fe22cd9a62))
+* **runtime:** `Jobs::child` (O6), and one tests/it binary per crate ([#324](https://github.com/onewaytek/owt-stack/issues/324)) ([737b640](https://github.com/onewaytek/owt-stack/commit/737b640e611243b0aef224240735a05dd3938b9b))
+* **tailwind:** neutral quiet buttons, a quiet danger variant and a focus-visible outline ([#340](https://github.com/onewaytek/owt-stack/issues/340)) ([d56574f](https://github.com/onewaytek/owt-stack/commit/d56574f0589349422c9120851e8fa49f0fc33a3d))
+* **web:** headers::public route layer for shared-cacheable pages ([#334](https://github.com/onewaytek/owt-stack/issues/334)) ([d2b8a5a](https://github.com/onewaytek/owt-stack/commit/d2b8a5a7a994faec35bb689cae138e43dbadce41))
+* **web:** log the session idle timeout and its source ([#339](https://github.com/onewaytek/owt-stack/issues/339)) ([a1007f3](https://github.com/onewaytek/owt-stack/commit/a1007f3815302151fac3736a900a37d80deb61ee))
+* **web:** read SESSION_IDLE_TIMEOUT in Sessions::from_env ([#333](https://github.com/onewaytek/owt-stack/issues/333)) ([e5ecd86](https://github.com/onewaytek/owt-stack/commit/e5ecd86db19db85642edc710c97b47ed8e19eaec))
+* **web:** SESSION_ABSOLUTE_LIFETIME sets how long a session may last ([#343](https://github.com/onewaytek/owt-stack/issues/343)) ([d2f9099](https://github.com/onewaytek/owt-stack/commit/d2f9099669632db6e86f00f89e29299559e9dfac))
+
+
+### Bug Fixes
+
+* **audit:** ignore rustsec-2026-0459, sqlite is in the lockfile only ([#328](https://github.com/onewaytek/owt-stack/issues/328)) ([802107d](https://github.com/onewaytek/owt-stack/commit/802107d038e5eb0601b36f30da58cbca0faf2e8c))
+* let just check pass on macos (cfg-gated test helper, portable sed) ([#345](https://github.com/onewaytek/owt-stack/issues/345)) ([16e6d93](https://github.com/onewaytek/owt-stack/commit/16e6d9389413cc68df991134e7737590a42868c6))
+* **runtime:** don't ping pool connections before acquire ([#337](https://github.com/onewaytek/owt-stack/issues/337)) ([540d77b](https://github.com/onewaytek/owt-stack/commit/540d77b2d438a20603fe8329f2eb19644aeb6c2f))
+* satisfy the Rust 1.100 clippy lints ([#341](https://github.com/onewaytek/owt-stack/issues/341)) ([c567e96](https://github.com/onewaytek/owt-stack/commit/c567e96a88257f98a67e738e1b7bcd85310d8407))
+
+
+### Performance Improvements
+
+* **web:** precompute the CSP header and add Csp::static_policy ([#336](https://github.com/onewaytek/owt-stack/issues/336)) ([41b6fcf](https://github.com/onewaytek/owt-stack/commit/41b6fcfe0e54fa68f39162fbcee40134257160ef))
+
+## [0.13.0](https://github.com/onewaytek/owt-stack/compare/v0.12.4...v0.13.0) (2026-11-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **ci:** the job calling release.yml grants actions: write (see "Upgrading from 0.12" in the README).
+
+### Features
+
+* **accounts:** StepUpGate, step-up as a middleware ([#320](https://github.com/onewaytek/owt-stack/issues/320)) ([4308769](https://github.com/onewaytek/owt-stack/commit/4308769d7c1903146b29ddcd2bdb8fd3530a2d67))
+* **ci:** release rc when a stale run or a sync leaves it unreleased ([#318](https://github.com/onewaytek/owt-stack/issues/318)) ([17ad8c2](https://github.com/onewaytek/owt-stack/commit/17ad8c2ed1e60041a18ff5dc517624b81d797d4c))
+* **mail:** add owt-mail, one mailer for apps ([#319](https://github.com/onewaytek/owt-stack/issues/319)) ([81a9aa1](https://github.com/onewaytek/owt-stack/commit/81a9aa1e0c5616332a831b98db09fc06f827ad24))
+* **runtime:** defaults from the architecture review ([#321](https://github.com/onewaytek/owt-stack/issues/321)) ([0396b78](https://github.com/onewaytek/owt-stack/commit/0396b78d93d6c65dfc8b6ea50e265f6ce9a5e52a))
+
+## [0.12.4](https://github.com/onewaytek/owt-stack/compare/v0.12.3...v0.12.4) (2026-11-05)
+
+
+### Features
+
+* **accounts:** record the address each sign-in link went to; confirmed_emails ([#314](https://github.com/onewaytek/owt-stack/issues/314)) ([4c8904f](https://github.com/onewaytek/owt-stack/commit/4c8904f44f8b9db4fdb18ec82b91a8cbb47ead7b))
+
+## [0.12.3](https://github.com/onewaytek/owt-stack/compare/v0.12.2...v0.12.3) (2026-11-04)
+
+
+### Bug Fixes
+
+* **ci:** release leaves no comments or labels on issues its commits mention ([#311](https://github.com/onewaytek/owt-stack/issues/311)) ([5fd40a7](https://github.com/onewaytek/owt-stack/commit/5fd40a775a4e3e4b7359e5b1e69a7a08a8502ab8))
+* **deps:** bump astral-sh/setup-uv from 10.3.2 to 10.3.3 ([#306](https://github.com/onewaytek/owt-stack/issues/306)) ([071a30b](https://github.com/onewaytek/owt-stack/commit/071a30b4c7ec2654fd07489348e0b5c53348d19a))
+* **deps:** bump log from 0.4.34 to 0.4.35 in the patch-and-minor group ([#307](https://github.com/onewaytek/owt-stack/issues/307)) ([61c8cc4](https://github.com/onewaytek/owt-stack/commit/61c8cc4f145751647427a0e6bbeb28baa94ef509))
+* **deps:** bump taiki-e/install-action from 2.87.31 to 2.88.1 ([#305](https://github.com/onewaytek/owt-stack/issues/305)) ([4bd2c5a](https://github.com/onewaytek/owt-stack/commit/4bd2c5a5690888269df2524cb054a6a8392771e6))
+
 ## [0.12.2](https://github.com/onewaytek/owt-stack/compare/v0.12.1...v0.12.2) (2026-11-02)
 
 

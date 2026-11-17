@@ -3,42 +3,49 @@ name: Requeue rc promotions
 # Reusable: promote again a PR whose checked promotion (promote-rc.yml's candidate
 # flow) was lost rather than refused. Two ways lose one:
 #
-# - GitHub keeps one pending run per concurrency group. A third run arriving while
+# - GitHub keeps one pending run or job per concurrency group. A third arriving while
 #   one runs and one waits cancels the waiting one, so that PR is never merged into
-#   rc until it is pushed again.
+#   rc until it is pushed again. Put the promote-rc group on the one job that calls
+#   the app's promotion (candidate, check, publish; promote-rc.yml has the shape) and
+#   name that job in `job`: only the promotion is cancelled then, never the PR's own
+#   checks. With the group on the workflow, the whole run is.
 # - publish-rc.yml refuses a candidate when rc moved while it was checked; the run
 #   fails at "Move rc to the candidate", having lost a race, not a check.
 #
 # This finds the open, same-repository, non-draft PRs into `base` whose head is not
 # in rc and whose latest promoting run of `workflow` for that head ended either way,
 # and re-runs the oldest one (the whole run, so the promotion starts from a fresh
-# candidate), every person's PR before any bot's (an author of type Bot: Dependabot,
-# but also any GitHub App, release-please's pull requests among them). A run that
-# succeeded without running promote-rc.yml's "Merge into rc" step (a trigger such as
-# `edited` that skips the candidate job) is passed over, so it can't hide a lost
-# promotion for the same head. One at a time, and only while no run of `workflow` is
-# waiting: a re-run is a new arrival in the concurrency group and would cancel a
-# waiting run, which is the first loss over again. The exception is a run pending on
-# the group that a bot started (its actor is of type Bot): a person's PR may cancel
-# it, and it is requeued after every person's, so a burst of Dependabot PRs cannot
-# keep a person's PR out of rc; a bot's PR never does. A run that failed its checks
-# is not re-run; nor is one already on its `max-attempts`th attempt. Call
-# it from the candidate workflow after publishing, so each promotion hands on to the
-# next lost one, and from a schedule, for when no promotion follows. The scheduled
-# one runs outside the concurrency group, so both can pick the same run; the run is
-# read again before it is re-run and once more if GitHub refuses the re-run, and a run
-# that is going again is logged, not failed, whatever GitHub's refusal says. Any
-# other refusal of one run is a warning and the next PR is tried, so a run GitHub
-# won't re-run (one over a month old) can't starve the rest; a refusal for want of
-# `actions: write` fails the job once every PR is walked:
+# candidate and its check can reuse the run's own `ci`), every person's PR before any
+# bot's (an author of type Bot: Dependabot, but also any GitHub App, release-please's
+# pull requests among them). A run that succeeded without running promote-rc.yml's
+# "Merge into rc" step (a trigger such as `edited` that skips the candidate job) is
+# passed over, so it can't hide a lost promotion for the same head. A failed run whose
+# `job` (or a job it calls) was cancelled while it waited, beside a check that failed
+# elsewhere in the run, counts as lost too. One at a time, and only while nothing of
+# `workflow` is waiting: no run, and with `job`, no job of it in a run in progress
+# that is held by the group or queued. A re-run is a new arrival in the group and
+# would cancel a waiting one, which is the first loss over again. The exception is a
+# run or job pending on the group that a bot started (its actor is of type Bot): a
+# person's PR may cancel it, and it is requeued after every person's, so a burst of
+# Dependabot PRs cannot keep a person's PR out of rc; a bot's PR never does. A run
+# that failed its checks is not re-run; nor is one already on its `max-attempts`th
+# attempt, which is reported as a warning. Call it from the candidate workflow after
+# the promotion, so each promotion hands on to the next lost one, and from a
+# schedule, for when no promotion follows. The scheduled one runs outside the
+# concurrency group, so both can pick the same run; the run is read again before it
+# is re-run and once more if GitHub refuses the re-run, and a run that is going again
+# is logged, not failed, whatever GitHub's refusal says. Any other refusal of one run
+# is a warning and the next PR is tried, so a run GitHub won't re-run (one over a
+# month old) can't starve the rest; a refusal for want of `actions: write` fails the
+# job once every PR is walked:
 #
-#   # pr.yml, beside the candidate flow
+#   # pr.yml, beside the `rc` job that holds the promote-rc group
 #   requeue:
-#     needs: promote
+#     needs: rc
 #     if: always() && github.event.pull_request.head.repo.full_name == github.repository
 #     permissions: {actions: write, contents: read, pull-requests: read}
 #     uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # vX.Y.Z, the release the app uses
-#     with: {workflow: pr.yml}
+#     with: {workflow: pr.yml, job: rc}
 #
 #   # requeue-rc.yml
 #   on:
@@ -48,7 +55,7 @@ name: Requeue rc promotions
 #     requeue:
 #       permissions: {actions: write, contents: read, pull-requests: read}
 #       uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # vX.Y.Z
-#       with: {workflow: pr.yml}
+#       with: {workflow: pr.yml, job: rc}
 #
 # Runs on the arc-openshift-k8s ARC scale set, as rust-ci.yml does (override with the
 # RUNS_ON repository or organization variable, a JSON string such as
@@ -73,6 +80,13 @@ on:
         description: Re-run a PR's run only while its attempt number is below this.
         type: number
         default: 5
+      job:
+        description: >-
+          The id of the job in `workflow` that holds the promote-rc concurrency group,
+          when the group is on that job rather than on the workflow (see the header).
+          Empty when the group is the workflow's.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -95,11 +109,16 @@ jobs:
           WORKFLOW: ${{ inputs.workflow }}
           BASE: ${{ inputs.base }}
           MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+          JOB: ${{ inputs.job }}
         with:
           script: |
             const { owner, repo } = context.repo;
             const workflow_id = process.env.WORKFLOW;
             const maxAttempts = Number(process.env.MAX_ATTEMPTS);
+            // A job of the one holding the group: that job itself, or (a reusable
+            // workflow's call) one of the jobs it runs, named "<job> / ...".
+            const groupJob = process.env.JOB;
+            const inGroup = (j) => groupJob !== "" && (j.name === groupJob || j.name.startsWith(`${groupJob} / `));
             // The step publish-rc.yml fails at when rc moved under the candidate.
             const raceStep = "Move rc to the candidate";
             // promote-rc.yml's step that makes the candidate: a run that ran it set
@@ -126,6 +145,23 @@ jobs:
                 return;
               }
               if (data.total_count > 0) botWaiting = true;
+            }
+            // With the group on a job, a run in progress (its checks running) can hold a
+            // job of the group's caller that has not started: held by the group, or
+            // queued for a runner. A job behind `needs` is not listed until it is
+            // queued. A bot's run may be passed over, as above.
+            if (groupJob !== "") {
+              const { data } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id, status: "in_progress", per_page: 100 });
+              for (const r of data.workflow_runs) {
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+                  owner, repo, run_id: r.id, attempt_number: r.run_attempt, per_page: 100,
+                });
+                const held = jobs.find((j) => inGroup(j) && ["requested", "queued", "pending", "waiting"].includes(j.status));
+                if (!held) continue;
+                if (held.status === "pending" && isBot(r.actor)) { botWaiting = true; continue; }
+                core.info(`job "${held.name}" of run ${r.id} is ${held.status}; a re-run now could cancel it, so none is made`);
+                return;
+              }
             }
 
             let rc;
@@ -180,8 +216,11 @@ jobs:
                 const steps = jobs.flatMap((j) => j.steps ?? []);
                 if (r.conclusion === "failure") {
                   // Lost the race at publishing, or failed a check (which is not re-run).
+                  // With the group on a job, a job of it cancelled while it waited
+                  // (another check of the run failing, say) is lost too.
                   run = r;
-                  lost = steps.some((s) => s.name === raceStep && s.conclusion === "failure");
+                  lost = steps.some((s) => s.name === raceStep && s.conclusion === "failure")
+                    || jobs.some((j) => inGroup(j) && j.conclusion === "cancelled");
                   break;
                 }
                 // Succeeded: a promotion if it merged; otherwise look further back.
@@ -192,7 +231,7 @@ jobs:
               }
               if (!run || !lost) continue;
               if (run.run_attempt >= maxAttempts) {
-                core.info(`#${pr.number}: run ${run.id} is on attempt ${run.run_attempt}; leaving it`);
+                core.warning(`#${pr.number}: run ${run.id} is on attempt ${run.run_attempt} and never promoted ${head}; push again or re-run it by hand`);
                 continue;
               }
 
