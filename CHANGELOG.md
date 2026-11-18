@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.9](https://github.com/onewaytek/owt-stack/compare/v0.14.8...v0.14.9) (2026-11-18)
+
+
+### Bug Fixes
+
+* **deps:** bump lettre to 0.11.24 for RUSTSEC-2026-0560/0561/0563/0565 ([#372](https://github.com/onewaytek/owt-stack/issues/372)) ([e637fa8](https://github.com/onewaytek/owt-stack/commit/e637fa8ce40986ed10709bb76a15aca662cfa032))
+
 ## [0.14.8](https://github.com/onewaytek/owt-stack/compare/v0.14.7...v0.14.8) (2026-11-18)
 
 
