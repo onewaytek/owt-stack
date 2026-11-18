@@ -105,8 +105,10 @@ jobs:
             exit 0
           fi
           args=("${SHA}:refs/owt/rc-checked/${GATE}/$(date +%s)")
+          # ls-remote matches a pattern against the tail of each name; delete only
+          # the records themselves, never a branch whose name ends like one.
           while read -r _ ref; do
-            [ -n "$ref" ] && args+=(":${ref}")
+            if [[ "$ref" == refs/owt/rc-checked/* ]]; then args+=(":${ref}"); fi
           done < <(git ls-remote origin 'refs/owt/rc-checked/*')
           git push --atomic origin "${args[@]}"
       - name: Release rc

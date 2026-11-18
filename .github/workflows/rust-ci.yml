@@ -43,7 +43,8 @@ name: Rust CI
 # on the commit it moves rc to, but only when the workflow files that ran the check are
 # the candidate's own. In rc's release (a push or dispatch on rc, `ref` empty), `tested`
 # looks for such a record of the event's commit, made in the last 12 hours, for the
-# same gate (every input but `ref` and `diff-base`, and RUNS_ON); on a match rust and
+# same gate (the commit's tree, every input but `ref` and `diff-base`, and RUNS_ON, so
+# a record names the code that was checked as well as the commit); on a match rust and
 # css are skipped and the workflow concludes in success. Anything else (no record, an
 # older one, another gate, another commit) runs the checks. Writing the record needs
 # `contents: write`, which no job that runs the app's code holds. The trade: the
@@ -51,7 +52,8 @@ name: Rust CI
 # database minutes to hours old.
 #
 # `skip-unbuilt: true` skips rust and css when the change touches nothing they build:
-# only Markdown and licence files that no other file names, `.github/dependabot.yml`,
+# only Markdown and licence files outside a `templates/` directory that no other file
+# or symlink names (by file name, or by a directory they sit in), `.github/dependabot.yml`,
 # and workflow files that call neither the checks, the image, the release nor a local
 # workflow. Every other path counts as code (sources, templates, migrations, `.sqlx/`,
 # `Cargo.*`, the justfile, the CI workflows themselves), as does any read that fails.
@@ -186,8 +188,8 @@ on:
         value: ${{ jobs.tested.outputs.skipped }}
       gate:
         description: >-
-          The gate's identity (a hash of the inputs but `ref` and `diff-base`, and of
-          RUNS_ON) when the checks passed or were reused in this run attempt; empty
+          The gate's identity (a hash of the checked tree, the inputs but `ref` and
+          `diff-base`, and RUNS_ON) when the checks passed or were reused in this run attempt; empty
           otherwise. publish-rc.yml takes it to record the checked candidate.
         value: >-
           ${{ (jobs.tested.outputs.passed == 'true' || (jobs.rust.result == 'success'
@@ -237,8 +239,10 @@ jobs:
           fetch-depth: ${{ inputs.skip-unbuilt && inputs.ref == '' && github.event_name == 'pull_request' && 2 || 1 }}
           sparse-checkout: .github
           persist-credentials: false
-      # The gate's identity: every input but those naming the commit, and the runner
-      # selector. toJSON puts one input on each line.
+      # The gate's identity: the commit's tree, every input but those naming the commit,
+      # and the runner selector. The tree binds an rc-checked record to the code that
+      # was checked, whichever check's `gate` a caller passes on. toJSON puts one input
+      # on each line.
       - id: key
         continue-on-error: true
         env:
@@ -249,7 +253,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(git rev-parse 'HEAD^{tree}')
-          gate=$(printf '%s\n%s\n' "$INPUTS" "$RUNS_ON" | grep -vE '^  "(ref|diff-base)": ' | sha256sum | cut -c1-16)
+          gate=$(printf '%s\n%s\n%s\n' "$tree" "$INPUTS" "$RUNS_ON" | grep -vE '^  "(ref|diff-base)": ' | sha256sum | cut -c1-16)
           echo "gate=${gate}" >> "$GITHUB_OUTPUT"
           echo "key=owt-rust-ci-passed-${RUN}-${tree}-${gate}" >> "$GITHUB_OUTPUT"
           echo "tree ${tree}, gate ${gate}"
@@ -282,7 +286,10 @@ jobs:
           refs=$(git -c "http.extraHeader=Authorization: basic ${auth}" ls-remote \
             "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/owt/rc-checked/${GATE}/*")
           now=$(date +%s)
+          # ls-remote matches a pattern against the tail of each name, so a branch
+          # named …/refs/owt/rc-checked/… is listed too: only the exact prefix counts.
           while read -r sha ref; do
+            [[ "$ref" == "refs/owt/rc-checked/${GATE}/"* ]] || continue
             at=${ref##*/}
             [[ "$at" =~ ^[0-9]{9,11}$ ]] || continue
             if [ "$sha" = "$GITHUB_SHA" ] && [ "$at" -le $((now + 300)) ] && [ $((now - at)) -le 43200 ]; then
@@ -328,25 +335,48 @@ jobs:
           [ "${#changed[@]}" -gt 0 ] || { echo "no change against ${base}: the checks run"; exit 0; }
           gate='rust-ci\.yml|image-check\.yml|image\.yml|promote-rc\.yml|publish-rc\.yml|release\.yml|conventional-commits\.yml|\./\.github/'
           # Fail closed: a read that errors (rather than finding nothing) counts as code.
+          # A Markdown or licence file is named when a file that is not Markdown, or a
+          # symlink (git grep skips those), in either tree carries its file name or the
+          # name of a directory it sits in: a crate that embeds a whole directory
+          # (rust-embed, include_dir!, a build.rs that walks `content/`) names no file in it.
+          esc() { sed 's/[][\.^$*+?(){}|/]/\\&/g' <<<"$1"; }
           named() {
-            local t r
+            local f=$1 t r d l pats=()
+            pats+=(-e "$(esc "${f##*/}")")
+            d=$f
+            while [[ "$d" == */* ]]; do
+              d=${d%/*}
+              pats+=(-e "(^|[^A-Za-z0-9_.-])$(esc "${d##*/}")(/|\"|'|\$)")
+            done
             for t in "$base" HEAD; do
-              r=0; git grep -qF -e "$1" "$t" -- . ':!*.md' ':!*.markdown' || r=$?
+              r=0; git grep -qE "${pats[@]}" "$t" -- . ':!*.md' ':!*.markdown' || r=$?
               [ "$r" = 1 ] || return 0
+              l=$(git ls-tree -r "$t") || return 0
+              while read -r mode _ obj _; do
+                [ "$mode" = 120000 ] || continue
+                r=0; git cat-file blob "$obj" | grep -qE "${pats[@]}" || r=$?
+                [ "$r" = 1 ] || return 0
+              done <<<"$l"
             done
             return 1
           }
           shows() {
-            local body
-            [ -n "$(git ls-tree "$1" -- "$2")" ] || return 1
+            local body entry
+            entry=$(git ls-tree "$1" -- "$2") || return 0
+            [ -n "$entry" ] || return 1
             body=$(git show "$1:$2") || return 0
             grep -qE "$gate" <<<"$body"
           }
           for f in "${changed[@]}"; do
             name=${f##*/}
+            case "/$f/" in
+              */templates/*) echo "$f is a template: the checks run"; exit 0 ;;
+            esac
+            if [[ "$f" =~ \.(md|markdown)$ || "$name" =~ ^(LICEN[CS]E|COPYING)(-[A-Za-z0-9]+)*(\.txt)?$ ]]; then
+              if named "$f"; then echo "$f is named by another file: the checks run"; exit 0; fi
+              continue
+            fi
             case "$f" in
-              *.md|*.markdown|LICENSE*|COPYING*)
-                if named "$name"; then echo "$f is named by another file: the checks run"; exit 0; fi ;;
               .github/dependabot.yml|.github/dependabot.yaml) ;;
               .github/workflows/*.yml|.github/workflows/*.yaml)
                 if shows "$base" "$f" || shows HEAD "$f"; then

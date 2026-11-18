@@ -5387,7 +5387,8 @@ jobs:
   `reuse-passed: false` on the call turns it off.
 - **rc's release does not check again the commit its promotion just checked.**
   `publish-rc.yml` given `gate: ${{ needs.check-rc.outputs.gate }}` (rust-ci.yml's
-  output: a hash of the inputs but `ref` and `diff-base`, and of `RUNS_ON`, set only
+  output: a hash of the checked tree, the inputs but `ref` and `diff-base`, and
+  `RUNS_ON`, set only
   when the checks passed or were reused) leaves the ref
   `refs/owt/rc-checked/<gate>/<unix time>` on the commit it moves `rc` to, replacing
   every earlier one, and only when the run's `.github/` is the candidate's own (so the
@@ -5402,8 +5403,10 @@ jobs:
   verified, signed and attested on `rc` as before, and main's release still checks its
   merge commit, which no PR checked.
 - **A change that builds nothing skips the checks** with `skip-unbuilt: true` on the
-  `rust-ci.yml` call: Markdown and licence files that no other file names (a README
-  that `include_str!` or `readme =` reads is code), `.github/dependabot.yml`, and
+  `rust-ci.yml` call: Markdown and licence files outside a `templates/` directory that
+  no other file or symlink names, by file name or by a directory they sit in (a README
+  that `include_str!` or `readme =` reads is code, and so is `content/*.md` in an app
+  that embeds `content/`), `.github/dependabot.yml`, and
   workflow files that call neither the checks, the image, the release nor a local
   workflow (a pin bump in `housekeeping.yml`). Every other path is code: sources,
   templates, migrations, `.sqlx/`, `Cargo.*`, the justfile, and the CI workflows
