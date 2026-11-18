@@ -78,8 +78,8 @@ ci-config:
     diff -u commitlint.config.mjs <(sed -n "/<<'JS'$/,/^ *JS$/p" .github/workflows/conventional-commits.yml | sed '1d;$d' | sed 's/^          //')
     bash scripts/renovate-test.sh
 
-# image-check.yml's `build` and `verify` jobs are image.yml's: `build` but for the
-# release's version and tag checkout, `verify` byte for byte.
+# image-check.yml's `build` and `scan` jobs are image.yml's: `build` but for the
+# release's version and tag checkout, `scan` but for its checkout's ref and comments.
 image-check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -99,7 +99,13 @@ image-check:
     }
     b1="$(build image.yml)"
     b2="$(build image-check.yml)"
-    v1="$(job image.yml verify)"
-    v2="$(job image-check.yml verify)"
+    # The scan job checks out the ignore file at the build's commit in image.yml and at
+    # the event's merge commit in image-check.yml; the head comments differ by design.
+    scan() {
+        job "$1" scan | sed -e '/^      # Only for the ignore file; /d' \
+            -e '/^          ref: .*needs\.build\.outputs\.commit/d'
+    }
+    v1="$(scan image.yml)"
+    v2="$(scan image-check.yml)"
     diff -u <(printf '%s\n' "$b1") <(printf '%s\n' "$b2")
     diff -u <(printf '%s\n' "$v1") <(printf '%s\n' "$v2")
