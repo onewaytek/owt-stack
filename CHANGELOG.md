@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.8](https://github.com/onewaytek/owt-stack/compare/v0.14.7...v0.14.8) (2026-11-18)
+
+
+### Bug Fixes
+
+* **actions-cleanup:** delete image layers of failed runs unless a consumer failed ([#367](https://github.com/onewaytek/owt-stack/issues/367)) ([0a5e362](https://github.com/onewaytek/owt-stack/commit/0a5e36263a92bd23b802842b5a0d0083bd4d7891))
+
 ## [0.14.7](https://github.com/onewaytek/owt-stack/compare/v0.14.6...v0.14.7) (2026-11-17)
 
 
