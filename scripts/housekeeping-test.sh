@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Proves the housekeeping workflows' shell without a network: actions-cleanup.yml treats
-# a 404 on DELETE as success and fails on any other error; ghcr-prune.yml's "Read the
+# a 404 on DELETE as success and fails on any other error, and deletes a completed run's
+# layer unless a job reading it failed or timed out; ghcr-prune.yml's "Read the
 # pins" step fails a deletion run (and warns on a dry run) when the deployments checkout
 # yields no pins, reads digest and `version:` pins, and its tag resolution protects the
 # version carrying a pinned tag. `just templates` runs it; it needs bash 4, jq and sed.
@@ -25,12 +26,15 @@ step() {
 }
 
 # --- actions-cleanup.yml -----------------------------------------------------
-step "$wf/actions-cleanup.yml" "Delete the artifacts of succeeded runs" >"$work/clean.sh"
+step "$wf/actions-cleanup.yml" "Delete the artifacts of completed runs" >"$work/clean.sh"
 [ -s "$work/clean.sh" ] || { echo "no cleanup script found" >&2; exit 1; }
 cat >"$work/bin/curl" <<'CURL'
 #!/usr/bin/env bash
-# Answers per the request: listings and runs from fixtures, DELETE by $DELETE_CODE[id].
-url="${*: -1}"; method=GET; out=""; want_code=false; prev=""
+# Answers per the request: the listing from $FIX/artifacts.json, a run from
+# $FIX/run-<id>.json and its jobs from $FIX/jobs-<id>.json (page 1 only; an error when
+# the file is missing), DELETE by
+# the code $DELETE_CODES gives the artifact id.
+url="${*: -1}"; method=GET; want_code=false; prev=""
 for a in "$@"; do
   [ "$prev" = -X ] && method=$a
   [ "$prev" = -w ] && want_code=true
@@ -40,26 +44,63 @@ echo "$method $url" >>"$CALLS"
 if [ "$method" = DELETE ]; then
   id="${url##*/}"; code=$(sed -n "s/^$id //p" "$DELETE_CODES")
   $want_code && printf '%s' "$code"
-  [ "$code" = 204 ] || [ "$code" = 404 ] && exit 22 || exit 22
+  exit 22
 fi
 case "$url" in
-  */actions/artifacts\?*page=1) echo '{"artifacts":[{"id":1,"expired":false,"size_in_bytes":10,"workflow_run":{"id":9}},{"id":2,"expired":false,"size_in_bytes":20,"workflow_run":{"id":9}}]}' ;;
+  */actions/artifacts\?*page=1) cat "$FIX/artifacts.json" ;;
   */actions/artifacts\?*) echo '{"artifacts":[]}' ;;
-  */actions/runs/9) echo '{"conclusion":"success"}' ;;
+  */actions/runs/*/jobs\?*page=1) r="${url%%/jobs*}"; cat "$FIX/jobs-${r##*/}.json" 2>/dev/null || exit 22 ;;
+  */actions/runs/*/jobs\?*) echo '{"jobs":[]}' ;;
+  */actions/runs/*) cat "$FIX/run-${url##*/}.json" ;;
 esac
 CURL
 chmod +x "$work/bin/curl"
-run_clean() { # $1 = delete codes
-  printf '%s\n' "$1" >"$work/codes"; : >"$work/calls"
-  (cd "$work" && PATH="$work/bin:$PATH" CALLS="$work/calls" DELETE_CODES="$work/codes" \
-    TOKEN=t RUN_ID="" NAMES=image-layer GITHUB_REPOSITORY=o/r RUNNER_TEMP="$work" \
-    GITHUB_STEP_SUMMARY="$work/summary" bash "$work/clean.sh" >"$work/out" 2>&1)
+fix="$work/fix"; mkdir -p "$fix"
+# Artifact <id> of run <id>, ten bytes each.
+artifacts() {
+  local id rows=()
+  for id in "$@"; do rows+=("{\"id\":$id,\"expired\":false,\"size_in_bytes\":10,\"workflow_run\":{\"id\":$id}}"); done
+  local IFS=,; echo "{\"artifacts\":[${rows[*]}]}" >"$fix/artifacts.json"
 }
+# run <id> <status> <job name>=<conclusion>...
+run() {
+  local id=$1 status=$2 rows=() j; shift 2
+  echo "{\"status\":\"$status\"}" >"$fix/run-$id.json"
+  for j in "$@"; do rows+=("{\"name\":\"${j%=*}\",\"conclusion\":\"${j#*=}\"}"); done
+  local IFS=,; echo "{\"jobs\":[${rows[*]}]}" >"$fix/jobs-$id.json"
+}
+run_clean() { # $1 = delete codes
+  printf '%s\n' "$1" >"$work/codes"; : >"$work/calls"; : >"$work/summary"
+  (cd "$work" && PATH="$work/bin:$PATH" CALLS="$work/calls" DELETE_CODES="$work/codes" FIX="$fix" \
+    TOKEN=t RUN_ID="" NAMES=image-layer CONSUMERS="verify scan push" GITHUB_REPOSITORY=o/r \
+    RUNNER_TEMP="$work" GITHUB_STEP_SUMMARY="$work/summary" bash "$work/clean.sh" >"$work/out" 2>&1)
+}
+deleted() { sed -n 's|^DELETE .*/artifacts/||p' "$work/calls" | sort -n | paste -sd' '; }
+artifacts 1 2
+run 1 completed "image-check / build=success" "image-check / verify=success"
+run 2 completed "image-check / build=success" "image-check / scan=success"
 rc=0; run_clean $'1 204\n2 404' || rc=$?
 check "cleanup: 404 on DELETE is success" "$rc" 0
-check "cleanup: both deletes attempted" "$(grep -c DELETE "$work/calls")" 2
+check "cleanup: both deletes attempted" "$(deleted)" "1 2"
 rc=0; run_clean $'1 204\n2 500' || rc=$?
 check "cleanup: 500 on DELETE fails" "$rc" 1
+# 1 in progress, 2 verify failed, 3 push timed out, 4 another job failed,
+# 5 cancelled, 6 succeeded.
+artifacts 1 2 3 4 5 6
+run 1 in_progress "image-check / build=success" "image-check / verify=null"
+run 2 completed "image-check / build=success" "image-check / verify=failure" "image-check / scan=skipped"
+run 3 completed "release / image / scan=success" "release / image / push=timed_out"
+run 4 completed "image-check / verify=success" "image-check / scan=success" "check-rc / checks / rust=failure"
+run 5 completed "image-check / verify=cancelled" "image-check / scan=cancelled"
+run 6 completed "release / image / verify=success" "release / image / push=success" "release / image / attest=failure"
+rc=0; run_clean "$(printf '%s 204\n' 1 2 3 4 5 6)" || rc=$?
+check "cleanup: the decision run succeeds" "$rc" 0
+check "cleanup: deletes failure elsewhere, cancelled and succeeded; keeps in progress and failed consumers" \
+  "$(deleted)" "4 5 6"
+check "cleanup: the summary counts" "$(cat "$work/summary")" "deleted 3 artifacts, 30 bytes; kept 3"
+artifacts 4; rm -f "$fix/jobs-4.json"
+run_clean "$(printf '%s 204\n' 4)" || true
+check "cleanup: a run whose jobs cannot be read keeps its layer" "$(deleted)" ""
 grep -q '^concurrency:\|^    concurrency:' "$wf/actions-cleanup.yml" && c=yes || c=no
 check "cleanup: concurrency group" "$c" yes
 grep -A3 'concurrency:' "$wf/actions-cleanup.yml" | grep -q 'cancel-in-progress: false' && c=yes || c=no
