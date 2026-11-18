@@ -20,7 +20,8 @@ name: Image check
 #
 # The crane build hands its layer to `verify` and `scan` as the `image-layer` artifact,
 # kept a day at most; actions-cleanup.yml, called by the app on `workflow_run`, deletes
-# it once the run has succeeded (no job here can, holding no write permission).
+# it once the run has completed, unless `verify` or `scan` failed (no job here can,
+# holding no write permission).
 #
 # It is a workflow of its own because no job in it can write: a caller's token needs
 # only `contents: read`. A reusable workflow whose jobs ask for `packages: write` (as

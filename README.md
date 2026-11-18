@@ -31,7 +31,7 @@ Outside the crates:
 | `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
 | `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
 | `.github/workflows/deploy-pin.yml` | reusable: pin a released image's digest in the deployments repository through a pull request, which merges itself for rc environments and waits for the owner for production ("Deploying with GitOps") |
-| `.github/workflows/actions-cleanup.yml` | reusable: delete the `image-layer` artifacts of an app's succeeded image runs, so they stop counting against the Actions storage ("Actions storage") |
+| `.github/workflows/actions-cleanup.yml` | reusable: delete the `image-layer` artifacts of an app's completed image runs, so they stop counting against the Actions storage ("Actions storage") |
 | `.github/workflows/ghcr-prune.yml` | reusable, a dry run unless told to delete: remove the app's untagged ghcr versions and all but its newest rc versions, never a release, a floating tag or a digest the deployments repository pins ("Actions storage") |
 | `renovate/base-images.json` | a Renovate preset: the base images pinned by digest in the Dockerfile and the `base-image` input, grouped, digest-only bumps automerged after 24 hours |
 | `scripts/bao-set.sh` | `env.sh` for OpenBao: writes an app environment's secrets from an `env.env` where `charts/owt-app`'s ExternalSecrets read them |
@@ -5682,7 +5682,7 @@ cluster already pulls the app's images, and two things show the whole image:
   (`gh run download <run-id> --repo <the app's repository> -n image-layer && tar -tvf
   layer.tar` lists paths, owners and modes, with `actions: read` there). It is kept
   for a day, or until `actions-cleanup.yml` deletes it ("Actions storage"): download it
-  from a failed run, or before the app's housekeeping runs.
+  from a run whose verify, scan or push failed, or before the app's housekeeping runs.
 
 The binary is built in Debian's Rust image, not Hummingbird's (which has no `tar`
 for the setup actions), so the verify job checks the newest `GLIBC_` version the
@@ -5775,7 +5775,13 @@ repository, billed only when a repository's cache limit is raised past it. The l
 artifact is `image-layer`: the crane build's job hands its layer (15 to 45 MB) to the
 jobs after it, and the jobs stay apart so the one running the app's code never holds a
 write token. It is kept a day; `actions-cleanup.yml` deletes it as soon as its run has
-succeeded (a failed run keeps it, for "Re-run failed jobs"). The SBOM artifact is kept
+completed, whatever the run's conclusion: an app's pull request run also carries checks
+and rc jobs that fail far more often than the image, and a layer kept for each of those
+fills a small plan's storage within a day. It keeps the layer only when a job that reads
+it (`consumers`, default `verify scan push`, matched against the last ` / ` part of the
+job's name) failed or timed out in the run's latest attempt, so "Re-run failed jobs"
+still finds it; a cancelled run's layer goes too, and a full re-run builds it again.
+Deletions show in the plan's storage figure 6 to 12 hours later. The SBOM artifact is kept
 a week (the image's attestation is the SBOM of record), and the docker builder uploads
 no build record. `ghcr-prune.yml` keeps the package itself in bounds. One caller does
 both, `.github/workflows/housekeeping.yml`, with the release and image-check workflows'

@@ -54,7 +54,8 @@ name: Image
 # The build job hands the layer to the jobs after it as the `image-layer` artifact
 # (kept a day at most). The jobs stay apart so the job that runs the app's code never
 # holds a write token, so the hand-off stays; actions-cleanup.yml, called by the app on
-# `workflow_run`, deletes the artifact once the run has succeeded.
+# `workflow_run`, deletes the artifact once the run has completed, unless a job that
+# reads it failed.
 #
 # The jobs run only for the repository's own events: a push, a dispatch, a schedule
 # or a pull request from a branch of the repository. A fork's pull request,
