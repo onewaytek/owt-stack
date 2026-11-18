@@ -59,23 +59,23 @@ file as its docs), so an API change that breaks these instructions fails CI.
 <!-- x-release-please-start-version -->
 ```toml
 [dependencies]
-owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
-owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
+owt-web = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
+owt-runtime = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
 # As needed:
-owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
-owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
-owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
-owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
-owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
-owt-storage = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
-owt-audit = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
-owt-mail = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
+owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
+owt-bus = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
+owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
+owt-change = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
+owt-crypt = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
+owt-storage = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
+owt-audit = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
+owt-mail = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
 
 # The app's own: static files, request logs, compression.
 tower-http = { version = "0.7", features = ["fs", "trace", "compression-gzip", "compression-br"] }
 
 [dev-dependencies]
-owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8" }
+owt-test = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9" }
 ```
 <!-- x-release-please-end -->
 
@@ -1322,7 +1322,7 @@ only for passwords, throttles or `oauth` turns the feature off:
 
 <!-- x-release-please-start-version -->
 ```toml
-owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.8", default-features = false }
+owt-auth = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.9", default-features = false }
 ```
 <!-- x-release-please-end -->
 
@@ -5233,7 +5233,7 @@ and `rustc-wrapper = "sccache"` under `[build]` in `~/.cargo/config.toml`.
 ```yaml
 jobs:
   checks:
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.9
     with:
       check-command: just check
       database: myapp        # empty for no Postgres
@@ -5317,12 +5317,12 @@ jobs:
   release:
     needs: ci
     permissions: {contents: write, issues: write, pull-requests: write, actions: write}
-    uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # v0.14.9
   image:
     needs: release
     if: needs.release.outputs.version != ''
     permissions: {contents: read, packages: write, id-token: write}
-    uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.14.9
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
@@ -5365,7 +5365,7 @@ jobs:
   jobs:
     image:
       permissions: {contents: read, packages: write, id-token: write}
-      uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.14.8
+      uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.14.9
       with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   ```
@@ -5520,7 +5520,7 @@ jobs:
     secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
     permissions: {contents: read, pull-requests: read}  # them); one check, "commits / commits",
-    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.9
     # with: {title: false}   # an app that checks titles another way: the commit lint alone
     # outputs: `commits` ("true" when every commit passed) and `title`; a promotion that
     # waits on the commits but not the title has `needs: [ci, commits]` and `if: ${{ !cancelled()
@@ -5537,7 +5537,7 @@ jobs:
     needs: rc
     if: always() && github.event.pull_request.head.repo.full_name == github.repository
     permissions: {actions: write, contents: read, pull-requests: read}
-    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/requeue-rc.yml@<commit>  # v0.14.9
     with: {workflow: pr.yml, job: rc}  # this file, and the job holding the group
 # rc.yml
 on:
@@ -5550,19 +5550,19 @@ on:
 jobs:
   candidate:
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.14.9
     with: {source: "${{ inputs.source }}", pr: "${{ inputs.pr }}", candidate: true}
   check-rc:
     needs: candidate
     if: needs.candidate.outputs.changed == 'true'
-    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.9
     with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
     # with skip-unbuilt: also diff-base: "${{ needs.candidate.outputs.base }}"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   promote:
     needs: [candidate, check-rc]
     permissions: {contents: write, actions: write}
-    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.14.9
     with:
       sha: "${{ needs.candidate.outputs.sha }}"
       base: "${{ needs.candidate.outputs.base }}"
@@ -5574,7 +5574,7 @@ jobs:
     needs: release
     if: github.ref_name == 'main'
     permissions: {contents: write, actions: write, pull-requests: write}
-    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/promote-rc.yml@<commit>  # v0.14.9
     with: {source: main}
 ```
 <!-- x-release-please-end -->
@@ -5823,7 +5823,7 @@ jobs:
     # A fork's pull request is not built here (image-check.yml refuses it too).
     if: github.event.pull_request.head.repo.full_name == github.repository
     permissions: {contents: read}
-    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.14.9
     with: {bin: myapp, cargo-profile: dev}   # as the release's image job, but the profile
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
@@ -5883,7 +5883,7 @@ jobs:
   artifacts:
     if: github.event_name == 'workflow_run' || github.event.schedule == '41 */6 * * *'
     permissions: {actions: write}
-    uses: onewaytek/owt-stack/.github/workflows/actions-cleanup.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/actions-cleanup.yml@<commit>  # v0.14.9
     with:
       run-id: ${{ github.event.workflow_run.id || '' }}
   ghcr:   # a dry run: read-only, and the only one a pull request or the schedule runs
@@ -5892,14 +5892,14 @@ jobs:
       || github.event.schedule == '17 5 * * 1'
       || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions: {contents: read, packages: read}
-    uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.9
     secrets:
       DEPLOY_APP_CLIENT_ID: ${{ secrets.DEPLOY_APP_CLIENT_ID }}
       DEPLOY_APP_KEY: ${{ secrets.DEPLOY_APP_KEY }}
   ghcr-delete:   # the only job holding packages: write
     if: github.event_name == 'workflow_dispatch' && inputs.delete
     permissions: {contents: read, packages: write}
-    uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.8
+    uses: onewaytek/owt-stack/.github/workflows/ghcr-prune.yml@<commit>  # v0.14.9
     with:
       delete: true
     secrets:
@@ -6546,7 +6546,7 @@ the exporter's port to Prometheus alone.
 
 <!-- x-release-please-start-version -->
 ```json
-"devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.14.8" }
+"devDependencies": { "@onewaytek/owt-stack": "github:onewaytek/owt-stack#v0.14.9" }
 ```
 <!-- x-release-please-end -->
 
