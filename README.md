@@ -5553,10 +5553,13 @@ the image) in a Rust job container (`container`,
 default `mirror.gcr.io/library/rust:1-trixie`; through sccache when the app passes
 the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
-(0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The
-read-only `verify` job checks the layer's paths and modes and that the base has
-`base-requires` and a glibc at least as new as the binary needs. The `push` job
-confirms the layer is the one verified and runs none of the app's code; of the
+(0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`.
+Before the compile, the `build` job uploads a few bytes as the `artifact-quota-probe`
+artifact, so a full Actions storage fails the job in seconds rather than at the
+layer's upload after the compile. The read-only `scan` job first checks the layer's
+paths and modes and that the base has `base-requires` and a glibc at least as new as
+the binary needs, and only then scans the image (below), in one pod. The `push` job
+confirms the layer is the one checked and runs none of the app's code; of the
 `crane` builder's jobs it alone holds `packages: write` (the `docker` builder's job
 and `attest` hold it too): with
 [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) (pinned
@@ -5600,8 +5603,13 @@ the template's:
   findings and never fails; any other value than `negligible`, `low`, `medium`,
   `high`, `critical` or `none` fails the job. grype reads exactly the configuration
   `vuln-ignore-file` names, and none when it is empty: a `.grype.yaml` in the
-  repository is not picked up unasked. A finding with no fix, or a false positive,
-  is waived in that file:
+  repository is not picked up unasked. grype's vulnerability database is kept in the
+  Actions cache for the UTC day (`grype-db-<os>-<date>`, scoped to the branch like any
+  cache entry, so a pull request cannot plant one for main or rc): the first scan of
+  a day downloads it, later scans restore it and download only a newer build. grype
+  refuses a database built more than 48 hours ago (`GRYPE_DB_MAX_ALLOWED_BUILT_AGE`),
+  so a stale restore fails the scan rather than passing it. A finding with no fix, or
+  a false positive, is waived in that file:
 
   ```yaml
   # .grype.yaml, named by vuln-ignore-file
@@ -5629,9 +5637,9 @@ the template's:
   tag instead uses `@refs/tags/vX.Y.Z`. Never match a pattern that ends at `@`: it
   also verifies an image signed by a workflow run from an unreviewed branch.
 - **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
-  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact (kept 7 days) and attaches
-  it to the image as a signed attestation (`cosign verify-attestation --type
-  spdxjson ...`, with the same identity flags).
+  digest and attaches the SPDX JSON to the image as a signed attestation (`cosign verify-attestation --type
+  spdxjson ...`, with the same identity flags). No workflow artifact is made, so the
+  signature and the attestation never depend on the Actions storage quota.
 
 The caller's job therefore grants `id-token: write` besides `packages: write`
 (`permissions: {contents: read, packages: write, id-token: write}`): a reusable
@@ -5736,14 +5744,16 @@ inputs can break only in the image, and without a check that shows after a versi
 tagged, as a release with no image. `image-check.yml` builds the pull request's merge
 commit the way a release does and verifies all but the push: with `builder: crane`
 (the default) the compile, the npm assets, the packed layer, and the base's tools and
-glibc, by the same `build` and `verify` jobs as `image.yml`'s (`just image-check`
+glibc, by the same `build` and `scan` jobs as `image.yml`'s (`just image-check`
 keeps them identical); with `builder: docker` the Dockerfile is built with BuildKit
 and pushed nowhere. It also scans the image with grype, as `image.yml` does, with the
 same `vuln-fail-on` and `vuln-ignore-file` inputs: this is where a vulnerable base image
 is most useful to learn of, before the release. Nothing is signed and no SBOM is made
 here, and the caller still grants `contents: read` only. It takes `image.yml`'s inputs that shape the build (`bin`,
 `cargo-args`, `files`, `base-image`, ...) and none that shape the push.
-`cargo-profile` makes the check cheaper: a pull request can build with `dev`, or with a
+`cargo-profile` makes the check cheaper: a pull request can build with `dev` (the
+example below does), which compiles with the flags the gate's own dev build uses, so
+with a warm sccache it is mostly cache hits, or with a
 profile of the app's own that turns off fat LTO and sets many codegen units
 (`[profile.ci] inherits = "release"`), instead of the release link. The check then does
 not prove that the release profile's link succeeds, so a release still builds with
@@ -5779,9 +5789,14 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     permissions: {contents: read}
     uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.14.8
-    with: {bin: myapp}   # as the release's image job
+    with: {bin: myapp, cargo-profile: dev}   # as the release's image job, but the profile
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
+
+An app whose image check is a required status calls it from its pull-request workflow
+instead, and filters with a job-level `if` (on a changed-paths output of an earlier
+job, say): a workflow that a `paths:` filter skips never reports, and leaves the
+required check pending, while a skipped job reports success.
 <!-- x-release-please-end -->
 
 The cost is one release build per push to a matching pull request. With `crane` it
@@ -5807,9 +5822,9 @@ fills a small plan's storage within a day. It keeps the layer only when a job th
 it (`consumers`, default `verify scan push`, matched against the last ` / ` part of the
 job's name) failed or timed out in the run's latest attempt, so "Re-run failed jobs"
 still finds it; a cancelled run's layer goes too, and a full re-run builds it again.
-Deletions show in the plan's storage figure 6 to 12 hours later. The SBOM artifact is kept
-a week (the image's attestation is the SBOM of record), and the docker builder uploads
-no build record. `ghcr-prune.yml` keeps the package itself in bounds. One caller does
+Deletions show in the plan's storage figure 6 to 12 hours later. The SBOM goes into
+the image's attestation and nowhere else, the quota probe is a few bytes kept a day,
+and the docker builder uploads no build record. `ghcr-prune.yml` keeps the package itself in bounds. One caller does
 both, `.github/workflows/housekeeping.yml`, with the release and image-check workflows'
 `name:`s:
 

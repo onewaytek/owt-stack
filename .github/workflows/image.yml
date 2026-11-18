@@ -27,10 +27,10 @@ name: Image
 #   layer: /usr/local/bin/server (root, 0755), any names linked to it, the work
 #   directory (0755, owned by `workdir-owner`) and the listed files under it (owned
 #   by `files-owner`). That job runs the app's code (build scripts, npm scripts) and
-#   holds only a read token. The `verify` job, also read-only, checks the layer (only
+#   holds only a read token. The `scan` job, also read-only, first checks the layer (only
 #   those paths; files, directories and symlinks; no setuid, setgid or sticky bit) and
 #   the base image (the tools operations rely on, and a glibc at least as new as the
-#   binary needs). The `push` job runs none of the app's code: it confirms the layer
+#   binary needs), then scans the image. The `push` job runs none of the app's code: it confirms the layer
 #   is the one verified, and with crane appends it to the base pinned by digest and
 #   sets the configuration, pushes by digest, reads the pushed configuration back and
 #   only then tags it. A tag never names a half-made image.
@@ -106,7 +106,7 @@ on:
         default: release
       container:
         description: >-
-          The Rust job container. It needs bash, git, curl and tar; the verify job checks
+          The Rust job container. It needs bash, git, curl and tar; the scan job checks
           that the base image's glibc is at least the one the binary links against.
         type: string
         default: mirror.gcr.io/library/rust:1-trixie
@@ -256,6 +256,19 @@ jobs:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: "true"
     steps:
+      # The artifact storage quota, probed before the compile: a full storage refuses
+      # every new artifact, the layer's too, and would otherwise discard the build at its
+      # last step. A few bytes, kept a day.
+      - name: Artifact storage quota
+        shell: bash
+        run: echo "quota probe" > "$RUNNER_TEMP/artifact-quota-probe"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: artifact-quota-probe
+          path: ${{ runner.temp }}/artifact-quota-probe
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
       - name: Resolve version
         shell: bash
         run: |
@@ -441,7 +454,7 @@ jobs:
             if [ ! -e "$f" ]; then
               echo "::error::files: '$f' does not exist after the assets are built"; exit 1
             fi
-            # A symlink would let one entry write through another; the verify job refuses
+            # A symlink would let one entry write through another; the scan job refuses
             # them, so say which here.
             links_in="$(find "$f" \( -name .git -o -name node_modules -o -name target \) -prune -o -type l -print)"
             if [ -n "$links_in" ]; then
@@ -480,9 +493,11 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  # The layer and the base, checked before anything is pushed. Holds no write
-  # permission. image-check.yml has the same job.
-  verify:
+  # The layer and the base checked, then the image as it would be pushed (the base and
+  # the layer) scanned for vulnerabilities, before anything is pushed. One job: one pod
+  # and one queue, the checks first and the scan only after them. Holds no write
+  # permission and runs none of the app's code. image-check.yml has the same job.
+  scan:
     needs: build
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
@@ -492,6 +507,8 @@ jobs:
       name: ${{ steps.base.outputs.name }}
       digest: ${{ steps.base.outputs.digest }}
       ref: ${{ steps.base.outputs.ref }}
+    env:
+      IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -622,18 +639,6 @@ jobs:
             echo "digest=${digest}"
             echo "ref=${ref}"
           } >> "$GITHUB_OUTPUT"
-
-  # The image as it would be pushed (the base and the layer), scanned for vulnerabilities
-  # before anything is pushed. Holds no write permission and runs none of the app's code.
-  scan:
-    needs: [build, verify]
-    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
-    permissions:
-      contents: read
-    env:
-      BASE_REF: ${{ needs.verify.outputs.ref }}
-      IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
-    steps:
       # Only for the ignore file; the commit the build job checked out.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ inputs.vuln-ignore-file != '' }}
@@ -663,40 +668,52 @@ jobs:
             echo '{}' > "$config"
           fi
           echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: image-layer
-          path: ${{ runner.temp }}/image-layer
-      - name: Install crane
-        shell: bash
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/crane"
-          mkdir -p "$dir"
-          curl -fsSL -o "$dir/crane.tar.gz" \
-            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
-          echo "${CRANE_SHA256}  $dir/crane.tar.gz" | sha256sum -c -
-          tar -xzf "$dir/crane.tar.gz" -C "$dir" crane
-          rm "$dir/crane.tar.gz"
-          echo "$dir" >> "$GITHUB_PATH"
       # What push makes, less its configuration: the base pinned by digest and the layer
       # on top, written to a tarball instead of a registry.
       - name: Assemble the image
+        env:
+          BASE_REF: ${{ steps.base.outputs.ref }}
         shell: bash
         run: |
           set -euo pipefail
           crane append --base "$BASE_REF" --new_layer "$RUNNER_TEMP/image-layer/layer.tar" \
             --new_tag scan.invalid/image:scan --output "$RUNNER_TEMP/image.tar"
+      # grype's database, kept in the Actions cache for the UTC day: the first scan of a
+      # day downloads and installs it, later ones restore it and grype only checks for a
+      # newer build. A cache entry is scoped to its branch, so a pull request cannot
+      # plant one for main or rc. grype refuses a database built more than 48 hours ago
+      # (GRYPE_DB_MAX_ALLOWED_BUILT_AGE below), so a stale restore fails the scan.
+      - name: Vulnerability database
+        id: grype-db
+        shell: bash
+        run: |
+          echo "GRYPE_DB_CACHE_DIR=$RUNNER_TEMP/grype-db" >> "$GITHUB_ENV"
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - id: grype-db-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/grype-db
+          key: grype-db-${{ runner.os }}-${{ steps.grype-db.outputs.day }}
       - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        env:
+          GRYPE_DB_VALIDATE_AGE: "true"
+          GRYPE_DB_MAX_ALLOWED_BUILT_AGE: 48h
         with:
           image: docker-archive:${{ runner.temp }}/image.tar
           severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
           fail-build: ${{ inputs.vuln-fail-on != 'none' }}
           output-format: table
           config: ${{ env.GRYPE_CONFIG }}
+      # Saved on a miss even when the scan failed: the database is good either way.
+      - if: ${{ !cancelled() && steps.grype-db-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/grype-db
+          key: grype-db-${{ runner.os }}-${{ steps.grype-db.outputs.day }}
 
   push:
-    needs: [build, verify, scan]
+    needs: [build, scan]
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
       contents: read
@@ -798,10 +815,10 @@ jobs:
         id: push
         env:
           TOKEN: ${{ github.token }}
-          BASE_NAME: ${{ needs.verify.outputs.name }}
-          BASE_DIGEST: ${{ needs.verify.outputs.digest }}
-          BASE_REF: ${{ needs.verify.outputs.ref }}
-          CHECKED_LAYER: ${{ needs.verify.outputs.layer }}
+          BASE_NAME: ${{ needs.scan.outputs.name }}
+          BASE_DIGEST: ${{ needs.scan.outputs.digest }}
+          BASE_REF: ${{ needs.scan.outputs.ref }}
+          CHECKED_LAYER: ${{ needs.scan.outputs.layer }}
           ENTRYPOINT: ${{ inputs.entrypoint }}
           CMD: ${{ inputs.cmd }}
           IMAGE_USER: ${{ inputs.user }}
@@ -812,9 +829,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The layer pushed is the layer verify checked.
+          # The layer pushed is the layer scan checked.
           [ "$(sha256sum "$RUNNER_TEMP/image-layer/layer.tar" | cut -d' ' -f1)" = "$CHECKED_LAYER" ] \
-            || { echo "::error::the layer changed since verify checked it"; exit 1; }
+            || { echo "::error::the layer changed since scan checked it"; exit 1; }
           # crane reads a list flag's value as CSV, so each element is quoted; crane
           # does not unescape a quote inside one, so none may hold a double quote.
           csv() {
@@ -1032,13 +1049,39 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}" >> "$GITHUB_ENV"
+      # grype's database, kept in the Actions cache for the UTC day: the first scan of a
+      # day downloads and installs it, later ones restore it and grype only checks for a
+      # newer build. A cache entry is scoped to its branch, so a pull request cannot
+      # plant one for main or rc. grype refuses a database built more than 48 hours ago
+      # (GRYPE_DB_MAX_ALLOWED_BUILT_AGE below), so a stale restore fails the scan.
+      - name: Vulnerability database
+        id: grype-db
+        shell: bash
+        run: |
+          echo "GRYPE_DB_CACHE_DIR=$RUNNER_TEMP/grype-db" >> "$GITHUB_ENV"
+          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - id: grype-db-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/grype-db
+          key: grype-db-${{ runner.os }}-${{ steps.grype-db.outputs.day }}
       - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        env:
+          GRYPE_DB_VALIDATE_AGE: "true"
+          GRYPE_DB_MAX_ALLOWED_BUILT_AGE: 48h
         with:
           image: registry:${{ env.IMAGE }}
           severity-cutoff: ${{ inputs.vuln-fail-on == 'none' && 'critical' || inputs.vuln-fail-on }}
           fail-build: ${{ inputs.vuln-fail-on != 'none' }}
           output-format: table
           config: ${{ env.GRYPE_CONFIG }}
+      # Saved on a miss even when the scan failed: the database is good either way.
+      - if: ${{ !cancelled() && steps.grype-db-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/grype-db
+          key: grype-db-${{ runner.os }}-${{ steps.grype-db.outputs.day }}
       - name: Tag the scanned image
         env:
           TAGS: ${{ steps.tags.outputs.list }}
@@ -1050,7 +1093,7 @@ jobs:
           printf 'tagged %s\n' "$IMAGE" "${args[@]}"
 
   # The pushed image, by digest: an SBOM (syft, SPDX JSON) attached to the image as a cosign
-  # attestation (and kept as a workflow artifact for 7 days), and a keyless cosign signature (the
+  # attestation, and a keyless cosign signature (the
   # runner's OIDC token, recorded in the Sigstore transparency log). It runs only after the
   # image passed its vulnerability scan, and signs the digest, never a tag. The one job
   # with `id-token: write`; it runs none of the app's code.
@@ -1098,9 +1141,9 @@ jobs:
           image: registry:${{ env.IMAGE }}
           format: spdx-json
           output-file: ${{ runner.temp }}/sbom.spdx.json
-          artifact-name: sbom.spdx.json
-          # The attestation is the SBOM of record; the run's copy is kept a week.
-          upload-artifact-retention: 7
+          # The attestation is the SBOM of record, and no workflow artifact is made: the
+          # signature and the attestation never wait on the Actions storage quota.
+          upload-artifact: false
           upload-release-assets: false
           dependency-snapshot: false
       - name: Sign and attest
