@@ -1,17 +1,22 @@
 name: Actions cleanup
 
 # Reusable: delete the `image-layer` artifacts image.yml and image-check.yml hand
-# from their build job to the jobs after it, once their run has succeeded, so they do
-# not count against the account's Actions storage for the day they are kept.
-# Artifact storage is billed by the hour; the layer is 15 to 45 MB and nothing reads
-# it after the run.
+# from their build job to the jobs after it, once their run has completed and no job
+# of it can still read the layer, so they do not count against the account's Actions
+# storage for the day they are kept. Artifact storage is billed by the hour; the layer
+# is 15 to 45 MB and nothing reads it after the run.
 #
 # - With `run-id` (a `workflow_run` caller passes the finished run's id), the
 #   artifacts of that run alone.
 # - Without it (a schedule), every such artifact in the repository whose run has
-#   succeeded: the sweep catches a run whose `workflow_run` event never came.
-# A failed or cancelled run keeps its layer, so "Re-run failed jobs" still finds it;
-# it expires after the day its upload set.
+#   completed: the sweep catches a run whose `workflow_run` event never came.
+# The run's conclusion does not decide it: an app's pull request run carries other
+# jobs (checks, rc candidates) that fail far more often than the image, and a layer
+# kept for each such failure fills the account's storage. A layer is kept only while
+# its run is still going, or when a job that reads it (`consumers`: verify, scan,
+# push) failed or timed out in the run's latest attempt, so "Re-run failed jobs" still
+# finds it; it expires after the day its upload set. A cancelled run's layer is
+# deleted: a full re-run builds it again.
 #
 # The job takes the caller's token permissions (it names none of its own, so a
 # Dependabot pull request that touches the caller still starts): grant
@@ -40,6 +45,12 @@ on:
         description: The artifact names deleted, space-separated.
         type: string
         default: image-layer
+      consumers:
+        description: >-
+          The jobs that read the artifacts, space-separated, matched against the last
+          " / " part of each job's name; a failed one keeps its run's artifacts.
+        type: string
+        default: verify scan push
 
 jobs:
   artifacts:
@@ -49,11 +60,12 @@ jobs:
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     timeout-minutes: 10
     steps:
-      - name: Delete the artifacts of succeeded runs
+      - name: Delete the artifacts of completed runs
         env:
           TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.run-id }}
           NAMES: ${{ inputs.names }}
+          CONSUMERS: ${{ inputs.consumers }}
         shell: bash
         run: |
           set -euo pipefail
@@ -79,17 +91,37 @@ jobs:
               page=$((page + 1))
             done
           done
-          declare -A conclusion
-          freed=0; count=0
+          for job in $CONSUMERS; do
+            [[ $job =~ ^[A-Za-z0-9._-]+$ ]] || fail "consumers: '$job' is not a job name"
+          done
+          consumers="$(jq -cn --arg c "$CONSUMERS" '$c | split(" ") | map(select(. != ""))')"
+          # "delete" once the run has completed and no consumer job of its latest attempt
+          # failed or timed out; "keep" otherwise, and whenever the API cannot say.
+          decide() {
+            local run="$1" status jobs page batch
+            status="$(gh_api "${api}/runs/${run}" | jq -r '.status')" || { echo keep; return; }
+            [ "$status" = completed ] || { echo keep; return; }
+            jobs='[]'; page=1
+            while :; do
+              batch="$(gh_api "${api}/runs/${run}/jobs?filter=latest&per_page=100&page=${page}")" \
+                || { echo keep; return; }
+              [ "$(jq '.jobs | length' <<<"$batch")" -gt 0 ] || break
+              jobs="$(jq -c --argjson more "$(jq -c '.jobs' <<<"$batch")" '. + $more' <<<"$jobs")"
+              page=$((page + 1))
+            done
+            jq -r --argjson consumers "$consumers" '
+              map(select((.name | split(" / ") | last) as $n | any($consumers[]; . == $n)))
+              | if any(.conclusion == "failure" or .conclusion == "timed_out")
+                then "keep" else "delete" end' <<<"$jobs"
+          }
+          declare -A decision
+          freed=0; count=0; kept=0
           while read -r id run size; do
-            if [ -z "${conclusion[$run]:-}" ]; then
-              conclusion[$run]="$(gh_api "${api}/runs/${run}" | jq -r '.conclusion // "running"')" \
-                || conclusion[$run]=unknown
-            fi
-            [ "${conclusion[$run]}" = success ] || continue
+            [ -n "${decision[$run]:-}" ] || decision[$run]="$(decide "$run")"
+            if [ "${decision[$run]}" != delete ]; then kept=$((kept + 1)); continue; fi
             # 404: the sweep or a workflow_run cleanup deleted it first; it is gone.
             code="$(gh_api -o /dev/null -w '%{http_code}' -X DELETE "${api}/artifacts/${id}" || true)"
             case "$code" in 204|404) ;; *) fail "deleting artifact ${id} returned HTTP ${code:-none}" ;; esac
             freed=$((freed + size)); count=$((count + 1))
           done < "$rows"
-          echo "deleted ${count} artifacts, ${freed} bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "deleted ${count} artifacts, ${freed} bytes; kept ${kept}" | tee -a "$GITHUB_STEP_SUMMARY"
