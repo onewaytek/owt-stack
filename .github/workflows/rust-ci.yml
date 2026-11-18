@@ -226,6 +226,12 @@ jobs:
     #
     # Docker Hub's official images, the job container's too, through Google's mirror:
     # the runners share an address, and Docker Hub's anonymous pull limit failed CI at it.
+    #
+    # The test database is the job's own and is thrown away with it, so it runs without
+    # durability: no fsync, no synchronous commit, no full-page writes (a crash loses
+    # nothing worth keeping), and with room for 300 connections, since sqlx::test makes
+    # a database per test and parallel test binaries each open a pool. initdb takes `-c`
+    # from Postgres 16; an older major starts with the image's defaults.
     container: ${{ inputs.container }}
     services:
       postgres:
@@ -234,6 +240,10 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: ${{ inputs.database }}
+          POSTGRES_INITDB_ARGS: >-
+            ${{ fromJSON(inputs.postgres-major) >= 16
+            && '-c fsync=off -c synchronous_commit=off -c full_page_writes=off -c max_connections=300'
+            || '' }}
       redis:
         image: ${{ inputs.redis && 'mirror.gcr.io/library/redis:8-alpine' || '' }}
     env:
@@ -321,16 +331,33 @@ jobs:
       # runner allows same-user ptrace, job code can read the password from the
       # server's memory too. So the secret goes only to repositories whose code is
       # trusted to run on the scale set at all, which is what RUNS_ON already decides.
+      #
+      # A Dependabot pull request reads Dependabot's secrets, not Actions', under the same
+      # name: an app that sets SCCACHE_REDIS_PASSWORD there too gives its dependency bumps
+      # the cache, and with it the trust above (a bump's new build scripts write to the
+      # shared Redis). Without it such a run compiles uncached, and says why.
+      #
+      # Off the scale set (RUNS_ON naming other runners) a cluster-internal endpoint (a
+      # `.svc` or `.cluster.local` name) cannot resolve, so the job skips sccache there
+      # rather than spend ten seconds finding that out.
       # A step's `if` cannot read secrets, so this step decides for the two after it.
       - name: Is sccache configured
         id: sccache
         env:
           PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
           ENDPOINT: ${{ inputs.sccache-redis }}
+          ACTOR: ${{ github.actor }}
         shell: bash
         run: |
-          if [ -n "$ENDPOINT" ] && [ -n "$PASSWORD" ]; then
+          host=${ENDPOINT#*://}
+          host=${host#*@}
+          host=${host%%[:/]*}
+          if [ "$ON_ARC" != true ] && [[ "$host" == *.svc || "$host" == *.cluster.local ]]; then
+            echo "Not on the scale set and ${host} is cluster-internal: compiling without sccache"
+          elif [ -n "$ENDPOINT" ] && [ -n "$PASSWORD" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif [ "$ACTOR" = "dependabot[bot]" ] && [ -n "$ENDPOINT" ]; then
+            echo "A Dependabot run reads Dependabot's secrets, and SCCACHE_REDIS_PASSWORD is not one: compiling without sccache"
           else
             echo "No sccache-redis endpoint or no SCCACHE_REDIS_PASSWORD secret: compiling without sccache"
           fi

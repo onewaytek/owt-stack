@@ -21,7 +21,11 @@ name: Conventional Commits
 #     commits:
 #       permissions: {contents: read, pull-requests: read}
 #       uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # vX.Y.Z
-#       # with: {title: false}   # to skip the title job, when titles are checked another way
+#       # with: {title: false}   # to skip the title step, when titles are checked another way
+#
+# One job, `commits`, checks both; its outputs say which passed, so a promotion can
+# wait on the commits alone (`if: needs.commits.outputs.commits == 'true'`, with
+# `!cancelled()`) instead of calling this workflow a second time with `title: false`.
 #
 # The caller's event must be a pull request (the title and the commits are its),
 # never `pull_request_target`, whose checkout would run a fork's code with a token
@@ -40,38 +44,48 @@ on:
       title:
         description: >-
           Check the pull request's title. An app that checks titles another way
-          passes false and gets the commit lint alone; the job is then skipped,
-          which a required check treats as passing.
+          passes false and gets the commit lint alone.
         type: boolean
         default: true
+    outputs:
+      commits:
+        description: >-
+          "true" when every commit passed commitlint, whatever the title; a promotion
+          that should not wait on the title gates on it (`needs.commits.outputs.commits`).
+        value: ${{ jobs.commits.outputs.commits }}
+      title:
+        description: '"true" when the title passed, or was not checked (`title: false`).'
+        value: ${{ jobs.commits.outputs.title }}
 
 permissions: {}
 
 jobs:
-  title:
-    # `inputs.title` is empty when this runs on its own pull_request; only an explicit
-    # false from a caller skips the job.
-    if: format('{0}', inputs.title) != 'false'
-    # A fork's pull request (or no pull request at all), and any repository outside
-    # the organization that owns the scale set, runs GitHub-hosted.
-    runs-on: ${{ fromJSON(github.repository_owner == 'onewaytek' && github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}
-    permissions:
-      pull-requests: read
-    steps:
-      - uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6.1.2
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          # A one-commit pull request squashes to that commit's message by default.
-          validateSingleCommit: true
-
+  # The title and the commits in one job, so one runner pod: the title step runs first
+  # and before the checkout, and a failed title still lets the commit lint run, so one
+  # run reports both. The outputs say which passed, so a caller can let a promotion wait
+  # on the commits alone (a squash merge takes the title, which a later edit can fix).
   commits:
     # A fork's pull request (or no pull request at all), and any repository outside
     # the organization that owns the scale set, runs GitHub-hosted.
     runs-on: ${{ fromJSON(github.repository_owner == 'onewaytek' && github.event.pull_request.head.repo.full_name == github.repository && (vars.RUNS_ON || '"arc-openshift-k8s"') || '"ubuntu-latest"') }}
     permissions:
       contents: read
+      pull-requests: read
+    outputs:
+      commits: ${{ steps.commitlint.outcome == 'success' }}
+      title: ${{ steps.title.outcome == 'success' || steps.title.outcome == 'skipped' }}
     steps:
+      # `inputs.title` is empty when this runs on its own pull_request; only an explicit
+      # false from a caller skips the step. The token reaches this step alone.
+      - id: title
+        if: format('{0}', inputs.title) != 'false'
+        continue-on-error: true
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          # A one-commit pull request squashes to that commit's message by default.
+          validateSingleCommit: true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -83,8 +97,9 @@ jobs:
       # this repository checks itself by (commitlint.config.mjs here, byte for
       # byte; `just ci-config` compares the two), written outside the checkout.
       # Dependabot's commits are passed over either way: their headers are generated,
-      # and the title job sees the pull request's.
+      # and the title step sees the pull request's.
       - name: commitlint
+        id: commitlint
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
@@ -149,7 +164,7 @@ jobs:
             // Dependabot's headers ("fix(deps): bump ...") are generated, and the title check
             // sees them.
             // A merge of the base into the branch never reaches main: a squash merge keeps only
-            // the title, which the title job checks. Only a whole first line in git's own merge
+            // the title, which the title step checks. Only a whole first line in git's own merge
             // wording is skipped ("Merge branch 'main' of github.com:o/r into fix/x", "Merge
             // remote-tracking branch 'origin/main'", "Merge origin/main", "Merge main into
             // fix/x"), so a commit cannot skip linting by starting "Merge". commitlint's own
@@ -170,3 +185,8 @@ jobs:
           fi
           npx --yes --ignore-scripts -p @commitlint/cli@21.2.3 -p @commitlint/config-conventional@21.2.3 \
             commitlint "${config[@]}" --from "$BASE" --to "$HEAD" --verbose
+      - name: The title is Conventional Commits
+        if: ${{ steps.title.outcome == 'failure' }}
+        run: |
+          echo "::error::the pull request's title is not a Conventional Commits header (the title step above)"
+          exit 1

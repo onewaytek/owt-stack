@@ -45,7 +45,7 @@ export default {
   // Dependabot's headers ("fix(deps): bump ...") are generated, and the title check
   // sees them.
   // A merge of the base into the branch never reaches main: a squash merge keeps only
-  // the title, which the title job checks. Only a whole first line in git's own merge
+  // the title, which the title step checks. Only a whole first line in git's own merge
   // wording is skipped ("Merge branch 'main' of github.com:o/r into fix/x", "Merge
   // remote-tracking branch 'origin/main'", "Merge origin/main", "Merge main into
   // fix/x"), so a commit cannot skip linting by starting "Merge". commitlint's own

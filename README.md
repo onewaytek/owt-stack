@@ -5177,9 +5177,22 @@ of the gate, build scripts or tests; a password with a control character in it (
 newline pasted into the secret) is refused with a warning and the job compiles
 uncached. Without the secret the job compiles without a cache. If the Redis cannot be
 used (unreachable, or the password is wrong), the job warns after about ten seconds
-and compiles without it; it does not fail. The job summary shows sccache's hit and
+and compiles without it; it does not fail. Off the scale set (`RUNS_ON` naming other
+runners) a cluster-internal endpoint (a `.svc` or `.cluster.local` host, as the
+default is) is skipped at once. The job summary shows sccache's hit and
 miss counts. The Redis is bounded (`maxmemory`, least recently used evicted) and
 entries expire after a month unused.
+
+**One dependency profile in every app.** The flags are part of an entry's key, so a
+registry crate built at `opt-level = 3` by one app and at 0 by another is stored twice,
+and the shared Redis holds every app's dev, check, test and release objects: an app
+whose dev profile differs from the others' evicts theirs and starts cold itself. Keep
+the dependency half of the dev profile to what this repository's root `Cargo.toml`
+has: `[profile.dev.package."*"] debug = "line-tables-only"`, no `opt-level` there, and
+`opt-level = 3` only on the cryptography crates listed under "Tests" below. Something
+that needs optimised dependencies outside the tests (a simulator, a load generator)
+gets a named profile (`[profile.sim] inherits = "release"`, run with `--profile sim`)
+rather than a faster `dev`, so the gate's builds stay shared.
 
 **Who to give the secret to.** Every repository given the secret trusts every other
 repository given it, as with a shared cache volume: the password keeps the Redis from
@@ -5191,6 +5204,16 @@ the secret to the repositories whose code may run on the scale set at all (the s
 judgement `RUNS_ON` makes), and keep a public repository, whose pull requests anyone
 can open, on GitHub-hosted runners with `sccache-redis: ""`. `image.yml` takes the
 same secret and `sccache-redis` input for its release build.
+
+**Dependabot and the cache.** A Dependabot pull request's run reads the repository's
+Dependabot secrets, not its Actions secrets, so it compiles uncached (5 to 10 minutes
+more per run) unless `SCCACHE_REDIS_PASSWORD` is set as a Dependabot secret too, under
+the same name; the workflows need no change, since `secrets.SCCACHE_REDIS_PASSWORD`
+resolves to it in such a run. Setting it extends the trust above to the code a
+dependency bump brings: a new crate version's build script runs with the job's
+sccache server and can write entries every other job reads. It is the same judgement
+as giving the secret to the repository at all (the bump's code runs in the gate
+either way); the job log says when a Dependabot run compiled uncached for want of it.
 
 A developer machine can use the
 same Redis; its paths differ from the runners', so its entries are its own (its
@@ -5246,8 +5269,9 @@ The checks run on the `arc-openshift-k8s` scale set unless the repository or
 organization variable `RUNS_ON` names other runners, as JSON (`"ubuntu-latest"`). A
 public repository should: self-hosted runners in the cluster are no place for code
 anyone can propose. Off the cluster the Redis's Service name does not resolve, so such
-an app passes `sccache-redis: ""` (otherwise each job spends about ten seconds finding
-that out, warns, and compiles without sccache). Off ARC the services are at their
+rust-ci.yml skips the default endpoint there by itself (a `.svc` host off ARC); an
+endpoint that is not cluster-internal but unreachable from those runners still costs
+about ten seconds and a warning, so such an app passes `sccache-redis: ""`. Off ARC the services are at their
 names (`postgres`, `redis`) rather than localhost; `DATABASE_URL` and `REDIS_URL`
 follow, so build on those rather than naming a host.
 
@@ -5464,10 +5488,12 @@ jobs:
     uses: ./.github/workflows/ci.yml   # the app's own
     secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
-    permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
-    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.8, and "commits / commits"
-    # with: {title: false}   # an app that checks titles another way: only "commits / commits" runs (the skipped
-    # "commits / title" counts as passing for a required check)
+    permissions: {contents: read, pull-requests: read}  # them); one check, "commits / commits",
+    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.8
+    # with: {title: false}   # an app that checks titles another way: the commit lint alone
+    # outputs: `commits` ("true" when every commit passed) and `title`; a promotion that
+    # waits on the commits but not the title has `needs: [ci, commits]` and `if: ${{ !cancelled()
+    # && needs.ci.result == 'success' && needs.commits.outputs.commits == 'true' && ... }}`
   rc:   # one promotion at a time; only this job waits in the group, never the checks
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
@@ -7155,7 +7181,7 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `fix(web): Drop the cache` does not. The first line runs to 120 characters at most;
 the body and the footers have no line-length limit, so a log, a link or quoted output
 goes in as it is. An app without a commitlint configuration of its own is checked by
-the same rules (`commitlint.config.mjs`). The title job checks the title's form (a
+the same rules (`commitlint.config.mjs`). The title step checks the title's form (a
 type, an optional scope, a subject), not its length. Every commit is
 linted but a merge of the base whose first line is exactly git's wording (`Merge
 branch 'main' of …`, `Merge remote-tracking branch 'origin/main' into …`, `Merge
