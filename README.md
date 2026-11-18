@@ -5177,9 +5177,22 @@ of the gate, build scripts or tests; a password with a control character in it (
 newline pasted into the secret) is refused with a warning and the job compiles
 uncached. Without the secret the job compiles without a cache. If the Redis cannot be
 used (unreachable, or the password is wrong), the job warns after about ten seconds
-and compiles without it; it does not fail. The job summary shows sccache's hit and
+and compiles without it; it does not fail. Off the scale set (`RUNS_ON` naming other
+runners) a cluster-internal endpoint (a `.svc` or `.cluster.local` host, as the
+default is) is skipped at once. The job summary shows sccache's hit and
 miss counts. The Redis is bounded (`maxmemory`, least recently used evicted) and
 entries expire after a month unused.
+
+**One dependency profile in every app.** The flags are part of an entry's key, so a
+registry crate built at `opt-level = 3` by one app and at 0 by another is stored twice,
+and the shared Redis holds every app's dev, check, test and release objects: an app
+whose dev profile differs from the others' evicts theirs and starts cold itself. Keep
+the dependency half of the dev profile to what this repository's root `Cargo.toml`
+has: `[profile.dev.package."*"] debug = "line-tables-only"`, no `opt-level` there, and
+`opt-level = 3` only on the cryptography crates listed under "Tests" below. Something
+that needs optimised dependencies outside the tests (a simulator, a load generator)
+gets a named profile (`[profile.sim] inherits = "release"`, run with `--profile sim`)
+rather than a faster `dev`, so the gate's builds stay shared.
 
 **Who to give the secret to.** Every repository given the secret trusts every other
 repository given it, as with a shared cache volume: the password keeps the Redis from
@@ -5191,6 +5204,16 @@ the secret to the repositories whose code may run on the scale set at all (the s
 judgement `RUNS_ON` makes), and keep a public repository, whose pull requests anyone
 can open, on GitHub-hosted runners with `sccache-redis: ""`. `image.yml` takes the
 same secret and `sccache-redis` input for its release build.
+
+**Dependabot and the cache.** A Dependabot pull request's run reads the repository's
+Dependabot secrets, not its Actions secrets, so it compiles uncached (5 to 10 minutes
+more per run) unless `SCCACHE_REDIS_PASSWORD` is set as a Dependabot secret too, under
+the same name; the workflows need no change, since `secrets.SCCACHE_REDIS_PASSWORD`
+resolves to it in such a run. Setting it extends the trust above to the code a
+dependency bump brings: a new crate version's build script runs with the job's
+sccache server and can write entries every other job reads. It is the same judgement
+as giving the secret to the repository at all (the bump's code runs in the gate
+either way); the job log says when a Dependabot run compiled uncached for want of it.
 
 A developer machine can use the
 same Redis; its paths differ from the runners', so its entries are its own (its
@@ -5246,8 +5269,9 @@ The checks run on the `arc-openshift-k8s` scale set unless the repository or
 organization variable `RUNS_ON` names other runners, as JSON (`"ubuntu-latest"`). A
 public repository should: self-hosted runners in the cluster are no place for code
 anyone can propose. Off the cluster the Redis's Service name does not resolve, so such
-an app passes `sccache-redis: ""` (otherwise each job spends about ten seconds finding
-that out, warns, and compiles without sccache). Off ARC the services are at their
+rust-ci.yml skips the default endpoint there by itself (a `.svc` host off ARC); an
+endpoint that is not cluster-internal but unreachable from those runners still costs
+about ten seconds and a warning, so such an app passes `sccache-redis: ""`. Off ARC the services are at their
 names (`postgres`, `redis`) rather than localhost; `DATABASE_URL` and `REDIS_URL`
 follow, so build on those rather than naming a host.
 
@@ -5336,7 +5360,7 @@ jobs:
   on:
     workflow_dispatch:
       inputs:
-        version: {description: "The released version (0.14.9, v0.2.0-rc.1)", required: true}
+        version: {description: "The released version (0.14.8, v0.2.0-rc.1)", required: true}
         floating-tags: {description: "Also move the channel's floating tags", type: boolean, default: false}
   jobs:
     image:
@@ -5385,6 +5409,37 @@ jobs:
   the run calls is the same run); an app that checks the candidate in a workflow run of
   its own gets no skip. Nothing to adopt beyond the pin;
   `reuse-passed: false` on the call turns it off.
+- **rc's release does not check again the commit its promotion just checked.**
+  `publish-rc.yml` given `gate: ${{ needs.check-rc.outputs.gate }}` (rust-ci.yml's
+  output: a hash of the checked tree, the inputs but `ref` and `diff-base`, and
+  `RUNS_ON`, set only
+  when the checks passed or were reused) leaves the ref
+  `refs/owt/rc-checked/<gate>/<unix time>` on the commit it moves `rc` to, replacing
+  every earlier one, and only when the run's `.github/` is the candidate's own (so the
+  release calls the same checks at the same pins). When the release it dispatches on
+  `rc` calls `rust-ci.yml` with no `ref`, `tested` looks the ref up: the event's own
+  commit, the same gate, made in the last 12 hours. On a match `rust` and `css` are
+  skipped (`skipped: rc-checked`); anything else runs them, and so does a release
+  whose `ci.yml` passes inputs that differ from the candidate check's. Writing the ref
+  takes `contents: write`, which only the promotion's and release's own jobs hold,
+  never a job that runs the app's code. The trade: `cargo audit` in rc's release reads
+  the advisory database as of the promotion. The image is still built, scanned,
+  verified, signed and attested on `rc` as before, and main's release still checks its
+  merge commit, which no PR checked.
+- **A change that builds nothing skips the checks** with `skip-unbuilt: true` on the
+  `rust-ci.yml` call: Markdown and licence files outside a `templates/` directory that
+  no other file or symlink names, by file name or by a directory they sit in (a README
+  that `include_str!` or `readme =` reads is code, and so is `content/*.md` in an app
+  that embeds `content/`), `.github/dependabot.yml`, and
+  workflow files that call neither the checks, the image, the release nor a local
+  workflow (a pin bump in `housekeeping.yml`). Every other path is code: sources,
+  templates, migrations, `.sqlx/`, `Cargo.*`, the justfile, and the CI workflows
+  themselves. A pull request compares with its base, a push with its previous head,
+  and a `ref` with `diff-base` (`check-rc` passes `${{ needs.candidate.outputs.base }}`);
+  with no base, or any failed read, the checks run. Skipped jobs report success, so
+  a required check neither blocks nor waits; a check the app runs as a job of its own
+  (owt-ehr's compliance lint) runs regardless. The skip passes no `gate`, so rc's
+  release checks such a commit.
 - **A promotion can be lost** in the candidate flow, two ways. GitHub keeps one
   *pending* run or job per concurrency group, so a third PR updated while one promotion
   runs and another waits cancels the waiting one, not queues it. And `publish-rc.yml`
@@ -5464,10 +5519,12 @@ jobs:
     uses: ./.github/workflows/ci.yml   # the app's own
     secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
-    permissions: {contents: read, pull-requests: read}  # them); checks "commits / title"
-    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.9, and "commits / commits"
-    # with: {title: false}   # an app that checks titles another way: only "commits / commits" runs (the skipped
-    # "commits / title" counts as passing for a required check)
+    permissions: {contents: read, pull-requests: read}  # them); one check, "commits / commits",
+    uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.9
+    # with: {title: false}   # an app that checks titles another way: the commit lint alone
+    # outputs: `commits` ("true" when every commit passed) and `title`; a promotion that
+    # waits on the commits but not the title has `needs: [ci, commits]` and `if: ${{ !cancelled()
+    # && needs.ci.result == 'success' && needs.commits.outputs.commits == 'true' && ... }}`
   rc:   # one promotion at a time; only this job waits in the group, never the checks
     needs: ci
     if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
@@ -5500,12 +5557,16 @@ jobs:
     if: needs.candidate.outputs.changed == 'true'
     uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.9
     with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
+    # with skip-unbuilt: also diff-base: "${{ needs.candidate.outputs.base }}"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   promote:
     needs: [candidate, check-rc]
     permissions: {contents: write, actions: write}
     uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.14.9
-    with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
+    with:
+      sha: "${{ needs.candidate.outputs.sha }}"
+      base: "${{ needs.candidate.outputs.base }}"
+      gate: "${{ needs.check-rc.outputs.gate }}"   # rc's release skips the checks of this commit
 # in requeue-rc.yml, on {schedule: [{cron: "*/30 * * * *"}], workflow_dispatch: {}}:
 # the requeue job above, without its needs and if
 # in release.yml
@@ -5527,10 +5588,13 @@ the image) in a Rust job container (`container`,
 default `mirror.gcr.io/library/rust:1-trixie`; through sccache when the app passes
 the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
-(0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`. The
-read-only `verify` job checks the layer's paths and modes and that the base has
-`base-requires` and a glibc at least as new as the binary needs. The `push` job
-confirms the layer is the one verified and runs none of the app's code; of the
+(0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`.
+Before the compile, the `build` job uploads a few bytes as the `artifact-quota-probe`
+artifact, so a full Actions storage fails the job in seconds rather than at the
+layer's upload after the compile. The read-only `scan` job first checks the layer's
+paths and modes and that the base has `base-requires` and a glibc at least as new as
+the binary needs, and only then scans the image (below), in one pod. The `push` job
+confirms the layer is the one checked and runs none of the app's code; of the
 `crane` builder's jobs it alone holds `packages: write` (the `docker` builder's job
 and `attest` hold it too): with
 [crane](https://github.com/google/go-containerregistry/tree/main/cmd/crane) (pinned
@@ -5574,8 +5638,13 @@ the template's:
   findings and never fails; any other value than `negligible`, `low`, `medium`,
   `high`, `critical` or `none` fails the job. grype reads exactly the configuration
   `vuln-ignore-file` names, and none when it is empty: a `.grype.yaml` in the
-  repository is not picked up unasked. A finding with no fix, or a false positive,
-  is waived in that file:
+  repository is not picked up unasked. grype's vulnerability database is kept in the
+  Actions cache for the UTC day (`grype-db-<os>-<date>`, scoped to the branch like any
+  cache entry, so a pull request cannot plant one for main or rc): the first scan of
+  a day downloads it, later scans restore it and download only a newer build. grype
+  refuses a database built more than 48 hours ago (`GRYPE_DB_MAX_ALLOWED_BUILT_AGE`),
+  so a stale restore fails the scan rather than passing it. A finding with no fix, or
+  a false positive, is waived in that file:
 
   ```yaml
   # .grype.yaml, named by vuln-ignore-file
@@ -5603,9 +5672,9 @@ the template's:
   tag instead uses `@refs/tags/vX.Y.Z`. Never match a pattern that ends at `@`: it
   also verifies an image signed by a workflow run from an unreviewed branch.
 - **SBOM:** the same job runs [syft](https://github.com/anchore/syft) on the pushed
-  digest, uploads the SPDX JSON as the run's `sbom.spdx.json` artifact (kept 7 days) and attaches
-  it to the image as a signed attestation (`cosign verify-attestation --type
-  spdxjson ...`, with the same identity flags).
+  digest and attaches the SPDX JSON to the image as a signed attestation (`cosign verify-attestation --type
+  spdxjson ...`, with the same identity flags). No workflow artifact is made, so the
+  signature and the attestation never depend on the Actions storage quota.
 
 The caller's job therefore grants `id-token: write` besides `packages: write`
 (`permissions: {contents: read, packages: write, id-token: write}`): a reusable
@@ -5710,14 +5779,16 @@ inputs can break only in the image, and without a check that shows after a versi
 tagged, as a release with no image. `image-check.yml` builds the pull request's merge
 commit the way a release does and verifies all but the push: with `builder: crane`
 (the default) the compile, the npm assets, the packed layer, and the base's tools and
-glibc, by the same `build` and `verify` jobs as `image.yml`'s (`just image-check`
+glibc, by the same `build` and `scan` jobs as `image.yml`'s (`just image-check`
 keeps them identical); with `builder: docker` the Dockerfile is built with BuildKit
 and pushed nowhere. It also scans the image with grype, as `image.yml` does, with the
 same `vuln-fail-on` and `vuln-ignore-file` inputs: this is where a vulnerable base image
 is most useful to learn of, before the release. Nothing is signed and no SBOM is made
 here, and the caller still grants `contents: read` only. It takes `image.yml`'s inputs that shape the build (`bin`,
 `cargo-args`, `files`, `base-image`, ...) and none that shape the push.
-`cargo-profile` makes the check cheaper: a pull request can build with `dev`, or with a
+`cargo-profile` makes the check cheaper: a pull request can build with `dev` (the
+example below does), which compiles with the flags the gate's own dev build uses, so
+with a warm sccache it is mostly cache hits, or with a
 profile of the app's own that turns off fat LTO and sets many codegen units
 (`[profile.ci] inherits = "release"`), instead of the release link. The check then does
 not prove that the release profile's link succeeds, so a release still builds with
@@ -5753,9 +5824,14 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     permissions: {contents: read}
     uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.14.9
-    with: {bin: myapp}   # as the release's image job
+    with: {bin: myapp, cargo-profile: dev}   # as the release's image job, but the profile
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
+
+An app whose image check is a required status calls it from its pull-request workflow
+instead, and filters with a job-level `if` (on a changed-paths output of an earlier
+job, say): a workflow that a `paths:` filter skips never reports, and leaves the
+required check pending, while a skipped job reports success.
 <!-- x-release-please-end -->
 
 The cost is one release build per push to a matching pull request. With `crane` it
@@ -5781,9 +5857,9 @@ fills a small plan's storage within a day. It keeps the layer only when a job th
 it (`consumers`, default `verify scan push`, matched against the last ` / ` part of the
 job's name) failed or timed out in the run's latest attempt, so "Re-run failed jobs"
 still finds it; a cancelled run's layer goes too, and a full re-run builds it again.
-Deletions show in the plan's storage figure 6 to 12 hours later. The SBOM artifact is kept
-a week (the image's attestation is the SBOM of record), and the docker builder uploads
-no build record. `ghcr-prune.yml` keeps the package itself in bounds. One caller does
+Deletions show in the plan's storage figure 6 to 12 hours later. The SBOM goes into
+the image's attestation and nowhere else, the quota probe is a few bytes kept a day,
+and the docker builder uploads no build record. `ghcr-prune.yml` keeps the package itself in bounds. One caller does
 both, `.github/workflows/housekeeping.yml`, with the release and image-check workflows'
 `name:`s:
 
@@ -7155,7 +7231,7 @@ starts lower-case unless its first word is a code identifier (`PUBLIC_URL`,
 `fix(web): Drop the cache` does not. The first line runs to 120 characters at most;
 the body and the footers have no line-length limit, so a log, a link or quoted output
 goes in as it is. An app without a commitlint configuration of its own is checked by
-the same rules (`commitlint.config.mjs`). The title job checks the title's form (a
+the same rules (`commitlint.config.mjs`). The title step checks the title's form (a
 type, an optional scope, a subject), not its length. Every commit is
 linted but a merge of the base whose first line is exactly git's wording (`Merge
 branch 'main' of …`, `Merge remote-tracking branch 'origin/main' into …`, `Merge
