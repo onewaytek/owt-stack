@@ -37,6 +37,13 @@ on:
         description: The app's release workflow file, dispatched on rc.
         type: string
         default: release.yml
+      gate:
+        description: >-
+          The checks' `gate` output (rust-ci.yml) from the candidate's check in this
+          run. When set, rc's release skips the checks for this exact commit (see
+          "The checked commit" below); empty, it runs them.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -77,6 +84,31 @@ jobs:
           # No force: a writer that moved rc since the fetch makes this fail.
           git push origin "${SHA}:refs/heads/rc"
           git push --force-with-lease="rc-candidate:${SHA}" origin :refs/heads/rc-candidate || true
+      # The checked commit: refs/owt/rc-checked/<gate>/<unix time> on the candidate tells
+      # rc's release (rust-ci.yml's `tested`) that this run's checks passed this exact
+      # commit with that gate, so it need not run them again. Written only when the
+      # workflow files that ran here are the candidate's own (so rc's release runs the
+      # same checks, pinned the same), and it replaces every earlier record. A failure
+      # here only costs the skip: the release then runs the checks.
+      - name: Record the checked commit
+        if: ${{ inputs.gate != '' }}
+        continue-on-error: true
+        env:
+          SHA: ${{ inputs.sha }}
+          GATE: ${{ inputs.gate }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GATE" =~ ^[0-9a-f]{16}$ ]] || { echo "::warning::gate '$GATE' is malformed: not recorded"; exit 0; }
+          if ! git cat-file -e "${GITHUB_SHA}^{commit}" || ! git diff --quiet "$GITHUB_SHA" "$SHA" -- .github; then
+            echo "the candidate's .github differs from the workflows that checked it: not recorded"
+            exit 0
+          fi
+          args=("${SHA}:refs/owt/rc-checked/${GATE}/$(date +%s)")
+          while read -r _ ref; do
+            [ -n "$ref" ] && args+=(":${ref}")
+          done < <(git ls-remote origin 'refs/owt/rc-checked/*')
+          git push --atomic origin "${args[@]}"
       - name: Release rc
         if: ${{ inputs.dispatch-release }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

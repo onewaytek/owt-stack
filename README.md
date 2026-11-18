@@ -5385,6 +5385,34 @@ jobs:
   the run calls is the same run); an app that checks the candidate in a workflow run of
   its own gets no skip. Nothing to adopt beyond the pin;
   `reuse-passed: false` on the call turns it off.
+- **rc's release does not check again the commit its promotion just checked.**
+  `publish-rc.yml` given `gate: ${{ needs.check-rc.outputs.gate }}` (rust-ci.yml's
+  output: a hash of the inputs but `ref` and `diff-base`, and of `RUNS_ON`, set only
+  when the checks passed or were reused) leaves the ref
+  `refs/owt/rc-checked/<gate>/<unix time>` on the commit it moves `rc` to, replacing
+  every earlier one, and only when the run's `.github/` is the candidate's own (so the
+  release calls the same checks at the same pins). When the release it dispatches on
+  `rc` calls `rust-ci.yml` with no `ref`, `tested` looks the ref up: the event's own
+  commit, the same gate, made in the last 12 hours. On a match `rust` and `css` are
+  skipped (`skipped: rc-checked`); anything else runs them, and so does a release
+  whose `ci.yml` passes inputs that differ from the candidate check's. Writing the ref
+  takes `contents: write`, which only the promotion's and release's own jobs hold,
+  never a job that runs the app's code. The trade: `cargo audit` in rc's release reads
+  the advisory database as of the promotion. The image is still built, scanned,
+  verified, signed and attested on `rc` as before, and main's release still checks its
+  merge commit, which no PR checked.
+- **A change that builds nothing skips the checks** with `skip-unbuilt: true` on the
+  `rust-ci.yml` call: Markdown and licence files that no other file names (a README
+  that `include_str!` or `readme =` reads is code), `.github/dependabot.yml`, and
+  workflow files that call neither the checks, the image, the release nor a local
+  workflow (a pin bump in `housekeeping.yml`). Every other path is code: sources,
+  templates, migrations, `.sqlx/`, `Cargo.*`, the justfile, and the CI workflows
+  themselves. A pull request compares with its base, a push with its previous head,
+  and a `ref` with `diff-base` (`check-rc` passes `${{ needs.candidate.outputs.base }}`);
+  with no base, or any failed read, the checks run. Skipped jobs report success, so
+  a required check neither blocks nor waits; a check the app runs as a job of its own
+  (owt-ehr's compliance lint) runs regardless. The skip passes no `gate`, so rc's
+  release checks such a commit.
 - **A promotion can be lost** in the candidate flow, two ways. GitHub keeps one
   *pending* run or job per concurrency group, so a third PR updated while one promotion
   runs and another waits cancels the waiting one, not queues it. And `publish-rc.yml`
@@ -5500,12 +5528,16 @@ jobs:
     if: needs.candidate.outputs.changed == 'true'
     uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.8
     with: {ref: "${{ needs.candidate.outputs.sha }}", database: myapp}  # as the app's CI
+    # with skip-unbuilt: also diff-base: "${{ needs.candidate.outputs.base }}"
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   promote:
     needs: [candidate, check-rc]
     permissions: {contents: write, actions: write}
     uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.14.8
-    with: {sha: "${{ needs.candidate.outputs.sha }}", base: "${{ needs.candidate.outputs.base }}"}
+    with:
+      sha: "${{ needs.candidate.outputs.sha }}"
+      base: "${{ needs.candidate.outputs.base }}"
+      gate: "${{ needs.check-rc.outputs.gate }}"   # rc's release skips the checks of this commit
 # in requeue-rc.yml, on {schedule: [{cron: "*/30 * * * *"}], workflow_dispatch: {}}:
 # the requeue job above, without its needs and if
 # in release.yml
