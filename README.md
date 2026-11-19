@@ -5436,7 +5436,8 @@ jobs:
   templates, migrations, `.sqlx/`, `Cargo.*`, the justfile, and the CI workflows
   themselves. A pull request compares with its base, a push with its previous head,
   and a `ref` with `diff-base` (`check-rc` passes `${{ needs.candidate.outputs.base }}`);
-  with no base, or any failed read, the checks run. Skipped jobs report success, so
+  with no base, or any failed read, the checks run. The reads fetch what the blobless
+  checkout lacks with the job's token, so the skip works in a private repository too. Skipped jobs report success, so
   a required check neither blocks nor waits; a check the app runs as a job of its own
   (owt-ehr's compliance lint) runs regardless. The skip passes no `gate`, so rc's
   release checks such a commit.

@@ -57,13 +57,15 @@ test *args:
 audit:
     cargo audit --deny warnings
 
-# The deploy and environment scripts against a stand-in `oc` (bash only; no cluster, no Rust).
+# The deploy and environment scripts against a stand-in `oc`, and the workflows' shell
+# (bash and git only; no cluster, no network, no Rust).
 templates:
     bash templates/openshift/apply-test.sh
     bash templates/openshift/env-test.sh
     bash scripts/bao-set-test.sh
     bash scripts/deploy-pin-test.sh
     bash scripts/housekeeping-test.sh
+    bash scripts/rust-ci-test.sh
 
 # charts/owt-app renders what templates/openshift renders, fixture by fixture, and its
 # schema refuses what it must (needs oc, helm, yq and jq; no cluster, no Rust). Not in
