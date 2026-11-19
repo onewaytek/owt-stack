@@ -5436,7 +5436,8 @@ jobs:
   templates, migrations, `.sqlx/`, `Cargo.*`, the justfile, and the CI workflows
   themselves. A pull request compares with its base, a push with its previous head,
   and a `ref` with `diff-base` (`check-rc` passes `${{ needs.candidate.outputs.base }}`);
-  with no base, or any failed read, the checks run. Skipped jobs report success, so
+  with no base, or any failed read, the checks run. The reads fetch what the blobless
+  checkout lacks with the job's token, so the skip works in a private repository too. Skipped jobs report success, so
   a required check neither blocks nor waits; a check the app runs as a job of its own
   (owt-ehr's compliance lint) runs regardless. The skip passes no `gate`, so rc's
   release checks such a commit.
@@ -5638,13 +5639,13 @@ the template's:
   findings and never fails; any other value than `negligible`, `low`, `medium`,
   `high`, `critical` or `none` fails the job. grype reads exactly the configuration
   `vuln-ignore-file` names, and none when it is empty: a `.grype.yaml` in the
-  repository is not picked up unasked. grype's vulnerability database is kept in the
-  Actions cache for the UTC day (`grype-db-<os>-<date>`, scoped to the branch like any
-  cache entry, so a pull request cannot plant one for main or rc): the first scan of
-  a day downloads it, later scans restore it and download only a newer build. grype
-  refuses a database built more than 48 hours ago (`GRYPE_DB_MAX_ALLOWED_BUILT_AGE`),
-  so a stale restore fails the scan rather than passing it. A finding with no fix, or
-  a false positive, is waived in that file:
+  repository is not picked up unasked. Every scan downloads grype's vulnerability
+  database (about 200 MB) and grype checks the archive against the checksum in its
+  listing; nothing comes from the Actions cache, which any job of the run can write on
+  its branch, the build that runs the app's code included. grype refuses a database
+  built more than 48 hours ago (`GRYPE_DB_MAX_ALLOWED_BUILT_AGE`), so a stale listing
+  fails the scan rather than passing it. A finding with no fix, or a false positive,
+  is waived in that file:
 
   ```yaml
   # .grype.yaml, named by vuln-ignore-file
@@ -5854,7 +5855,7 @@ write token. It is kept a day; `actions-cleanup.yml` deletes it as soon as its r
 completed, whatever the run's conclusion: an app's pull request run also carries checks
 and rc jobs that fail far more often than the image, and a layer kept for each of those
 fills a small plan's storage within a day. It keeps the layer only when a job that reads
-it (`consumers`, default `verify scan push`, matched against the last ` / ` part of the
+it (`consumers`, default `scan push`, matched against the last ` / ` part of the
 job's name) failed or timed out in the run's latest attempt, so "Re-run failed jobs"
 still finds it; a cancelled run's layer goes too, and a full re-run builds it again.
 Deletions show in the plan's storage figure 6 to 12 hours later. The SBOM goes into

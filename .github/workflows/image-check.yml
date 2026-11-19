@@ -600,22 +600,12 @@ jobs:
           set -euo pipefail
           crane append --base "$BASE_REF" --new_layer "$RUNNER_TEMP/image-layer/layer.tar" \
             --new_tag scan.invalid/image:scan --output "$RUNNER_TEMP/image.tar"
-      # grype's database, kept in the Actions cache for the UTC day: the first scan of a
-      # day downloads and installs it, later ones restore it and grype only checks for a
-      # newer build. A cache entry is scoped to its branch, so a pull request cannot
-      # plant one for main or rc. grype refuses a database built more than 48 hours ago
-      # (GRYPE_DB_MAX_ALLOWED_BUILT_AGE below), so a stale restore fails the scan.
-      - name: Vulnerability database
-        id: grype-db
-        shell: bash
-        run: |
-          echo "GRYPE_DB_CACHE_DIR=$RUNNER_TEMP/grype-db" >> "$GITHUB_ENV"
-          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
-      - id: grype-db-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/grype-db
-          key: grype-db-${{ runner.os }}-${{ steps.grype-db.outputs.day }}
+      # grype downloads its vulnerability database in every scan and checks the archive
+      # against the checksum in grype's listing. No Actions cache: any job of the run can
+      # write a cache entry on its branch, the build runs the app's code, and a restore
+      # unpacks whatever the entry holds into the scanning job, so a planted entry could
+      # blind the scan that gates the push and the tags. grype refuses a database built
+      # more than 48 hours ago.
       - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         env:
           GRYPE_DB_VALIDATE_AGE: "true"
@@ -626,13 +616,6 @@ jobs:
           fail-build: ${{ inputs.vuln-fail-on != 'none' }}
           output-format: table
           config: ${{ env.GRYPE_CONFIG }}
-      # Saved on a miss even when the scan failed: the database is good either way.
-      - if: ${{ !cancelled() && steps.grype-db-cache.outputs.cache-hit != 'true' }}
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/grype-db
-          key: grype-db-${{ runner.os }}-${{ steps.grype-db.outputs.day }}
 
   docker:
     if: >-
@@ -684,22 +667,12 @@ jobs:
             echo '{}' > "$config"
           fi
           echo "GRYPE_CONFIG=${config}" >> "$GITHUB_ENV"
-      # grype's database, kept in the Actions cache for the UTC day: the first scan of a
-      # day downloads and installs it, later ones restore it and grype only checks for a
-      # newer build. A cache entry is scoped to its branch, so a pull request cannot
-      # plant one for main or rc. grype refuses a database built more than 48 hours ago
-      # (GRYPE_DB_MAX_ALLOWED_BUILT_AGE below), so a stale restore fails the scan.
-      - name: Vulnerability database
-        id: grype-db
-        shell: bash
-        run: |
-          echo "GRYPE_DB_CACHE_DIR=$RUNNER_TEMP/grype-db" >> "$GITHUB_ENV"
-          echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
-      - id: grype-db-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/grype-db
-          key: grype-db-${{ runner.os }}-${{ steps.grype-db.outputs.day }}
+      # grype downloads its vulnerability database in every scan and checks the archive
+      # against the checksum in grype's listing. No Actions cache: any job of the run can
+      # write a cache entry on its branch, the build runs the app's code, and a restore
+      # unpacks whatever the entry holds into the scanning job, so a planted entry could
+      # blind the scan that gates the push and the tags. grype refuses a database built
+      # more than 48 hours ago.
       - uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         env:
           GRYPE_DB_VALIDATE_AGE: "true"
@@ -710,13 +683,6 @@ jobs:
           fail-build: ${{ inputs.vuln-fail-on != 'none' }}
           output-format: table
           config: ${{ env.GRYPE_CONFIG }}
-      # Saved on a miss even when the scan failed: the database is good either way.
-      - if: ${{ !cancelled() && steps.grype-db-cache.outputs.cache-hit != 'true' }}
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/grype-db
-          key: grype-db-${{ runner.os }}-${{ steps.grype-db.outputs.day }}
 
   # Says why when nothing would run, rather than succeed with no check.
   refused:

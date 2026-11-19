@@ -327,9 +327,15 @@ jobs:
           if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]] || [ "$base" = 0000000000000000000000000000000000000000 ]; then
             echo "no base to compare with: the checks run"; exit 0
           fi
+          # The checkout is a blobless partial clone (sparse-checkout fetches with
+          # --filter=blob:none) whose remote holds no credentials, so every git command
+          # here, a lazy fetch of a missing blob included, carries the token: a private
+          # repository refuses an anonymous fetch.
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.${GITHUB_SERVER_URL}/.extraHeader"
+          export GIT_CONFIG_VALUE_0="Authorization: basic ${auth}"
           if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
-            auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
-            git -c "http.extraHeader=Authorization: basic ${auth}" fetch -q --no-tags --depth=1 origin "$base"
+            git fetch -q --no-tags --depth=1 origin "$base"
           fi
           mapfile -t changed < <(git diff --name-only --no-renames "$base" HEAD)
           [ "${#changed[@]}" -gt 0 ] || { echo "no change against ${base}: the checks run"; exit 0; }
@@ -340,8 +346,24 @@ jobs:
           # name of a directory it sits in: a crate that embeds a whole directory
           # (rust-embed, include_dir!, a build.rs that walks `content/`) names no file in it.
           esc() { sed 's/[][\.^$*+?(){}|/]/\\&/g' <<<"$1"; }
+          # The blobs of both trees in one fetch, the first time a read needs them, in
+          # place of one lazy fetch per blob.
+          blobs=
+          prefetch() {
+            [ -z "$blobs" ] || return 0
+            local missing
+            # Called as `prefetch || …`, which suspends `set -e`: each failure returns.
+            missing=$(git rev-list --objects --missing=print "${base}^{tree}" 'HEAD^{tree}' |
+              sed -n 's/^?//p') || return 1
+            if [ -n "$missing" ]; then
+              git -c fetch.negotiationAlgorithm=noop fetch -q --no-tags --no-write-fetch-head \
+                --recurse-submodules=no --filter=blob:none --stdin origin <<<"$missing" || return 1
+            fi
+            blobs=1
+          }
           named() {
             local f=$1 t r d l pats=()
+            prefetch || return 0
             pats+=(-e "$(esc "${f##*/}")")
             d=$f
             while [[ "$d" == */* ]]; do
@@ -362,6 +384,7 @@ jobs:
           }
           shows() {
             local body entry
+            prefetch || return 0
             entry=$(git ls-tree "$1" -- "$2") || return 0
             [ -n "$entry" ] || return 1
             body=$(git show "$1:$2") || return 0

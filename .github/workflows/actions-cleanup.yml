@@ -13,8 +13,8 @@ name: Actions cleanup
 # The run's conclusion does not decide it: an app's pull request run carries other
 # jobs (checks, rc candidates) that fail far more often than the image, and a layer
 # kept for each such failure fills the account's storage. A layer is kept only while
-# its run is still going, or when a job that reads it (`consumers`: verify, scan,
-# push) failed or timed out in the run's latest attempt, so "Re-run failed jobs" still
+# its run is still going, or when a job that reads it (`consumers`: scan, push)
+# failed or timed out in the run's latest attempt, so "Re-run failed jobs" still
 # finds it; it expires after the day its upload set. A cancelled run's layer is
 # deleted: a full re-run builds it again.
 #
@@ -50,7 +50,7 @@ on:
           The jobs that read the artifacts, space-separated, matched against the last
           " / " part of each job's name; a failed one keeps its run's artifacts.
         type: string
-        default: verify scan push
+        default: scan push
 
 jobs:
   artifacts:

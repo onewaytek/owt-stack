@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Proves the housekeeping workflows' shell without a network: actions-cleanup.yml treats
 # a 404 on DELETE as success and fails on any other error, and deletes a completed run's
-# layer unless a job reading it failed or timed out; ghcr-prune.yml's "Read the
+# layer unless a job reading it failed or timed out, and names in its default `consumers`
+# only image.yml jobs that read the layer; ghcr-prune.yml's "Read the
 # pins" step fails a deletion run (and warns on a dry run) when the deployments checkout
 # yields no pins, reads digest and `version:` pins, and its tag resolution protects the
 # version carrying a pinned tag. `just templates` runs it; it needs bash 4, jq and sed.
@@ -69,30 +70,39 @@ run() {
   for j in "$@"; do rows+=("{\"name\":\"${j%=*}\",\"conclusion\":\"${j#*=}\"}"); done
   local IFS=,; echo "{\"jobs\":[${rows[*]}]}" >"$fix/jobs-$id.json"
 }
+# The workflow's own default, and each name in it a job that reads the layer.
+consumers=$(awk '/^      consumers:/ {on = 1} on && /^        default: / {sub(/^        default: /, ""); print; exit}' \
+  "$wf/actions-cleanup.yml")
+check "cleanup: the default consumers" "$consumers" "scan push"
+for j in $consumers; do
+  grep -qx "  $j:" "$wf/image.yml" && grep -q "image-layer" <(awk -v j="  $j:" '$0 == j {on=1; next} on && /^  [^ ]/ {exit} on' "$wf/image.yml") \
+    && c=yes || c=no
+  check "cleanup: consumer $j is an image.yml job that reads the layer" "$c" yes
+done
 run_clean() { # $1 = delete codes
   printf '%s\n' "$1" >"$work/codes"; : >"$work/calls"; : >"$work/summary"
   (cd "$work" && PATH="$work/bin:$PATH" CALLS="$work/calls" DELETE_CODES="$work/codes" FIX="$fix" \
-    TOKEN=t RUN_ID="" NAMES=image-layer CONSUMERS="verify scan push" GITHUB_REPOSITORY=o/r \
+    TOKEN=t RUN_ID="" NAMES=image-layer CONSUMERS="$consumers" GITHUB_REPOSITORY=o/r \
     RUNNER_TEMP="$work" GITHUB_STEP_SUMMARY="$work/summary" bash "$work/clean.sh" >"$work/out" 2>&1)
 }
 deleted() { sed -n 's|^DELETE .*/artifacts/||p' "$work/calls" | sort -n | paste -sd' '; }
 artifacts 1 2
-run 1 completed "image-check / build=success" "image-check / verify=success"
+run 1 completed "image-check / build=success" "image-check / scan=success"
 run 2 completed "image-check / build=success" "image-check / scan=success"
 rc=0; run_clean $'1 204\n2 404' || rc=$?
 check "cleanup: 404 on DELETE is success" "$rc" 0
 check "cleanup: both deletes attempted" "$(deleted)" "1 2"
 rc=0; run_clean $'1 204\n2 500' || rc=$?
 check "cleanup: 500 on DELETE fails" "$rc" 1
-# 1 in progress, 2 verify failed, 3 push timed out, 4 another job failed,
+# 1 in progress, 2 scan failed, 3 push timed out, 4 another job failed,
 # 5 cancelled, 6 succeeded.
 artifacts 1 2 3 4 5 6
-run 1 in_progress "image-check / build=success" "image-check / verify=null"
-run 2 completed "image-check / build=success" "image-check / verify=failure" "image-check / scan=skipped"
+run 1 in_progress "image-check / build=success" "image-check / scan=null"
+run 2 completed "image-check / build=success" "image-check / scan=failure"
 run 3 completed "release / image / scan=success" "release / image / push=timed_out"
-run 4 completed "image-check / verify=success" "image-check / scan=success" "check-rc / checks / rust=failure"
-run 5 completed "image-check / verify=cancelled" "image-check / scan=cancelled"
-run 6 completed "release / image / verify=success" "release / image / push=success" "release / image / attest=failure"
+run 4 completed "image-check / scan=success" "check-rc / checks / rust=failure"
+run 5 completed "image-check / scan=cancelled"
+run 6 completed "release / image / scan=success" "release / image / push=success" "release / image / attest=failure"
 rc=0; run_clean "$(printf '%s 204\n' 1 2 3 4 5 6)" || rc=$?
 check "cleanup: the decision run succeeds" "$rc" 0
 check "cleanup: deletes failure elsewhere, cancelled and succeeded; keeps in progress and failed consumers" \
