@@ -5855,7 +5855,7 @@ write token. It is kept a day; `actions-cleanup.yml` deletes it as soon as its r
 completed, whatever the run's conclusion: an app's pull request run also carries checks
 and rc jobs that fail far more often than the image, and a layer kept for each of those
 fills a small plan's storage within a day. It keeps the layer only when a job that reads
-it (`consumers`, default `verify scan push`, matched against the last ` / ` part of the
+it (`consumers`, default `scan push`, matched against the last ` / ` part of the
 job's name) failed or timed out in the run's latest attempt, so "Re-run failed jobs"
 still finds it; a cancelled run's layer goes too, and a full re-run builds it again.
 Deletions show in the plan's storage figure 6 to 12 hours later. The SBOM goes into
