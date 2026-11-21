@@ -69,7 +69,7 @@ name: Rust CI
 # `skip-unbuilt: true` skips rust and css when the change touches nothing they build:
 # only Markdown and licence files outside a `templates/` directory that no other file
 # or symlink names (by file name, or by a directory they sit in), `.github/dependabot.yml`,
-# and workflow files that call neither the checks, the image, the release nor a local
+# `renovate.json`, and workflow files that call neither the checks, the image, the release nor a local
 # workflow. Every other path counts as code (sources, templates, migrations, `.sqlx/`,
 # `Cargo.*`, the justfile, the CI workflows themselves), as does any read that fails.
 # Skipped jobs count as passing for a required check, so nothing waits. A check the
@@ -178,7 +178,7 @@ on:
       skip-unbuilt:
         description: >-
           Skip the checks when the change touches only Markdown and licence files that
-          no other file names, `.github/dependabot.yml`, or workflow files that do not
+          no other file names, `.github/dependabot.yml`, `renovate.json`, or workflow files that do not
           call the checks, the image, the release or a local workflow (see the header).
           A pull request compares with its base, a push with its previous head, a `ref`
           with `diff-base`; with no base the checks run.
@@ -500,7 +500,7 @@ jobs:
               continue
             fi
             case "$f" in
-              .github/dependabot.yml|.github/dependabot.yaml) ;;
+              .github/dependabot.yml|.github/dependabot.yaml|renovate.json|.github/renovate.json) ;;
               .github/workflows/*.yml|.github/workflows/*.yaml)
                 if shows "$base" "$f" || shows HEAD "$f"; then
                   echo "$f runs the checks, the image or the release: the checks run"; exit 0

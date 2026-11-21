@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Proves renovate/base-images.json against the files it governs: every custom manager
+# Proves renovate/base-images.json against the files it governs, and renovate/default.json
+# against the rules the README states for it: every custom manager
 # matches at least one digest-pinned image in the files its managerFilePatterns select,
 # every `name:tag@sha256:` pin in templates/, charts/ and .github/workflows/ is read by
 # some manager (the pruner image, which names the cluster's internal registry and which
@@ -12,6 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 preset=renovate/base-images.json
+default=renovate/default.json
 fails=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi; }
 
@@ -54,8 +56,51 @@ for f in "${files[@]}"; do
   [[ $f =~ ^(templates|charts|\.github/workflows)/ && $f =~ \.(ya?ml|json)$ ]] || continue
   while IFS=: read -r line pin; do
     [[ $pin == image-registry.openshift-image-registry.svc:* ]] && continue
+    # A workflow's job or service `image:` (or `container:`) is the github-actions
+    # manager's, which default.json enables.
+    if [[ $f == .github/workflows/* ]] && sed -n "${line}p" "$f" | grep -qP '^\s*(image|container):\s'; then
+      check "$f:$line $pin is read by the github-actions manager" 'jq -e ".enabledManagers | index(\"github-actions\")" "$default" >/dev/null'
+      continue
+    fi
     check "$f:$line $pin is read by a manager" 'grep -qxF "$f:$line" "$covered"'
   done < <(grep -noP '[A-Za-z0-9][^\s"=]*:[^\s@"]+(?=@sha256:[a-f0-9]{64})' "$f" || true)
 done
+# default.json, the preset apps extend: the rules the README promises.
+d=$default
+check "default extends base-images relatively (same tag)" '[ "$(jq -c .extends "$d")" = "[\"./base-images\"]" ]'
+check "default enables every manager base-images does" \
+  '[ -z "$(jq -r --slurpfile b "$preset" "\$b[0].enabledManagers - .enabledManagers | .[]" "$d")" ]'
+check "default enables cargo, npm and github-actions" \
+  '[ "$(jq "[.enabledManagers[] | select(. == \"cargo\" or . == \"npm\" or . == \"github-actions\")] | length" "$d")" = 3 ]'
+check "default targets main alone" '[ "$(jq -c .baseBranchPatterns "$d")" = "[\"main\"]" ]'
+check "default automerges only CI container-image digests" \
+  '[ "$(jq -c "[.packageRules[] | select(.automerge == true) | [.matchManagers, .matchDatasources, .matchUpdateTypes]]" "$d")" = "[[[\"github-actions\"],[\"docker\"],[\"digest\"]]]" ]'
+check "base-images automerges digests alone" \
+  '[ "$(jq -c "[.packageRules[] | select(.automerge == true) | .matchUpdateTypes]" "$preset")" = "[[\"digest\"]]" ]'
+check "the dependency dashboard is off" 'jq -e ".extends | index(\":disableDependencyDashboard\")" "$preset" >/dev/null'
+check "updates are fix(deps)" '[ "$(jq -r "[.semanticCommitType, .semanticCommitScope] | join(\" \")" "$preset")" = "fix deps" ]'
+check "third-party actions are ci(deps)" \
+  '[ "$(jq -r ".packageRules[] | select(.groupSlug == \"actions\") | .semanticCommitType" "$d")" = ci ]'
+check "an owt-stack release is one fix(deps) group, every update type" '[ "$(jq -c ".packageRules[-1]
+  | [.matchPackageNames, .groupSlug, .separateMajorMinor, .semanticCommitType]" "$d")" = "[[\"onewaytek/owt-stack\"],\"owt-stack\",false,\"fix\"]" ]'
+check "the app template extends default at a tag" \
+  'jq -e ".extends == [\"github>onewaytek/owt-stack//renovate/default#vX.Y.Z\"]" templates/renovate.json >/dev/null'
+check "no action pin automerges" \
+  '[ "$(jq -r ".packageRules[] | select(.groupSlug == \"actions\") | .automerge" "$d")" = false ]'
+# A lock-file update runs cargo and npm on third-party packages, beside the App's token.
+check "the run keeps package scripts off and the job's environment to itself" \
+  'grep -qxF "          RENOVATE_ALLOW_SCRIPTS: \"false\"" .github/workflows/renovate.yml &&
+   grep -qxF "          RENOVATE_EXPOSE_ALL_ENV: \"false\"" .github/workflows/renovate.yml &&
+   ! grep -q "RENOVATE_ALLOWED_COMMANDS\|RENOVATE_ALLOWED_POST_UPGRADE_COMMANDS" .github/workflows/renovate.yml'
+# Renovate's log names what it visits, and this repository's run logs are public.
+check "this repository's run holds a token for this repository alone" \
+  'grep -qxF "      repositories: owt-stack" .github/workflows/renovate-run.yml &&
+   grep -qxF "          repositories: \${{ inputs.repositories }}" .github/workflows/renovate.yml'
+check "this repository's run renovates this repository alone" \
+  'grep -qxF "      autodiscover-filter: '"'"'[\"onewaytek/owt-stack\"]'"'"'" .github/workflows/renovate-run.yml'
+for j in renovate/*.json renovate.json templates/renovate.json; do
+  check "$j is JSON" 'jq -e . "$j" >/dev/null'
+done
+
 [ "$fails" = 0 ] || { echo "$fails check(s) failed"; exit 1; }
 echo "renovate: all checks passed"

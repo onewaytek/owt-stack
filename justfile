@@ -74,11 +74,21 @@ chart *cases:
     bash charts/owt-app/tests/render-equivalence.sh {{ cases }}
 
 # The commitlint rules conventional-commits.yml writes for an app without its own are
-# commitlint.config.mjs, byte for byte; the Renovate preset reads every digest pin it
-# should (scripts/renovate-test.sh).
+# commitlint.config.mjs, byte for byte; the Renovate presets read every digest pin they
+# should and keep the rules the README states (scripts/renovate-test.sh).
 ci-config:
     diff -u commitlint.config.mjs <(sed -n "/<<'JS'$/,/^ *JS$/p" .github/workflows/conventional-commits.yml | sed '1d;$d' | sed 's/^          //')
     bash scripts/renovate-test.sh
+
+# The Renovate configurations against Renovate's own validator, at the version
+# renovate.yml runs (needs node and the network; not in `check`, whose CI container has
+# neither). Run it after changing a preset.
+renovate-validate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v=$(grep -oP 'renovatebot/renovate:\K[0-9.]+(?=@)' .github/workflows/renovate.yml)
+    npx --yes --package "renovate@$v" -- renovate-config-validator --strict \
+        renovate/base-images.json renovate/default.json renovate.json templates/renovate.json
 
 # image-check.yml's `build` and `scan` jobs are image.yml's: `build` but for the
 # release's version and tag checkout, `scan` but for its checkout's ref and comments.

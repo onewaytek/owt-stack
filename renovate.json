@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "owt-stack's own updates (.github/workflows/renovate-run.yml): renovate/default.json from main, but apps run this repository's reusable workflows at a release tag, so its action pins ship with a release: fix(deps), twice a week like the crates, not the apps' monthly ci(deps).",
+  "extends": ["github>onewaytek/owt-stack//renovate/default"],
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "semanticCommitType": "fix",
+      "schedule": ["* 0-6 * * 1,4"]
+    }
+  ]
+}
