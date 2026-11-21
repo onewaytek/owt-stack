@@ -149,11 +149,15 @@ jobs:
           tag=$(printf 'object %s\ntype commit\ntag rc-checked\ntagger publish-rc <publish-rc@owt.invalid> %s +0000\n\n%s\n' \
             "$SHA" "$now" "$(cat "$jwt")" | git mktag)
           rm -f "$jwt"
-          args=("${tag}:refs/owt/rc-checked/${GATE}/${now}")
+          name="refs/owt/rc-checked/${GATE}/${now}"
+          args=("+${tag}:${name}")
           # ls-remote matches a pattern against the tail of each name; delete only
-          # the records themselves, never a branch whose name ends like one.
+          # the records themselves, never a branch whose name ends like one, and not
+          # the name this push replaces (a record made in the same second).
           while read -r _ ref; do
-            if [[ "$ref" == refs/owt/rc-checked/* && "$ref" != *'^{}' ]]; then args+=(":${ref}"); fi
+            if [[ "$ref" == refs/owt/rc-checked/* && "$ref" != *'^{}' && "$ref" != "$name" ]]; then
+              args+=(":${ref}")
+            fi
           done < <(git ls-remote origin 'refs/owt/rc-checked/*')
           git push --atomic origin "${args[@]}"
       - name: Release rc

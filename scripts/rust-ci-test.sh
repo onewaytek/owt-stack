@@ -216,8 +216,10 @@ check "rc-checked: a token older than 12 hours runs" "$(verify)" run
 record "$(printf '%s.%s.' "$(printf '{"alg":"none"}' | base64 -w0 | tr '+/' '-_' | tr -d =)" \
   "$(claims | base64 -w0 | tr '+/' '-_' | tr -d =)")"
 check "rc-checked: an unsigned token runs" "$(verify)" run
-record "$(mint "$(claims)")"
-check "rc-checked: an honest record again skips" "$(verify)" checked
+mkdir -p "$work/clock" && printf '#!/bin/sh\necho %s\n' "$now" >"$work/clock/date" && chmod +x "$work/clock/date"
+PATH="$work/clock:$PATH" record "$(mint "$(claims aud='"owt-rc-checked:0:0"')")"
+PATH="$work/clock:$PATH" record "$(mint "$(claims)")"
+check "rc-checked: a record made in the same second as the last replaces it" "$(verify)" checked
 
 [ "$fails" = 0 ] || { echo "$fails rust-ci test(s) failed"; exit 1; }
 echo "rust-ci tests passed"
