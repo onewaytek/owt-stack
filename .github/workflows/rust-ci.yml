@@ -43,13 +43,26 @@ name: Rust CI
 # on the commit it moves rc to, but only when the workflow files that ran the check are
 # the candidate's own. In rc's release (a push or dispatch on rc, `ref` empty), `tested`
 # looks for such a record of the event's commit, made in the last 12 hours, for the
-# same gate (the commit's tree, every input but `ref` and `diff-base`, and RUNS_ON, so
-# a record names the code that was checked as well as the commit); on a match rust and
+# same gate (the commit's tree, every input but `ref`, `diff-base` and
+# `reuse-rc-checked`, and RUNS_ON, so a record names the code that was checked as well
+# as the commit); on a match rust and
 # css are skipped and the workflow concludes in success. Anything else (no record, an
-# older one, another gate, another commit) runs the checks. Writing the record needs
-# `contents: write`, which no job that runs the app's code holds. The trade: the
-# release's checks are as old as the promotion's, so `cargo audit` reads an advisory
-# database minutes to hours old.
+# older one, another gate, another commit) runs the checks. The ref itself proves
+# nothing: anyone or anything that can push (a collaborator, a deploy key, a token with
+# `contents: write` in any workflow) can create one, and no rule protects refs outside
+# refs/heads and refs/tags. So the record is an annotated tag whose message is an OIDC
+# token publish-rc.yml mints for the audience `owt-rc-checked:<commit>:<gate>`, and the
+# skip needs that token verified against GitHub's published keys: the issuer, the
+# audience, this repository, a `job_workflow_ref` naming onewaytek/owt-stack's
+# publish-rc.yml, and its age. No push can produce that signature, and publish-rc.yml
+# mints it only after moving rc to a candidate whose `.github` is the workflows that
+# checked it. Any doubt (no record, an unsigned or unverifiable one, the keys out of
+# reach) runs the checks. A writer who can change workflows can still run publish-rc.yml
+# from a workflow of their own, but only one that is in the released commit's own
+# `.github`, where it is as visible as an edit to the release workflow itself.
+# `reuse-rc-checked: false` turns the lookup off. The trade: the release's checks are as
+# old as the promotion's, so `cargo audit` reads an advisory database minutes to hours
+# old.
 #
 # `skip-unbuilt: true` skips rust and css when the change touches nothing they build:
 # only Markdown and licence files outside a `templates/` directory that no other file
@@ -153,6 +166,13 @@ on:
           PR's tree); see the header.
         type: boolean
         default: true
+      reuse-rc-checked:
+        description: >-
+          In rc's release, skip the checks of a commit its promotion passed, on a record
+          signed for that commit by publish-rc.yml (see the header). false always runs
+          them. Not part of the gate.
+        type: boolean
+        default: true
       skip-unbuilt:
         description: >-
           Skip the checks when the change touches only Markdown and licence files that
@@ -198,8 +218,8 @@ on:
         value: ${{ jobs.tested.outputs.code == 'false' && 'false' || 'true' }}
       gate:
         description: >-
-          The gate's identity (a hash of the checked tree, the inputs but `ref` and
-          `diff-base`, and RUNS_ON) when the checks passed or were reused in this run attempt; empty
+          The gate's identity (a hash of the checked tree, the inputs but `ref`,
+          `diff-base` and `reuse-rc-checked`, and RUNS_ON) when the checks passed or were reused in this run attempt; empty
           otherwise. publish-rc.yml takes it to record the checked candidate.
         value: >-
           ${{ (jobs.tested.outputs.passed == 'true' || (jobs.rust.result == 'success'
@@ -264,7 +284,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(git rev-parse 'HEAD^{tree}')
-          gate=$(printf '%s\n%s\n%s\n' "$tree" "$INPUTS" "$RUNS_ON" | grep -vE '^  "(ref|diff-base)": ' | sha256sum | cut -c1-16)
+          gate=$(printf '%s\n%s\n%s\n' "$tree" "$INPUTS" "$RUNS_ON" | grep -vE '^  "(ref|diff-base|reuse-rc-checked)": ' | sha256sum | cut -c1-16)
           echo "gate=${gate}" >> "$GITHUB_OUTPUT"
           echo "key=owt-rust-ci-passed-${RUN}-${tree}-${gate}" >> "$GITHUB_OUTPUT"
           echo "tree ${tree}, gate ${gate}"
@@ -280,36 +300,87 @@ jobs:
         run: echo "::notice::This tree passed these checks earlier in this run; rust and css are skipped."
       # rc's release: publish-rc.yml left refs/owt/rc-checked/<gate>/<unix time> on the
       # commit when the promoting run's checks passed it with this gate and the same
-      # workflow files. Only the event's own commit on rc, only a record made in the
-      # last 12 hours, and only a record of this gate; anything else runs the checks.
+      # workflow files. The ref is only a pointer, which anyone who can push can forge;
+      # the evidence is the OIDC token in the annotated tag it names. A record counts
+      # only when the tag points at the event's own commit on rc, and the token is
+      # signed by GitHub's Actions issuer (its published keys, RS256), for the audience
+      # `owt-rc-checked:<this commit>:<this gate>`, for this repository, minted by
+      # onewaytek/owt-stack's publish-rc.yml (`job_workflow_ref`), at most 12 hours ago
+      # and not from the future. Anything else, including any failure to fetch or to
+      # verify, runs the checks. `reuse-rc-checked: false` skips the lookup.
       - id: rc
         if: >-
-          ${{ steps.key.outputs.gate != '' && steps.lookup.outputs.cache-hit != 'true' && inputs.ref == ''
-          && github.ref == 'refs/heads/rc' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+          ${{ inputs.reuse-rc-checked && steps.key.outputs.gate != '' && steps.lookup.outputs.cache-hit != 'true'
+          && inputs.ref == '' && github.ref == 'refs/heads/rc'
+          && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           GATE: ${{ steps.key.outputs.gate }}
           TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
-          refs=$(git -c "http.extraHeader=Authorization: basic ${auth}" ls-remote \
-            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/owt/rc-checked/${GATE}/*")
-          now=$(date +%s)
-          # ls-remote matches a pattern against the tail of each name, so a branch
-          # named …/refs/owt/rc-checked/… is listed too: only the exact prefix counts.
-          while read -r sha ref; do
-            [[ "$ref" == "refs/owt/rc-checked/${GATE}/"* ]] || continue
-            at=${ref##*/}
-            [[ "$at" =~ ^[0-9]{9,11}$ ]] || continue
-            if [ "$sha" = "$GITHUB_SHA" ] && [ "$at" -le $((now + 300)) ] && [ $((now - at)) -le 43200 ]; then
-              echo "checked=true" >> "$GITHUB_OUTPUT"
-              echo "::notice::The promoting run passed ${GITHUB_SHA} with this gate ($ref); rust and css are skipped."
-              exit 0
-            fi
-          done <<<"$refs"
-          echo "no record that the promoting run passed ${GITHUB_SHA} with gate ${GATE}: the checks run"
+        with:
+          script: |
+            const crypto = require("crypto");
+            const issuer = "https://token.actions.githubusercontent.com";
+            const publisher = "onewaytek/owt-stack/.github/workflows/publish-rc.yml@";
+            const { GATE: gate, TOKEN: token, GITHUB_SHA: sha, GITHUB_REPOSITORY: repo } = process.env;
+            const server = process.env.GITHUB_SERVER_URL;
+            const prefix = `refs/owt/rc-checked/${gate}/`;
+            const none = (why) => core.info(`no verified record that the promoting run passed ${sha} with gate ${gate} (${why}): the checks run`);
+            if (!/^[0-9a-f]{16}$/.test(gate) || !/^[0-9a-f]{40}$/.test(sha)) return none("malformed gate or commit");
+            const git = async (args, env = {}) => {
+              const r = await exec.getExecOutput("git", args, { silent: true, ignoreReturnCode: true, env: { ...process.env, ...env } });
+              if (r.exitCode !== 0) throw new Error(`git ${args[0]}: ${r.stderr.trim()}`);
+              return r.stdout;
+            };
+            // The token goes to git through the environment, for the server alone.
+            const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
+            await git(["fetch", "--no-tags", "--depth=1", `${server}/${repo}.git`, `+${prefix}*:${prefix}*`], {
+              GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: `http.${server}/.extraHeader`,
+              GIT_CONFIG_VALUE_0: `Authorization: basic ${auth}`,
+            });
+            const records = (await git(["for-each-ref", "--format=%(refname) %(objecttype) %(*objectname)", prefix]))
+              .split("\n").map((l) => l.split(" ")).filter(([ref, type, target]) => ref && type === "tag" && target === sha);
+            if (records.length === 0) return none("no record of this commit");
+            const res = await fetch(`${issuer}/.well-known/jwks`, { signal: AbortSignal.timeout(15000) });
+            if (!res.ok) return none(`the issuer's keys: HTTP ${res.status}`);
+            const keys = (await res.json()).keys ?? [];
+            const part = (s) => JSON.parse(Buffer.from(s, "base64url").toString("utf8"));
+            const now = Math.floor(Date.now() / 1000);
+            const verify = (jwt) => {
+              const segs = jwt.split(".");
+              if (segs.length !== 3 || !segs.every((s) => /^[A-Za-z0-9_-]+$/.test(s))) return "not a JWT";
+              const head = part(segs[0]);
+              if (head.alg !== "RS256" || typeof head.kid !== "string") return "not RS256 with a key id";
+              const jwk = keys.find((k) => k.kid === head.kid && k.kty === "RSA");
+              if (!jwk) return "signed by a key the issuer does not publish";
+              const key = crypto.createPublicKey({ key: { kty: "RSA", n: jwk.n, e: jwk.e }, format: "jwk" });
+              if (!crypto.verify("RSA-SHA256", Buffer.from(`${segs[0]}.${segs[1]}`), key, Buffer.from(segs[2], "base64url"))) return "bad signature";
+              const c = part(segs[1]);
+              const aud = Array.isArray(c.aud) && c.aud.length === 1 ? c.aud[0] : c.aud;
+              if (c.iss !== issuer) return "another issuer";
+              if (aud !== `owt-rc-checked:${sha}:${gate}`) return "another commit or gate";
+              if (c.repository !== repo) return "another repository";
+              if (typeof c.job_workflow_ref !== "string" || !c.job_workflow_ref.startsWith(publisher)) return "not minted by publish-rc.yml";
+              if (!Number.isInteger(c.iat) || c.iat > now + 300 || now - c.iat > 43200) return "older than 12 hours, or from the future";
+              return "";
+            };
+            for (const [ref] of records) {
+              let why;
+              try {
+                const body = await git(["cat-file", "tag", ref]);
+                why = verify(body.slice(body.indexOf("\n\n") + 2).trim());
+              } catch (e) {
+                why = e.message;
+              }
+              if (why === "") {
+                core.setOutput("checked", "true");
+                core.notice(`The promoting run passed ${sha} with this gate (${ref}, signed by publish-rc.yml); rust and css are skipped.`);
+                return;
+              }
+              core.info(`${ref}: ${why}`);
+            }
+            none("no record verified");
       # `skip-unbuilt`: a change of only documentation, licences or workflows that do
       # not run the checks or build the image. Against what it changes: a pull
       # request's base (its merge commit's first parent), a push's previous head, or
