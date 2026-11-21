@@ -54,7 +54,9 @@ name: Rust CI
 # token publish-rc.yml mints for the audience `owt-rc-checked:<commit>:<gate>`, and the
 # skip needs that token verified against GitHub's published keys: the issuer, the
 # audience, this repository, a `job_workflow_ref` naming onewaytek/owt-stack's
-# publish-rc.yml, and its age. No push can produce that signature, and publish-rc.yml
+# publish-rc.yml at the ref the released commit's own workflows call it at (so not a
+# changed copy on a branch of owt-stack, or in a fork, called from a throwaway branch of
+# the app), and its age. No push can produce that signature, and publish-rc.yml
 # mints it only after moving rc to a candidate whose `.github` is the workflows that
 # checked it. Any doubt (no record, an unsigned or unverifiable one, the keys out of
 # reach) runs the checks. A writer who can change workflows can still run publish-rc.yml
@@ -305,8 +307,8 @@ jobs:
       # only when the tag points at the event's own commit on rc, and the token is
       # signed by GitHub's Actions issuer (its published keys, RS256), for the audience
       # `owt-rc-checked:<this commit>:<this gate>`, for this repository, minted by
-      # onewaytek/owt-stack's publish-rc.yml (`job_workflow_ref`), at most 12 hours ago
-      # and not from the future. Anything else, including any failure to fetch or to
+      # onewaytek/owt-stack's publish-rc.yml (`job_workflow_ref`) at the very ref this
+      # commit's own workflows call it at, at most 12 hours ago and not from the future. Anything else, including any failure to fetch or to
       # verify, runs the checks. `reuse-rc-checked: false` skips the lookup.
       - id: rc
         if: >-
@@ -339,6 +341,20 @@ jobs:
               GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: `http.${server}/.extraHeader`,
               GIT_CONFIG_VALUE_0: `Authorization: basic ${auth}`,
             });
+            // The publish-rc.yml this commit's own workflows call, at the ref they pin: a
+            // token minted by the file at any other ref of owt-stack (a branch, or a commit
+            // of a fork, which the fork network serves under this name) does not count.
+            const fs = require("fs");
+            const pins = new Set();
+            for (const f of fs.readdirSync(".github/workflows").filter((f) => /\.ya?ml$/.test(f))) {
+              const text = fs.readFileSync(`.github/workflows/${f}`, "utf8");
+              for (const m of text.matchAll(/^[ \t-]*uses:[ \t]*["']?onewaytek\/owt-stack\/\.github\/workflows\/publish-rc\.yml@([A-Za-z0-9._\/-]+)/gm)) pins.add(m[1]);
+            }
+            if (pins.size === 0) return none("this commit's workflows call no publish-rc.yml");
+            const pinned = (c) => [...pins].some((pin) => {
+              const at = c.job_workflow_ref.slice(publisher.length);
+              return at === pin || at === `refs/tags/${pin}` || at === `refs/heads/${pin}` || (/^[0-9a-f]{40}$/.test(pin) && c.job_workflow_sha === pin);
+            });
             const records = (await git(["for-each-ref", "--format=%(refname) %(objecttype) %(*objectname)", prefix]))
               .split("\n").map((l) => l.split(" ")).filter(([ref, type, target]) => ref && type === "tag" && target === sha);
             if (records.length === 0) return none("no record of this commit");
@@ -362,6 +378,7 @@ jobs:
               if (aud !== `owt-rc-checked:${sha}:${gate}`) return "another commit or gate";
               if (c.repository !== repo) return "another repository";
               if (typeof c.job_workflow_ref !== "string" || !c.job_workflow_ref.startsWith(publisher)) return "not minted by publish-rc.yml";
+              if (!pinned(c)) return "minted by a publish-rc.yml this commit's workflows do not call";
               if (!Number.isInteger(c.iat) || c.iat > now + 300 || now - c.iat > 43200) return "older than 12 hours, or from the future";
               return "";
             };
@@ -378,7 +395,8 @@ jobs:
                 core.notice(`The promoting run passed ${sha} with this gate (${ref}, signed by publish-rc.yml); rust and css are skipped.`);
                 return;
               }
-              core.info(`${ref}: ${why}`);
+              // A record's bytes are a pusher's: nothing of them starts a line of the log.
+              core.info(`${ref}: ${why}`.replace(/[^\x20-\x7e]+/g, " "));
             }
             none("no record verified");
       # `skip-unbuilt`: a change of only documentation, licences or workflows that do

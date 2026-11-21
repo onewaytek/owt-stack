@@ -43,6 +43,8 @@ printf '# guide\n' >"$src/docs/guide.md"
 printf 'pub const G: &str = include_str!("../docs/guide.md");\n' >"$src/src/lib.rs"
 printf 'jobs: {ci: {uses: o/s/.github/workflows/rust-ci.yml@x}}\n' >"$src/.github/workflows/ci.yml"
 printf 'jobs: {a: {uses: o/s/.github/workflows/actions-cleanup.yml@x}}\n' >"$src/.github/workflows/housekeeping.yml"
+pin=1111111111111111111111111111111111111111
+printf 'jobs:\n  promote:\n    uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@%s # v1\n' "$pin" >"$src/.github/workflows/rc.yml"
 git -C "$src" add -A && git -C "$src" commit -qm base
 base=$(git -C "$src" rev-parse HEAD)
 origin="$work/origin.git"
@@ -164,8 +166,8 @@ gate=0123456789abcdef
 now=$(date +%s)
 claims() { # claims [field=json]...: an honest record's claims with fields replaced
   local c
-  c=$(printf '{"iss":"https://token.actions.githubusercontent.com","aud":"owt-rc-checked:%s:%s","repository":"%s","job_workflow_ref":"onewaytek/owt-stack/.github/workflows/publish-rc.yml@%s","iat":%s,"exp":%s}' \
-    "$x" "$gate" "$repo" "$x" "$now" "$((now + 300))")
+  c=$(printf '{"iss":"https://token.actions.githubusercontent.com","aud":"owt-rc-checked:%s:%s","repository":"%s","job_workflow_ref":"onewaytek/owt-stack/.github/workflows/publish-rc.yml@%s","job_workflow_sha":"%s","iat":%s,"exp":%s}' \
+    "$x" "$gate" "$repo" "$pin" "$pin" "$now" "$((now + 300))")
   for kv in "$@"; do c=$("$node" -e 'const c=JSON.parse(process.argv[1]); c[process.argv[2]]=JSON.parse(process.argv[3]); console.log(JSON.stringify(c))' "$c" "${kv%%=*}" "${kv#*=}"); done
   printf '%s' "$c"
 }
@@ -209,6 +211,14 @@ record "$(mint "$(claims repository='"o/other"')")"
 check "rc-checked: another repository runs" "$(verify)" run
 record "$(mint "$(claims job_workflow_ref="\"$repo/.github/workflows/rc.yml@refs/heads/x\"")")"
 check "rc-checked: a token another workflow minted runs" "$(verify)" run
+record "$(mint "$(claims job_workflow_ref='"onewaytek/owt-stack/.github/workflows/publish-rc.yml@refs/heads/x"' job_workflow_sha='"2222222222222222222222222222222222222222"')")"
+check "rc-checked: publish-rc.yml on a branch the commit does not pin runs" "$(verify)" run
+record "$(mint "$(claims job_workflow_ref='"onewaytek/owt-stack/.github/workflows/publish-rc.yml@2222222222222222222222222222222222222222"' job_workflow_sha='"2222222222222222222222222222222222222222"')")"
+check "rc-checked: publish-rc.yml at another commit runs" "$(verify)" run
+record "$(printf '%s.e30.AA' "$(printf '\n::stop-commands::a' | base64 -w0 | tr '+/' '-_' | tr -d =)")"
+: >"$work/rc.log"
+check "rc-checked: a record that is not a token runs" "$(verify)" run
+check "rc-checked: its bytes start no line of the log" "$(grep -c '^::' "$work/rc.log" || true)" 0
 record "$(mint "$(claims iss='"https://example.invalid"')")"
 check "rc-checked: another issuer runs" "$(verify)" run
 record "$(mint "$(claims iat=$((now - 43300)))")"

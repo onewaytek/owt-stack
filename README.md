@@ -5463,7 +5463,9 @@ jobs:
   `rc` calls `rust-ci.yml` with no `ref`, `tested` looks the ref up and verifies the
   token: GitHub's signature (the issuer's published keys), the audience naming the
   event's own commit and the same gate, this repository, a `job_workflow_ref` naming
-  `onewaytek/owt-stack`'s `publish-rc.yml`, and an age under 12 hours. On a match `rust`
+  `onewaytek/owt-stack`'s `publish-rc.yml` at the ref the released commit's own
+  workflows call it at (a `uses:` line under `.github/workflows/`; a copy on another
+  branch or in a fork of owt-stack does not count), and an age under 12 hours. On a match `rust`
   and `css` are skipped (`skipped: rc-checked`); anything else runs them: no record, a
   bare ref, a token that fails any of those checks, the issuer's keys out of reach, and
   a release whose `ci.yml` passes inputs that differ from the candidate check's.
