@@ -23,7 +23,7 @@
 //! | `GET {base}/passkey.js` | the script the passkey buttons run (same origin, so a CSP of `script-src 'self'` allows it) |
 //!
 //! The passkey routes, and the passkey buttons on the challenge and re-authentication
-//! pages, appear once [`Mfa::passkeys`] names the site; each page that shows a button
+//! pages, appear once `Mfa::passkeys` names the site; each page that shows a button
 //! begins its ceremony as it renders, and the answer is posted with the form
 //! (`passkey_token`, `passkey_credential`).
 //!
@@ -81,9 +81,10 @@ use owt_web::session::Session;
 use serde::Deserialize;
 use sqlx::PgPool;
 
+use super::passkey::PasskeyInfo;
+#[cfg(feature = "passkeys")]
 use super::passkey::{
-    Ceremony, PasskeyInfo, PublicKeyCredential, RegisterPublicKeyCredential,
-    RequestChallengeResponse,
+    Ceremony, PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse,
 };
 use super::{
     Answer, Event, Key, Kind, Limiter, Mfa, MfaError, MfaSession, Next, Throttled, TotpEnrollment,
@@ -698,7 +699,16 @@ impl<T: MfaSession> MfaPages<T> {
         let base = self.base.clone();
         let reauth = self.reauth.clone();
         let pages = Arc::new(self);
-        Router::new()
+        #[cfg(feature = "passkeys")]
+        let ceremonies = Router::new()
+            .route(&format!("{base}/passkey.js"), get(passkey_script))
+            .route(
+                &format!("{base}/passkeys/add"),
+                get(passkey_add_form::<T>).post(passkey_add::<T>),
+            );
+        #[cfg(not(feature = "passkeys"))]
+        let ceremonies = Router::new();
+        ceremonies
             .route(&base, get(settings::<T>))
             .route(
                 &format!("{base}/challenge"),
@@ -711,11 +721,6 @@ impl<T: MfaSession> MfaPages<T> {
             .route(&format!("{base}/remove"), post(remove::<T>))
             .route(&format!("{base}/reenroll"), post(reenroll::<T>))
             .route(&format!("{base}/recovery-codes"), post(recovery_codes::<T>))
-            .route(&format!("{base}/passkey.js"), get(passkey_script))
-            .route(
-                &format!("{base}/passkeys/add"),
-                get(passkey_add_form::<T>).post(passkey_add::<T>),
-            )
             .route(
                 &format!("{base}/passkeys/{{id}}/rename"),
                 post(passkey_rename::<T>),
@@ -739,17 +744,19 @@ impl<T: MfaSession> MfaPages<T> {
         format!("{}/enroll", self.base)
     }
 
+    #[cfg(feature = "passkeys")]
     fn script_url(&self) -> String {
         format!("{}/passkey.js", self.base)
     }
 
     fn add_passkey_url(&self) -> Option<String> {
         self.mfa
-            .relying_party()
-            .map(|_| format!("{}/passkeys/add", self.base))
+            .passkeys_on()
+            .then(|| format!("{}/passkeys/add", self.base))
     }
 
     /// The passkey button for `account`, when it has a passkey and they are on.
+    #[cfg(feature = "passkeys")]
     async fn passkey_prompt(
         &self,
         session: &Session<T>,
@@ -765,6 +772,50 @@ impl<T: MfaSession> MfaPages<T> {
         Ok(Some(self.prompt(&begun)?))
     }
 
+    /// The passkey button: never, without the `passkeys` feature.
+    #[cfg(not(feature = "passkeys"))]
+    #[allow(clippy::unused_self)] // the same signature as with the feature
+    fn passkey_prompt(
+        &self,
+        _: &Session<T>,
+        _: &Account,
+    ) -> std::future::Ready<Result<Option<PasskeyPrompt>, MfaError>> {
+        std::future::ready(Ok(None))
+    }
+
+    /// Answer the pending challenge with the passkey a form carried.
+    #[cfg(feature = "passkeys")]
+    async fn challenge_passkey(
+        &self,
+        session: &Session<T>,
+        ip: IpAddr,
+        pk: &PasskeyAnswer<PublicKeyCredential>,
+    ) -> Result<(Account, Vec<Event>), MfaError> {
+        self.mfa
+            .challenge_passkey(
+                &self.pool,
+                &self.limiter,
+                session,
+                ip,
+                &pk.token,
+                &pk.credential,
+            )
+            .await
+    }
+
+    /// Without the feature no credential parses, so no passkey answer reaches here.
+    #[cfg(not(feature = "passkeys"))]
+    #[allow(clippy::unused_self)] // the same signature as with the feature
+    fn challenge_passkey(
+        &self,
+        _: &Session<T>,
+        _: IpAddr,
+        pk: &PasskeyAnswer<PublicKeyCredential>,
+    ) -> std::future::Ready<Result<(Account, Vec<Event>), MfaError>> {
+        match pk.credential {}
+    }
+
+    #[cfg(feature = "passkeys")]
     fn prompt(
         &self,
         begun: &Ceremony<RequestChallengeResponse>,
@@ -890,8 +941,15 @@ struct CodeForm {
     next: Option<String>,
 }
 
+/// The credential a passkey answer carries without the `passkeys` feature: none, so a
+/// posted one is refused as [`MfaError::Invalid`].
+#[cfg(not(feature = "passkeys"))]
+#[derive(Deserialize)]
+enum PublicKeyCredential {}
+
 /// A passkey answer a form carried: its token and the browser's credential, parsed.
 struct PasskeyAnswer<C> {
+    #[cfg_attr(not(feature = "passkeys"), allow(dead_code))] // read by the ceremonies only
     token: String,
     credential: C,
 }
@@ -1064,11 +1122,7 @@ async fn challenge<T: MfaSession>(
     };
     let pending = session.read(|d| d.mfa().pending.map(|p| p.account));
     let attempt = match (form.passkey(), form.answer()) {
-        (Some(Ok(pk)), _) => Some(
-            p.mfa
-                .challenge_passkey(&p.pool, &p.limiter, &session, ip, &pk.token, &pk.credential)
-                .await,
-        ),
+        (Some(Ok(pk)), _) => Some(p.challenge_passkey(&session, ip, &pk).await),
         (Some(Err(e)), _) => Some(Err(e)),
         (None, Some(answer)) => Some(
             p.mfa
@@ -1211,8 +1265,7 @@ async fn reauth_post<T: MfaSession>(
         .await;
     let outcome = match (begun, passkey, answer) {
         (Ok(Next::Challenge), Some(Ok(pk)), _) => p
-            .mfa
-            .challenge_passkey(&p.pool, &p.limiter, &session, ip, &pk.token, &pk.credential)
+            .challenge_passkey(&session, ip, &pk)
             .await
             .map(|(_, events)| events),
         (Ok(Next::Challenge), Some(Err(e)), _) | (Err(e), _, _) => Err(e),
@@ -1415,15 +1468,14 @@ async fn settings<T: MfaSession>(
         Ok(f) => f,
         Err(e) => return owt_web::Error::from(e).into_response(),
     };
-    let passkeys =
-        if p.mfa.relying_party().is_some() || factors.passkeys + factors.passkeys_disabled > 0 {
-            match p.mfa.list_passkeys(&p.pool, account.id).await {
-                Ok(list) => list,
-                Err(e) => return owt_web::Error::from(e).into_response(),
-            }
-        } else {
-            Vec::new()
-        };
+    let passkeys = if p.mfa.passkeys_on() || factors.passkeys + factors.passkeys_disabled > 0 {
+        match p.mfa.list_passkeys(&p.pool, account.id).await {
+            Ok(list) => list,
+            Err(e) => return owt_web::Error::from(e).into_response(),
+        }
+    } else {
+        Vec::new()
+    };
     let passkeys = passkeys
         .into_iter()
         .map(|info| PasskeyRow {
@@ -1544,6 +1596,7 @@ async fn recovery_codes<T: MfaSession>(
     }
 }
 
+#[cfg(feature = "passkeys")]
 /// The script the passkey buttons run.
 async fn passkey_script() -> Response {
     (
@@ -1556,6 +1609,7 @@ async fn passkey_script() -> Response {
         .into_response()
 }
 
+#[cfg(feature = "passkeys")]
 #[derive(Deserialize)]
 struct PasskeyForm {
     #[serde(default)]
@@ -1568,6 +1622,7 @@ struct PasskeyForm {
     next: Option<String>,
 }
 
+#[cfg(feature = "passkeys")]
 impl fmt::Debug for PasskeyForm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PasskeyForm(<redacted>)")
@@ -1577,6 +1632,7 @@ impl fmt::Debug for PasskeyForm {
 /// The add-a-passkey page with a fresh ceremony, and `error` if the last answer was
 /// refused.
 #[allow(clippy::too_many_arguments)] // each is a separate input of the page
+#[cfg(feature = "passkeys")]
 async fn passkey_add_page<T: MfaSession>(
     p: &MfaPages<T>,
     parts: &Parts,
@@ -1614,6 +1670,7 @@ async fn passkey_add_page<T: MfaSession>(
     p.render(parts, signed, "Add a passkey", status, body).await
 }
 
+#[cfg(feature = "passkeys")]
 async fn passkey_add_form<T: MfaSession>(
     State(p): Shared<T>,
     Req(parts): Req,
@@ -1641,6 +1698,7 @@ async fn passkey_add_form<T: MfaSession>(
     passkey_add_page(&p, &parts, &session, &account, &proof, pending, next, None).await
 }
 
+#[cfg(feature = "passkeys")]
 async fn passkey_add<T: MfaSession>(
     State(p): Shared<T>,
     Req(parts): Req,

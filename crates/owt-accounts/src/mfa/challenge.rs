@@ -9,6 +9,7 @@ use owt_auth::totp;
 use owt_web::session::Session;
 use sqlx::PgPool;
 
+#[cfg(feature = "passkeys")]
 use super::passkey::PublicKeyCredential;
 use super::state::{self, Kind, MfaSession, State};
 use super::{Event, EventKind, Factor, Key, Limiter, Mfa, MfaError, Next};
@@ -27,6 +28,7 @@ pub enum Answer<'a> {
 /// What answers a pending sign-in: a code, or a passkey's assertion.
 enum Proof<'a> {
     Code(Answer<'a>),
+    #[cfg(feature = "passkeys")]
     Passkey {
         token: &'a str,
         credential: &'a PublicKeyCredential,
@@ -113,6 +115,7 @@ impl Mfa {
     /// As [`challenge`](Self::challenge), and [`MfaError::PasskeyExpired`],
     /// [`MfaError::PasskeyOrigin`], [`MfaError::PasskeyCloned`] (record
     /// [`MfaError::event`]) and [`MfaError::PasskeysOff`].
+    #[cfg(feature = "passkeys")]
     pub async fn challenge_passkey<T: MfaSession, L: Limiter>(
         &self,
         pool: &PgPool,
@@ -168,8 +171,13 @@ impl Mfa {
         };
 
         let mut events = Vec::new();
+        #[cfg_attr(
+            not(feature = "passkeys"),
+            expect(unused_mut, reason = "set by a passkey only")
+        )]
         let mut used_passkey = None;
         let factor = match proof {
+            #[cfg(feature = "passkeys")]
             Proof::Passkey { token, credential } => {
                 used_passkey = Some(
                     self.check_passkey(pool, session, &account, token, credential)

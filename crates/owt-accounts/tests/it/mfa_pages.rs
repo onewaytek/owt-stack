@@ -581,6 +581,7 @@ async fn a_cross_origin_post_is_refused() {
 
 /// The value of the first `name="…" value="…"` or `data-options="…"` attribute,
 /// unescaped.
+#[cfg(feature = "passkeys")]
 fn attr(html: &str, after: &str) -> String {
     let rest = html
         .split(after)
@@ -597,6 +598,7 @@ fn attr(html: &str, after: &str) -> String {
         .replace("&amp;", "&")
 }
 
+#[cfg(feature = "passkeys")]
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one flow: add, answer, then list as disabled
 async fn a_passkey_added_on_the_settings_page_answers_the_challenge() {
@@ -707,6 +709,24 @@ async fn a_passkey_added_on_the_settings_page_answers_the_challenge() {
     let html = app.client.get("/mfa").await.text();
     assert!(html.contains("Disabled: suspected copy"), "{html}");
     assert!(html.contains("/remove\""), "{html}");
+    db.drop().await;
+}
+
+/// Without the `passkeys` feature the ceremony routes are not mounted, and a posted
+/// passkey answer is refused rather than taken for a code.
+#[cfg(not(feature = "passkeys"))]
+#[tokio::test]
+async fn without_the_passkeys_feature_no_ceremony_route_is_mounted() {
+    let db = db!();
+    account(&db, "ada").await;
+    let app = app(&db, 1000);
+    app.client
+        .post_form("/login", &[("login", "ada"), ("password", PASSWORD)])
+        .await;
+    assert_eq!(app.client.get("/mfa/passkey.js").await.status, 404);
+    assert_eq!(app.client.get("/mfa/passkeys/add").await.status, 404);
+    let settings = app.client.get("/mfa").await.text();
+    assert!(!settings.contains("/mfa/passkeys/add"), "{settings}");
     db.drop().await;
 }
 

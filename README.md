@@ -2406,9 +2406,9 @@ models carry each form's URL; the fields are `code`, `recovery_code`, `password`
 | `GET, POST /mfa/enroll?next=` | enrolling; also where `RecentMfa` sends an account with no factor |
 | `POST /mfa/remove`, `/mfa/reenroll`, `/mfa/recovery-codes` | changes, each behind step-up |
 | `GET, POST /reauth?next=` | step-up: the password (if the account has one) and a code or a passkey (if it has a factor) |
-| `GET, POST /mfa/passkeys/add?next=` | names and creates a passkey, behind step-up (or for a pending enrollment) |
+| `GET, POST /mfa/passkeys/add?next=` | names and creates a passkey, behind step-up (or for a pending enrollment); `passkeys` feature only |
 | `POST /mfa/passkeys/{id}/rename`, `/mfa/passkeys/{id}/remove` | renames one; removes one, behind step-up |
-| `GET /mfa/passkey.js` | the script the passkey buttons run (same origin: `script-src 'self'` allows it) |
+| `GET /mfa/passkey.js` | the script the passkey buttons run (same origin: `script-src 'self'` allows it); `passkeys` feature only |
 
 `MfaPages::at("/account/mfa")` and `.reauth_at("/account/confirm")` move them; tell
 `Accounts::enroll_at` (`{base}/enroll`) and `Accounts::reauth_at` the same. What they hold
@@ -2484,7 +2484,34 @@ here either: staff unlock a locked one (`Mfa::unlock_totp`).
 A passkey (WebAuthn, through `webauthn-rs` 0.6 on RustCrypto, no OpenSSL) is a second
 factor beside the authenticator app: an account may hold the authenticator and any number
 of passkeys, any one of them answers the challenge and step-up, and a passkey satisfies
-`RecentMfa` as a code does. Passkeys are off until the app names its site:
+`RecentMfa` as a code does.
+
+**Passkeys are a cargo feature of `owt-accounts`, `passkeys`, off by default.** Only an
+app that offers them turns it on:
+
+<!-- x-release-please-start-version -->
+```toml
+owt-accounts = { git = "https://github.com/onewaytek/owt-stack", tag = "v0.14.10", features = ["passkeys"] }
+```
+<!-- x-release-please-end -->
+
+Without it `webauthn-rs` is neither built nor in the app's `Cargo.lock`, and with it
+go a release-candidate `rsa` (RUSTSEC-2023-0071, Marvin) and serde_with's optional
+`chrono` (RUSTSEC-2026-0543, unmaintained), so an app that offers no passkeys needs
+neither advisory in its `.cargo/audit.toml` on their account. The build without the
+feature is the build with it and no relying party: the passkey tables are migrated
+all the same (an app may turn the feature on later without a migration), the factor
+counts read them, the settings page still lists an account's passkeys for renaming and
+removal (`Mfa::list_passkeys`, `Mfa::rename_passkey` and `Mfa::remove_passkey` stay),
+and the view models keep their passkey fields, empty. What the feature adds is
+`passkey::RelyingParty`, `Mfa::passkeys`, the registration and challenge ceremonies
+(`Mfa::begin_passkey_registration`, `Mfa::finish_passkey_registration`,
+`Mfa::begin_passkey_challenge`, `Mfa::challenge_passkey`), and the
+`{base}/passkeys/add` and `{base}/passkey.js` routes of `MfaPages`. An app that turns
+it on keeps both advisories ignored and says why: webauthn-rs only verifies
+signatures, a public-key operation.
+
+With the feature on, passkeys are still off until the app names its site:
 
 | Variable | Production | Local development |
 |---|---|---|
