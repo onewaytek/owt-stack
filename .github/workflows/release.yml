@@ -1,7 +1,8 @@
 name: App release (reusable)
 
 # Reusable: cut a release from conventional commits. Called from the app's own
-# workflow on a push to main (stable releases) or rc (X.Y.Z-rc.N prereleases):
+# workflow on main (stable releases), from a nightly schedule or a dispatch, or on rc
+# (X.Y.Z-rc.N prereleases), from a push or a dispatch:
 #
 #   jobs:
 #     release:
@@ -32,8 +33,8 @@ name: App release (reusable)
 # commit older than the branch's head ("local branch rc is behind the remote one")
 # and ends without a version, so no image is built. That happens to a run re-run
 # after the branch moved, and to one that waited in the runner queue while it moved.
-# On main the newer head was pushed by someone and started a run of its own, so the
-# stale run only says so. On rc the newer head was usually pushed with a workflow's
+# On main the next run (the newer head's push, the nightly schedule or a dispatch)
+# releases the newer head, so the stale run only says so. On rc the newer head was usually pushed with a workflow's
 # own token (promote-rc.yml, publish-rc.yml, the main-to-rc sync), which starts no
 # run, so the stale run dispatches the app's release workflow on rc: the fresh run
 # checks and releases the head, the stale run's commits with it. That dispatch is
@@ -54,8 +55,8 @@ name: App release (reusable)
 # '"ubuntu-latest"'). It needs nothing installed there but git: Node comes from
 # setup-node and uv from setup-uv. An app's version-command runs there too, so it
 # finds no cargo and no gh (see the input). The job holds a token that can push tags, so it
-# runs only for the repository's own pushes and dispatches: no pull request, and no
-# event a fork can start, reaches it.
+# runs only for the repository's own pushes and dispatches, and its schedule on main:
+# no pull request, and no event a fork can start, reaches it.
 
 on:
   workflow_call:
@@ -110,11 +111,13 @@ jobs:
       group: release-${{ github.repository }}-${{ github.ref_name }}
       cancel-in-progress: false
     # A push to a fork's main is not a release of ours, and only a push or a dispatch
-    # (both need write access to the repository) releases.
+    # (both need write access to the repository), or the schedule on main (it runs the
+    # default branch's own workflow file at its head, as a push to main does), releases.
     if: >-
       ${{ github.repository_owner == 'onewaytek'
       && (github.ref_name == 'main' || github.ref_name == 'rc')
-      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'schedule' && github.ref_name == 'main')) }}
     runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
       contents: write
@@ -270,7 +273,7 @@ jobs:
               return;
             }
             if (branch !== "rc") {
-              core.notice(`${branch} moved from ${context.sha} to ${head} under this run, which released nothing; the push of ${head} started its own run`);
+              core.notice(`${branch} moved from ${context.sha} to ${head} under this run, which released nothing; the next run on ${branch} (a push, the schedule or a dispatch) releases ${head}`);
               return;
             }
             // "owner/repo/.github/workflows/release.yml@refs/heads/rc": the caller's file.

@@ -1,12 +1,12 @@
 name: Image check
 
-# Reusable: build the image on a pull request and verify it, pushing nothing, so a
-# broken Dockerfile or image input fails before a version is tagged rather than
-# leaving a release without an image. It is image.yml's build without the release:
+# Reusable: build the image and verify it, pushing nothing, so a broken Dockerfile or
+# image input, or a base image with a new vulnerability, shows between releases rather
+# than as a release without an image. It is image.yml's build without the release:
 #
-# - `crane` (the default) runs image.yml's `build` and `scan` jobs on the pull
-#   request's merge commit: the compile, the npm assets, the packed layer, and the
-#   checks of that layer and the base image (the tools operations rely on, a glibc at
+# - `crane` (the default) runs image.yml's `build` and `scan` jobs on the event's
+#   commit (a pull request's merge commit): the compile, the npm assets, the packed
+#   layer, and the checks of that layer and the base image (the tools operations rely on, a glibc at
 #   least as new as the binary needs), then the vulnerability scan. The jobs are image.yml's byte for byte but for
 #   the checkout (`just image-check` compares them), so the two cannot drift.
 # - `docker` builds the app's Dockerfile with BuildKit on a GitHub-hosted runner,
@@ -27,21 +27,24 @@ name: Image check
 # only `contents: read`. A reusable workflow whose jobs ask for `packages: write` (as
 # image.yml's push does) fails to start for a caller that grants less, even when the
 # job is skipped, and a Dependabot pull request's token cannot grant it. Call it from
-# a workflow of its own with a `paths:` filter on the image's inputs:
+# a workflow of its own, on a dispatch and a weekly schedule on main (the release's
+# image.yml builds and scans every image before any tag moves, so a pull request need
+# not build it too):
 #
 #   on:
-#     pull_request:
-#       paths: [Dockerfile, .dockerignore, Cargo.toml, Cargo.lock, src/**, package.json, ...]
+#     workflow_dispatch:
+#     schedule: [{cron: "37 6 * * 1"}]   # weekly, on main
 #   permissions: {}
 #   jobs:
 #     image:
-#       if: github.event.pull_request.head.repo.full_name == github.repository
+#       if: vars.IMAGE_BUILDS != 'off'
 #       permissions: {contents: read}
 #       uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # vX.Y.Z
 #       with: {bin: myapp}   # the inputs of the release's image job that shape the build
 #       secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 #
-# Cost: one release build per push to a matching pull request; `cargo-profile` (say
+# Cost: one release build per run (a pull request caller: per push to a matching pull
+# request); `cargo-profile` (say
 # `dev`, or a profile of the app's own that turns off fat LTO) builds with a lighter
 # one instead, and then the check does not prove that the release profile's link
 # succeeds. `crane` runs on the arc-openshift-k8s ARC scale set (override with the

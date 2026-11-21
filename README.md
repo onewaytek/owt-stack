@@ -5231,11 +5231,18 @@ and `rustc-wrapper = "sccache"` under `[build]` in `~/.cargo/config.toml`.
 
 <!-- x-release-please-start-version -->
 ```yaml
+# .github/workflows/ci.yml, called by pr.yml and release.yml
+on:
+  workflow_call:
+    outputs:
+      code:   # "false" when the change builds nothing (skip-unbuilt); pr.yml's rc reads it
+        value: ${{ jobs.checks.outputs.code }}
 jobs:
   checks:
     uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit>  # v0.14.9
     with:
       check-command: just check
+      skip-unbuilt: true     # a change of only docs or workflow pins skips the checks
       database: myapp        # empty for no Postgres
       postgres-major: "18"   # the major the CNPG cluster runs
       redis: true
@@ -5283,8 +5290,9 @@ actions), so they run in the runner pod itself, with no job container. A fork's
 `conventional-commits.yml` checks it (and any repository outside the organization)
 on GitHub-hosted runners instead. The jobs whose
 token can write (the release, a promotion, a publish, a requeue) also refuse every
-event but the repository's own: a push or a dispatch for a release; a push, a
-dispatch, a schedule or a same-repository pull request for the rc jobs. A
+event but the repository's own: a push or a dispatch for a release, or the schedule
+on main; a push, a dispatch, a schedule or a same-repository pull request for the rc
+jobs. A
 `pull_request_target`, `workflow_run` or `issue_comment` caller runs none of them.
 An app's `version-command` runs in that runner pod too, which has git, curl, jq,
 tar, perl, Node and (with `uv: true`) uv, but no cargo and no gh: a command that needs
@@ -5295,8 +5303,9 @@ reusable `release.yml`. owt-stack releases itself differently, with release-plea
 (see "Working on owt-stack"). Conventional commits decide an app's version: `feat` is
 a minor release, `fix` and `perf` are a patch, `!` or a `BREAKING CHANGE` footer is
 major (from 0.x too: a breaking change in 0.4.2 releases 1.0.0), and anything else
-releases nothing. `main` cuts stable releases; an `rc` branch, if the app has one, cuts
-`X.Y.Z-rc.N` prereleases. Each release is a `vX.Y.Z` tag, a GitHub release with
+releases nothing. `main` cuts stable releases, nightly and on a dispatch (not on every
+merge; see "Running CI less often"); an `rc` branch, if the app has one, cuts
+`X.Y.Z-rc.N` prereleases at each promotion. Each release is a `vX.Y.Z` tag, a GitHub release with
 generated notes, and an image in ghcr. An app with its own `.releaserc` must keep the
 `publishCmd` that writes `version` and `channel` to `$GITHUB_OUTPUT`, or no image is
 built.
@@ -5304,14 +5313,42 @@ built.
 <!-- x-release-please-start-version -->
 ```yaml
 # .github/workflows/release.yml
+name: Release
 on:
-  push: {branches: [main, rc]}
-  workflow_dispatch:          # promote-rc.yml and release.yml start rc releases this way
+  push: {branches: [rc]}
+  schedule: [{cron: "30 4 * * *"}]   # the stable release, nightly, on main
+  workflow_dispatch:          # promote-rc.yml and release.yml start rc releases this way;
+                              # a person dispatches a stable release on main
 # One run at a time per branch, none cancelled. The release job serialises itself;
 # this keeps a second push's ci and image jobs from running beside the first's release.
 concurrency: {group: "release-${{ github.ref_name }}", cancel-in-progress: false}
 jobs:
+  due:   # the schedule runs only when main moved since its last stable release run
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    permissions: {contents: read, actions: read}
+    outputs: {due: "${{ steps.due.outputs.due }}"}
+    steps:
+      - id: due
+        env: {TOKEN: "${{ github.token }}", EVENT: "${{ github.event_name }}"}
+        run: |
+          set -uo pipefail
+          # A push, a dispatch, and any failed read here run the release.
+          due() { echo "due=$1" >> "$GITHUB_OUTPUT"; echo "$2"; exit 0; }
+          [ "$EVENT" = schedule ] || due true "a ${EVENT}: the release runs"
+          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          tags=$(git -c "http.extraHeader=Authorization: basic ${auth}" ls-remote --tags \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" 'v*') || due true "tags unread: the release runs"
+          grep -qE "^${GITHUB_SHA}[[:space:]]+refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(\^\{\})?$" <<<"$tags" &&
+            due false "main is at a stable release (${GITHUB_SHA}): nothing to release"
+          file=${GITHUB_WORKFLOW_REF%@*}; file=${file##*/}
+          last=$(curl -fsS -H "Authorization: Bearer ${TOKEN}" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${file}/runs?branch=main&status=success&per_page=1" |
+            jq -r '.workflow_runs[0].head_sha // ""') || due true "runs unread: the release runs"
+          [ "$last" != "$GITHUB_SHA" ] || due false "the last successful run was at ${GITHUB_SHA}: nothing new"
+          due true "main moved since its last stable release run: the release runs"
   ci:
+    needs: due
+    if: needs.due.outputs.due == 'true'
     uses: ./.github/workflows/ci.yml   # the app's own: it passes the sccache secret on
     secrets: inherit
   release:
@@ -5320,7 +5357,9 @@ jobs:
     uses: onewaytek/owt-stack/.github/workflows/release.yml@<commit>  # v0.14.9
   image:
     needs: release
-    if: needs.release.outputs.version != ''
+    # IMAGE_BUILDS=off (a repository variable) pauses the image while Actions storage is
+    # full: the version is tagged with no image, and nothing deploys it (see below).
+    if: needs.release.outputs.version != '' && vars.IMAGE_BUILDS != 'off'
     permissions: {contents: read, packages: write, id-token: write}
     uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.14.9
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
@@ -5462,7 +5501,9 @@ jobs:
   approval is left for a person. Keeping the workflow's
   `pull_request` types to the default (`opened`, `synchronize`, `reopened`) plus
   `ready_for_review` (a draft marked ready is promoted then, not at its next push)
-  avoids those wasted re-runs.
+  avoids those wasted re-runs; `labeled` (for `ci:run`, see "Running CI less often")
+  re-runs a ready PR's checks and promotion on any label added, which costs a run
+  but loses nothing.
   A run that failed its checks is left alone, and so is one already on
   its fifth attempt (`max-attempts`). Run it after each promotion, so one hands on to
   the next, and on a schedule, for when none follows. The scheduled one sits outside
@@ -5512,14 +5553,20 @@ jobs:
 # pr.yml
 on:
   pull_request:
-    # The defaults plus ready_for_review: a draft marked ready is promoted then, not
-    # at its next push. Not `edited` (see "A promotion can be lost" above).
-    types: [opened, synchronize, reopened, ready_for_review]
+    # The defaults plus ready_for_review: a draft marked ready is checked and promoted
+    # then, not at its next push; and labeled, for the `ci:run` label on a draft. Not
+    # `edited` (see "A promotion can be lost" above).
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 jobs:
-  ci:
-    uses: ./.github/workflows/ci.yml   # the app's own
+  ci:   # not on a draft, unless it carries the `ci:run` label
+    if: ${{ !github.event.pull_request.draft || contains(github.event.pull_request.labels.*.name, 'ci:run') }}
+    # A newer push cancels this PR's checks still running for an older head; never the
+    # promotion, which holds a group of its own (see "Running CI less often").
+    concurrency: {group: "pr-ci-${{ github.event.pull_request.number }}", cancel-in-progress: true}
+    uses: ./.github/workflows/ci.yml   # the app's own; it passes rust-ci.yml's `code` on
     secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
+    concurrency: {group: "pr-commits-${{ github.event.pull_request.number }}", cancel-in-progress: true}
     permissions: {contents: read, pull-requests: read}  # them); one check, "commits / commits",
     uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.9
     # with: {title: false}   # an app that checks titles another way: the commit lint alone
@@ -5528,7 +5575,11 @@ jobs:
     # && needs.ci.result == 'success' && needs.commits.outputs.commits == 'true' && ... }}`
   rc:   # one promotion at a time; only this job waits in the group, never the checks
     needs: ci
-    if: github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft
+    # Not for a draft, nor for a change that builds nothing (`code`: docs, workflow pins,
+    # dependabot.yml), which reaches rc at the next stable release's sync-rc instead.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && !github.event.pull_request.draft && needs.ci.outputs.code != 'false'
     concurrency: {group: promote-rc, cancel-in-progress: false}
     permissions: {contents: write, actions: write, pull-requests: write}
     uses: ./.github/workflows/rc.yml
@@ -5568,8 +5619,9 @@ jobs:
       sha: "${{ needs.candidate.outputs.sha }}"
       base: "${{ needs.candidate.outputs.base }}"
       gate: "${{ needs.check-rc.outputs.gate }}"   # rc's release skips the checks of this commit
-# in requeue-rc.yml, on {schedule: [{cron: "*/30 * * * *"}], workflow_dispatch: {}}:
-# the requeue job above, without its needs and if
+# in requeue-rc.yml, on {schedule: [{cron: "23 7,19 * * *"}], workflow_dispatch: {}}
+# (a backstop: the requeue job above hands each promotion on): that job, without its
+# needs and if
 # in release.yml
   sync-rc:
     needs: release
@@ -5579,6 +5631,60 @@ jobs:
     with: {source: main}
 ```
 <!-- x-release-please-end -->
+
+**Running CI less often.** The callers above run each check where it can stop a bad
+change and nowhere else; none of these trades away a check before anything deploys:
+
+- **Superseded checks are cancelled.** `ci` and `commits` in `pr.yml` each hold a
+  per-PR concurrency group with `cancel-in-progress`, so a push cancels the previous
+  head's checks still running. The newest head is still checked in full. The
+  group is on those jobs, never on the workflow, on `rc`, or on a release: a cancelled
+  check skips the promotion behind it (`rc` needs `ci`), while cancelling a promotion
+  mid-run would leave a stale `rc-candidate` and a half-pushed release would leave tags
+  without an image.
+- **Drafts run `commits` only.** `ci` runs once the PR is marked ready
+  (`ready_for_review`) and at every push after, or on a draft that carries the
+  `ci:run` label. `rc` already refused drafts, so every PR still passes `ci` in the run
+  that promotes it, and `requeue-rc.yml` passes drafts over. Open a PR as a draft, push
+  freely, and mark it ready when it should be checked and promoted.
+- **A change that builds nothing is not promoted.** With `skip-unbuilt`, `rust-ci.yml`
+  outputs `code: false` for a change of only docs, workflow pins or `dependabot.yml`
+  (and `true` for anything else, any failed comparison included), and `pr.yml`'s `rc`
+  skips on it. Such a change reaches `rc` at the next stable release's `sync-rc`. An
+  app's `ci.yml` passes the output on (`on.workflow_call.outputs.code`); without it the
+  output is empty and `rc` promotes as before.
+- **The stable release is nightly.** `release.yml` runs on main on a schedule and on a
+  dispatch, not at every merge. The `due` job skips the scheduled run when main's head
+  is a stable tag's commit or the head of the last successful run; any read that fails
+  runs it. Each stable release still runs `ci` on main's head before the release job,
+  and `image.yml` still builds and scans the image before it pushes or tags anything,
+  then signs and attests it, as before. Production (`latest`) trails `rc` by a day at most; dispatch the
+  workflow on main to release at once. rc releases are unchanged: each promotion
+  dispatches one.
+- **The image check is weekly.** No pull request builds the image ("Checking the image
+  between releases" below): every release, rc's first, builds and scans it before any
+  image tag moves, and the weekly check finds a new vulnerability in an unchanged image.
+- **Lost promotions are requeued twice a day** by the schedule; each promotion's own
+  `requeue` job, which runs after every promotion, stays the main path. A promotion
+  lost with nothing after it waits at most 12 hours.
+- **Workflow pins move monthly,** in one Dependabot pull request, committed as
+  `ci(deps):` (`templates/dependabot.yml`): no release, so no rc or main image.
+- **`IMAGE_BUILDS=off` pauses image builds** (a repository variable; the `image` jobs
+  of `release.yml` and `image-check.yml` test it) while Actions storage is full, when
+  each build would fail at its quota probe anyway. A release still tags its version,
+  with no image, so nothing deploys it; once the variable is cleared, rebuild a version
+  that should run with the app's `image.yml` dispatch (above). Clear it before relying
+  on a release again.
+
+An app moving to these callers changes: `pr.yml` (`labeled` in the types, the `if:` and
+`concurrency:` on `ci`, the `concurrency:` on `commits`, the `code` test in `rc`'s
+`if:`), `ci.yml` (the `code` output, and `skip-unbuilt: true` if it lacks it),
+`release.yml` (`push` on `rc` only, the schedule, the `due` job and `ci`'s `needs`
+and `if:`, the `IMAGE_BUILDS` test on `image`), `requeue-rc.yml` (the cron),
+`image-check.yml` (dispatch and schedule in place of `pull_request`, the
+`IMAGE_BUILDS` test; an `image-check` job in `pr.yml` moves there), and
+`.github/dependabot.yml` (the `github-actions` entry). Agents open their pull requests
+as drafts.
 
 **Image:** `image.yml` builds the image on the ARC scale set (`RUNS_ON`, as the checks)
 with no Docker daemon and no privileges, from inputs rather than a Dockerfile, and
@@ -5775,10 +5881,11 @@ first instruction, not root until a `USER` line, so a `RUN` in the runtime stage
 needs root (a package install, a write outside `/app`) fails there. Do that work in an earlier
 stage and `COPY` the result in, with `--chown=65532:0` for what the app writes.
 
-**Checking the image on a pull request** (opt-in): the Dockerfile or the build
+**Checking the image between releases** (opt-in): the Dockerfile or the build
 inputs can break only in the image, and without a check that shows after a version is
-tagged, as a release with no image. `image-check.yml` builds the pull request's merge
-commit the way a release does and verifies all but the push: with `builder: crane`
+tagged, as a release with no image. `image-check.yml` builds the event's commit (a
+dispatch's branch, main on the schedule, or a pull request's merge commit) the way a
+release does and verifies all but the push: with `builder: crane`
 (the default) the compile, the npm assets, the packed layer, and the base's tools and
 glibc, by the same `build` and `scan` jobs as `image.yml`'s (`just image-check`
 keeps them identical); with `builder: docker` the Dockerfile is built with BuildKit
@@ -5787,8 +5894,7 @@ same `vuln-fail-on` and `vuln-ignore-file` inputs: this is where a vulnerable ba
 is most useful to learn of, before the release. Nothing is signed and no SBOM is made
 here, and the caller still grants `contents: read` only. It takes `image.yml`'s inputs that shape the build (`bin`,
 `cargo-args`, `files`, `base-image`, ...) and none that shape the push.
-`cargo-profile` makes the check cheaper: a pull request can build with `dev` (the
-example below does), which compiles with the flags the gate's own dev build uses, so
+`cargo-profile` makes the check cheaper: a check can build with `dev`, which compiles with the flags the gate's own dev build uses, so
 with a warm sccache it is mostly cache hits, or with a
 profile of the app's own that turns off fat LTO and sets many codegen units
 (`[profile.ci] inherits = "release"`), instead of the release link. The check then does
@@ -5796,46 +5902,37 @@ not prove that the release profile's link succeeds, so a release still builds wi
 `release`. It is a workflow of its own because no job in it writes: the caller grants `contents: read`
 only, which a Dependabot pull request's token can. (A called workflow that asks for
 `packages: write`, as `image.yml`'s `push` does, fails to start for a caller that
-grants less, skipped job or not.) Call it from a workflow of its own with a `paths:`
-filter, so it neither gates every merge nor runs for a change the image does not see:
+grants less, skipped job or not.) Call it from a workflow of its own, on a dispatch
+and a weekly schedule, not on pull requests: the release's `image.yml` builds, checks
+and scans every image before any tag moves, so a bad image still never ships, and a
+pull request need not build one too. The weekly run on main, with the release profile,
+proves the release link and reads grype's newest database against an unchanged image,
+so a base image's new vulnerability shows within a week, not at the next release:
 
 <!-- x-release-please-start-version -->
 ```yaml
 # .github/workflows/image-check.yml
+name: Image check
 on:
-  pull_request:
-    # What the image reads: the Dockerfile and its ignore file, the Rust sources and
-    # manifests (every workspace crate), the lockfiles and the asset inputs.
-    paths:
-      - Dockerfile
-      - .dockerignore
-      - Cargo.toml
-      - Cargo.lock
-      - src/**
-      - crates/**
-      - package.json
-      - package-lock.json
-      - static/**
-      - templates/**
-      - .github/workflows/image-check.yml
+  workflow_dispatch:                 # any branch, before a risky merge
+  schedule: [{cron: "37 6 * * 1"}]   # weekly, on main
 permissions: {}
 jobs:
   image:
-    # A fork's pull request is not built here (image-check.yml refuses it too).
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.IMAGE_BUILDS != 'off'   # paused with the release's image job
     permissions: {contents: read}
     uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.14.9
-    with: {bin: myapp, cargo-profile: dev}   # as the release's image job, but the profile
+    with: {bin: myapp}   # as the release's image job
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
-
-An app whose image check is a required status calls it from its pull-request workflow
-instead, and filters with a job-level `if` (on a changed-paths output of an earlier
-job, say): a workflow that a `paths:` filter skips never reports, and leaves the
-required check pending, while a skipped job reports success.
 <!-- x-release-please-end -->
 
-The cost is one release build per push to a matching pull request. With `crane` it
+An app can still call it on `pull_request` (with a `paths:` filter on what the image
+reads, and `if: github.event.pull_request.head.repo.full_name == github.repository`),
+at one build per push to a matching pull request; it should not be a required status,
+since a workflow a `paths:` filter skips never reports.
+
+The cost is one release build per run. With `crane` it
 runs on the ARC scale set, which bills no GitHub-hosted minutes (it takes the
 cluster's capacity), and sccache shortens the compile (a Dependabot pull request
 reads Dependabot's secrets, not Actions', so it compiles without it). With
@@ -5843,8 +5940,7 @@ reads Dependabot's secrets, not Actions', so it compiles without it). With
 such push, and the build is cold: a pull request restores the Actions cache only from
 its own ref, its base branch and the default branch, and the release builds write
 theirs under tag refs, so none is read (a cold BuildKit build of a Rust app takes
-ten minutes or more). Keep the `paths:` list to the files the image reads, and leave
-the check out of an app whose Dockerfile rarely changes.
+ten minutes or more).
 
 **Actions storage.** An account's Actions storage is its artifacts, billed by the hour
 (GB-hours) against the plan's allowance; the Actions cache is a separate 10 GB per
