@@ -49,7 +49,7 @@ change() {
   local msg=$1 kv; shift
   git -C "$src" checkout -q --detach "$base"
   for kv in "$@"; do printf '%s\n' "${kv#*=}" >"$src/${kv%%=*}"; done
-  git -C "$src" commit -qam "$msg"
+  git -C "$src" add -A && git -C "$src" commit -qm "$msg"
   git -C "$src" push -q "$origin" "HEAD:refs/heads/$msg"
   git -C "$src" rev-parse HEAD
 }
@@ -70,6 +70,7 @@ run() {
 
 check "unbuilt: a README no file names skips" "$(run "$(change readme 'README.md=# app, more')")" skip
 check "unbuilt: a Markdown file that code embeds runs" "$(run "$(change guide 'docs/guide.md=# more')")" run
+check "unbuilt: renovate.json alone skips" "$(run "$(change renovate 'renovate.json={}')")" skip
 check "unbuilt: a source change runs" "$(run "$(change code 'src/lib.rs=pub fn f() {}')")" run
 check "unbuilt: a workflow that calls none of the gates skips" \
   "$(run "$(change pin '.github/workflows/housekeeping.yml=jobs: {a: {uses: o/s/.github/workflows/actions-cleanup.yml@y}}')")" skip

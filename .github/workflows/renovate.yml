@@ -1,0 +1,125 @@
+name: Renovate
+
+# Reusable: run the self-hosted Renovate over the repositories its GitHub App is
+# installed on, as that App. Renovate reads each repository's own renovate.json (a
+# repository without one is skipped, and none gets an onboarding pull request), opens
+# and rebases its update pull requests, and automerges what that configuration allows.
+# renovate/default.json is the configuration apps extend (README, "Dependency updates").
+#
+# It runs the Renovate container on the ARC runners (no GitHub-hosted minutes, no
+# artifacts, no cache upload): each run starts cold, installs the tools a lock-file
+# update needs (cargo, npm) on demand, and finds its state in the repositories
+# themselves (branches and pull requests).
+#
+# The token is the App's installation token, minted for the permissions Renovate needs
+# and nothing more: contents, pull requests, issues, workflows (to move pins in
+# .github/workflows/) and commit statuses write; checks and Dependabot alerts read
+# (Renovate opens a pull request for an alert as soon as it sees one, outside the
+# schedule). Commits go through the API (`platformCommit`), so GitHub signs them as the
+# App. The job asks the workflow token for nothing.
+#
+# Renovate's log names every repository it visits and every dependency it moves. A
+# caller in a public repository therefore limits `autodiscover-filter` to public
+# repositories; private ones are renovated from a caller in a private repository.
+#
+#   on:
+#     schedule: [{cron: "17 1,5 * * 1,4"}]   # inside renovate/default.json's schedule
+#     workflow_dispatch:
+#   permissions: {}
+#   jobs:
+#     renovate:
+#       uses: onewaytek/owt-stack/.github/workflows/renovate.yml@<commit>  # vX.Y.Z
+#       with:
+#         autodiscover-filter: '["myorg/*", "!myorg/owt-stack"]'
+#       secrets:
+#         app-client-id: ${{ secrets.RENOVATE_APP_CLIENT_ID }}
+#         app-key: ${{ secrets.RENOVATE_APP_KEY }}
+#
+# Without the secrets the run says so in a notice and does nothing, so a schedule can
+# land before the App exists. Runs never overlap within one calling repository; two
+# callers must not share a repository (their filters are disjoint).
+
+on:
+  workflow_call:
+    inputs:
+      autodiscover-filter:
+        description: >-
+          The repositories to renovate, among those the App is installed on: a JSON
+          list of globs or /regex/, `!` negating (Renovate's autodiscoverFilter).
+        type: string
+        required: true
+      dry-run:
+        description: Look up and log what would change, and change nothing.
+        type: boolean
+        default: false
+      log-level:
+        description: Renovate's LOG_LEVEL (debug, info, warn).
+        type: string
+        default: info
+    secrets:
+      app-client-id:
+        description: The GitHub App's client ID.
+        required: false
+      app-key:
+        description: The GitHub App's private key (PEM).
+        required: false
+
+jobs:
+  renovate:
+    permissions: {}
+    concurrency:
+      group: renovate-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/renovatebot/renovate:44.221.6@sha256:52454eae0bdcb51ddfecc39035e0fc2d97172751124049144e89d44343f6ae81
+    steps:
+      - name: Check for the App
+        id: app
+        env:
+          HAVE_APP: ${{ secrets.app-client-id != '' && secrets.app-key != '' }}
+        shell: bash
+        run: |
+          if [ "$HAVE_APP" = true ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no app-client-id/app-key secrets: Renovate does not run"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint the App's token
+        id: token
+        if: ${{ steps.app.outputs.ok == 'true' }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.app-client-id }}
+          private-key: ${{ secrets.app-key }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-workflows: write
+          permission-statuses: write
+          permission-checks: read
+          permission-vulnerability-alerts: read
+
+      - name: Run Renovate
+        if: ${{ steps.app.outputs.ok == 'true' }}
+        env:
+          RENOVATE_TOKEN: ${{ steps.token.outputs.token }}
+          RENOVATE_PLATFORM: github
+          RENOVATE_AUTODISCOVER: "true"
+          RENOVATE_AUTODISCOVER_FILTER: ${{ inputs.autodiscover-filter }}
+          RENOVATE_ONBOARDING: "false"
+          RENOVATE_REQUIRE_CONFIG: required
+          RENOVATE_PLATFORM_COMMIT: enabled
+          RENOVATE_BINARY_SOURCE: install
+          RENOVATE_BASE_DIR: ${{ runner.temp }}/renovate
+          DRY_RUN: ${{ inputs.dry-run }}
+          LOG_LEVEL: ${{ inputs.log-level }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" = true ]; then export RENOVATE_DRY_RUN=full; fi
+          renovate

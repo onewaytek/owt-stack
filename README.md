@@ -33,11 +33,13 @@ Outside the crates:
 | `.github/workflows/deploy-pin.yml` | reusable: pin a released image's digest in the deployments repository through a pull request, which merges itself for rc environments and waits for the owner for production ("Deploying with GitOps") |
 | `.github/workflows/actions-cleanup.yml` | reusable: delete the `image-layer` artifacts of an app's completed image runs, so they stop counting against the Actions storage ("Actions storage") |
 | `.github/workflows/ghcr-prune.yml` | reusable, a dry run unless told to delete: remove the app's untagged ghcr versions and all but its newest rc versions, never a release, a floating tag or a digest the deployments repository pins ("Actions storage") |
-| `renovate/base-images.json` | a Renovate preset: the base images pinned by digest in the Dockerfile and the `base-image` input, grouped, digest-only bumps automerged after 24 hours |
+| `renovate/default.json` | the Renovate preset an app extends: `fix(deps)` pull requests to `main` for its crates, npm packages and owt-stack release pins, a monthly `ci(deps)` one for its action pins, and the base images below ("Dependency updates") |
+| `renovate/base-images.json` | a Renovate preset `default.json` extends: the base images pinned by digest in the Dockerfile and the `base-image` input, grouped, digest-only bumps automerged after 24 hours |
+| `.github/workflows/renovate.yml` | reusable: run the self-hosted Renovate on the ARC runners over the repositories its GitHub App is installed on ("Dependency updates") |
 | `scripts/bao-set.sh` | `env.sh` for OpenBao: writes an app environment's secrets from an `env.env` where `charts/owt-app`'s ExternalSecrets read them |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
-| `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its crates and its npm packages, minors and patches grouped, and a monthly `ci(deps)` one for its action and workflow pins |
+| `templates/renovate.json` | an app's `renovate.json`: `renovate/default.json` at a release tag ("Dependency updates") |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
 | `charts/owt-app` | the app's deploy as a Helm chart for Argo CD ("Deploying with GitOps"): the templates below with the image pinned by digest, stateful objects never pruned, and Secrets from OpenBao through External Secrets; `just chart` proves its renders match the templates' |
 | `templates/openshift/app.yaml` | deprecated for `charts/owt-app`, supported until its removal: an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, a `migrate` init container as the schema's owner and the app serving as a runtime role that owns nothing, the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
@@ -5068,15 +5070,101 @@ set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
 ## Commands, CI, releases and deployment
 
 **Day to day:** copy `templates/justfile` and `templates/compose.yaml` into the app,
-and `templates/dependabot.yml` as `.github/dependabot.yml`, so the app's action and
-workflow pins, crates and npm packages move by Dependabot's pull requests (crates and
-npm weekly as `fix(deps)`, each a patch release once merged; the pins monthly as
-`ci(deps)`, which releases nothing), instead of by hand at the next adoption (Dependabot
-follows a git dependency pinned to a version tag, such as the crates' `tag = "vX.Y.Z"`;
-an app's first weekly pull request shows it). The template ignores one npm package, the
-stylesheet's `github:onewaytek/owt-stack#vX.Y.Z`: Dependabot does not order a git
-dependency's tags as versions and proposes moving it to an older tag, so the app moves
-it with `npm install -D` when it adopts a release (**Tailwind:** below).
+and `templates/renovate.json` as `renovate.json`, so the app's crates, npm packages,
+owt-stack release pins, action and workflow pins and base images move by Renovate's
+pull requests instead of by hand at the next adoption ("Dependency updates", below).
+
+**Dependency updates.** A self-hosted Renovate (`.github/workflows/renovate.yml`)
+opens the update pull requests, as the GitHub App it runs as. An app takes part with
+a `renovate.json` at its root; a repository without one is skipped, and none gets an
+onboarding pull request:
+
+```json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>onewaytek/owt-stack//renovate/default#vX.Y.Z"]
+}
+```
+
+`#vX.Y.Z` is the release the app adopts (`renovate/default.json` extends
+`base-images.json` at the same tag); the owt-stack pull requests below move it with
+the rest. `renovate/default.json` gives:
+
+- **Every pull request targets `main`,** also in an app whose default branch is `rc`:
+  a bump reaches `rc` through `promote-rc.yml` like any other pull request, and review
+  before `main` stays where it was.
+- **Crates and npm packages** as `fix(deps):`, a patch release once merged; minors and
+  patches grouped per ecosystem (`Rust crates (minor and patch)`, `npm packages (minor
+  and patch)`), each major alone, and a release only once it is three days old
+  upstream. A Cargo range that already admits the new version (`tokio = "1.47"`) moves
+  only `Cargo.lock`. Each Monday, `fix(deps): refresh lock files` updates what no
+  manifest names.
+- **An owt-stack release** in one `fix(deps)` pull request (`owt-stack`), whatever
+  the update type: every crate pinned with `git = "https://github.com/onewaytek/owt-stack",
+  tag = "vX.Y.Z"` in `Cargo.toml`, the stylesheet's
+  `"@onewaytek/owt-stack": "github:onewaytek/owt-stack#vX.Y.Z"` in `package.json`,
+  and the reusable workflows pinned by commit, with no minimum age. Renovate reads
+  both git pins natively (by GitHub tag, with the `v` kept), and rewrites `Cargo.lock`
+  and `package-lock.json`; check the lock's `resolved` commit of the stylesheet as
+  **Tailwind:** says. The pull request is the release's adoption: its upgrade notes
+  are the app's work on that branch.
+- **Action pins** (`uses: …@<commit> # vX.Y.Z`, a job's `container:` image) in one
+  `ci(deps):` pull request on the first Monday of the month, every update type
+  together: no release, so no rc or main image. Renovate moves the commit and rewrites
+  the comment with it; third-party actions wait three days.
+- **Base images** as `base-images.json` says (**Base images**, under "Deploying with
+  GitOps"): the one automerge, a digest-only bump.
+- Monday and Thursday mornings (UTC), at most six open pull requests per repository,
+  no dependency dashboard. A vulnerability alert (the repository's "Dependabot
+  alerts" setting stays on) gets its pull request as soon as Renovate sees it, outside
+  the schedule; Dependabot's own version and security-update pull requests are off,
+  and the app keeps no `.github/dependabot.yml`.
+
+An app adds rules after the `extends`. One that must never automerge (regulated
+data) turns the base-image digests off too:
+
+```json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>onewaytek/owt-stack//renovate/default#vX.Y.Z"],
+  "automerge": false,
+  "packageRules": [{"matchPackageNames": ["*"], "automerge": false}]
+}
+```
+
+**The Renovate run.** `renovate.yml` runs the Renovate container (pinned by digest,
+moved by Renovate itself) on the ARC runners, with an installation token minted from
+the GitHub App's `app-client-id` and `app-key` secrets for contents, pull requests,
+issues, workflows and commit statuses (write), checks and Dependabot alerts (read); it
+asks the workflow token for nothing and commits through the API, signed as the App. It
+renovates every repository the App is installed on that `autodiscover-filter` (a JSON
+list of globs or `/regex/`, `!` negating) admits, one run at a time per calling
+repository, and does nothing (a notice) without the secrets. Renovate's log names
+every repository and dependency it visits, so a public repository's caller renovates
+public repositories only: this repository's `renovate-run.yml` renovates itself (its
+action pins ship to apps, so they are `fix(deps)` here, twice a week), and the apps
+are renovated from a caller in a private repository:
+
+```yaml
+name: Renovate
+on:
+  schedule: [{cron: "17 1,5 * * 1,4"}]   # twice inside the preset's schedule
+  workflow_dispatch:
+permissions: {}
+jobs:
+  renovate:
+    uses: onewaytek/owt-stack/.github/workflows/renovate.yml@<commit>  # vX.Y.Z
+    with:
+      autodiscover-filter: '["onewaytek/*", "!onewaytek/owt-stack"]'
+    secrets:
+      app-client-id: ${{ secrets.RENOVATE_APP_CLIENT_ID }}
+      app-key: ${{ secrets.RENOVATE_APP_KEY }}
+```
+
+The second run of a morning is the one that automerges a digest bump whose checks
+passed after the first. `dry-run: true` logs what would change and changes nothing.
+`just renovate-validate` runs Renovate's validator, at `renovate.yml`'s version, over
+the presets; `just ci-config` checks their rules without the network.
 Every app then answers to the same commands:
 
 ```sh
@@ -5263,12 +5351,11 @@ declare none and need only their job's token, and `image.yml`, which declares th
 sccache secret as `rust-ci.yml` does. And pin each `uses:` by
 commit rather than by tag, with the tag in a comment
 (`uses: onewaytek/owt-stack/.github/workflows/rust-ci.yml@<commit> # vX.Y.Z`): GitHub
-resolves a tag on every run, and a tag can be moved, while a commit cannot; Dependabot
-(the `github-actions` ecosystem in the app's `.github/dependabot.yml`, which
-`templates/dependabot.yml` is) keeps such a pin moving with the releases: it reads the
-tag in the comment, moves the commit to the release after it and rewrites the comment,
-for an action and for a reusable workflow alike (this repository's own pins move that
-way, in its `fix(deps): bump …` pull requests). `Cargo.lock` and
+resolves a tag on every run, and a tag can be moved, while a commit cannot; Renovate
+(the app's `renovate.json`, "Dependency updates") keeps such a pin moving with the
+releases: it reads the tag in the comment, moves the commit to the release after it
+and rewrites the comment, for an action and for a reusable workflow alike (this
+repository's own pins move that way, in its `fix(deps):` pull requests). `Cargo.lock` and
 `package-lock.json` already pin the crates and the stylesheet to a commit. A workflow
 in the app's own repository (`ci.yml` called from `release.yml`) is the app's own
 code: `secrets: inherit` on that call is fine, and it passes the one secret on.
@@ -5470,7 +5557,7 @@ jobs:
   `rust-ci.yml` call: Markdown and licence files outside a `templates/` directory that
   no other file or symlink names, by file name or by a directory they sit in (a README
   that `include_str!` or `readme =` reads is code, and so is `content/*.md` in an app
-  that embeds `content/`), `.github/dependabot.yml`, and
+  that embeds `content/`), `.github/dependabot.yml`, `renovate.json`, and
   workflow files that call neither the checks, the image, the release nor a local
   workflow (a pin bump in `housekeeping.yml`). Every other path is code: sources,
   templates, migrations, `.sqlx/`, `Cargo.*`, the justfile, and the CI workflows
@@ -5548,7 +5635,9 @@ jobs:
   started (that PR is requeued after every person's); a bot's re-run cancels nothing.
   A bot is an author or actor whose account type is `Bot`: Dependabot, but also any
   GitHub App, release-please's pull requests and one an app opens among them. A
-  person's PR waits for the run in progress, not for the bumps behind it.
+  person's PR waits for the run in progress, not for the bumps behind it. Renovate's
+  pull requests are a bot's too, but come from the repository's own branches with the
+  Actions secrets and the usual token, so none of the Dependabot secrets above apply.
 
 ```yaml
 # pr.yml
@@ -5577,7 +5666,7 @@ jobs:
   rc:   # one promotion at a time; only this job waits in the group, never the checks
     needs: ci
     # Not for a draft, nor for a change that builds nothing (`code`: docs, workflow pins,
-    # dependabot.yml), which reaches rc at the next stable release's sync-rc instead.
+    # renovate.json), which reaches rc at the next stable release's sync-rc instead.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository
       && !github.event.pull_request.draft && needs.ci.outputs.code != 'false'
@@ -5649,7 +5738,7 @@ change and nowhere else; none of these trades away a check before anything deplo
   that promotes it, and `requeue-rc.yml` passes drafts over. Open a PR as a draft, push
   freely, and mark it ready when it should be checked and promoted.
 - **A change that builds nothing is not promoted.** With `skip-unbuilt`, `rust-ci.yml`
-  outputs `code: false` for a change of only docs, workflow pins or `dependabot.yml`
+  outputs `code: false` for a change of only docs, workflow pins or `renovate.json`
   (and `true` for anything else, any failed comparison included), and `pr.yml`'s `rc`
   skips on it. Such a change reaches `rc` at the next stable release's `sync-rc`. An
   app's `ci.yml` passes the output on (`on.workflow_call.outputs.code`); without it the
@@ -5668,8 +5757,9 @@ change and nowhere else; none of these trades away a check before anything deplo
 - **Lost promotions are requeued twice a day** by the schedule; each promotion's own
   `requeue` job, which runs after every promotion, stays the main path. A promotion
   lost with nothing after it waits at most 12 hours.
-- **Workflow pins move monthly,** in one Dependabot pull request, committed as
-  `ci(deps):` (`templates/dependabot.yml`): no release, so no rc or main image.
+- **Action pins move monthly,** in one Renovate pull request, committed as
+  `ci(deps):` (`renovate/default.json`): no release, so no rc or main image. The
+  reusable workflows move with the owt-stack release that ships them.
 - **`IMAGE_BUILDS=off` pauses image builds** (a repository variable; the `image` jobs
   of `release.yml` and `image-check.yml` test it) while Actions storage is full, when
   each build would fail at its quota probe anyway. A release still tags its version,
@@ -5687,7 +5777,7 @@ An app moving to these callers changes: `pr.yml` (`labeled` in the types, the `i
 and `if:`, the `IMAGE_BUILDS` test on `image`), `requeue-rc.yml` (the cron),
 `image-check.yml` (dispatch and schedule in place of `pull_request`, the
 `IMAGE_BUILDS` test; an `image-check` job in `pr.yml` moves there), and
-`.github/dependabot.yml` (the `github-actions` entry). Agents open their pull requests
+`renovate.json` (from `templates/renovate.json`). Agents open their pull requests
 as drafts.
 
 **Image:** `image.yml` builds the image on the ARC scale set (`RUNS_ON`, as the checks)
@@ -6672,8 +6762,9 @@ the package, and check either way: the lock's `resolved` URL ends in the commit 
 was installed, to compare with the tag's (`git ls-remote
 https://github.com/onewaytek/owt-stack vX.Y.Z 'vX.Y.Z^{}'`: the `^{}` line if there is
 one, otherwise the only line).
-Dependabot leaves this dependency alone (`templates/dependabot.yml` ignores it), so
-this command, run when the app adopts a release, is the only thing that moves it.
+Renovate's `owt-stack` pull request moves this dependency with the crates; check
+its `resolved` commit there the same way, and run this command on that branch if the
+lock kept the old one.
 
 ## Deploying with GitOps
 
@@ -6870,12 +6961,9 @@ overrides `ghcr.io/onewaytek/<app>` for an image of its own.
 **Base images.** The app pins its runtime base by digest in both places it is named,
 the Dockerfile's `FROM` and release.yml's `base-image:` input, with the tag kept for
 reading (`registry.access.redhat.com/hi/core-runtime:2@sha256:…`), and the builders
-the same way. A self-hosted Renovate keeps them current with this preset, in the
-app's `renovate.json`:
-
-```json
-{"extends": ["github>onewaytek/owt-stack//renovate/base-images#vX.Y.Z"]}
-```
+the same way. The self-hosted Renovate keeps them current with
+`renovate/base-images.json`, which `renovate/default.json` extends ("Dependency
+updates", under "Commands, CI, releases and deployment").
 
 It groups every `registry.access.redhat.com/hi/*` image into one `fix(deps)` pull
 request, so builder and runtime glibc move together, on Monday and Thursday mornings
@@ -6891,9 +6979,9 @@ defaults, `name:tag@sha256:…`), so those digests are bumped like the base imag
 the chart and the templates move together; it matches those paths in the repository it
 runs on. `just ci-config` runs `scripts/renovate-test.sh`, which checks that each
 pattern matches its files and that every digest pin in them is read (the pruner image,
-which names the cluster's internal registry, is updated by hand). An app that must not automerge at all (regulated data)
-adds `"packageRules": [{"matchPackageNames": ["*"], "automerge": false}]` after the
-`extends`.
+which names the cluster's internal registry, is updated by hand). An app that must
+not automerge at all (regulated data) turns it off in its `renovate.json`
+("Dependency updates").
 
 **Secrets: `scripts/bao-set.sh`.** `env.sh`'s counterpart for OpenBao. It reads the
 same `env.env` (literals, `@generate`, `@env`, and `@prompt` for a value typed at a
