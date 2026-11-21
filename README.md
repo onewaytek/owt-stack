@@ -26,7 +26,7 @@ Outside the crates:
 | `.github/workflows/conventional-commits.yml` | Conventional Commits checked on every pull request, here and, as a reusable workflow, in an app: the title and every commit but a merge of the base into the branch (a squash merge drops it), with one commitlint and one configuration |
 | `.github/workflows/release.yml` | reusable releases from conventional commits: stable on `main`, prereleases on `rc`, optional version write-back and changelog |
 | `.github/workflows/image.yml` | reusable image build for a released tag, daemonless on ARC (or the Dockerfile, GitHub-hosted), pushed to ghcr with the channel's floating tags |
-| `.github/workflows/image-check.yml` | reusable, opt-in: the same image built and verified on a pull request, pushing nothing, for a caller that grants only `contents: read` |
+| `.github/workflows/image-check.yml` | reusable, opt-in: the same image built and verified between releases (a dispatch, a weekly schedule, or a pull request), pushing nothing, for a caller that grants only `contents: read` |
 | `.github/workflows/promote-rc.yml` | reusable rc channel: merge a PR (or `main`) into `rc` and start its prerelease, or into `rc-candidate` for checking first |
 | `.github/workflows/publish-rc.yml` | reusable: move `rc` to a checked `rc-candidate` and start its prerelease |
 | `.github/workflows/requeue-rc.yml` | reusable: re-run a PR's promotion that was cancelled while waiting or refused because `rc` moved |
@@ -37,7 +37,7 @@ Outside the crates:
 | `scripts/bao-set.sh` | `env.sh` for OpenBao: writes an app environment's secrets from an `env.env` where `charts/owt-app`'s ExternalSecrets read them |
 | `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
-| `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its action and workflow pins, its crates and its npm packages, minors and patches grouped |
+| `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its crates and its npm packages, minors and patches grouped, and a monthly `ci(deps)` one for its action and workflow pins |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
 | `charts/owt-app` | the app's deploy as a Helm chart for Argo CD ("Deploying with GitOps"): the templates below with the image pinned by digest, stateful objects never pruned, and Secrets from OpenBao through External Secrets; `just chart` proves its renders match the templates' |
 | `templates/openshift/app.yaml` | deprecated for `charts/owt-app`, supported until its removal: an OpenShift Template: ImageStream following a ghcr channel, Deployment with an image trigger, a `migrate` init container as the schema's owner and the app serving as a runtime role that owns nothing, the app's environment from a Secret, Service, Route, CNPG Postgres over verified TLS with nightly volume-snapshot backups and their pruning, NetworkPolicies |
@@ -5069,8 +5069,9 @@ set `Sec-Fetch-Site: cross-site` on one to test the protection itself.
 
 **Day to day:** copy `templates/justfile` and `templates/compose.yaml` into the app,
 and `templates/dependabot.yml` as `.github/dependabot.yml`, so the app's action and
-workflow pins, crates and npm packages move by weekly `fix(deps)` pull requests, each
-a patch release once merged, instead of by hand at the next adoption (Dependabot
+workflow pins, crates and npm packages move by Dependabot's pull requests (crates and
+npm weekly as `fix(deps)`, each a patch release once merged; the pins monthly as
+`ci(deps)`, which releases nothing), instead of by hand at the next adoption (Dependabot
 follows a git dependency pinned to a version tag, such as the crates' `tag = "vX.Y.Z"`;
 an app's first weekly pull request shows it). The template ignores one npm package, the
 stylesheet's `github:onewaytek/owt-stack#vX.Y.Z`: Dependabot does not order a git
@@ -5566,8 +5567,8 @@ jobs:
     uses: ./.github/workflows/ci.yml   # the app's own; it passes rust-ci.yml's `code` on
     secrets: inherit
   commits:   # the title and every commit follow Conventional Commits (release.yml reads
-    concurrency: {group: "pr-commits-${{ github.event.pull_request.number }}", cancel-in-progress: true}
     permissions: {contents: read, pull-requests: read}  # them); one check, "commits / commits",
+    concurrency: {group: "pr-commits-${{ github.event.pull_request.number }}", cancel-in-progress: true}
     uses: onewaytek/owt-stack/.github/workflows/conventional-commits.yml@<commit>  # v0.14.9
     # with: {title: false}   # an app that checks titles another way: the commit lint alone
     # outputs: `commits` ("true" when every commit passed) and `title`; a promotion that
@@ -5672,9 +5673,12 @@ change and nowhere else; none of these trades away a check before anything deplo
 - **`IMAGE_BUILDS=off` pauses image builds** (a repository variable; the `image` jobs
   of `release.yml` and `image-check.yml` test it) while Actions storage is full, when
   each build would fail at its quota probe anyway. A release still tags its version,
-  with no image, so nothing deploys it; once the variable is cleared, rebuild a version
-  that should run with the app's `image.yml` dispatch (above). Clear it before relying
-  on a release again.
+  with no image, so no image tag moves and nothing deploys it: the `deploy` job
+  (`deploy-pin.yml`) needs `image` and is skipped with it, so keep that job's `if:` free
+  of `always()` and `!cancelled()` (`deploy-pin.yml` refuses an empty digest even then).
+  Once the variable is cleared, rebuild a version that should run with the app's
+  `image.yml` dispatch (above), which pins nothing: the next release's `deploy` job
+  pins, or a person does. Clear it before relying on a release again.
 
 An app moving to these callers changes: `pr.yml` (`labeled` in the types, the `if:` and
 `concurrency:` on `ci`, the `concurrency:` on `commits`, the `code` test in `rc`'s
