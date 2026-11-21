@@ -41,7 +41,7 @@
       "groupSlug": "npm-minor-patch"
     },
     {
-      "description": "Action pins change CI, not what an app ships: one ci(deps) pull request a month (the first Monday), every update type together, which releases nothing and builds no image. None automerges, a job's container image included (base-images.json's digest rule is for the images an app ships). The digest keeps its `# vX.Y.Z` comment, which Renovate rewrites with it. The owt-stack rule below takes the reusable workflows out of this group.",
+      "description": "Action pins change CI, not what an app ships: one ci(deps) pull request a month (the first Monday), every update type together, which releases nothing and builds no image. Action pins never automerge; a job's container image moves by digest under the next rule. The digest keeps its `# vX.Y.Z` comment, which Renovate rewrites with it. The owt-stack rule below takes the reusable workflows out of this group.",
       "matchManagers": ["github-actions"],
       "semanticCommitType": "ci",
       "groupName": "GitHub Actions",
@@ -49,6 +49,19 @@
       "separateMajorMinor": false,
       "automerge": false,
       "schedule": ["* 0-6 1-7 * 1"]
+    },
+    {
+      "description": "A job's container image in a workflow (`container:` or `image:` pinned by digest): a digest-only bump (same tag, new digest) automerges after its checks once the digest is 24 hours old, like a base image, on the twice-weekly schedule. A tag change still waits in the monthly actions group for review.",
+      "matchManagers": ["github-actions"],
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["digest"],
+      "groupName": "CI container images (digest)",
+      "groupSlug": "ci-images-digest",
+      "minimumReleaseAge": "24 hours",
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": false,
+      "schedule": ["* 0-6 * * 1,4"]
     },
     {
       "description": "An owt-stack release: every crate pinned by git tag in Cargo.toml, the stylesheet's github:onewaytek/owt-stack#vX.Y.Z in package.json and the reusable workflows pinned by commit move together in one pull request, whatever the update type, as fix(deps) (the workflows ship with the release the app adopts). Twice a week like the crates, not monthly like the other action pins. No minimum age: owt-stack's own releases are adopted as they come.",

@@ -73,8 +73,8 @@ check "default enables every manager base-images does" \
 check "default enables cargo, npm and github-actions" \
   '[ "$(jq "[.enabledManagers[] | select(. == \"cargo\" or . == \"npm\" or . == \"github-actions\")] | length" "$d")" = 3 ]'
 check "default targets main alone" '[ "$(jq -c .baseBranchPatterns "$d")" = "[\"main\"]" ]'
-check "default automerges nothing (base-images' digest rule is the one automerge)" \
-  '[ "$(jq "[.. | objects | select(.automerge == true)] | length" "$d")" = 0 ]'
+check "default automerges only CI container-image digests" \
+  '[ "$(jq -c "[.packageRules[] | select(.automerge == true) | [.matchManagers, .matchDatasources, .matchUpdateTypes]]" "$d")" = "[[[\"github-actions\"],[\"docker\"],[\"digest\"]]]" ]'
 check "base-images automerges digests alone" \
   '[ "$(jq -c "[.packageRules[] | select(.automerge == true) | .matchUpdateTypes]" "$preset")" = "[[\"digest\"]]" ]'
 check "the dependency dashboard is off" 'jq -e ".extends | index(\":disableDependencyDashboard\")" "$preset" >/dev/null'
@@ -85,7 +85,7 @@ check "an owt-stack release is one fix(deps) group, every update type" '[ "$(jq 
   | [.matchPackageNames, .groupSlug, .separateMajorMinor, .semanticCommitType]" "$d")" = "[[\"onewaytek/owt-stack\"],\"owt-stack\",false,\"fix\"]" ]'
 check "the app template extends default at a tag" \
   'jq -e ".extends == [\"github>onewaytek/owt-stack//renovate/default#vX.Y.Z\"]" templates/renovate.json >/dev/null'
-check "no action pin or job container image automerges" \
+check "no action pin automerges" \
   '[ "$(jq -r ".packageRules[] | select(.groupSlug == \"actions\") | .automerge" "$d")" = false ]'
 # A lock-file update runs cargo and npm on third-party packages, beside the App's token.
 check "the run keeps package scripts off and the job's environment to itself" \

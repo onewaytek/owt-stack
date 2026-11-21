@@ -5113,10 +5113,11 @@ the rest. `renovate/default.json` gives:
 - **Action pins** (`uses: …@<commit> # vX.Y.Z`, a job's `container:` image) in one
   `ci(deps):` pull request on the first Monday of the month, every update type
   together: no release, so no rc or main image. Renovate moves the commit and rewrites
-  the comment with it; third-party actions wait three days. None automerges, a
-  container image's digest-only bump included.
+  the comment with it; third-party actions wait three days. None automerges. A job
+  container image's digest-only bump comes on its own twice a week and automerges
+  after its checks once the digest is 24 hours old; a tag change waits for review.
 - **Base images** as `base-images.json` says (**Base images**, under "Deploying with
-  GitOps"): the one automerge, a digest-only bump.
+  GitOps"): a digest-only bump automerges, as a CI container image's does.
 - Monday and Thursday mornings (UTC), at most six open pull requests per repository,
   no dependency dashboard. A vulnerability alert (the repository's "Dependabot
   alerts" setting stays on) gets its pull request as soon as Renovate sees it, outside
