@@ -1,7 +1,7 @@
 name: Renovate run
 
 # owt-stack's own Renovate run (renovate.yml): this repository alone, since its log is
-# public. The apps are renovated from a caller in a private repository (README,
+# public, with a token minted for this repository alone. The apps are renovated from a caller in a private repository (README,
 # "Dependency updates"). Monday and Thursday, twice inside renovate/default.json's
 # schedule, so a pull request whose checks passed after the first run can automerge
 # (base-image digests only) on the second.
@@ -27,6 +27,7 @@ jobs:
     uses: ./.github/workflows/renovate.yml
     with:
       autodiscover-filter: '["onewaytek/owt-stack"]'
+      repositories: owt-stack
       dry-run: ${{ inputs.dry-run || false }}
       log-level: ${{ inputs.log-level || 'info' }}
     secrets:

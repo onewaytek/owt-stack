@@ -41,12 +41,13 @@
       "groupSlug": "npm-minor-patch"
     },
     {
-      "description": "Action pins change CI, not what an app ships: one ci(deps) pull request a month (the first Monday), every update type together, which releases nothing and builds no image. The digest keeps its `# vX.Y.Z` comment, which Renovate rewrites with it. The owt-stack rule below takes the reusable workflows out of this group.",
+      "description": "Action pins change CI, not what an app ships: one ci(deps) pull request a month (the first Monday), every update type together, which releases nothing and builds no image. None automerges, a job's container image included (base-images.json's digest rule is for the images an app ships). The digest keeps its `# vX.Y.Z` comment, which Renovate rewrites with it. The owt-stack rule below takes the reusable workflows out of this group.",
       "matchManagers": ["github-actions"],
       "semanticCommitType": "ci",
       "groupName": "GitHub Actions",
       "groupSlug": "actions",
       "separateMajorMinor": false,
+      "automerge": false,
       "schedule": ["* 0-6 1-7 * 1"]
     },
     {

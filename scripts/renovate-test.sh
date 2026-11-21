@@ -85,7 +85,17 @@ check "an owt-stack release is one fix(deps) group, every update type" '[ "$(jq 
   | [.matchPackageNames, .groupSlug, .separateMajorMinor, .semanticCommitType]" "$d")" = "[[\"onewaytek/owt-stack\"],\"owt-stack\",false,\"fix\"]" ]'
 check "the app template extends default at a tag" \
   'jq -e ".extends == [\"github>onewaytek/owt-stack//renovate/default#vX.Y.Z\"]" templates/renovate.json >/dev/null'
+check "no action pin or job container image automerges" \
+  '[ "$(jq -r ".packageRules[] | select(.groupSlug == \"actions\") | .automerge" "$d")" = false ]'
+# A lock-file update runs cargo and npm on third-party packages, beside the App's token.
+check "the run keeps package scripts off and the job's environment to itself" \
+  'grep -qxF "          RENOVATE_ALLOW_SCRIPTS: \"false\"" .github/workflows/renovate.yml &&
+   grep -qxF "          RENOVATE_EXPOSE_ALL_ENV: \"false\"" .github/workflows/renovate.yml &&
+   ! grep -q "RENOVATE_ALLOWED_COMMANDS\|RENOVATE_ALLOWED_POST_UPGRADE_COMMANDS" .github/workflows/renovate.yml'
 # Renovate's log names what it visits, and this repository's run logs are public.
+check "this repository's run holds a token for this repository alone" \
+  'grep -qxF "      repositories: owt-stack" .github/workflows/renovate-run.yml &&
+   grep -qxF "          repositories: \${{ inputs.repositories }}" .github/workflows/renovate.yml'
 check "this repository's run renovates this repository alone" \
   'grep -qxF "      autodiscover-filter: '"'"'[\"onewaytek/owt-stack\"]'"'"'" .github/workflows/renovate-run.yml'
 for j in renovate/*.json renovate.json templates/renovate.json; do

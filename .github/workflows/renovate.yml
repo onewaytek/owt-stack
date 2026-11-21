@@ -18,9 +18,17 @@ name: Renovate
 # schedule). Commits go through the API (`platformCommit`), so GitHub signs them as the
 # App. The job asks the workflow token for nothing.
 #
-# Renovate's log names every repository it visits and every dependency it moves. A
-# caller in a public repository therefore limits `autodiscover-filter` to public
-# repositories; private ones are renovated from a caller in a private repository.
+# Renovate's log names every repository it visits and every dependency it moves (and,
+# at `trace`, every repository the token reaches). A caller in a public repository
+# therefore limits `autodiscover-filter` to public repositories and names them in
+# `repositories`, which mints the token for those alone: such a run can neither read,
+# write nor name any other repository the App is installed on. Private ones are
+# renovated from a caller in a private repository.
+#
+# A lock-file update runs cargo and npm on what a dependency publishes. Package
+# lifecycle scripts stay off (`allowScripts`), a repository's configuration can run no
+# command of its own (no `allowedCommands`), and the child processes get Renovate's
+# short list of environment variables, not the job's (`exposeAllEnv`).
 #
 #   on:
 #     schedule: [{cron: "17 1,5 * * 1,4"}]   # inside renovate/default.json's schedule
@@ -48,6 +56,12 @@ on:
           list of globs or /regex/, `!` negating (Renovate's autodiscoverFilter).
         type: string
         required: true
+      repositories:
+        description: >-
+          The repositories the token is minted for, by name without the owner, comma
+          separated. Empty: every repository the App is installed on for this owner.
+        type: string
+        default: ""
       dry-run:
         description: Look up and log what would change, and change nothing.
         type: boolean
@@ -96,6 +110,7 @@ jobs:
           client-id: ${{ secrets.app-client-id }}
           private-key: ${{ secrets.app-key }}
           owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.repositories }}
           permission-contents: write
           permission-pull-requests: write
           permission-issues: write
@@ -115,6 +130,8 @@ jobs:
           RENOVATE_REQUIRE_CONFIG: required
           RENOVATE_PLATFORM_COMMIT: enabled
           RENOVATE_BINARY_SOURCE: install
+          RENOVATE_ALLOW_SCRIPTS: "false"
+          RENOVATE_EXPOSE_ALL_ENV: "false"
           RENOVATE_BASE_DIR: ${{ runner.temp }}/renovate
           DRY_RUN: ${{ inputs.dry-run }}
           LOG_LEVEL: ${{ inputs.log-level }}

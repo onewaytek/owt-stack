@@ -5092,7 +5092,9 @@ the rest. `renovate/default.json` gives:
 
 - **Every pull request targets `main`,** also in an app whose default branch is `rc`:
   a bump reaches `rc` through `promote-rc.yml` like any other pull request, and review
-  before `main` stays where it was.
+  before `main` stays where it was. Renovate reads `renovate.json` from the default
+  branch, though: such an app is renovated once the file is on `rc`, and skipped until
+  then.
 - **Crates and npm packages** as `fix(deps):`, a patch release once merged; minors and
   patches grouped per ecosystem (`Rust crates (minor and patch)`, `npm packages (minor
   and patch)`), each major alone, and a release only once it is three days old
@@ -5111,7 +5113,8 @@ the rest. `renovate/default.json` gives:
 - **Action pins** (`uses: …@<commit> # vX.Y.Z`, a job's `container:` image) in one
   `ci(deps):` pull request on the first Monday of the month, every update type
   together: no release, so no rc or main image. Renovate moves the commit and rewrites
-  the comment with it; third-party actions wait three days.
+  the comment with it; third-party actions wait three days. None automerges, a
+  container image's digest-only bump included.
 - **Base images** as `base-images.json` says (**Base images**, under "Deploying with
   GitOps"): the one automerge, a digest-only bump.
 - Monday and Thursday mornings (UTC), at most six open pull requests per repository,
@@ -5141,9 +5144,12 @@ renovates every repository the App is installed on that `autodiscover-filter` (a
 list of globs or `/regex/`, `!` negating) admits, one run at a time per calling
 repository, and does nothing (a notice) without the secrets. Renovate's log names
 every repository and dependency it visits, so a public repository's caller renovates
-public repositories only: this repository's `renovate-run.yml` renovates itself (its
-action pins ship to apps, so they are `fix(deps)` here, twice a week), and the apps
-are renovated from a caller in a private repository:
+public repositories only and names them in `repositories` (names without the owner,
+comma separated), which mints the token for those alone; left empty, the token reaches
+every repository the App is installed on. This repository's `renovate-run.yml`
+renovates itself with a token for itself (its action pins ship to apps, so they are
+`fix(deps)` here, twice a week), and the apps are renovated from a caller in a private
+repository:
 
 ```yaml
 name: Renovate
@@ -5163,6 +5169,8 @@ jobs:
 
 The second run of a morning is the one that automerges a digest bump whose checks
 passed after the first. `dry-run: true` logs what would change and changes nothing.
+A lock-file update runs cargo and npm with package scripts off (`allowScripts`), and
+those processes see Renovate's short list of environment variables, not the job's.
 `just renovate-validate` runs Renovate's validator, at `renovate.yml`'s version, over
 the presets; `just ci-config` checks their rules without the network.
 Every app then answers to the same commands:
