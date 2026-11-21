@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.10](https://github.com/onewaytek/owt-stack/compare/v0.14.9...v0.14.10) (2026-11-21)
+
+
+### Features
+
+* **ci:** run CI less often ([#376](https://github.com/onewaytek/owt-stack/issues/376)) ([e3a960d](https://github.com/onewaytek/owt-stack/commit/e3a960d2bf36d1a2ac69df357fcfe90cd044da47))
+
+
+### Bug Fixes
+
+* **ci:** authenticate skip-unbuilt reads, drop the grype cache, scan push consumers ([#374](https://github.com/onewaytek/owt-stack/issues/374)) ([6f653d6](https://github.com/onewaytek/owt-stack/commit/6f653d6f89493d144ded473e7954e3f3e26186f0))
+
 ## [0.14.9](https://github.com/onewaytek/owt-stack/compare/v0.14.8...v0.14.9) (2026-11-18)
 
 
