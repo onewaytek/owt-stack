@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.15.0](https://github.com/onewaytek/owt-stack/compare/v0.14.10...v0.15.0) (2026-11-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** an app that calls `Mfa::passkeys` adds `features = ["passkeys"]` to its owt-accounts dependency.
+* **ci:** the job calling publish-rc.yml grants id-token: write; records an older publish-rc.yml left no longer skip the checks.
+
+### Features
+
+* **accounts:** gate passkeys behind a `passkeys` feature, off by default ([#380](https://github.com/onewaytek/owt-stack/issues/380)) ([b1c1d63](https://github.com/onewaytek/owt-stack/commit/b1c1d6398f95364158bf9845d55d254b9eeef7b6))
+
+
+### Bug Fixes
+
+* **ci:** honour an rc-checked record only with a token publish-rc signed ([#378](https://github.com/onewaytek/owt-stack/issues/378)) ([8af23cb](https://github.com/onewaytek/owt-stack/commit/8af23cb80ab2305486e9dac03c04b9e8ad3dc2db))
+
 ## [0.14.10](https://github.com/onewaytek/owt-stack/compare/v0.14.9...v0.14.10) (2026-11-21)
 
 
