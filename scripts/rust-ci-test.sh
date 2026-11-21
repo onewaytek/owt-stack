@@ -4,7 +4,8 @@
 # origin. Lazy fetches are forbidden (GIT_NO_LAZY_FETCH), as an unauthenticated one is
 # in a private repository, so every blob the step reads comes through its own fetch.
 # Also: the step gives git the token for the server alone, and a read that fails (no
-# origin) runs the checks. `just templates` runs it; it needs bash 4 and git 2.44.
+# origin) runs the checks, and the `code` output is "false" only on the step's answer.
+# `just templates` runs it; it needs bash 4 and git 2.44.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -78,6 +79,15 @@ sha=$(change readme2 'README.md=# app, again')
 mv "$origin" "$origin.gone"; mkdir "$origin"
 check "unbuilt: a failed read runs the checks" "$(run "$sha" 2>/dev/null || echo run)" run
 rmdir "$origin"; mv "$origin.gone" "$origin"
+
+# The `code` output is "false" only on the step's positive answer: the job's output
+# reads the step alone, and the workflow's turns anything but "false" (a skipped or
+# failed classification, a fork's skipped job) into "true", so a promotion is never
+# skipped for want of an answer.
+grep -qxF "      code: \${{ steps.unbuilt.outputs.unbuilt == 'true' && 'false' || 'true' }}" "$wf/rust-ci.yml" && c=yes || c=no
+check "code: false only when the step found nothing built" "$c" yes
+grep -qxF "        value: \${{ jobs.tested.outputs.code == 'false' && 'false' || 'true' }}" "$wf/rust-ci.yml" && c=yes || c=no
+check "code: the workflow's output is true unless the job said false" "$c" yes
 
 [ "$fails" = 0 ] || { echo "$fails rust-ci test(s) failed"; exit 1; }
 echo "rust-ci tests passed"

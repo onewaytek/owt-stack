@@ -49,7 +49,7 @@ name: Requeue rc promotions
 #
 #   # requeue-rc.yml
 #   on:
-#     schedule: [{cron: "*/30 * * * *"}]
+#     schedule: [{cron: "23 7,19 * * *"}]   # twice a day: the in-run requeue is the main path
 #     workflow_dispatch:
 #   jobs:
 #     requeue:

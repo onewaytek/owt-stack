@@ -58,7 +58,9 @@ name: Rust CI
 # workflow. Every other path counts as code (sources, templates, migrations, `.sqlx/`,
 # `Cargo.*`, the justfile, the CI workflows themselves), as does any read that fails.
 # Skipped jobs count as passing for a required check, so nothing waits. A check the
-# app runs as a job of its own (a compliance lint) runs regardless.
+# app runs as a job of its own (a compliance lint) runs regardless. The `code` output
+# carries the same answer to the caller: "false" only when this classification found
+# nothing built, so a pull request workflow can skip its rc promotion for such a change.
 #
 # The runners are inside the cluster's network, so a pull request from a fork runs
 # nothing here: its code is not ours to run there. Actions are pinned to commits (a
@@ -186,6 +188,14 @@ on:
           run passed this commit; see the header), "unbuilt" (`skip-unbuilt`), or
           empty when they ran.
         value: ${{ jobs.tested.outputs.skipped }}
+      code:
+        description: >-
+          "false" when `skip-unbuilt` found that the change touches nothing the checks
+          build (see the header); "true" otherwise: without `skip-unbuilt`, when the
+          checks were skipped for another reason, when the comparison could not be made,
+          and for a fork's pull request. A pull request workflow skips its rc promotion
+          on "false"; any other answer promotes.
+        value: ${{ jobs.tested.outputs.code == 'false' && 'false' || 'true' }}
       gate:
         description: >-
           The gate's identity (a hash of the checked tree, the inputs but `ref` and
@@ -229,6 +239,7 @@ jobs:
       gate: ${{ steps.key.outputs.gate }}
       passed: ${{ steps.lookup.outputs.cache-hit == 'true' && 'true' || 'false' }}
       skip: ${{ (steps.lookup.outputs.cache-hit == 'true' || steps.rc.outputs.checked == 'true' || steps.unbuilt.outputs.unbuilt == 'true') && 'true' || 'false' }}
+      code: ${{ steps.unbuilt.outputs.unbuilt == 'true' && 'false' || 'true' }}
       skipped: ${{ steps.lookup.outputs.cache-hit == 'true' && 'reused' || steps.rc.outputs.checked == 'true' && 'rc-checked' || steps.unbuilt.outputs.unbuilt == 'true' && 'unbuilt' || '' }}
     steps:
       - continue-on-error: true

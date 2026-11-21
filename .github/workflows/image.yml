@@ -48,7 +48,7 @@ name: Image
 # attestation and to the run as an artifact kept for 7 days. The caller grants `id-token: write` and
 # `packages: write`; `attest: false` skips the signing and the SBOM.
 #
-# image-check.yml builds and verifies the same image on a pull request, pushing
+# image-check.yml builds and verifies the same image between releases, pushing
 # nothing, for a caller that grants no write permission.
 #
 # The build job hands the layer to the jobs after it as the `image-layer` artifact
