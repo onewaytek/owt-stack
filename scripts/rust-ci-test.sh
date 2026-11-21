@@ -158,7 +158,8 @@ repo=o/app
 appo="$work/$repo.git"
 mkdir -p "$work/o" && git clone -q --bare "$src" "$appo"
 x=$(git -C "$src" rev-parse "$base")
-y=$sha
+y=$(change other 'README.md=# another commit')
+git -C "$src" push -q "$appo" "$y:refs/heads/other"
 gate=0123456789abcdef
 now=$(date +%s)
 claims() { # claims [field=json]...: an honest record's claims with fields replaced
@@ -174,7 +175,8 @@ record() {
   local pub="$work/pub"
   rm -rf "$pub" "$work/tmp" && mkdir "$work/tmp" && git clone -q "$appo" "$pub"
   printf '%s' "$1" >"$work/tmp/rc-checked.jwt"
-  (cd "$pub" && SHA="${2:-$x}" GATE="$gate" RUNNER_TEMP="$work/tmp" bash "$work/record.sh" >/dev/null 2>&1)
+  (cd "$pub" && SHA="${2:-$x}" GATE="$gate" RUNNER_TEMP="$work/tmp" bash "$work/record.sh" >/dev/null 2>&1) ||
+    { echo "FAIL rc-checked: the record step failed"; fails=$((fails + 1)); }
 }
 # verify [jwks]: the rc step in a checkout-style clone of X, as rc's release of X.
 verify() {
