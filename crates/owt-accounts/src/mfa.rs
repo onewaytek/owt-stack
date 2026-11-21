@@ -2,7 +2,8 @@
 //! re-authentication for sensitive actions.
 //!
 //! Three factors exist: an **authenticator app** (TOTP, [`owt_auth::totp`]),
-//! **passkeys** (Web Authentication, [`passkey`]; on once [`Mfa::passkeys`] names the site) and,
+//! **passkeys** (Web Authentication, [`passkey`]; with the `passkeys` feature, on once
+//! `Mfa::passkeys` names the site) and,
 //! behind them, **recovery codes** ([`owt_auth::recovery`]) for the day the phone is
 //! lost. An account may hold an authenticator and any number of passkeys; any one of
 //! them answers a challenge, and the recovery codes stay while one of them remains.
@@ -562,7 +563,7 @@ pub enum MfaError {
     /// Re-authenticating needs a password or a factor, and the account has neither.
     #[error("There is nothing to confirm your identity with. Sign in again.")]
     NothingToProve,
-    /// Passkeys are not turned on ([`Mfa::passkeys`]).
+    /// Passkeys are not turned on (`Mfa::passkeys`).
     #[error("Passkeys are not available on this site.")]
     PasskeysOff,
     /// The passkey ceremony the answer names does not exist, has expired (five
@@ -570,7 +571,7 @@ pub enum MfaError {
     #[error("That passkey request has expired. Please try again.")]
     PasskeyExpired,
     /// The browser answered for another origin or relying-party id than the
-    /// configuration names ([`passkey::RelyingParty`]); the log says which.
+    /// configuration names (`passkey::RelyingParty`); the log says which.
     #[error("That passkey was made for another site address.")]
     PasskeyOrigin,
     /// The credential is registered already (to this account or another).
@@ -769,7 +770,7 @@ pub const LOCK_FOR_MIN: Duration = Duration::from_mins(1);
 /// and nothing else, and asked for by every function that changes them
 /// ([`Mfa::begin_totp`], [`Mfa::confirm_totp`], [`Mfa::remove_totp`],
 /// [`Mfa::regenerate_recovery_codes`], and for passkeys
-/// [`Mfa::begin_passkey_registration`], [`Mfa::finish_passkey_registration`] and
+/// `Mfa::begin_passkey_registration`, `Mfa::finish_passkey_registration` and
 /// [`Mfa::remove_passkey`]), so a handler that forgets the step-up does not
 /// compile.
 #[derive(Debug)]
@@ -805,6 +806,7 @@ pub struct Mfa {
     accept_plaintext: bool,
     lock_after: i32,
     lock_for: Duration,
+    #[cfg(feature = "passkeys")]
     passkeys: Option<passkey::RelyingParty>,
     notifier: Option<Arc<dyn Notifier>>,
     after_suspected_copy: AfterSuspectedCopy,
@@ -842,6 +844,7 @@ impl Mfa {
             accept_plaintext: true,
             lock_after: LOCK_AFTER,
             lock_for: LOCK_FOR,
+            #[cfg(feature = "passkeys")]
             passkeys: None,
             notifier: None,
             after_suspected_copy: AfterSuspectedCopy::default(),

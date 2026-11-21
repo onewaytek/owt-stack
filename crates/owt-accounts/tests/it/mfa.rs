@@ -1688,6 +1688,7 @@ async fn the_step_up_gate_can_ask_for_the_second_factor() {
 }
 
 /// Passkeys, with webauthn-rs's software authenticator standing in for the browser.
+#[cfg(feature = "passkeys")]
 mod passkeys {
     use super::*;
     use owt_accounts::mfa::passkey::{RelyingParty, RelyingPartyError, Url};

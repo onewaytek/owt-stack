@@ -22,10 +22,15 @@ lint:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 # The builds `lint` cannot see: a crate without its default features (owt-auth without
-# `jwt` is how owt-accounts builds it).
+# `jwt` is how owt-accounts builds it), and owt-accounts without `passkeys`, which must
+# neither build nor link webauthn-rs and must still pass its own tests (`test` runs them
+# with every feature).
 features:
     cargo clippy -p owt-change --all-targets --no-default-features --locked -- -D warnings
     cargo clippy -p owt-auth --all-targets --no-default-features --locked -- -D warnings
+    cargo clippy -p owt-accounts --all-targets --locked -- -D warnings
+    ! cargo tree -p owt-accounts --edges normal,build --locked --prefix none | grep -q '^webauthn-rs '
+    cargo test -p owt-accounts --locked
 
 # owt-test seals a session for any account, and owt-accounts' `test-util` records a
 # policy acceptance for any account id, so no crate of the stack may depend on owt-test, or
