@@ -11,7 +11,7 @@
 # token in it verifies; a bare ref, another key, audience, repository, workflow or age,
 # and unreachable keys all run the checks. Tokens are signed with a key made here.
 # `just templates` runs it; it needs bash 4, git 2.44 and Node 18 (on PATH, or the
-# Actions runner's own).
+# Actions runner's own, which a job container sees under /__e).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -96,7 +96,8 @@ grep -qxF "        value: \${{ jobs.tested.outputs.code == 'false' && 'false' ||
 check "code: the workflow's output is true unless the job said false" "$c" yes
 
 # --- the rc-checked record (publish-rc.yml writes, rust-ci.yml's `rc` reads) --------
-node=$(command -v node || ls -d /home/runner/externals/node*/bin/node 2>/dev/null | tail -n1 || true)
+# The Actions runner's own Node: /__e in a job container, externals/ on the host.
+node=$(command -v node || ls -d /__e/node*/bin/node /home/runner/externals/node*/bin/node 2>/dev/null | tail -n1 || true)
 [ -n "$node" ] || { echo "FAIL rc-checked: no Node to run the rc step with"; exit 1; }
 # The `rc` step's github-script and publish-rc.yml's two record steps.
 awk '
