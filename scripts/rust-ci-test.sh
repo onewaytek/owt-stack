@@ -97,7 +97,11 @@ check "code: the workflow's output is true unless the job said false" "$c" yes
 
 # --- the rc-checked record (publish-rc.yml writes, rust-ci.yml's `rc` reads) --------
 # The Actions runner's own Node: /__e in a job container, externals/ on the host.
-node=$(command -v node || ls -d /__e/node*/bin/node /home/runner/externals/node*/bin/node 2>/dev/null | tail -n1 || true)
+# The first that runs: /__e holds an Alpine build beside the glibc one.
+node=
+for n in "$(command -v node || true)" /__e/node*/bin/node /home/runner/externals/node*/bin/node; do
+  if [ -x "$n" ] && "$n" --version >/dev/null 2>&1; then node=$n; break; fi
+done
 [ -n "$node" ] || { echo "FAIL rc-checked: no Node to run the rc step with"; exit 1; }
 # The `rc` step's github-script and publish-rc.yml's two record steps.
 awk '
