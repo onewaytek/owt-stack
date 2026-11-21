@@ -5451,18 +5451,36 @@ jobs:
   `reuse-passed: false` on the call turns it off.
 - **rc's release does not check again the commit its promotion just checked.**
   `publish-rc.yml` given `gate: ${{ needs.check-rc.outputs.gate }}` (rust-ci.yml's
-  output: a hash of the checked tree, the inputs but `ref` and `diff-base`, and
-  `RUNS_ON`, set only
+  output: a hash of the checked tree, the inputs but `ref`, `diff-base` and
+  `reuse-rc-checked`, and `RUNS_ON`, set only
   when the checks passed or were reused) leaves the ref
   `refs/owt/rc-checked/<gate>/<unix time>` on the commit it moves `rc` to, replacing
   every earlier one, and only when the run's `.github/` is the candidate's own (so the
-  release calls the same checks at the same pins). When the release it dispatches on
-  `rc` calls `rust-ci.yml` with no `ref`, `tested` looks the ref up: the event's own
-  commit, the same gate, made in the last 12 hours. On a match `rust` and `css` are
-  skipped (`skipped: rc-checked`); anything else runs them, and so does a release
-  whose `ci.yml` passes inputs that differ from the candidate check's. Writing the ref
-  takes `contents: write`, which only the promotion's and release's own jobs hold,
-  never a job that runs the app's code. The trade: `cargo audit` in rc's release reads
+  release calls the same checks at the same pins). The ref is an annotated tag whose
+  message is a GitHub Actions OIDC token the job mints for the audience
+  `owt-rc-checked:<commit>:<gate>`, so the promoting job grants `id-token: write`
+  (as in the example below). When the release it dispatches on
+  `rc` calls `rust-ci.yml` with no `ref`, `tested` looks the ref up and verifies the
+  token: GitHub's signature (the issuer's published keys), the audience naming the
+  event's own commit and the same gate, this repository, a `job_workflow_ref` naming
+  `onewaytek/owt-stack`'s `publish-rc.yml` at the ref the released commit's own
+  workflows call it at (a `uses:` line under `.github/workflows/`; a copy on another
+  branch or in a fork of owt-stack does not count), and an age under 12 hours. On a match `rust`
+  and `css` are skipped (`skipped: rc-checked`); anything else runs them: no record, a
+  bare ref, a token that fails any of those checks, the issuer's keys out of reach, and
+  a release whose `ci.yml` passes inputs that differ from the candidate check's.
+  `reuse-rc-checked: false` on the release's `rust-ci.yml` call always runs them.
+
+  Why the token and not the ref: anyone or anything that can push (a collaborator, a
+  deploy key, a token with `contents: write` in any workflow) can create a ref under
+  `refs/owt/`, and no rule protects refs outside `refs/heads` and `refs/tags`, so a
+  bare ref would let them make rc's release skip its checks. A signature from GitHub's
+  issuer naming `publish-rc.yml` cannot be pushed; it exists only where that workflow
+  ran after the candidate's checks passed and moved `rc` to it. A writer who can change
+  workflows could call `publish-rc.yml` from a workflow of their own, but it records
+  only a candidate whose `.github/` is that very workflow, which is then in the
+  released commit for anyone to see, as an edit of the release workflow would be. The
+  trade: `cargo audit` in rc's release reads
   the advisory database as of the promotion. The image is still built, scanned,
   verified, signed and attested on `rc` as before, and main's release still checks its
   merge commit, which no PR checked.
@@ -5533,7 +5551,8 @@ jobs:
   required before `main` and production. It reaches `rc` only under these conditions,
   which are GitHub's for a run Dependabot triggers (it gets a read-only `GITHUB_TOKEN`
   and only Dependabot secrets, and a re-run keeps both): the `permissions:` the
-  promotion jobs declare (`contents: write`, `actions: write`, as in the example below) raise the
+  promotion jobs declare (`contents: write`, `actions: write`, and `id-token: write` on
+  the `publish-rc.yml` call, as in the example below) raise the
   token, which is what lets the merge push `rc` and dispatch the release, so the
   calling jobs must declare them and the repository must not cap the token below
   them; and every secret the checks and the candidate's checks use (the sccache
@@ -5614,7 +5633,8 @@ jobs:
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
   promote:
     needs: [candidate, check-rc]
-    permissions: {contents: write, actions: write}
+    # id-token signs the record of the checked commit (`gate`)
+    permissions: {contents: write, actions: write, id-token: write}
     uses: onewaytek/owt-stack/.github/workflows/publish-rc.yml@<commit>  # v0.14.10
     with:
       sha: "${{ needs.candidate.outputs.sha }}"
@@ -7053,6 +7073,21 @@ The router example under "Wiring an app" composes the layers; beyond it:
       .directive("img-src", "'self' data: https://cdn.example")
       .static_policy();
   ```
+
+## Upgrading from 0.14
+
+- **Breaking for every `publish-rc.yml` caller:** the job that calls it grants
+  `id-token: write` beside `contents: write` and `actions: write`
+  (`permissions: {contents: write, actions: write, id-token: write}`), whether or not
+  it passes `gate`; without it GitHub refuses to start the workflow. The token signs
+  the record that lets rc's release skip the checks.
+- **rc's release honours only a signed record.** A record that an older
+  `publish-rc.yml` left (a bare ref) no longer skips anything: the first release after
+  the upgrade runs the checks, and promotions from then on write signed records. Pin
+  `publish-rc.yml` and `rust-ci.yml` at the same release, or the release never skips.
+- An app that wants rc's release always to run the checks passes
+  `reuse-rc-checked: false` to the release's `rust-ci.yml` call (through its `ci.yml`
+  when it has one), or stops passing `gate` to `publish-rc.yml`.
 
 ## Upgrading from 0.13
 
