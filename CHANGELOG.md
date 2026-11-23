@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.1](https://github.com/onewaytek/owt-stack/compare/v0.15.0...v0.15.1) (2026-11-23)
+
+
+### Bug Fixes
+
+* **deps:** bump cookie to 0.18.3 for RUSTSEC-2026-0594 ([#383](https://github.com/onewaytek/owt-stack/issues/383)) ([ec618db](https://github.com/onewaytek/owt-stack/commit/ec618dba252fbcc2a68db4198060db9f98532488))
+* **deps:** bump url to 2.5.9 for RUSTSEC-2026-0592 ([#381](https://github.com/onewaytek/owt-stack/issues/381)) ([f2c0c6c](https://github.com/onewaytek/owt-stack/commit/f2c0c6ca1cf8994bae63f909cbfd3678c4bfedb7))
+
 ## [0.15.0](https://github.com/onewaytek/owt-stack/compare/v0.14.10...v0.15.0) (2026-11-21)
 
 
