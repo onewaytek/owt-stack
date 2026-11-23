@@ -11,7 +11,7 @@ default:
 # when REDIS_URL is set.
 #
 # Everything that must pass before a commit.
-check: fmt lint features dev-only test audit templates ci-config image-check
+check: fmt audit lint features dev-only test templates ci-config image-check
 
 # Formatting, checked rather than applied.
 fmt:
@@ -58,9 +58,21 @@ dev-only:
 test *args:
     cargo test --workspace --all-features --locked {{ args }}
 
-# No advisories against Cargo.lock (ignored ones are in .cargo/audit.toml, with why).
+# No advisories against any tracked lockfile, fuzz/'s and tests/image-sample/'s too (the
+# ignored ones are in .cargo/audit.toml, with why). It compiles nothing, so `check` runs it
+# second, before anything that builds.
 audit:
-    cargo audit --deny warnings
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # safe.directory: in a CI container the checkout's owner need not be the user.
+    locks=$(git -c safe.directory="$PWD" ls-files '*Cargo.lock')
+    [ -n "$locks" ] || { echo "no tracked Cargo.lock to audit" >&2; exit 1; }
+    status=0
+    while IFS= read -r lock; do
+        echo "cargo audit --file $lock"
+        cargo audit --deny warnings --file "$lock" || status=1
+    done <<<"$locks"
+    exit "$status"
 
 # The deploy and environment scripts against a stand-in `oc`, and the workflows' shell
 # (bash and git only; no cluster, no network, no Rust).

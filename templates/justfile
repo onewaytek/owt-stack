@@ -78,7 +78,7 @@ dev: css
 # which read DATABASE_URL's schema unless SQLX_OFFLINE is set.
 #
 # Everything that must pass before a commit.
-check: migrate fmt lint doc sqlx-check audit test
+check: migrate fmt audit lint doc sqlx-check test
 
 # Formatting, checked rather than applied: the gate must not change files.
 fmt:
@@ -96,9 +96,21 @@ doc:
 sqlx-check: migrate
     if [ -d .sqlx ]; then SQLX_OFFLINE=false cargo sqlx prepare --check -- --all-targets; fi
 
-# No advisories against Cargo.lock (ignored ones are in .cargo/audit.toml, with why).
+# No advisories against any tracked lockfile, a second workspace's (fuzz/, a load
+# generator) too; the ignored ones are in .cargo/audit.toml, with why. It compiles
+# nothing, so `check` runs it before anything that builds.
 audit:
-    cargo audit --deny warnings
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # safe.directory: in a CI container the checkout's owner need not be the user.
+    locks=$(git -c safe.directory="$PWD" ls-files '*Cargo.lock')
+    [ -n "$locks" ] || { echo "no tracked Cargo.lock to audit" >&2; exit 1; }
+    status=0
+    while IFS= read -r lock; do
+        echo "cargo audit --file $lock"
+        cargo audit --deny warnings --file "$lock" || status=1
+    done <<<"$locks"
+    exit "$status"
 
 # The tests; arguments pass through (`just test --test worlds`).
 test *args:

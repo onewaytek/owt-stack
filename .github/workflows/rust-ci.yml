@@ -108,7 +108,7 @@ on:
         type: boolean
         default: true
       audit:
-        description: Fail on advisories in Cargo.lock (cargo audit).
+        description: Fail on advisories in any tracked Cargo.lock (cargo audit).
         type: boolean
         default: true
       css-script:
@@ -826,9 +826,23 @@ jobs:
         with:
           tool: cargo-audit@0.22.2
           fallback: none
+      # Every tracked lockfile, a second workspace's (fuzz/, a load generator) too, as
+      # templates/justfile's `audit` does. It compiles nothing, so it runs before the
+      # steps that build.
       - name: cargo audit
         if: ${{ inputs.check-command == '' && inputs.audit }}
-        run: cargo audit --deny warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+          # safe.directory: the container's user need not own the checkout.
+          locks=$(git -c safe.directory="$PWD" ls-files '*Cargo.lock')
+          [ -n "$locks" ] || { echo "no tracked Cargo.lock to audit" >&2; exit 1; }
+          status=0
+          while IFS= read -r lock; do
+            echo "cargo audit --file $lock"
+            cargo audit --deny warnings --file "$lock" || status=1
+          done <<<"$locks"
+          exit "$status"
       # Also the migration step without check-command: an app with a migrate-command
       # and no .sqlx/ migrates here without sqlx-cli.
       - name: sqlx metadata is current
