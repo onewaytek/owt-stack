@@ -5344,7 +5344,8 @@ built.
 name: Release
 on:
   push: {branches: [rc]}
-  schedule: [{cron: "30 4 * * *"}]   # the stable release, nightly, on main
+  schedule: [{cron: "0 4 * * *"}]   # the stable release, nightly, on main; 4 is this
+                                    # app's own hour (see below), no other app's
   workflow_dispatch:          # promote-rc.yml and release.yml start rc releases this way;
                               # a person dispatches a stable release on main
 # One run at a time per branch, none cancelled. The release job serialises itself;
@@ -5394,6 +5395,11 @@ jobs:
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
 
+- **Pick an hour unique to the app** for the schedule; do not copy the one above.
+  GitHub starts a scheduled run late, by minutes to hours under load (on 2026-11-22,
+  eight hours), and starts the delayed ones together, so a stagger by minutes (`30 4`
+  here, `50 3` there) vanishes and every app's release queues for the same ARC scale
+  set at once. Whole hours apart (`0 1`, `0 2`, `0 3`, ...) keeps them apart.
 - **An app whose code reads its version** writes it into its files with the release:
   `with: {version-command: 'uv version "$VERSION" && uv lock', version-files:
   "pyproject.toml uv.lock", changelog: true, uv: true}`. The files are committed back
@@ -7108,6 +7114,9 @@ The router example under "Wiring an app" composes the layers; beyond it:
   clippy, rustdoc and the sqlx check; `audit` reads every lockfile `git ls-files` finds
   (a `fuzz/` or load generator's workspace too), each with `.cargo/audit.toml`.
   `rust-ci.yml`'s built-in audit step (no `check-command`) does the same.
+- **Move the nightly release off `30 4`** to an hour no other app uses (`release.yml`'s
+  `schedule`, under "Releasing an app"): GitHub delays scheduled runs and starts them
+  together, so apps sharing a minute or staggered by minutes all queue at once.
 
 ## Upgrading from 0.14
 
