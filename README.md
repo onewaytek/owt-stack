@@ -5110,7 +5110,7 @@ Every app then answers to the same commands:
 just setup        # npm ci, sqlx-cli and cargo-audit at CI's versions
 just db           # Postgres 18 and Redis 8 (compose.yaml), then the migrations
 just dev          # the app, with the stylesheet rebuilt on change
-just check        # the gate: fmt, clippy, rustdoc, .sqlx freshness, audit, tests
+just check        # the gate: fmt, audit, clippy, rustdoc, .sqlx freshness, tests
 just test --test worlds
 just prepare      # regenerate .sqlx/ after changing a query
 ```
@@ -5344,7 +5344,8 @@ built.
 name: Release
 on:
   push: {branches: [rc]}
-  schedule: [{cron: "30 4 * * *"}]   # the stable release, nightly, on main
+  schedule: [{cron: "0 4 * * *"}]   # the stable release, nightly, on main; 4 is this
+                                    # app's own hour (see below), no other app's
   workflow_dispatch:          # promote-rc.yml and release.yml start rc releases this way;
                               # a person dispatches a stable release on main
 # One run at a time per branch, none cancelled. The release job serialises itself;
@@ -5394,6 +5395,11 @@ jobs:
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
 
+- **Pick an hour unique to the app** for the schedule; do not copy the one above.
+  GitHub starts a scheduled run late, by minutes to hours under load (on 2026-11-22,
+  eight hours), and starts the delayed ones together, so a stagger by minutes (`30 4`
+  here, `50 3` there) vanishes and every app's release queues for the same ARC scale
+  set at once. Whole hours apart (`0 1`, `0 2`, `0 3`, ...) keeps them apart.
 - **An app whose code reads its version** writes it into its files with the release:
   `with: {version-command: 'uv version "$VERSION" && uv lock', version-files:
   "pyproject.toml uv.lock", changelog: true, uv: true}`. The files are committed back
@@ -7101,6 +7107,17 @@ The router example under "Wiring an app" composes the layers; beyond it:
       .static_policy();
   ```
 
+## Upgrading from 0.15
+
+- **Copy `templates/justfile`'s `check` and `audit`.** `check` runs `audit` right after
+  `fmt`, before anything compiles, so an advisory fails CI in seconds instead of after
+  clippy, rustdoc and the sqlx check; `audit` reads every lockfile `git ls-files` finds
+  (a `fuzz/` or load generator's workspace too), each with `.cargo/audit.toml`.
+  `rust-ci.yml`'s built-in audit step (no `check-command`) does the same.
+- **Move the nightly release off `30 4`** to an hour no other app uses (`release.yml`'s
+  `schedule`, under "Releasing an app"): GitHub delays scheduled runs and starts them
+  together, so apps sharing a minute or staggered by minutes all queue at once.
+
 ## Upgrading from 0.14
 
 - **Breaking for every `publish-rc.yml` caller:** the job that calls it grants
@@ -7349,11 +7366,13 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ## Working on owt-stack
 
-`just check` is the gate (fmt, clippy over every crate and feature and over
-`owt-change` and `owt-auth` without their defaults, `dev-only`, the tests with the README
-doctests, `cargo audit`, the template tests, the commitlint configuration and `image-check`), and CI
-runs the same command. `just chart` (needs oc, helm, yq and jq) proves `charts/owt-app`
-against the templates; CI's `chart.yml` runs it. The Redis tests run when
+`just check` is the gate (fmt, `cargo audit` over every tracked lockfile, clippy over
+every crate and feature and over `owt-change` and `owt-auth` without their defaults,
+`dev-only`, the tests with the README doctests, the template tests, the commitlint
+configuration and `image-check`), and CI runs the same command. `audit` comes second
+because it compiles nothing: an advisory fails the gate in seconds, not after the build.
+`just chart` (needs oc, helm, yq and jq) proves `charts/owt-app` against the templates;
+CI's `chart.yml` runs it. The Redis tests run when
 `REDIS_URL` is set, the Postgres ones (`owt-runtime`'s singleton jobs) when
 `DATABASE_URL` is, and `owt-bus`'s TLS test when `REDIS_TLS_URL` is a `rediss://` URL
 whose certificate the system trusts (`SSL_CERT_FILE=ca.crt` for a test CA; the test's
