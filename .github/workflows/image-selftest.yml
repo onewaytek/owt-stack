@@ -4,8 +4,11 @@ name: Image selftest
 # standalone crate (and a busybox Dockerfile) that is never shipped. Run it by hand
 # after changing either workflow; nothing triggers it.
 #
-# Dispatch runs both check jobs (the crane and the docker builder), which build and
-# verify the image and push nothing. With `image` set it then runs image.yml for both
+# Dispatch runs the check jobs, which build and verify the image and push nothing to
+# ghcr: the crane builder with each layer hand-off (`registry`, through the CI staging
+# registry, and `artifact`) and the docker builder. The `registry` legs need the
+# organization's CI_STAGING_* variables and secrets and the ARC runners; the `artifact`
+# leg needs Actions artifact storage. With `image` set it then runs image.yml for both
 # builders, which signs and attests as a real release does and pushes the test tags
 # `selftest` and `selftest-docker` to ghcr.io/onewaytek/owt-stack. image.yml builds a
 # release tag, so:
@@ -48,6 +51,19 @@ jobs:
       assets-script: ""
       sccache-redis: ""
       files: tests/image-sample/files
+    secrets:
+      CI_STAGING_PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
+      CI_STAGING_PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
+  check-crane-artifact:
+    permissions: {contents: read}
+    uses: ./.github/workflows/image-check.yml
+    with:
+      handoff: artifact
+      bin: image-sample
+      cargo-args: --manifest-path tests/image-sample/Cargo.toml --target-dir target
+      assets-script: ""
+      sccache-redis: ""
+      files: tests/image-sample/files
   check-docker:
     permissions: {contents: read}
     uses: ./.github/workflows/image-check.yml
@@ -57,7 +73,7 @@ jobs:
       dockerfile: tests/image-sample/Dockerfile
   image-crane:
     if: inputs.image
-    needs: [check-crane, check-docker]
+    needs: [check-crane, check-crane-artifact, check-docker]
     permissions: {contents: read, packages: write, id-token: write}
     uses: ./.github/workflows/image.yml
     with:
@@ -68,9 +84,12 @@ jobs:
       assets-script: ""
       sccache-redis: ""
       files: tests/image-sample/files
+    secrets:
+      CI_STAGING_PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
+      CI_STAGING_PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
   image-docker:
     if: inputs.image
-    needs: [check-crane, check-docker]
+    needs: [check-crane, check-crane-artifact, check-docker]
     permissions: {contents: read, packages: write, id-token: write}
     uses: ./.github/workflows/image.yml
     with:

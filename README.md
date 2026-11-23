@@ -5392,7 +5392,10 @@ jobs:
     permissions: {contents: read, packages: write, id-token: write}
     uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.15.1
     with: {version: "${{ needs.release.outputs.version }}", bin: myapp}  # see "Image"
-    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
+    secrets:
+      SCCACHE_REDIS_PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+      CI_STAGING_PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}  # the layer hand-off
+      CI_STAGING_PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
 ```
 
 - **Pick an hour unique to the app** for the schedule; do not copy the one above.
@@ -5440,7 +5443,10 @@ jobs:
       permissions: {contents: read, packages: write, id-token: write}
       uses: onewaytek/owt-stack/.github/workflows/image.yml@<commit>  # v0.15.1
       with: {version: "${{ inputs.version }}", floating-tags: "${{ inputs.floating-tags }}", bin: myapp}
-      secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
+      secrets:
+        SCCACHE_REDIS_PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+        CI_STAGING_PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
+        CI_STAGING_PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
   ```
 - **The rc channel** (optional): on each same-repository PR into `main`, once its
   checks pass, merge the PR into `rc` and cut a prerelease. After each stable
@@ -5753,9 +5759,8 @@ default `mirror.gcr.io/library/rust:1-trixie`; through sccache when the app pass
 the secret), runs `npm ci` and `npm run <assets-script>`, and packs one layer:
 `/usr/local/bin/server` (root, 0755), any `bin-links` to it, the work directory
 (0755, owned by `workdir-owner`), and the `files` under it, owned by `files-owner`.
-Before the compile, the `build` job uploads a few bytes as the `artifact-quota-probe`
-artifact, so a full Actions storage fails the job in seconds rather than at the
-layer's upload after the compile. The read-only `scan` job first checks the layer's
+The `build` job hands the layer to the jobs after it through the CI staging
+registry (see "Layer hand-off" below). The read-only `scan` job first checks the layer's
 paths and modes and that the base has `base-requires` and a glibc at least as new as
 the binary needs, and only then scans the image (below), in one pod. The `push` job
 confirms the layer is the one checked and runs none of the app's code; of the
@@ -5789,6 +5794,37 @@ the template's:
 | `vuln-fail-on` | `critical` | none (the scan below); `negligible`, `low`, `medium`, `high`, `critical`, or `none` to report only |
 | `vuln-ignore-file` | none | none; a grype configuration file in the repository whose `ignore:` rules waive findings |
 | `attest` | `true` | none; `false` skips the signature and the SBOM (`image.yml` only) |
+| `handoff` | `registry` | none; how `build` hands the layer on: `registry`, or `artifact` for runners outside the cluster (below) |
+| `staging-registry` | the `CI_STAGING_REGISTRY` variable | none; the staging registry and namespace for `handoff: registry` |
+
+**Layer hand-off:** the job that runs the app's code holds no write token, so the
+layer travels from `build` to `scan` and `push` (`scan` alone in `image-check.yml`).
+
+- **`handoff: registry`** (the default): `build` pushes the layer as a one-layer image
+  with no base to the CI staging registry, an in-cluster registry that only the ARC
+  pods reach, under a tag nothing reads (`run-<run id>-<attempt>-<random>`), and
+  outputs the manifest digest. `scan` and `push` fetch the manifest and the layer
+  blob by digest and hash both; neither resolves a tag, and `just image-check` fails
+  if a workflow change makes one. `push` still refuses a layer whose SHA-256 differs
+  from the one `scan` checked. The registry is trusted only to be available: a build
+  that rewrote or deleted a staged layer would make a run fail, never ship other
+  bytes. Staged layers are deleted two days after the push, so a rerun after that
+  reruns the whole workflow.
+  The caller passes the two secrets by name (never `secrets: inherit`):
+  `CI_STAGING_PUSH_PASSWORD`, which only the build job receives, and
+  `CI_STAGING_PULL_PASSWORD`, a read-only credential for the jobs that fetch. The
+  organization variables `CI_STAGING_REGISTRY` (registry and namespace, such as
+  `quay.owt-registry.svc/ci-staging`; the `staging-registry` input overrides it),
+  `CI_STAGING_PUSH_USER`, `CI_STAGING_PULL_USER` and `CI_STAGING_CA` (the registry's
+  CA certificate in PEM, trusted beside the system bundle) complete it, so the
+  registry can move without a release of these workflows. The staging registry must
+  hold a repository named after the app's GitHub repository (lower-case).
+- **`handoff: artifact`**, for a caller whose runners cannot reach the cluster
+  (`RUNS_ON` set to GitHub-hosted runners): the layer is the `image-layer` workflow
+  artifact, kept a day at most, and needs neither secret. Before the compile, the
+  `build` job uploads a few bytes as the `artifact-quota-probe` artifact, so a full
+  Actions storage fails the job in seconds rather than at the layer's upload after the
+  compile. `actions-cleanup.yml` deletes the artifacts once the run has completed.
 
 **Supply chain:** each image is scanned, signed and given an SBOM.
 
@@ -5980,7 +6016,10 @@ jobs:
     permissions: {contents: read}
     uses: onewaytek/owt-stack/.github/workflows/image-check.yml@<commit>  # v0.15.1
     with: {bin: myapp}   # as the release's image job
-    secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
+    secrets:
+      SCCACHE_REDIS_PASSWORD: ${{ secrets.SCCACHE_REDIS_PASSWORD }}
+      CI_STAGING_PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
+      CI_STAGING_PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
 ```
 <!-- x-release-please-end -->
 
@@ -7109,6 +7148,14 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ## Upgrading from 0.15
 
+- **Breaking for every `image.yml` and `image-check.yml` caller with the `crane`
+  builder:** the layer reaches `scan` and `push` through the CI staging registry
+  (`handoff: registry`, the default; "Layer hand-off" under "Image"). Pass
+  `CI_STAGING_PUSH_PASSWORD` and `CI_STAGING_PULL_PASSWORD` by name in each call
+  (`release.yml`'s image job, the app's own `image.yml` and `image-check.yml`); the
+  organization's `CI_STAGING_*` variables need no change in the app. A caller on
+  GitHub-hosted runners passes `handoff: artifact` instead and keeps the artifact
+  hand-off. The `docker` builder is unchanged.
 - **Copy `templates/justfile`'s `check` and `audit`.** `check` runs `audit` right after
   `fmt`, before anything compiles, so an advisory fails CI in seconds instead of after
   clippy, rustdoc and the sqlx check; `audit` reads every lockfile `git ls-files` finds

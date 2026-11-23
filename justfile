@@ -111,7 +111,7 @@ image-check:
     # Without what differs by design: the release's version and its tag checkout (two
     # steps), the commit output, and image-check.yml's own checkout.
     build() {
-        job "$1" build | sed -e '/^    outputs:$/,/^      commit:/d' -e '/RAW_VERSION/d' \
+        job "$1" build | sed -e '/^      # Recorded by the checkout/d' -e '/^      commit: /d' -e '/RAW_VERSION/d' \
             -e '/^      # The event.s own checkout/,/^          persist-credentials: false$/d' \
             -e '/^      - name: Resolve version$/,/^          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"$/d' \
             -e '/^      # The ref is qualified/,/^          persist-credentials: false$/d'
@@ -128,3 +128,15 @@ image-check:
     v2="$(scan image-check.yml)"
     diff -u <(printf '%s\n' "$b1") <(printf '%s\n' "$b2")
     diff -u <(printf '%s\n' "$v1") <(printf '%s\n' "$v2")
+    # A staging tag can be moved by any build (Quay's write permission includes it), so
+    # every read from the staging registry names a digest: each crane call on
+    # `${staging}` is `${staging}@${...}`, and the only call on STAGING_REGISTRY itself
+    # is the build job's push and its login.
+    for f in image.yml image-check.yml; do
+        bad="$(grep -nE 'crane [a-z]+ .*\$\{?staging' ".github/workflows/$f" | grep -vE '"\$\{staging\}@\$\{[A-Za-z_]+\}"' || true)"
+        bad+="$(grep -nE 'crane [a-z]+ .*STAGING_REGISTRY' ".github/workflows/$f" | grep -vE 'crane auth login "\$\{STAGING_REGISTRY%%/\*\}"' || true)"
+        bad+="$(grep -nE '^ *-t "\$\{STAGING_REGISTRY\}' ".github/workflows/$f" | grep -vE ':run-\$\{GITHUB_RUN_ID\}-' || true)"
+        [ -z "$bad" ] || { echo "$f: staging registry read not by digest:" >&2; echo "$bad" >&2; exit 1; }
+        n="$(grep -c 'crane manifest "${staging}@${STAGED}"' ".github/workflows/$f")"
+        [ "$n" -ge 1 ] || { echo "$f: no digest fetch of the staged layer" >&2; exit 1; }
+    done

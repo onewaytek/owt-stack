@@ -51,11 +51,18 @@ name: Image
 # image-check.yml builds and verifies the same image between releases, pushing
 # nothing, for a caller that grants no write permission.
 #
-# The build job hands the layer to the jobs after it as the `image-layer` artifact
-# (kept a day at most). The jobs stay apart so the job that runs the app's code never
-# holds a write token, so the hand-off stays; actions-cleanup.yml, called by the app on
-# `workflow_run`, deletes the artifact once the run has completed, unless a job that
-# reads it failed.
+# The jobs stay apart so the job that runs the app's code never holds a write token,
+# so the layer is handed from `build` to the jobs after it. With `handoff: registry`
+# (the default) the build job pushes it to the CI staging registry, an in-cluster
+# registry the ARC pods reach (CI_STAGING_REGISTRY), and outputs the manifest digest;
+# `scan` and `push` fetch the manifest and the blob by digest and hash both, never
+# resolving a tag. The build job holds the push credential, the others the read-only
+# one. Integrity rests on the digests and on `push` comparing the layer with the one
+# `scan` hashed, not on the registry, which expires staged layers after two days.
+# With `handoff: artifact`, for runners outside the cluster, the layer is the
+# `image-layer` artifact (kept a day at most); actions-cleanup.yml, called by the app
+# on `workflow_run`, deletes it once the run has completed, unless a job that reads
+# it failed.
 #
 # The jobs run only for the repository's own events: a push, a dispatch, a schedule
 # or a pull request from a branch of the repository. A fork's pull request,
@@ -215,9 +222,34 @@ on:
           `ignore:` rules waive a finding by id, package or fix state; empty for none.
         type: string
         default: ""
+      # the layer's hand-off from `build` to the jobs after it
+      handoff:
+        description: >-
+          How the crane build hands its layer on: `registry` pushes it to the CI staging
+          registry, from which the later jobs fetch it by digest; `artifact` uploads it as
+          the `image-layer` workflow artifact, for runners that cannot reach the cluster
+          (GitHub-hosted ones).
+        type: string
+        default: registry
+      staging-registry:
+        description: >-
+          The staging registry and namespace for `handoff: registry`, such as
+          `quay.owt-registry.svc/ci-staging`; empty takes the CI_STAGING_REGISTRY variable.
+        type: string
+        default: ""
     secrets:
       SCCACHE_REDIS_PASSWORD:
         description: "As in rust-ci.yml; passed by name, never with `secrets: inherit`."
+        required: false
+      CI_STAGING_PUSH_PASSWORD:
+        description: >-
+          The staging registry's push credential (`handoff: registry`), given to the
+          build job alone; passed by name.
+        required: false
+      CI_STAGING_PULL_PASSWORD:
+        description: >-
+          The staging registry's read-only credential (`handoff: registry`), given to the
+          jobs that fetch the layer; passed by name.
         required: false
     outputs:
       digest:
@@ -232,6 +264,12 @@ env:
   # SHA-256 before crane runs.
   CRANE_VERSION: "0.22.1"
   CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+  # The CI staging registry for `handoff: registry` and its two identities: one that
+  # can push (the build job's) and one that can only read. Organization variables, so
+  # the registry can change without a release of this workflow.
+  STAGING_REGISTRY: ${{ inputs.staging-registry || vars.CI_STAGING_REGISTRY }}
+  STAGING_PUSH_USER: ${{ vars.CI_STAGING_PUSH_USER }}
+  STAGING_PULL_USER: ${{ vars.CI_STAGING_PULL_USER }}
   # cosign's release binary for linux/amd64, checked against this SHA-256 before the
   # attest job runs it. Installed with curl and coreutils alone: the ARC runner image
   # has no envsubst, which sigstore/cosign-installer needs.
@@ -249,6 +287,7 @@ jobs:
     permissions:
       contents: read
     outputs:
+      staging-digest: ${{ steps.stage.outputs.digest }}
       # Recorded by the checkout, before any of the app's code runs.
       commit: ${{ steps.checkout.outputs.commit }}
     env:
@@ -256,13 +295,40 @@ jobs:
       CARGO_TERM_COLOR: always
       SQLX_OFFLINE: "true"
     steps:
-      # The artifact storage quota, probed before the compile: a full storage refuses
-      # every new artifact, the layer's too, and would otherwise discard the build at its
-      # last step. A few bytes, kept a day.
+      # Checked before the compile, so a missing variable or secret costs no build.
+      - name: Hand-off
+        env:
+          HANDOFF: ${{ inputs.handoff }}
+          PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$HANDOFF" in
+            artifact) exit 0 ;;
+            registry) ;;
+            *) echo "::error::handoff: '$HANDOFF' is neither registry nor artifact"; exit 1 ;;
+          esac
+          if ! [[ "$STAGING_REGISTRY" =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$ ]]; then
+            echo "::error::handoff: registry needs a staging registry and namespace (the staging-registry input or the CI_STAGING_REGISTRY variable), not '$STAGING_REGISTRY'"
+            exit 1
+          fi
+          if [ -z "$STAGING_PUSH_USER" ] || [ -z "$STAGING_PULL_USER" ]; then
+            echo "::error::handoff: registry needs the CI_STAGING_PUSH_USER and CI_STAGING_PULL_USER variables"
+            exit 1
+          fi
+          if [ -z "$PUSH_PASSWORD" ]; then
+            echo "::error::handoff: registry needs the CI_STAGING_PUSH_PASSWORD secret, passed by name"
+            exit 1
+          fi
+      # With `handoff: artifact`, the artifact storage quota, probed before the compile: a
+      # full storage refuses every new artifact, the layer's too, and would otherwise
+      # discard the build at its last step. A few bytes, kept a day.
       - name: Artifact storage quota
+        if: ${{ inputs.handoff == 'artifact' }}
         shell: bash
         run: echo "quota probe" > "$RUNNER_TEMP/artifact-quota-probe"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ inputs.handoff == 'artifact' }}
         with:
           name: artifact-quota-probe
           path: ${{ runner.temp }}/artifact-quota-probe
@@ -486,12 +552,59 @@ jobs:
           fi
           echo "layer: $(stat -c %s "$out/layer.tar") bytes, $(tar -tf "$out/layer.tar" | wc -l) entries"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ inputs.handoff == 'artifact' }}
         with:
           name: image-layer
           path: ${{ runner.temp }}/image-layer/layer.tar
           retention-days: 1
           if-no-files-found: error
           overwrite: true
+      - name: Install crane
+        if: ${{ inputs.handoff == 'registry' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/crane"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/crane.tar.gz" \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  $dir/crane.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/crane.tar.gz" -C "$dir" crane
+          rm "$dir/crane.tar.gz"
+          echo "$dir" >> "$GITHUB_PATH"
+      # A one-layer image with no base, under a tag nothing reads (the run, its attempt
+      # and a random suffix, so no push ever moves a tag); the jobs after this one fetch it
+      # by the manifest digest this step outputs. The push identity can add images to the
+      # staging registry and nothing else this run relies on.
+      - name: Stage the layer
+        id: stage
+        if: ${{ inputs.handoff == 'registry' }}
+        env:
+          PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
+          STAGING_CA: ${{ vars.CI_STAGING_CA }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$RUNNER_TEMP/staging"
+          rm -rf "$tmp" && mkdir -m 700 "$tmp"
+          trap 'rm -rf "$tmp"' EXIT
+          export DOCKER_CONFIG="$tmp/auth" SSL_CERT_FILE="$tmp/ca.pem"
+          # The system bundle plus the staging registry's CA (a service CA): crane trusts
+          # both, so the same file serves a step that also reaches a public registry.
+          for b in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+            if [ -f "$b" ]; then cat "$b"; break; fi
+          done > "$SSL_CERT_FILE"
+          if [ -n "$STAGING_CA" ]; then printf '%s\n' "$STAGING_CA" >> "$SSL_CERT_FILE"; fi
+          repo="$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          suffix="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          printf '%s' "$PUSH_PASSWORD" \
+            | crane auth login "${STAGING_REGISTRY%%/*}" -u "$STAGING_PUSH_USER" --password-stdin
+          out="$(crane append --new_layer "$RUNNER_TEMP/image-layer/layer.tar" \
+            -t "${STAGING_REGISTRY}/${repo}:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}")"
+          digest="${out##*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::crane printed no digest ('$out')"; exit 1; }
+          echo "staged ${STAGING_REGISTRY}/${repo}@${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
   # The layer and the base checked, then the image as it would be pushed (the base and
   # the layer) scanned for vulnerabilities, before anything is pushed. One job: one pod
@@ -511,6 +624,7 @@ jobs:
       IGNORE_FILE: ${{ inputs.vuln-ignore-file }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ inputs.handoff == 'artifact' }}
         with:
           name: image-layer
           path: ${{ runner.temp }}/image-layer
@@ -526,6 +640,55 @@ jobs:
           tar -xzf "$dir/crane.tar.gz" -C "$dir" crane
           rm "$dir/crane.tar.gz"
           echo "$dir" >> "$GITHUB_PATH"
+      # With `handoff: registry`, the layer comes from the staging registry by the digest
+      # the build job output. No step resolves a staging tag: the manifest and the blob
+      # are each hashed here and must match their digests, so the registry is trusted
+      # only to be available, and the bytes below are the bytes the build job pushed.
+      - name: Fetch the layer
+        if: ${{ inputs.handoff == 'registry' }}
+        env:
+          STAGED: ${{ needs.build.outputs.staging-digest }}
+          PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
+          STAGING_CA: ${{ vars.CI_STAGING_CA }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$STAGED" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::the build job output no staging digest ('$STAGED')"; exit 1; }
+          [ -n "$PULL_PASSWORD" ] \
+            || { echo "::error::handoff: registry needs the CI_STAGING_PULL_PASSWORD secret, passed by name"; exit 1; }
+          tmp="$RUNNER_TEMP/staging"
+          rm -rf "$tmp" && mkdir -m 700 "$tmp"
+          trap 'rm -rf "$tmp"' EXIT
+          export DOCKER_CONFIG="$tmp/auth" SSL_CERT_FILE="$tmp/ca.pem"
+          # The system bundle plus the staging registry's CA (a service CA): crane trusts
+          # both, so the same file serves a step that also reaches a public registry.
+          for b in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+            if [ -f "$b" ]; then cat "$b"; break; fi
+          done > "$SSL_CERT_FILE"
+          if [ -n "$STAGING_CA" ]; then printf '%s\n' "$STAGING_CA" >> "$SSL_CERT_FILE"; fi
+          staging="${STAGING_REGISTRY}/$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          printf '%s' "$PULL_PASSWORD" \
+            | crane auth login "${STAGING_REGISTRY%%/*}" -u "$STAGING_PULL_USER" --password-stdin
+          sha() { echo "sha256:$(sha256sum "$1" | cut -d' ' -f1)"; }
+          crane manifest "${staging}@${STAGED}" > "$tmp/manifest.json"
+          [ "$(sha "$tmp/manifest.json")" = "$STAGED" ] \
+            || { echo "::error::the staged manifest does not match its digest"; exit 1; }
+          [ "$(jq '.layers | length' "$tmp/manifest.json")" = 1 ] \
+            || { echo "::error::the staged image does not hold exactly one layer"; exit 1; }
+          media="$(jq -r '.layers[0].mediaType' "$tmp/manifest.json")"
+          blob="$(jq -r '.layers[0].digest' "$tmp/manifest.json")"
+          [[ "$blob" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad layer digest '$blob'"; exit 1; }
+          crane blob "${staging}@${blob}" > "$tmp/blob"
+          [ "$(sha "$tmp/blob")" = "$blob" ] \
+            || { echo "::error::the staged layer does not match its digest"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/image-layer"
+          case "$media" in
+            *.tar.gzip | *.tar+gzip) gzip -dc "$tmp/blob" > "$RUNNER_TEMP/image-layer/layer.tar" ;;
+            *.tar) mv "$tmp/blob" "$RUNNER_TEMP/image-layer/layer.tar" ;;
+            *) echo "::error::unexpected layer media type '$media'"; exit 1 ;;
+          esac
+          echo "layer ${staging}@${blob}: $(stat -c %s "$RUNNER_TEMP/image-layer/layer.tar") bytes"
       # The build job ran the app's code; this job trusts its layer only as far as this
       # check: the paths packed, nothing that is not a file, directory or symlink, and
       # no setuid, setgid or sticky bit.
@@ -779,6 +942,7 @@ jobs:
             exit 1
           fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ inputs.handoff == 'artifact' }}
         with:
           name: image-layer
           path: ${{ runner.temp }}/image-layer
@@ -794,6 +958,55 @@ jobs:
           tar -xzf "$dir/crane.tar.gz" -C "$dir" crane
           rm "$dir/crane.tar.gz"
           echo "$dir" >> "$GITHUB_PATH"
+      # With `handoff: registry`, the layer comes from the staging registry by the digest
+      # the build job output. No step resolves a staging tag: the manifest and the blob
+      # are each hashed here and must match their digests, so the registry is trusted
+      # only to be available, and the bytes below are the bytes the build job pushed.
+      - name: Fetch the layer
+        if: ${{ inputs.handoff == 'registry' }}
+        env:
+          STAGED: ${{ needs.build.outputs.staging-digest }}
+          PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
+          STAGING_CA: ${{ vars.CI_STAGING_CA }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$STAGED" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::the build job output no staging digest ('$STAGED')"; exit 1; }
+          [ -n "$PULL_PASSWORD" ] \
+            || { echo "::error::handoff: registry needs the CI_STAGING_PULL_PASSWORD secret, passed by name"; exit 1; }
+          tmp="$RUNNER_TEMP/staging"
+          rm -rf "$tmp" && mkdir -m 700 "$tmp"
+          trap 'rm -rf "$tmp"' EXIT
+          export DOCKER_CONFIG="$tmp/auth" SSL_CERT_FILE="$tmp/ca.pem"
+          # The system bundle plus the staging registry's CA (a service CA): crane trusts
+          # both, so the same file serves a step that also reaches a public registry.
+          for b in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+            if [ -f "$b" ]; then cat "$b"; break; fi
+          done > "$SSL_CERT_FILE"
+          if [ -n "$STAGING_CA" ]; then printf '%s\n' "$STAGING_CA" >> "$SSL_CERT_FILE"; fi
+          staging="${STAGING_REGISTRY}/$(echo "${GITHUB_REPOSITORY#*/}" | tr '[:upper:]' '[:lower:]')"
+          printf '%s' "$PULL_PASSWORD" \
+            | crane auth login "${STAGING_REGISTRY%%/*}" -u "$STAGING_PULL_USER" --password-stdin
+          sha() { echo "sha256:$(sha256sum "$1" | cut -d' ' -f1)"; }
+          crane manifest "${staging}@${STAGED}" > "$tmp/manifest.json"
+          [ "$(sha "$tmp/manifest.json")" = "$STAGED" ] \
+            || { echo "::error::the staged manifest does not match its digest"; exit 1; }
+          [ "$(jq '.layers | length' "$tmp/manifest.json")" = 1 ] \
+            || { echo "::error::the staged image does not hold exactly one layer"; exit 1; }
+          media="$(jq -r '.layers[0].mediaType' "$tmp/manifest.json")"
+          blob="$(jq -r '.layers[0].digest' "$tmp/manifest.json")"
+          [[ "$blob" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad layer digest '$blob'"; exit 1; }
+          crane blob "${staging}@${blob}" > "$tmp/blob"
+          [ "$(sha "$tmp/blob")" = "$blob" ] \
+            || { echo "::error::the staged layer does not match its digest"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/image-layer"
+          case "$media" in
+            *.tar.gzip | *.tar+gzip) gzip -dc "$tmp/blob" > "$RUNNER_TEMP/image-layer/layer.tar" ;;
+            *.tar) mv "$tmp/blob" "$RUNNER_TEMP/image-layer/layer.tar" ;;
+            *) echo "::error::unexpected layer media type '$media'"; exit 1 ;;
+          esac
+          echo "layer ${staging}@${blob}: $(stat -c %s "$RUNNER_TEMP/image-layer/layer.tar") bytes"
       - name: Push
         id: push
         env:
