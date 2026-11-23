@@ -18,8 +18,8 @@ name: Image
 # Two builders:
 #
 # - `crane` (the default) builds on the arc-openshift-k8s ARC scale set (override
-#   with the RUNS_ON repository or organization variable, a JSON string such as
-#   '"ubuntu-latest"'), with no Docker daemon and no privileges. It produces what
+#   with the `runs-on` input or the RUNS_ON repository or organization variable, a JSON
+#   string such as '"ubuntu-latest"'), with no Docker daemon and no privileges. It produces what
 #   templates/Dockerfile's runtime stage produces, from inputs instead of a
 #   Dockerfile. The `build` job builds the static assets with npm, compiles the
 #   binary in a Rust job container in the work directory, as the Dockerfile does
@@ -59,6 +59,11 @@ name: Image
 # resolving a tag. The build job holds the push credential, the others the read-only
 # one. Integrity rests on the digests and on `push` comparing the layer with the one
 # `scan` hashed, not on the registry, which expires staged layers after two days.
+# Each app has its own push identity (CI_STAGING_PUSH_USER and CI_STAGING_PUSH_PASSWORD,
+# set on the app's repository), which can write only that app's staging repository,
+# so no app's build can retag or delete another's staged layers; the read-only
+# identity is shared. `staging-environment` takes all of them from a GitHub
+# environment instead (owt-stack's own selftest).
 # With `handoff: artifact`, for runners outside the cluster, the layer is the
 # `image-layer` artifact (kept a day at most); actions-cleanup.yml, called by the app
 # on `workflow_run`, deletes it once the run has completed, unless a job that reads
@@ -237,6 +242,19 @@ on:
           `quay.owt-registry.svc/ci-staging`; empty takes the CI_STAGING_REGISTRY variable.
         type: string
         default: ""
+      staging-environment:
+        description: >-
+          A GitHub environment of the caller's repository for the jobs that touch the
+          staging registry: its CI_STAGING_* variables and secrets take the place of the
+          repository's and organization's and of the secrets passed. Empty: none.
+        type: string
+        default: ""
+      runs-on:
+        description: >-
+          The runners for the crane jobs, a JSON string such as `"ubuntu-latest"`; empty
+          takes the RUNS_ON variable, else the arc-openshift-k8s scale set.
+        type: string
+        default: ""
     secrets:
       SCCACHE_REDIS_PASSWORD:
         description: "As in rust-ci.yml; passed by name, never with `secrets: inherit`."
@@ -264,12 +282,6 @@ env:
   # SHA-256 before crane runs.
   CRANE_VERSION: "0.22.1"
   CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
-  # The CI staging registry for `handoff: registry` and its two identities: one that
-  # can push (the build job's) and one that can only read. Organization variables, so
-  # the registry can change without a release of this workflow.
-  STAGING_REGISTRY: ${{ inputs.staging-registry || vars.CI_STAGING_REGISTRY }}
-  STAGING_PUSH_USER: ${{ vars.CI_STAGING_PUSH_USER }}
-  STAGING_PULL_USER: ${{ vars.CI_STAGING_PULL_USER }}
   # cosign's release binary for linux/amd64, checked against this SHA-256 before the
   # attest job runs it. Installed with curl and coreutils alone: the ARC runner image
   # has no envsubst, which sigstore/cosign-installer needs.
@@ -282,7 +294,8 @@ jobs:
       ${{ inputs.builder == 'crane' && github.repository_owner == 'onewaytek'
       && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
       || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
-    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    runs-on: ${{ fromJSON(inputs.runs-on || vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    environment: ${{ inputs.staging-environment }}
     container: ${{ inputs.container }}
     permissions:
       contents: read
@@ -299,6 +312,9 @@ jobs:
       - name: Hand-off
         env:
           HANDOFF: ${{ inputs.handoff }}
+          STAGING_REGISTRY: ${{ inputs.staging-registry || vars.CI_STAGING_REGISTRY }}
+          STAGING_PUSH_USER: ${{ vars.CI_STAGING_PUSH_USER }}
+          STAGING_PULL_USER: ${{ vars.CI_STAGING_PULL_USER }}
           PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
         shell: bash
         run: |
@@ -582,6 +598,8 @@ jobs:
         env:
           PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
           STAGING_CA: ${{ vars.CI_STAGING_CA }}
+          STAGING_REGISTRY: ${{ inputs.staging-registry || vars.CI_STAGING_REGISTRY }}
+          STAGING_PUSH_USER: ${{ vars.CI_STAGING_PUSH_USER }}
         shell: bash
         run: |
           set -euo pipefail
@@ -612,7 +630,8 @@ jobs:
   # permission and runs none of the app's code. image-check.yml has the same job.
   scan:
     needs: build
-    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    runs-on: ${{ fromJSON(inputs.runs-on || vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    environment: ${{ inputs.staging-environment }}
     permissions:
       contents: read
     outputs:
@@ -650,6 +669,8 @@ jobs:
           STAGED: ${{ needs.build.outputs.staging-digest }}
           PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
           STAGING_CA: ${{ vars.CI_STAGING_CA }}
+          STAGING_REGISTRY: ${{ inputs.staging-registry || vars.CI_STAGING_REGISTRY }}
+          STAGING_PULL_USER: ${{ vars.CI_STAGING_PULL_USER }}
         shell: bash
         run: |
           set -euo pipefail
@@ -860,7 +881,8 @@ jobs:
 
   push:
     needs: [build, scan]
-    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    runs-on: ${{ fromJSON(inputs.runs-on || vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    environment: ${{ inputs.staging-environment }}
     permissions:
       contents: read
       packages: write
@@ -968,6 +990,8 @@ jobs:
           STAGED: ${{ needs.build.outputs.staging-digest }}
           PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
           STAGING_CA: ${{ vars.CI_STAGING_CA }}
+          STAGING_REGISTRY: ${{ inputs.staging-registry || vars.CI_STAGING_REGISTRY }}
+          STAGING_PULL_USER: ${{ vars.CI_STAGING_PULL_USER }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1281,7 +1305,7 @@ jobs:
       ${{ !cancelled() && inputs.attest
       && (needs.push.result == 'success' || needs.docker.result == 'success') }}
     needs: [push, docker]
-    runs-on: ${{ fromJSON(vars.RUNS_ON || '"arc-openshift-k8s"') }}
+    runs-on: ${{ fromJSON(inputs.runs-on || vars.RUNS_ON || '"arc-openshift-k8s"') }}
     permissions:
       packages: write
       id-token: write

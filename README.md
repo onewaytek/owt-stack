@@ -5796,6 +5796,8 @@ the template's:
 | `attest` | `true` | none; `false` skips the signature and the SBOM (`image.yml` only) |
 | `handoff` | `registry` | none; how `build` hands the layer on: `registry`, or `artifact` for runners outside the cluster (below) |
 | `staging-registry` | the `CI_STAGING_REGISTRY` variable | none; the staging registry and namespace for `handoff: registry` |
+| `staging-environment` | none | none; a GitHub environment whose `CI_STAGING_*` variables and secrets the hand-off jobs use instead |
+| `runs-on` | the `RUNS_ON` variable, else `"arc-openshift-k8s"` | none; the crane jobs' runners, a JSON string |
 
 **Layer hand-off:** the job that runs the app's code holds no write token, so the
 layer travels from `build` to `scan` and `push` (`scan` alone in `image-check.yml`).
@@ -5812,13 +5814,20 @@ layer travels from `build` to `scan` and `push` (`scan` alone in `image-check.ym
   reruns the whole workflow.
   The caller passes the two secrets by name (never `secrets: inherit`):
   `CI_STAGING_PUSH_PASSWORD`, which only the build job receives, and
-  `CI_STAGING_PULL_PASSWORD`, a read-only credential for the jobs that fetch. The
-  organization variables `CI_STAGING_REGISTRY` (registry and namespace, such as
-  `quay.owt-registry.svc/ci-staging`; the `staging-registry` input overrides it),
-  `CI_STAGING_PUSH_USER`, `CI_STAGING_PULL_USER` and `CI_STAGING_CA` (the registry's
-  CA certificate in PEM, trusted beside the system bundle) complete it, so the
-  registry can move without a release of these workflows. The staging registry must
-  hold a repository named after the app's GitHub repository (lower-case).
+  `CI_STAGING_PULL_PASSWORD`, a read-only credential for the jobs that fetch.
+  Each app has its own push identity: `CI_STAGING_PUSH_PASSWORD` and the variable
+  `CI_STAGING_PUSH_USER` are set on the app's repository, and that identity can write
+  only the app's own staging repository, so one app's build cannot retag or delete
+  another's staged layers. The organization holds the shared read-only
+  `CI_STAGING_PULL_PASSWORD` and the variables `CI_STAGING_REGISTRY` (registry and
+  namespace, such as `quay.owt-registry.svc/ci-staging`; the `staging-registry` input
+  overrides it), `CI_STAGING_PULL_USER` and `CI_STAGING_CA` (the registry's CA
+  certificate in PEM, trusted beside the system bundle), so the registry can move
+  without a release of these workflows. The staging registry must hold a repository
+  named after the app's GitHub repository (lower-case). With `staging-environment`,
+  the jobs that touch the registry run in that GitHub environment and take every
+  `CI_STAGING_*` value from it; owt-stack's own selftest uses one, so its public
+  repository holds credentials for a staging organization no app uses.
 - **`handoff: artifact`**, for a caller whose runners cannot reach the cluster
   (`RUNS_ON` set to GitHub-hosted runners): the layer is the `image-layer` workflow
   artifact, kept a day at most, and needs neither secret. Before the compile, the
@@ -7152,8 +7161,9 @@ The router example under "Wiring an app" composes the layers; beyond it:
   builder:** the layer reaches `scan` and `push` through the CI staging registry
   (`handoff: registry`, the default; "Layer hand-off" under "Image"). Pass
   `CI_STAGING_PUSH_PASSWORD` and `CI_STAGING_PULL_PASSWORD` by name in each call
-  (`release.yml`'s image job, the app's own `image.yml` and `image-check.yml`); the
-  organization's `CI_STAGING_*` variables need no change in the app. A caller on
+  (`release.yml`'s image job, the app's own `image.yml` and `image-check.yml`). The
+  push secret and `CI_STAGING_PUSH_USER` are set on the app's repository (its own
+  push identity), the rest on the organization. A caller on
   GitHub-hosted runners passes `handoff: artifact` instead and keeps the artifact
   hand-off. The `docker` builder is unchanged.
 - **Copy `templates/justfile`'s `check` and `audit`.** `check` runs `audit` right after

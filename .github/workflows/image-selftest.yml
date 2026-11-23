@@ -6,10 +6,12 @@ name: Image selftest
 #
 # Dispatch runs the check jobs, which build and verify the image and push nothing to
 # ghcr: the crane builder with each layer hand-off (`registry`, through the CI staging
-# registry, and `artifact`) and the docker builder. The `registry` legs need the
-# organization's CI_STAGING_* variables and secrets and the ARC runners; the `artifact`
-# leg needs Actions artifact storage. With `image` set it then runs image.yml for both
-# builders, which signs and attests as a real release does and pushes the test tags
+# registry, and `artifact`) and the docker builder. The `registry` legs run on the ARC
+# runners in the `ci-staging-selftest` environment, whose CI_STAGING_* variables and
+# secrets name a staging organization of this repository's own: its robots cannot
+# reach any app's staged layers. The `artifact` leg runs on `artifact-runs-on`
+# (GitHub-hosted by default) and needs Actions artifact storage. With `image` set it
+# then runs image.yml for both builders, which signs and attests as a real release does and pushes the test tags
 # `selftest` and `selftest-docker` to ghcr.io/onewaytek/owt-stack. image.yml builds a
 # release tag, so:
 #
@@ -38,6 +40,10 @@ on:
         description: With image, a prerelease tag that exists on the commit (v0.0.0-rc.N).
         type: string
         default: ""
+      artifact-runs-on:
+        description: "The runners for the `handoff: artifact` leg, a JSON string."
+        type: string
+        default: '"ubuntu-latest"'
 
 permissions: {}
 
@@ -51,14 +57,13 @@ jobs:
       assets-script: ""
       sccache-redis: ""
       files: tests/image-sample/files
-    secrets:
-      CI_STAGING_PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
-      CI_STAGING_PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
+      staging-environment: ci-staging-selftest
   check-crane-artifact:
     permissions: {contents: read}
     uses: ./.github/workflows/image-check.yml
     with:
       handoff: artifact
+      runs-on: ${{ inputs.artifact-runs-on }}
       bin: image-sample
       cargo-args: --manifest-path tests/image-sample/Cargo.toml --target-dir target
       assets-script: ""
@@ -84,9 +89,7 @@ jobs:
       assets-script: ""
       sccache-redis: ""
       files: tests/image-sample/files
-    secrets:
-      CI_STAGING_PUSH_PASSWORD: ${{ secrets.CI_STAGING_PUSH_PASSWORD }}
-      CI_STAGING_PULL_PASSWORD: ${{ secrets.CI_STAGING_PULL_PASSWORD }}
+      staging-environment: ci-staging-selftest
   image-docker:
     if: inputs.image
     needs: [check-crane, check-crane-artifact, check-docker]
