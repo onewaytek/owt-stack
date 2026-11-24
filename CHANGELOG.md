@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.2](https://github.com/onewaytek/owt-stack/compare/v0.15.1...v0.15.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **deps:** bump actions/create-github-app-token from 3.3.0 to 3.4.0 ([#387](https://github.com/onewaytek/owt-stack/issues/387)) ([b47104c](https://github.com/onewaytek/owt-stack/commit/b47104c60ca7e3cf6d775021b89f1d09ef4cb73d))
+* **deps:** bump amannn/action-semantic-pull-request from 6.1.2 to 6.1.3 ([#388](https://github.com/onewaytek/owt-stack/issues/388)) ([1e2573f](https://github.com/onewaytek/owt-stack/commit/1e2573f589631adf0cc3a3e251247c91bd5423ce))
+* **deps:** bump astral-sh/setup-uv from 10.3.3 to 10.4.0 ([#385](https://github.com/onewaytek/owt-stack/issues/385)) ([b1f119a](https://github.com/onewaytek/owt-stack/commit/b1f119af04323535d586e87d1fe7a50553e9970a))
+* **deps:** bump qrcode from 0.14.1 to 0.15.0 ([#390](https://github.com/onewaytek/owt-stack/issues/390)) ([f1e594b](https://github.com/onewaytek/owt-stack/commit/f1e594bf5647e256de87f0c8fd9f6a742bdd5b05))
+* **deps:** bump taiki-e/install-action from 2.90.3 to 2.90.6 ([#386](https://github.com/onewaytek/owt-stack/issues/386)) ([68f0db2](https://github.com/onewaytek/owt-stack/commit/68f0db2718bdf870b6b688239ae30dbebd270566))
+* **deps:** bump the patch-and-minor group with 7 updates ([#389](https://github.com/onewaytek/owt-stack/issues/389)) ([1df2da3](https://github.com/onewaytek/owt-stack/commit/1df2da34e58211dd15ab82a85f8b931bc5122bfb))
+
 ## [0.15.1](https://github.com/onewaytek/owt-stack/compare/v0.15.0...v0.15.1) (2026-11-23)
 
 
