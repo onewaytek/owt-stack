@@ -1258,7 +1258,7 @@ impl Mfa {
                     .min_dimensions(224, 224)
                     .build()
             })
-            .map_err(|e| MfaError::fault(e.into()))?;
+            .map_err(|e| MfaError::fault(anyhow::anyhow!("qr encode: {e}")))?;
         Ok(TotpEnrollment {
             secret: secret.to_base32(),
             uri,
