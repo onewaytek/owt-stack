@@ -577,6 +577,38 @@ the handler and write `<script nonce="{{ nonce }}">`.
   unset) and `SESSION_ABSOLUTE_LIFETIME` (24 hours when unset; see "Idle timeout and lifetimes"). `Sessions::from_vars` reads a map
   instead, for tests.
 
+  **The cookie's name.** With `secure`, a name without a `__Host-` or `__Secure-`
+  prefix becomes `__Host-<name>` (`Secure`, `Path=/`, no `Domain`): a sibling
+  subdomain can then neither plant a session of its own nor shadow the real one.
+  `cookie_name()` returns the name in force. A session still under the bare name
+  opens, and the layer re-issues it under the prefixed name (same id, start and
+  last-active time) and removes the bare cookie, so the prefix signs no one out; a
+  prefixed cookie always wins over a bare one. `legacy_cookie_name()` returns the bare
+  name while it is read. One `max_age` after the release that adds the prefix, end
+  the transition with `without_legacy_cookie()`: until then a sibling can still
+  plant a bare cookie on a browser that has no prefixed one. A name that already has
+  a prefix (`"__Host-session"`) is kept as given and has no legacy name, and without
+  `secure` (plain-HTTP development) the name is kept as well, so
+  `if secure { "__Host-myapp" } else { "myapp" }` and `"myapp"` name the same cookie.
+  Code that writes the session's `Cookie` header itself (tests, load generators)
+  takes the name from `cookie_name()`, never a literal.
+
+  ```rust
+  # fn main() -> anyhow::Result<()> {
+  use owt_web::session::{Sessions, key_for};
+  # #[derive(Clone, Default, serde::Serialize, serde::Deserialize)] struct SessionData;
+  # let key = key_for("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==", "myapp/test")?;
+  let max_age = std::time::Duration::from_secs(14 * 86_400);
+  let sessions = Sessions::<SessionData>::new(key.clone(), "myapp_session", max_age, true);
+  assert_eq!(sessions.cookie_name(), "__Host-myapp_session");
+  assert_eq!(sessions.legacy_cookie_name(), Some("myapp_session")); // read, re-issued, removed
+  let later = sessions.without_legacy_cookie(); // one max_age after the release
+  assert_eq!(later.legacy_cookie_name(), None);
+  let dev = Sessions::<SessionData>::new(key, "myapp_session", max_age, false);
+  assert_eq!(dev.cookie_name(), "myapp_session"); // plain HTTP: no prefix
+  # Ok(()) }
+  ```
+
   **Moving onto `from_env` without signing anyone out.** The key must stay the one
   the app derives today, so first read the purpose actually in effect, from the live
   configuration rather than the code's defaults: an app whose unset purpose meant
@@ -5972,7 +6004,7 @@ so a base image's new vulnerability shows within a week, not at the next release
 name: Image check
 on:
   workflow_dispatch:                 # any branch, before a risky merge
-  schedule: [{cron: "37 6 * * 1"}]   # weekly, on main
+  schedule: [{cron: "37 6 * * 1"}]   # weekly, on main; pick an hour and weekday unique to the app
 permissions: {}
 jobs:
   image:

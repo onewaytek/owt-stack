@@ -216,6 +216,9 @@ struct Config {
     /// Keys that still open sessions and seal none: a rotation's predecessors.
     old_keys: Vec<Key>,
     cookie: String,
+    /// The name the cookie had before [`Sessions::new`] gave it the `__Host-` prefix:
+    /// still read, and its session re-issued under [`Self::cookie`].
+    legacy: Option<String>,
     max_age: Duration,
     absolute: Duration,
     /// A session idle this long is no session.
@@ -377,6 +380,11 @@ struct Sealed<T> {
     data: T,
 }
 
+/// The name of the last-active cookie beside the session cookie `cookie`.
+fn seen_name(cookie: &str) -> String {
+    format!("{cookie}-seen")
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -387,17 +395,30 @@ impl<T: SessionData> Sessions<T> {
     /// Sessions sealed with `key` in the cookie `cookie`, good for `max_age`, `Secure`
     /// when `secure` (always, outside plain-HTTP development), ending after
     /// [`IDLE_TIMEOUT`] without activity and [`ABSOLUTE_LIFETIME`] (or `max_age`, if
-    /// longer) after they began. Name the cookie
-    /// `__Host-<name>` in production: browsers then refuse a copy set over plain HTTP
-    /// or by a sibling subdomain. A `__Host-` or `__Secure-` name is always `Secure`.
+    /// longer) after they began.
+    ///
+    /// When `secure`, a `cookie` without a `__Host-` or `__Secure-` prefix is named
+    /// `__Host-<cookie>`: browsers then refuse a copy set over plain HTTP or by a
+    /// sibling subdomain. A session presented under the bare `cookie` still opens and
+    /// is re-issued under the prefixed name, its bare cookie removed, so the prefix
+    /// signs no one out; [`without_legacy_cookie`](Self::without_legacy_cookie) stops
+    /// reading the bare name. A name that already has a prefix is kept as given, and
+    /// is always `Secure`. Without `secure` (plain-HTTP development) the name is kept.
     pub fn new(key: Key, cookie: impl Into<String>, max_age: Duration, secure: bool) -> Self {
         let cookie = cookie.into();
-        let secure = secure || cookie.starts_with("__Host-") || cookie.starts_with("__Secure-");
+        let prefixed = cookie.starts_with("__Host-") || cookie.starts_with("__Secure-");
+        let (cookie, legacy) = if secure && !prefixed {
+            (format!("__Host-{cookie}"), Some(cookie))
+        } else {
+            (cookie, None)
+        };
+        let secure = secure || prefixed;
         Self {
             inner: Arc::new(Config {
                 key,
                 old_keys: Vec::new(),
                 cookie,
+                legacy,
                 max_age,
                 absolute: ABSOLUTE_LIFETIME.max(max_age),
                 idle: Some(IDLE_TIMEOUT),
@@ -604,7 +625,7 @@ impl<T: SessionData> Sessions<T> {
 
     /// The cookie that carries an activity-only refresh of the last-active time.
     fn seen_cookie_name(&self) -> String {
-        format!("{}-seen", self.inner.cookie)
+        seen_name(&self.inner.cookie)
     }
 
     /// The sealed value of the last-active cookie for session `id`.
@@ -622,8 +643,8 @@ impl<T: SessionData> Sessions<T> {
     }
 
     /// The last-active time a last-active cookie records for session `id`.
-    fn unseal_seen(&self, value: &str, id: &str) -> Option<u64> {
-        let name = self.seen_cookie_name();
+    fn unseal_seen(&self, name: &str, value: &str, id: &str) -> Option<u64> {
+        let name = name.to_owned();
         let mut jar = cookie::CookieJar::new();
         jar.add_original(Cookie::new(name.clone(), value.to_owned()));
         let opened = std::iter::once(&self.inner.key)
@@ -669,10 +690,26 @@ impl<T: SessionData> Sessions<T> {
         self
     }
 
-    /// The cookie's name.
+    /// The cookie's name: `__Host-<name>` when [`new`](Self::new) gave it the prefix.
     #[must_use]
     pub fn cookie_name(&self) -> &str {
         &self.inner.cookie
+    }
+
+    /// The bare name a session is still read from and moved off, if
+    /// [`new`](Self::new) gave the cookie the `__Host-` prefix.
+    #[must_use]
+    pub fn legacy_cookie_name(&self) -> Option<&str> {
+        self.inner.legacy.as_deref()
+    }
+
+    /// Stop reading the bare name [`new`](Self::new) prefixed: a session still under
+    /// it is no session. For when every session under it has lapsed (`max_age` after
+    /// the release that prefixed it), or for an app that never used the bare name.
+    #[must_use]
+    pub fn without_legacy_cookie(mut self) -> Self {
+        Arc::make_mut(&mut self.inner).legacy = None;
+        self
     }
 
     /// Whether these sessions open one sealed with `key` under the same cookie name
@@ -729,11 +766,16 @@ impl<T: SessionData> Sessions<T> {
     }
 
     fn unseal_presented(&self, value: &str) -> Option<Opened<T>> {
+        self.unseal_named(&self.inner.cookie, value)
+    }
+
+    /// A session sealed under the cookie name `name`, which the seal authenticates.
+    fn unseal_named(&self, name: &str, value: &str) -> Option<Opened<T>> {
         let mut jar = cookie::CookieJar::new();
-        jar.add_original(Cookie::new(self.inner.cookie.clone(), value.to_owned()));
+        jar.add_original(Cookie::new(name.to_owned(), value.to_owned()));
         let opened = std::iter::once(&self.inner.key)
             .chain(&self.inner.old_keys)
-            .find_map(|key| jar.private(key).get(&self.inner.cookie))?;
+            .find_map(|key| jar.private(key).get(name))?;
         let sealed: Sealed<T> = serde_json::from_str(opened.value()).ok()?;
         let now = now();
         let alive = sealed.expires > now
@@ -755,8 +797,9 @@ impl<T: SessionData> Sessions<T> {
 
     /// The request's session: the session cookie, its last-active time raised by the
     /// last-active cookie when that names the same session, and the idle timeout
-    /// applied.
-    fn open(&self, headers: &HeaderMap) -> Option<Opened<T>> {
+    /// applied. Without a session under the cookie's name, the one under the legacy
+    /// name, with its own last-active cookie; `true` beside it says it came from there.
+    fn open(&self, headers: &HeaderMap) -> Option<(Opened<T>, bool)> {
         let cookies: Vec<Cookie<'static>> = headers
             .get_all(header::COOKIE)
             .iter()
@@ -767,19 +810,30 @@ impl<T: SessionData> Sessions<T> {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let current = self.open_named(&cookies, &self.inner.cookie);
+        match (current, &self.inner.legacy) {
+            (Some(opened), _) => Some((opened, false)),
+            (None, Some(legacy)) => self.open_named(&cookies, legacy).map(|o| (o, true)),
+            (None, None) => None,
+        }
+    }
+
+    /// The session among `cookies` under the name `name`, with the last-active cookie
+    /// of that name and the idle timeout applied.
+    fn open_named(&self, cookies: &[Cookie<'static>], name: &str) -> Option<Opened<T>> {
         let opened = cookies
             .iter()
-            .filter(|c| c.name() == self.inner.cookie)
-            .find_map(|c| self.unseal_presented(c.value()))?;
+            .filter(|c| c.name() == name)
+            .find_map(|c| self.unseal_named(name, c.value()))?;
         let Opened::Live(presented, mut seen) = opened else {
             return Some(opened);
         };
         if self.inner.idle.is_some() {
-            let seen_name = self.seen_cookie_name();
+            let seen_name = seen_name(name);
             if let Some(later) = cookies
                 .iter()
                 .filter(|c| c.name() == seen_name)
-                .find_map(|c| self.unseal_seen(c.value(), &presented.id))
+                .find_map(|c| self.unseal_seen(&seen_name, c.value(), &presented.id))
             {
                 seen = seen.max(later.min(now()));
             }
@@ -839,13 +893,14 @@ impl<T: SessionData> Sessions<T> {
             inner.idle = this.inner.idle;
             inner.absolute = Some(this.inner.absolute);
         }
-        let (mut refused, mut unchecked) = (false, false);
+        let (mut refused, mut unchecked, mut legacy) = (false, false, false);
         let passive = req
             .headers()
             .get(PASSIVE_HEADER)
             .is_some_and(|v| v.as_bytes() == b"1");
         match this.open(req.headers()) {
-            Some(Opened::Live(presented, seen)) => {
+            Some((Opened::Live(presented, seen), from_legacy)) => {
+                legacy = from_legacy;
                 let verdict = match &this.validator {
                     Some(valid) => valid(presented.clone()).await,
                     None => Verdict::Valid,
@@ -862,7 +917,8 @@ impl<T: SessionData> Sessions<T> {
                     Verdict::Unknown => unchecked = true,
                 }
             }
-            Some(Opened::Idle) => {
+            Some((Opened::Idle, from_legacy)) => {
+                legacy = from_legacy;
                 refused = true;
                 session.inner().idle_expired = true;
             }
@@ -902,6 +958,8 @@ impl<T: SessionData> Sessions<T> {
                     )
                 })
             };
+            let reseal =
+                reseal.or_else(|| (legacy && !failed && !unchecked).then(|| moved(&inner, now))?);
             let touch = (reseal.is_none()
                 && !failed
                 && !unchecked
@@ -922,13 +980,25 @@ impl<T: SessionData> Sessions<T> {
             (reseal, touch, seen)
         };
         let (reseal, touch, seen) = changed;
-        this.write(response.headers_mut(), reseal, touch, seen, refused, now);
+        // The legacy cookies go once the session they held is re-issued or refused.
+        let drop_legacy = legacy && (reseal.is_some() || refused);
+        this.write(
+            response.headers_mut(),
+            reseal,
+            touch,
+            seen,
+            refused,
+            drop_legacy,
+            now,
+        );
         response
     }
 
     /// Write what the layer decided into the response's headers: the resealed
     /// session, a refused session's removal, the last-active cookie, the time left,
-    /// and the cache policy any of them requires.
+    /// the legacy-named cookies' removal when `drop_legacy`, and the cache policy any
+    /// of them requires.
+    #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
         h: &mut HeaderMap,
@@ -936,10 +1006,17 @@ impl<T: SessionData> Sessions<T> {
         touch: Option<String>,
         seen: Option<u64>,
         refused: bool,
+        drop_legacy: bool,
         now: u64,
     ) {
         let this = self;
         let mut set = Vec::new();
+        if let Some(legacy) = this.inner.legacy.as_ref().filter(|_| drop_legacy) {
+            set.extend(this.named_cookie(legacy.clone(), String::new(), 0));
+            if this.inner.idle.is_some() {
+                set.extend(this.named_cookie(seen_name(legacy), String::new(), 0));
+            }
+        }
         match reseal {
             Some((id, issued, seen, data)) => set.extend(this.set_cookie(&id, issued, seen, &data)),
             // Take a refused session's cookies away rather than open them every request.
@@ -976,6 +1053,17 @@ impl<T: SessionData> Sessions<T> {
             );
         }
     }
+}
+
+/// A session that came under the legacy name, to seal under the cookie's name
+/// unchanged: same id, start and last-active time. `None` when it is no session.
+fn moved<T: Clone>(inner: &Inner<T>, now: u64) -> Option<(String, u64, u64, T)> {
+    Some((
+        inner.id.clone()?,
+        inner.issued?,
+        inner.seen.unwrap_or(now),
+        inner.data.clone(),
+    ))
 }
 
 /// What the last-active cookie holds, before sealing: the session it belongs to and
@@ -1604,8 +1692,8 @@ mod tests {
         let seal_plain = |plain: &str| {
             let mut jar = cookie::CookieJar::new();
             jar.private_mut(&s.inner.key)
-                .add(Cookie::new("sid", plain.to_owned()));
-            jar.get("sid").unwrap().value().to_owned()
+                .add(Cookie::new("__Host-sid", plain.to_owned()));
+            jar.get("__Host-sid").unwrap().value().to_owned()
         };
         let far = now() + 3000;
         for plain in [
@@ -1839,7 +1927,7 @@ mod tests {
     fn cookie_seen(s: &Sessions<Data>, ago: u64) -> String {
         let now = now();
         format!(
-            "sid={}",
+            "__Host-sid={}",
             s.seal_begun("abc", now - 3600, now - ago, &Data { user: Some(1) })
         )
     }
@@ -1867,7 +1955,7 @@ mod tests {
             text(get_with(idle_app(&s), "/who", Some(&fresh)).await).await,
             "Some(1)"
         );
-        assert_eq!(s.unseal(&stale["sid=".len()..]), None);
+        assert_eq!(s.unseal(&stale["__Host-sid=".len()..]), None);
     }
 
     fn set_cookies(res: &Response) -> Vec<Cookie<'static>> {
@@ -1901,7 +1989,7 @@ mod tests {
         let res = get_with(idle_app(&s), "/who", Some(&main)).await;
         let set = set_cookies(&res);
         assert_eq!(set.len(), 1);
-        assert_eq!(set[0].name(), "sid-seen");
+        assert_eq!(set[0].name(), "__Host-sid-seen");
         assert_eq!(res.headers()[IDLE_REMAINING_HEADER], "900");
         // With it, the session counts from now even when the main cookie is old.
         let both = format!("{main}; sid-seen={}", set[0].value());
@@ -1993,12 +2081,12 @@ mod tests {
         let s = sessions();
         let v = s.seal("abc", &Data { user: Some(1) });
         assert!(s.unseal(&v).is_some());
-        let res = get_with(idle_app(&s), "/who", Some(&format!("sid={v}"))).await;
+        let res = get_with(idle_app(&s), "/who", Some(&format!("__Host-sid={v}"))).await;
         assert!(!res.headers().contains_key(IDLE_REMAINING_HEADER));
         assert!(!res.headers().contains_key(header::SET_COOKIE));
         // A cookie sealed before the timeout was set was last active when it began.
         let old = format!(
-            "sid={}",
+            "__Host-sid={}",
             s.seal_begun("abc", now() - 3600, now(), &Data { user: Some(1) })
         );
         let idle = s.clone().idle_timeout(Duration::from_mins(15));
@@ -2089,10 +2177,157 @@ mod tests {
         assert!(set.to_str().unwrap().contains("Secure"));
     }
 
+    #[test]
+    fn a_secure_bare_name_gets_the_host_prefix_and_keeps_the_bare_one_to_read() {
+        let named = |name: &str, secure: bool| {
+            let s = Sessions::<Data>::new(Key::generate(), name, Duration::from_secs(60), secure);
+            (
+                s.cookie_name().to_owned(),
+                s.legacy_cookie_name().map(str::to_owned),
+            )
+        };
+        assert_eq!(
+            named("sid", true),
+            ("__Host-sid".into(), Some("sid".into()))
+        );
+        // Plain-HTTP development keeps the name, and the cookie is not `Secure`.
+        assert_eq!(named("sid", false), ("sid".into(), None));
+        // A name that has a prefix already is the app's choice, and never doubled.
+        assert_eq!(named("__Host-sid", true), ("__Host-sid".into(), None));
+        assert_eq!(named("__Secure-sid", true), ("__Secure-sid".into(), None));
+        assert_eq!(
+            sessions().without_legacy_cookie().legacy_cookie_name(),
+            None
+        );
+
+        let dev = Sessions::<Data>::new(Key::generate(), "sid", Duration::from_secs(60), false);
+        let set = dev
+            .set_cookie("abc", now(), now(), &Data::default())
+            .unwrap();
+        let set = set.to_str().unwrap();
+        assert!(set.starts_with("sid=") && !set.contains("Secure"), "{set}");
+        let prod = sessions()
+            .set_cookie("abc", now(), now(), &Data::default())
+            .unwrap();
+        let prod = Cookie::parse_encoded(prod.to_str().unwrap().to_owned()).unwrap();
+        // What a `__Host-` cookie needs: Secure, Path=/ and no Domain.
+        assert_eq!(
+            (prod.name(), prod.secure(), prod.path(), prod.domain()),
+            ("__Host-sid", Some(true), Some("/"), None)
+        );
+    }
+
+    /// Sessions as the app sealed them before the prefix: the same key, the bare name.
+    fn bare(s: &Sessions<Data>) -> Sessions<Data> {
+        let mut config = (*s.inner).clone();
+        config.cookie = "sid".into();
+        config.legacy = None;
+        Sessions {
+            inner: Arc::new(config),
+            validator: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_under_the_bare_name_is_reissued_under_the_prefixed_one() {
+        let s = idle_sessions();
+        let old = bare(&s);
+        let now = now();
+        let begun = now - 3600;
+        let sealed = old.seal_begun("abc", begun, now - 10 * 60, &Data { user: Some(1) });
+        // Its last-active cookie, under the bare name too, says it was active since.
+        let seen = old.seal_seen("abc", now - 60);
+        let cookie = format!("sid={sealed}; sid-seen={seen}");
+        let res = get_with(idle_app(&s), "/who", Some(&cookie)).await;
+        let set = set_cookies(&res);
+        assert_eq!(text(res).await, "Some(1)");
+
+        let names: Vec<_> = set
+            .iter()
+            .map(|c| (c.name(), c.value().is_empty()))
+            .collect();
+        assert_eq!(
+            names,
+            [("sid", true), ("sid-seen", true), ("__Host-sid", false)],
+            "the bare cookies removed, the session re-issued"
+        );
+        assert!(
+            set[..2]
+                .iter()
+                .all(|c| c.max_age() == Some(cookie::time::Duration::ZERO))
+        );
+        let Some(Opened::Live(moved, moved_seen)) = s.unseal_presented(set[2].value()) else {
+            panic!("a live session under the prefixed name");
+        };
+        assert_eq!((moved.id.as_str(), moved.issued), ("abc", begun));
+        assert_eq!(moved.data, Data { user: Some(1) });
+        assert!(
+            (now - 60..=now).contains(&moved_seen),
+            "the last-active time moves with it, not reset to the seal's"
+        );
+
+        // The re-issued cookie alone opens it, and is not re-issued again (at most the
+        // last-active cookie is touched, a refresh having passed).
+        let cookie = format!("__Host-sid={}", set[2].value());
+        let res = get_with(idle_app(&s), "/who", Some(&cookie)).await;
+        let names: Vec<_> = set_cookies(&res)
+            .iter()
+            .map(|c| c.name().to_owned())
+            .collect();
+        assert!(names.iter().all(|n| n == "__Host-sid-seen"), "{names:?}");
+        assert_eq!(text(res).await, "Some(1)");
+
+        // Once the transition is over, the bare name opens nothing.
+        let ended = s.clone().without_legacy_cookie();
+        let res = get_with(idle_app(&ended), "/who", Some(&format!("sid={sealed}"))).await;
+        assert!(set_cookies(&res).is_empty(), "the bare name is not read");
+        assert_eq!(text(res).await, "None");
+    }
+
+    #[tokio::test]
+    async fn the_prefixed_cookie_wins_over_a_bare_one() {
+        // A sibling subdomain can still plant the bare name: it never displaces a
+        // session under the prefixed one.
+        let s = sessions();
+        let planted = format!("sid={}", bare(&s).seal("evil", &Data { user: Some(2) }));
+        let own = format!("__Host-sid={}", s.seal("abc", &Data { user: Some(1) }));
+        let app = who().layer(from_fn_with_state(s.clone(), Sessions::<Data>::layer));
+        let res = get_with(app, "/who", Some(&format!("{planted}; {own}"))).await;
+        assert!(set_cookies(&res).is_empty(), "bare cookie left alone");
+        assert_eq!(text(res).await, "Some(1)");
+    }
+
+    #[tokio::test]
+    async fn a_bare_session_refused_loses_its_cookie_and_one_unchecked_keeps_it() {
+        let s = sessions();
+        let cookie = format!("sid={}", bare(&s).seal("abc", &Data { user: Some(7) }));
+        let revoking = s
+            .clone()
+            .validate_with(|_: Presented<Data>| async { false });
+        let app = who().layer(from_fn_with_state(revoking, Sessions::<Data>::layer));
+        let res = get_with(app, "/who", Some(&cookie)).await;
+        let set = set_cookies(&res);
+        assert_eq!(text(res).await, "None");
+        assert!(
+            set.iter()
+                .any(|c| c.name() == "sid" && c.value().is_empty())
+        );
+        assert!(
+            set.iter().all(|c| c.value().is_empty()),
+            "nothing re-issued"
+        );
+
+        let unknown = s.validate_with(|_: Presented<Data>| async { Verdict::Unknown });
+        let app = who().layer(from_fn_with_state(unknown, Sessions::<Data>::layer));
+        let res = get_with(app, "/who", Some(&cookie)).await;
+        assert!(set_cookies(&res).is_empty(), "an outage moves nothing");
+        assert_eq!(text(res).await, "None");
+    }
+
     #[tokio::test]
     async fn a_refused_session_is_no_session_and_loses_its_cookie() {
         let s = sessions();
-        let cookie = format!("sid={}", s.seal("abc", &Data { user: Some(7) }));
+        let cookie = format!("__Host-sid={}", s.seal("abc", &Data { user: Some(7) }));
         let open = who().layer(from_fn_with_state(s.clone(), Sessions::<Data>::layer));
         assert_eq!(
             text(get_with(open, "/who", Some(&cookie)).await).await,
@@ -2107,7 +2342,7 @@ mod tests {
             .unwrap()
             .to_owned();
         assert!(
-            set.starts_with("sid=;") && set.contains("Max-Age=0"),
+            set.starts_with("__Host-sid=;") && set.contains("Max-Age=0"),
             "{set}"
         );
         assert_eq!(text(res).await, "None");
@@ -2116,7 +2351,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_that_cannot_be_checked_is_withheld_and_kept() {
         let s = sessions();
-        let cookie = format!("sid={}", s.seal("abc", &Data { user: Some(7) }));
+        let cookie = format!("__Host-sid={}", s.seal("abc", &Data { user: Some(7) }));
         let down = s.validate_with(|_: Presented<Data>| async { Verdict::Unknown });
         let app = who().layer(from_fn_with_state(down, Sessions::<Data>::layer));
         let res = get_with(app.clone(), "/who", Some(&cookie)).await;
@@ -2133,7 +2368,7 @@ mod tests {
     #[tokio::test]
     async fn a_sign_out_during_an_outage_still_replaces_the_cookie() {
         let s = sessions();
-        let cookie = format!("sid={}", s.seal("abc", &Data { user: Some(7) }));
+        let cookie = format!("__Host-sid={}", s.seal("abc", &Data { user: Some(7) }));
         let down = s
             .clone()
             .validate_with(|_: Presented<Data>| async { Verdict::Unknown });
@@ -2194,7 +2429,7 @@ mod tests {
         let s = sessions();
         let began = now() - 600;
         let cookie = format!(
-            "sid={}",
+            "__Host-sid={}",
             s.seal_begun("abc", began, began, &Data { user: Some(7) })
         );
         let app =
@@ -2217,7 +2452,7 @@ mod tests {
         let set = res.headers()[header::SET_COOKIE].to_str().unwrap();
         let resealed = Cookie::parse_encoded(set).unwrap();
         assert_eq!(resealed.name(), s.cookie_name());
-        assert_eq!(s.cookie_name(), "sid");
+        assert_eq!(s.cookie_name(), "__Host-sid");
         let Some(Opened::Live(opened, _)) = s.unseal_presented(resealed.value()) else {
             panic!("a live session");
         };
