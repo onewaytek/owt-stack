@@ -2293,7 +2293,7 @@ mod tests {
         let own = format!("__Host-sid={}", s.seal("abc", &Data { user: Some(1) }));
         let app = who().layer(from_fn_with_state(s.clone(), Sessions::<Data>::layer));
         let res = get_with(app, "/who", Some(&format!("{planted}; {own}"))).await;
-        assert!(set_cookies(&res).is_empty(), "the bare cookie is left alone");
+        assert!(set_cookies(&res).is_empty(), "bare cookie left alone");
         assert_eq!(text(res).await, "Some(1)");
     }
 
