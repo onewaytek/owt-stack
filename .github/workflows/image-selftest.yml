@@ -9,7 +9,9 @@ name: Image selftest
 # registry, and `artifact`) and the docker builder. The `registry` legs run on the ARC
 # runners in the `ci-staging-selftest` environment, whose CI_STAGING_* variables and
 # secrets name a staging organization of this repository's own: its robots cannot
-# reach any app's staged layers. The `artifact` leg runs on `artifact-runs-on`
+# reach any app's staged layers. The environment deploys from `main` only, so a dispatch
+# from another branch needs a temporary deployment-branch rule for that branch. The
+# `artifact` leg runs on `artifact-runs-on`
 # (GitHub-hosted by default) and needs Actions artifact storage. With `image` set it
 # then runs image.yml for both builders, which signs and attests as a real release does and pushes the test tags
 # `selftest` and `selftest-docker` to ghcr.io/onewaytek/owt-stack. image.yml builds a
