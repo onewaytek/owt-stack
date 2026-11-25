@@ -243,18 +243,78 @@ fn warn_if_unverified(opts: &PgConnectOptions) {
     }
 }
 
+/// How [`migrate_locked`] bounds waiting for a table lock. A migration's `ALTER TABLE`
+/// queues behind any transaction that holds a lock on the table (a long export, an
+/// idle session) and every later query on the table queues behind it, so the whole
+/// table stalls. With a `lock_timeout` the statement gives up instead, the migration
+/// rolls back, and the run is tried again after a pause, up to `attempts` times.
+///
+/// A migration that needs a different bound for itself starts with
+/// `SET LOCAL lock_timeout = '30s';`: each migration runs in its own transaction, and
+/// that setting replaces this one until the transaction ends.
+#[derive(Clone, Copy, Debug)]
+pub struct MigrateLock {
+    /// Postgres's `lock_timeout` while migrating (5 s by default); `None` waits
+    /// without limit.
+    pub timeout: Option<Duration>,
+    /// Runs tried before giving up on a lock timeout (5 by default; at least 1). Any
+    /// other failure is not retried.
+    pub attempts: u32,
+    /// Pause after the first timed-out run (1 s by default), doubling after each.
+    pub backoff: Duration,
+}
+
+impl Default for MigrateLock {
+    fn default() -> Self {
+        Self {
+            timeout: Some(Duration::from_secs(5)),
+            attempts: 5,
+            backoff: Duration::from_secs(1),
+        }
+    }
+}
+
+impl MigrateLock {
+    /// The defaults, with `MIGRATE_LOCK_TIMEOUT_MS` (`0` for no limit) and
+    /// `MIGRATE_LOCK_ATTEMPTS` read when set; this is what [`migrate_locked`] uses.
+    ///
+    /// # Errors
+    ///
+    /// When a variable is set and is not a whole number.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let mut lock = Self::default();
+        if let Some(ms) = crate::env::var("MIGRATE_LOCK_TIMEOUT_MS") {
+            let ms: u64 = ms
+                .parse()
+                .map_err(|_| anyhow::anyhow!("MIGRATE_LOCK_TIMEOUT_MS is not a number: {ms:?}"))?;
+            lock.timeout = (ms > 0).then(|| Duration::from_millis(ms));
+        }
+        if let Some(n) = crate::env::var("MIGRATE_LOCK_ATTEMPTS") {
+            lock.attempts = n
+                .parse()
+                .map_err(|_| anyhow::anyhow!("MIGRATE_LOCK_ATTEMPTS is not a number: {n:?}"))?;
+        }
+        Ok(lock)
+    }
+}
+
 /// Apply `migrator` under the advisory lock `lock_id`, held on one connection for the
 /// whole run, so replicas starting together (or a migrate Job racing a rollout)
 /// migrate once and the rest wait. sqlx takes its own lock too; an explicit id lets
 /// another migrator (a predecessor app on the same schema) exclude this one. When the
 /// run fails, that connection is closed rather than pooled: sqlx's failed run leaves
 /// its lock held on it, so the pool stays usable (to retry, or to ask what failed).
+///
+/// A statement that cannot get its table lock within the [`MigrateLock`] timeout (5 s;
+/// [`MigrateLock::from_env`] reads the overrides) fails, and the run is retried with a
+/// growing pause, each retry logged. The advisory lock is waited for without that
+/// limit: it is taken first.
 pub async fn migrate_locked(
     pool: &PgPool,
     migrator: &Migrator,
     lock_id: i64,
 ) -> anyhow::Result<()> {
-    locked(pool, migrator, None, lock_id).await
+    locked(pool, migrator, None, lock_id, MigrateLock::from_env()?).await
 }
 
 /// [`migrate_locked`], applying `migrator`'s migrations up to and including version
@@ -267,7 +327,39 @@ pub async fn migrate_locked_to(
     target: i64,
     lock_id: i64,
 ) -> anyhow::Result<()> {
-    locked(pool, migrator, Some(target), lock_id).await
+    locked(
+        pool,
+        migrator,
+        Some(target),
+        lock_id,
+        MigrateLock::from_env()?,
+    )
+    .await
+}
+
+/// [`migrate_locked`] (or, with a `target`, [`migrate_locked_to`]) with an explicit
+/// [`MigrateLock`] instead of the environment's.
+pub async fn migrate_locked_with(
+    pool: &PgPool,
+    migrator: &Migrator,
+    target: Option<i64>,
+    lock_id: i64,
+    lock: MigrateLock,
+) -> anyhow::Result<()> {
+    locked(pool, migrator, target, lock_id, lock).await
+}
+
+/// Whether `e` is Postgres refusing to wait longer for a lock (`lock_not_available`).
+fn lock_timed_out(e: &anyhow::Error) -> bool {
+    let db = |e: &sqlx::Error| matches!(e, sqlx::Error::Database(d) if d.code().is_some_and(|c| c == "55P03"));
+    match e.downcast_ref::<sqlx::migrate::MigrateError>() {
+        Some(
+            sqlx::migrate::MigrateError::Execute(e)
+            | sqlx::migrate::MigrateError::ExecuteMigration(e, _),
+        ) => db(e),
+        Some(_) => false,
+        None => e.downcast_ref::<sqlx::Error>().is_some_and(db),
+    }
 }
 
 async fn locked(
@@ -275,6 +367,35 @@ async fn locked(
     migrator: &Migrator,
     target: Option<i64>,
     lock_id: i64,
+    lock: MigrateLock,
+) -> anyhow::Result<()> {
+    let attempts = lock.attempts.max(1);
+    let mut pause = lock.backoff;
+    for attempt in 1.. {
+        match attempt_locked(pool, migrator, target, lock_id, lock.timeout).await {
+            Err(e) if attempt < attempts && lock_timed_out(&e) => {
+                tracing::warn!(
+                    attempt,
+                    attempts,
+                    retry_in_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+                    error = %e,
+                    "migration could not get its table lock in time; retrying"
+                );
+                tokio::time::sleep(pause).await;
+                pause = pause.saturating_mul(2);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
+}
+
+async fn attempt_locked(
+    pool: &PgPool,
+    migrator: &Migrator,
+    target: Option<i64>,
+    lock_id: i64,
+    lock_timeout: Option<Duration>,
 ) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
     // Waiting on another replica's migration and building an index both outlast any
@@ -287,6 +408,14 @@ async fn locked(
         .bind(lock_id)
         .execute(&mut *conn)
         .await?;
+    // After the advisory lock: `lock_timeout` also bounds waiting for that, and a
+    // replica waiting on another's long migration is not a stalled table.
+    if let Some(t) = lock_timeout {
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(format!("{}ms", t.as_millis().max(1)))
+            .execute(&mut *conn)
+            .await?;
+    }
     // On the connection itself, not through `Acquire`, so the future is `Send` for any
     // lifetime and a start can be spawned.
     let result = migrator.run_direct(target, &mut *conn, false).await;
@@ -294,9 +423,13 @@ async fn locked(
         .bind(lock_id)
         .execute(&mut *conn)
         .await;
-    let reset = sqlx::query("RESET statement_timeout")
+    let reset = match sqlx::query("RESET statement_timeout")
         .execute(&mut *conn)
-        .await;
+        .await
+    {
+        Ok(_) => sqlx::query("RESET lock_timeout").execute(&mut *conn).await,
+        Err(e) => Err(e),
+    };
     if result.is_err() || unlocked.is_err() || reset.is_err() {
         // A failed run returns before sqlx releases its own advisory lock (one per
         // database), and a failed unlock leaves this one: back in the pool, the

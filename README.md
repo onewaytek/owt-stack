@@ -229,7 +229,8 @@ deadline. Every connection carries Postgres's `statement_timeout` (30 s, the `Li
 request deadline: a query whose request timed out stops on the server too) and
 `idle_in_transaction_session_timeout` (60 s: a transaction left open while its task
 awaits something else ends, with its locks), as startup parameters that win over the
-URL's `options`. `migrate_locked` runs without the statement timeout; other long work
+URL's `options`. `migrate_locked` runs without the statement timeout (and with a lock
+timeout, below); other long work
 uses `SET LOCAL statement_timeout` in its transaction, or a pool with
 `statement_timeout: None` (`reserve_beside` builds one beside the main pool). `None`
 leaves either to the server. A connection pooler in transaction mode that refuses
@@ -1728,6 +1729,32 @@ can call it against a copy of the app's schema before adopting the crate. Migrat
 `migrate_locked`, not `Migrator::run` on the pool: a failed `run` keeps sqlx's
 database-wide advisory lock on the connection it returns to the pool, where every later
 migration waits on it, while `migrate_locked` closes that connection.
+
+`migrate_locked` also sets Postgres's `lock_timeout` to 5 s, so a migration's `ALTER TABLE`
+that queues behind a long transaction (an export, an idle session) fails instead of
+stalling every query on the table behind it. The run rolls back and is tried again after
+a pause that doubles from 1 s, up to 5 runs, logging each retry as a warning; only a lock
+timeout is retried. `MIGRATE_LOCK_TIMEOUT_MS` (`0` for no limit) and
+`MIGRATE_LOCK_ATTEMPTS` override the defaults, and `migrate_locked_with` takes a
+`MigrateLock` for code that sets them itself. A single migration that needs longer starts
+with `SET LOCAL lock_timeout = '30s';`, which holds for that migration's transaction. The
+advisory lock is taken before the timeout is set, so a replica waiting on another's
+migration is not cut short.
+
+```rust,no_run
+# async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
+use owt_runtime::db::{MigrateLock, migrate_locked_with};
+use std::time::Duration;
+
+let lock = MigrateLock {
+    timeout: Some(Duration::from_secs(10)),
+    attempts: 8,
+    ..MigrateLock::default()
+};
+migrate_locked_with(&pool, migrator, None, 8_531_207, lock).await?;
+# Ok(())
+# }
+```
 
 ```rust,no_run
 # async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {

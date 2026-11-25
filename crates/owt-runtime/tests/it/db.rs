@@ -1,9 +1,9 @@
 //! `owt_runtime::db` against a real Postgres (`DATABASE_URL`); skipped when it is
 //! unset. The test takes a schema of its own and leaves nothing.
 
-use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{Connection, PgPool};
 
 /// A migration that fails stops `migrate_locked` without leaving an advisory lock
 /// held: neither its own nor sqlx's, which sqlx's failed run never releases. Left on a
@@ -64,6 +64,110 @@ async fn a_failed_migration_leaves_no_lock_held() {
         .await
         .unwrap();
     assert_eq!(one, 1);
+
+    pool.close().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {name} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+/// A conflicting lock held in another connection makes `migrate_locked_with` time out
+/// on the table lock and retry; it succeeds once the lock is released, and fails
+/// cleanly (a `lock_not_available` error, the pool still usable) when the attempts run
+/// out first.
+#[tokio::test]
+async fn a_migration_retries_when_it_cannot_get_its_table_lock() {
+    use owt_runtime::db::{MigrateLock, migrate_locked_with};
+    use std::time::Duration;
+
+    let Some(url) = owt_runtime::env::var("DATABASE_URL") else {
+        return;
+    };
+    let name = format!("owt_db_{}_{}", std::process::id(), rand::random::<u32>());
+    let admin = PgPool::connect(&url).await.expect("DATABASE_URL connects");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let dir = std::env::temp_dir().join(&name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts: PgConnectOptions = url.parse().unwrap();
+    let opts = opts.options([("search_path", name.as_str())]);
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(opts.clone())
+        .await
+        .unwrap();
+    // The table exists first, so the migration's ALTER needs a lock on it.
+    sqlx::query("CREATE TABLE held (id int)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    std::fs::write(
+        dir.join("0001_table.sql"),
+        "ALTER TABLE held ADD COLUMN note text;",
+    )
+    .unwrap();
+    let migrator = Migrator::new(dir.as_path()).await.unwrap();
+    let lock_id = i64::from(rand::random::<u32>());
+    let fast = MigrateLock {
+        timeout: Some(Duration::from_millis(200)),
+        attempts: 3,
+        backoff: Duration::from_millis(50),
+    };
+
+    // The holder reads the table inside a transaction, which excludes the ALTER.
+    let mut holder = sqlx::PgConnection::connect_with(&opts).await.unwrap();
+    sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+    sqlx::query("LOCK TABLE held IN ACCESS SHARE MODE")
+        .execute(&mut holder)
+        .await
+        .unwrap();
+
+    // Held throughout: every attempt times out, and the call fails cleanly.
+    let err = migrate_locked_with(&pool, &migrator, None, lock_id, fast)
+        .await
+        .expect_err("the lock is never released");
+    assert!(
+        format!("{err:#}").contains("lock timeout"),
+        "not a lock timeout: {err:#}"
+    );
+    let one: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(one, 1);
+
+    // Released while the migration is between attempts: a later attempt succeeds.
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        sqlx::query("COMMIT").execute(&mut holder).await.unwrap();
+    });
+    let slow = MigrateLock {
+        attempts: 10,
+        ..fast
+    };
+    migrate_locked_with(&pool, &migrator, None, lock_id, slow)
+        .await
+        .expect("the migration runs once the lock is released");
+    release.await.unwrap();
+    let has: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+         WHERE table_schema = $1 AND table_name = 'held' AND column_name = 'note')",
+    )
+    .bind(&name)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has);
+    // The connection's settings are put back for the pool.
+    let t: String = sqlx::query_scalar("SHOW lock_timeout")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(t, "200ms");
 
     pool.close().await;
     std::fs::remove_dir_all(&dir).unwrap();
