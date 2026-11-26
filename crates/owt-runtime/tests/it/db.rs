@@ -297,3 +297,121 @@ async fn now_reads_the_database_clock_as_it_runs() {
     );
     tx.rollback().await.unwrap();
 }
+
+/// A schema of its own on `DATABASE_URL`, a two-connection pool in it, and a migrations
+/// directory holding `files`; `None` without `DATABASE_URL`.
+async fn lock_fixture(
+    files: &[(&str, &str)],
+) -> Option<(PgPool, PgPool, PgConnectOptions, String, std::path::PathBuf)> {
+    let url = owt_runtime::env::var("DATABASE_URL")?;
+    let name = format!("owt_db_{}_{}", std::process::id(), rand::random::<u32>());
+    let admin = PgPool::connect(&url).await.expect("DATABASE_URL connects");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let dir = std::env::temp_dir().join(&name);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, sql) in files {
+        std::fs::write(dir.join(file), sql).unwrap();
+    }
+    let opts: PgConnectOptions = url.parse().unwrap();
+    let opts = opts.options([("search_path", name.as_str())]);
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(opts.clone())
+        .await
+        .unwrap();
+    Some((admin, pool, opts, name, dir))
+}
+
+async fn drop_fixture(admin: PgPool, pool: PgPool, name: &str, dir: &std::path::Path) {
+    pool.close().await;
+    std::fs::remove_dir_all(dir).unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {name} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+/// sqlx's own advisory lock (one per database, shared by every migrator on it) is
+/// waited for without the lock timeout: another migrator holding it past the timeout
+/// delays the run, and does not fail it.
+#[tokio::test]
+async fn sqlx_s_own_lock_is_waited_for_without_the_lock_timeout() {
+    use owt_runtime::db::{MigrateLock, migrate_locked_with};
+    use sqlx::migrate::Migrate;
+    use std::time::Duration;
+
+    let Some((admin, pool, opts, name, dir)) =
+        lock_fixture(&[("0001_table.sql", "CREATE TABLE t (id int);")]).await
+    else {
+        return;
+    };
+    let migrator = Migrator::new(dir.as_path()).await.unwrap();
+    // Another migrator on the same database, taking sqlx's lock as sqlx does.
+    let mut holder = sqlx::PgConnection::connect_with(&opts).await.unwrap();
+    holder.lock().await.unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        holder.unlock().await.unwrap();
+        holder
+    });
+    let fast = MigrateLock {
+        timeout: Some(Duration::from_millis(100)),
+        attempts: 1,
+        backoff: Duration::from_millis(50),
+    };
+    migrate_locked_with(&pool, &migrator, None, rand::random::<u32>().into(), fast)
+        .await
+        .expect("the run waits for sqlx's lock instead of timing out");
+    drop(release.await.unwrap());
+    drop_fixture(admin, pool, &name, &dir).await;
+}
+
+/// A pending `-- no-transaction` migration runs without the lock timeout: one that
+/// timed out would leave its ledger row dirty, which no retry gets past.
+#[tokio::test]
+async fn a_no_transaction_migration_waits_for_its_lock() {
+    use owt_runtime::db::{MigrateLock, migrate_locked_with};
+    use std::time::Duration;
+
+    let Some((admin, pool, opts, name, dir)) = lock_fixture(&[(
+        "0001_note.sql",
+        "-- no-transaction\nALTER TABLE held ADD COLUMN note text;",
+    )])
+    .await
+    else {
+        return;
+    };
+    sqlx::query("CREATE TABLE held (id int)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let migrator = Migrator::new(dir.as_path()).await.unwrap();
+    let mut holder = sqlx::PgConnection::connect_with(&opts).await.unwrap();
+    sqlx::query("BEGIN").execute(&mut holder).await.unwrap();
+    sqlx::query("LOCK TABLE held IN ACCESS SHARE MODE")
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        sqlx::query("COMMIT").execute(&mut holder).await.unwrap();
+    });
+    let fast = MigrateLock {
+        timeout: Some(Duration::from_millis(100)),
+        attempts: 1,
+        backoff: Duration::from_millis(50),
+    };
+    migrate_locked_with(&pool, &migrator, None, rand::random::<u32>().into(), fast)
+        .await
+        .expect("the no-transaction migration waits instead of timing out");
+    release.await.unwrap();
+    let dirty: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE NOT success")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(dirty, 0);
+    drop_fixture(admin, pool, &name, &dir).await;
+}

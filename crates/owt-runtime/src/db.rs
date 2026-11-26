@@ -305,10 +305,13 @@ impl MigrateLock {
 /// run fails, that connection is closed rather than pooled: sqlx's failed run leaves
 /// its lock held on it, so the pool stays usable (to retry, or to ask what failed).
 ///
-/// A statement that cannot get its table lock within the [`MigrateLock`] timeout (5 s;
-/// [`MigrateLock::from_env`] reads the overrides) fails, and the run is retried with a
-/// growing pause, each retry logged. The advisory lock is waited for without that
-/// limit: it is taken first.
+/// A statement that cannot get a lock on a table or a row within the [`MigrateLock`]
+/// timeout (5 s; [`MigrateLock::from_env`] reads the overrides) fails, and the run is
+/// retried with a growing pause, each retry logged. The advisory locks, `lock_id` and
+/// sqlx's own (one per database, shared by every migrator on it), are waited for
+/// without that limit: both are taken before the timeout is set. A run with a
+/// `-- no-transaction` migration still to apply gets no timeout at all: such a
+/// migration that fails leaves its ledger row dirty, which no retry gets past.
 pub async fn migrate_locked(
     pool: &PgPool,
     migrator: &Migrator,
@@ -408,21 +411,20 @@ async fn attempt_locked(
         .bind(lock_id)
         .execute(&mut *conn)
         .await?;
-    // After the advisory lock: `lock_timeout` also bounds waiting for that, and a
-    // replica waiting on another's long migration is not a stalled table.
-    if let Some(t) = lock_timeout {
-        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-            .bind(format!("{}ms", t.as_millis().max(1)))
+    // Everything after the first lock reports through `result`, so a failure anywhere
+    // still unlocks (or closes) the connection below.
+    let mut sqlx_lock = None;
+    let result = run_held(&mut conn, migrator, target, lock_timeout, &mut sqlx_lock).await;
+    let mut unlocked = Ok(());
+    for id in sqlx_lock.into_iter().chain([lock_id]) {
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(id)
             .execute(&mut *conn)
-            .await?;
+            .await
+        {
+            unlocked = Err(e);
+        }
     }
-    // On the connection itself, not through `Acquire`, so the future is `Send` for any
-    // lifetime and a start can be spawned.
-    let result = migrator.run_direct(target, &mut *conn, false).await;
-    let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_id)
-        .execute(&mut *conn)
-        .await;
     let reset = match sqlx::query("RESET statement_timeout")
         .execute(&mut *conn)
         .await
@@ -442,6 +444,104 @@ async fn attempt_locked(
     reset?;
     tracing::info!("migrations applied");
     Ok(())
+}
+
+/// [`attempt_locked`] once `lock_id` is held: sqlx's lock (recorded in `sqlx_lock`, for
+/// the caller to release), the lock timeout, and the run.
+async fn run_held(
+    conn: &mut sqlx::PgConnection,
+    migrator: &Migrator,
+    target: Option<i64>,
+    lock_timeout: Option<Duration>,
+    sqlx_lock: &mut Option<i64>,
+) -> anyhow::Result<()> {
+    // sqlx's own lock too, which `run_direct` takes again (session advisory locks
+    // nest, so that returns at once) and releases once.
+    if migrator.locking {
+        let db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&mut *conn)
+            .await?;
+        let id = sqlx_lock_id(&db);
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+        *sqlx_lock = Some(id);
+    }
+    // After both advisory locks: `lock_timeout` also bounds waiting for those, and a
+    // replica waiting on another's long migration (or another app's tests migrating
+    // the same database) is not a stalled table. Not for a pending no-transaction
+    // migration, whose timeout would leave a dirty row instead of a retry.
+    let lock_timeout = match lock_timeout {
+        Some(t) if pending_no_tx(conn, migrator, target).await? => {
+            tracing::info!(
+                timeout_ms = u64::try_from(t.as_millis()).unwrap_or(u64::MAX),
+                "a no-transaction migration is pending; migrating without a lock timeout"
+            );
+            None
+        }
+        t => t,
+    };
+    if let Some(t) = lock_timeout {
+        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+            .bind(format!("{}ms", t.as_millis().max(1)))
+            .execute(&mut *conn)
+            .await?;
+    }
+    // On the connection itself, not through `Acquire`, so the future is `Send` for any
+    // lifetime and a start can be spawned.
+    migrator.run_direct(target, &mut *conn, false).await?;
+    Ok(())
+}
+
+/// The advisory lock id sqlx's Postgres migrator takes for `database`
+/// (sqlx-postgres' `generate_lock_id`): the CRC-32 (ISO-HDLC) of the name, times
+/// `0x3d32ad9e`. A test pins it against sqlx's own lock.
+fn sqlx_lock_id(database: &str) -> i64 {
+    let mut crc = !0u32;
+    for b in database.bytes() {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    0x3d32_ad9e * i64::from(!crc)
+}
+
+/// Whether `migrator` would apply a `-- no-transaction` migration (up to `target`)
+/// that its ledger does not record as applied.
+async fn pending_no_tx(
+    conn: &mut sqlx::PgConnection,
+    migrator: &Migrator,
+    target: Option<i64>,
+) -> sqlx::Result<bool> {
+    let candidates: Vec<i64> = migrator
+        .iter()
+        .filter(|m| m.no_tx && !m.migration_type.is_down_migration())
+        .filter(|m| target.is_none_or(|t| m.version <= t))
+        .map(|m| m.version)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+    let table = &migrator.table_name;
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(table.as_ref())
+        .fetch_one(&mut *conn)
+        .await?;
+    if !exists {
+        return Ok(true);
+    }
+    let applied: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT version FROM {table} WHERE success"
+    )))
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(candidates.iter().any(|v| !applied.contains(v)))
 }
 
 /// `role` as a quoted SQL identifier, for a statement that cannot bind one (`GRANT`):

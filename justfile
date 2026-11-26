@@ -13,6 +13,10 @@ default:
 # Everything that must pass before a commit.
 check: fmt audit lint features dev-only test templates ci-config image-check
 
+# Use .githooks/ (pre-push: `cargo fmt --check` and the commit-message lint CI runs).
+hooks:
+    git config core.hooksPath .githooks
+
 # Formatting, checked rather than applied.
 fmt:
     cargo fmt --check
@@ -65,7 +69,12 @@ audit:
     #!/usr/bin/env bash
     set -euo pipefail
     # safe.directory: in a CI container the checkout's owner need not be the user.
-    locks=$(git -c safe.directory="$PWD" ls-files '*Cargo.lock')
+    # Without a .git (a `git archive` export), every lockfile outside target/.
+    if [ -e .git ]; then
+        locks=$(git -c safe.directory="$PWD" ls-files '*Cargo.lock')
+    else
+        locks=$(find . -name Cargo.lock -not -path '*/target/*' -not -path '*/node_modules/*' | sed 's|^\./||' | sort)
+    fi
     [ -n "$locks" ] || { echo "no tracked Cargo.lock to audit" >&2; exit 1; }
     status=0
     while IFS= read -r lock; do
@@ -92,10 +101,17 @@ chart *cases:
 
 # The commitlint rules conventional-commits.yml writes for an app without its own are
 # commitlint.config.mjs, byte for byte; the Renovate preset reads every digest pin it
-# should (scripts/renovate-test.sh).
+# should (scripts/renovate-test.sh); the pre-push hook is the same file in the app
+# template, passes and refuses what commitlint does (scripts/pre-push-test.sh), uses no
+# syntax newer than bash 3.2 (macOS's /bin/bash), and has commitlint.config.mjs's header
+# limit.
 ci-config:
     diff -u commitlint.config.mjs <(sed -n "/<<'JS'$/,/^ *JS$/p" .github/workflows/conventional-commits.yml | sed '1d;$d' | sed 's/^          //')
     bash scripts/renovate-test.sh
+    diff -u .githooks/pre-push templates/githooks/pre-push
+    bash scripts/pre-push-test.sh
+    ! grep -nE ',,}|\^\^}|declare -[aAlu]*A|mapfile|readarray|\$\{[A-Za-z_]+@|\|&|&>>|coproc|;;&|;&$' .githooks/pre-push scripts/pre-push-test.sh
+    grep -q "^header_max=$(sed -n 's/.*"header-max-length": \[2, "always", \([0-9]*\)\].*/\1/p' commitlint.config.mjs)$" .githooks/pre-push
 
 # image-check.yml's `build` and `scan` jobs are image.yml's: `build` but for the
 # release's version and tag checkout, `scan` but for its checkout's ref and comments.

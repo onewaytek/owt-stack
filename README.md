@@ -35,7 +35,8 @@ Outside the crates:
 | `.github/workflows/ghcr-prune.yml` | reusable, a dry run unless told to delete: remove the app's untagged ghcr versions and all but its newest rc versions, never a release, a floating tag or a digest the deployments repository pins ("Actions storage") |
 | `renovate/base-images.json` | a Renovate preset: the base images pinned by digest in the Dockerfile and the `base-image` input, grouped, digest-only bumps automerged after 24 hours |
 | `scripts/bao-set.sh` | `env.sh` for OpenBao: writes an app environment's secrets from an `env.env` where `charts/owt-app`'s ExternalSecrets read them |
-| `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev`), and Postgres and Redis for them |
+| `templates/justfile`, `templates/compose.yaml` | the commands every app answers to (`just check`, `just db`, `just dev-db`, `just dev`, `just hooks`), and Postgres and Redis for them |
+| `templates/githooks/pre-push` | an app's `.githooks/pre-push`: `cargo fmt --check` and CI's commit-message rules before every push |
 | `templates/vendor-js` | downloads the vendored browser files `vendor.pins` lists, refusing any hash mismatch |
 | `templates/dependabot.yml` | an app's `.github/dependabot.yml`: weekly `fix(deps)` pull requests for its crates and its npm packages, minors and patches grouped, and a monthly `ci(deps)` one for its action and workflow pins |
 | `templates/Dockerfile` | Red Hat Hummingbird images throughout: cargo-chef, an npm Tailwind stage, a minimal non-root glibc runtime that keeps a shell (with `templates/dockerignore`) |
@@ -1732,14 +1733,19 @@ migration waits on it, while `migrate_locked` closes that connection.
 
 `migrate_locked` also sets Postgres's `lock_timeout` to 5 s, so a migration's `ALTER TABLE`
 that queues behind a long transaction (an export, an idle session) fails instead of
-stalling every query on the table behind it. The run rolls back and is tried again after
+stalling every query on the table behind it (a data migration's `UPDATE` that waits on a
+locked row does the same). The run rolls back and is tried again after
 a pause that doubles from 1 s, up to 5 runs, logging each retry as a warning; only a lock
 timeout is retried. `MIGRATE_LOCK_TIMEOUT_MS` (`0` for no limit) and
 `MIGRATE_LOCK_ATTEMPTS` override the defaults, and `migrate_locked_with` takes a
 `MigrateLock` for code that sets them itself. A single migration that needs longer starts
 with `SET LOCAL lock_timeout = '30s';`, which holds for that migration's transaction. The
-advisory lock is taken before the timeout is set, so a replica waiting on another's
-migration is not cut short.
+advisory locks, the app's and sqlx's own (one per database, which every migrator on it
+shares, other apps' tests on a shared server included), are taken before the timeout is
+set, so a replica waiting on another's migration is not cut short. A run with a
+`-- no-transaction` migration still to apply sets no timeout at all: such a migration
+cannot roll back, and one that failed would leave its row in `_sqlx_migrations` dirty,
+which no retry (nor any later start) gets past until it is repaired by hand.
 
 ```rust,no_run
 # async fn start(pool: sqlx::PgPool, migrator: &sqlx::migrate::Migrator) -> anyhow::Result<()> {
@@ -5167,7 +5173,9 @@ Every app then answers to the same commands:
 
 ```sh
 just setup        # npm ci, sqlx-cli and cargo-audit at CI's versions
+just hooks        # git uses .githooks/: pre-push checks formatting and commit messages
 just db           # Postgres 18 and Redis 8 (compose.yaml), then the migrations
+eval "$(just dev-db)"  # or: a migrated database of this worktree's own on a shared server
 just dev          # the app, with the stylesheet rebuilt on change
 just check        # the gate: fmt, audit, clippy, rustdoc, .sqlx freshness, tests
 just test --test worlds
@@ -5183,6 +5191,28 @@ own (`just db`'s, or a scratch one on a shared server, `createdb myapp_check`), 
 at one another app migrates: outside CI, the recipe refuses a server's shared
 `postgres` or `template1` database, and a URL that names none (the user's name is
 then the database).
+**Hooks:** copy `templates/githooks/pre-push` to the app's `.githooks/pre-push` and run
+`just hooks` once per clone or worktree (`git config core.hooksPath .githooks`). Before
+every push it runs `cargo fmt --check` and lints each commit origin/main lacks by the
+rules CI's commitlint applies (an allowed type, a lower-case subject unless it opens
+with a code identifier, a header of at most 120 characters), so what CI would refuse
+for either never leaves the machine. `git push --no-verify` skips it; `pre-push --lint`
+lints one message on stdin. This repository runs the same file from its own
+`.githooks/`, and `just ci-config` keeps the two copies identical and tests the lint.
+
+**A database per worktree:** `just dev-db` creates a database named after the
+worktree's directory on a shared server (`DEV_DB_SERVER`, by default
+`postgres://postgres:pw@127.0.0.1:55432`), migrates it, and prints
+`export DATABASE_URL=…`, so `eval "$(just dev-db)"` points the shell at it and parallel
+worktrees never migrate one another's schema. It works when the branch adds a query
+that `.sqlx/` does not hold yet: when `migrate_command` fails (an app on owt-accounts'
+ledger builds its binary to migrate, offline), it builds the binary at the merge base
+with origin/main in a temporary worktree, which runs the libraries' migrations and
+main's, and then applies the branch's own with `sqlx migrate run`.
+
+`just audit` audits every tracked `Cargo.lock`; in an export without `.git` (`git
+archive`), every `Cargo.lock` outside `target/` and `node_modules/`.
+
 App-specific recipes go below the template's `---- app recipes ----` line. The
 compose ports and database name come from the app's `.env` (`POSTGRES_PORT`,
 `POSTGRES_DB`, ...), so two apps' stacks can run side by side.
@@ -6042,6 +6072,10 @@ jobs:
     secrets: {SCCACHE_REDIS_PASSWORD: "${{ secrets.SCCACHE_REDIS_PASSWORD }}"}
 ```
 <!-- x-release-please-end -->
+
+- **Pick an hour and weekday unique to the app** for the schedule, as for the release's
+  (above); do not copy `37 6 * * 1`, which would queue every app's image build for the
+  same ARC scale set at once.
 
 An app can still call it on `pull_request` (with a `paths:` filter on what the image
 reads, and `if: github.event.pull_request.head.repo.full_name == github.repository`),
@@ -7425,10 +7459,14 @@ The router example under "Wiring an app" composes the layers; beyond it:
 
 ## Working on owt-stack
 
+Run `just hooks` once per clone or worktree: git then runs `.githooks/pre-push`, which
+refuses a push with unformatted code or a commit message CI's commitlint would refuse
+(**Hooks:** above).
+
 `just check` is the gate (fmt, `cargo audit` over every tracked lockfile, clippy over
 every crate and feature and over `owt-change` and `owt-auth` without their defaults,
 `dev-only`, the tests with the README doctests, the template tests, the commitlint
-configuration and `image-check`), and CI runs the same command. `audit` comes second
+configuration and the pre-push hook, and `image-check`), and CI runs the same command. `audit` comes second
 because it compiles nothing: an advisory fails the gate in seconds, not after the build.
 `just chart` (needs oc, helm, yq and jq) proves `charts/owt-app` against the templates;
 CI's `chart.yml` runs it. The Redis tests run when
