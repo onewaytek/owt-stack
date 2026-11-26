@@ -102,13 +102,15 @@ chart *cases:
 # The commitlint rules conventional-commits.yml writes for an app without its own are
 # commitlint.config.mjs, byte for byte; the Renovate preset reads every digest pin it
 # should (scripts/renovate-test.sh); the pre-push hook is the same file in the app
-# template, passes and refuses what commitlint does (scripts/pre-push-test.sh), and has
-# commitlint.config.mjs's header limit.
+# template, passes and refuses what commitlint does (scripts/pre-push-test.sh), uses no
+# syntax newer than bash 3.2 (macOS's /bin/bash), and has commitlint.config.mjs's header
+# limit.
 ci-config:
     diff -u commitlint.config.mjs <(sed -n "/<<'JS'$/,/^ *JS$/p" .github/workflows/conventional-commits.yml | sed '1d;$d' | sed 's/^          //')
     bash scripts/renovate-test.sh
     diff -u .githooks/pre-push templates/githooks/pre-push
     bash scripts/pre-push-test.sh
+    ! grep -nE ',,}|\^\^}|declare -[aAlu]*A|mapfile|readarray|\$\{[A-Za-z_]+@|\|&|&>>|coproc|;;&|;&$' .githooks/pre-push scripts/pre-push-test.sh
     grep -q "^header_max=$(sed -n 's/.*"header-max-length": \[2, "always", \([0-9]*\)\].*/\1/p' commitlint.config.mjs)$" .githooks/pre-push
 
 # image-check.yml's `build` and `scan` jobs are image.yml's: `build` but for the

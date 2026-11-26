@@ -13,6 +13,10 @@
 
 set -euo pipefail
 
+# Bash 3.2 (macOS's /bin/bash) runs it: no case-changing expansions, associative
+# arrays, array-reading builtins or other bash 4 syntax, and no expansion of an
+# empty array under `set -u`. `just ci-config` refuses the bash 4 syntax.
+
 # commitlint.config.mjs's limits: a header of at most 120 characters, and body and
 # footer lines of any length (0 is no limit). `just ci-config` compares the header's.
 header_max=120
@@ -50,7 +54,7 @@ lint() {
     elif ! [[ " $types " == *" $type "* ]]; then
         echo "type '$type' is not one of: $types"
     fi
-    if [ "$scope" != "${scope,,}" ]; then
+    if [ "$scope" != "$(printf '%s' "$scope" | tr '[:upper:]' '[:lower:]')" ]; then
         echo "scope '$scope' is not lower-case"
     fi
     if [ -z "$subject" ]; then
