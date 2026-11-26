@@ -19,6 +19,10 @@ setup:
     cargo install sqlx-cli@0.9.0 --locked --no-default-features --features postgres,rustls
     cargo install cargo-audit@0.22.2 --locked
 
+# Use .githooks/ (pre-push: `cargo fmt --check` and the commit-message lint CI runs).
+hooks:
+    git config core.hooksPath .githooks
+
 # Start Postgres and Redis (compose.yaml) and apply the migrations.
 db: && migrate
     {{ compose }} up -d --wait
@@ -55,6 +59,42 @@ migrate:
         esac
     fi
     {{ migrate_command }}
+
+# A database of this worktree's own on a shared Postgres server (DEV_DB_SERVER, by
+# default the test server at 127.0.0.1:55432), named after the worktree's directory,
+# created if absent and migrated. It prints only the export, so
+# `eval "$(just dev-db)"` points this shell at it; the progress goes to stderr.
+#
+# `migrate_command` runs first as it is (with SQLX_OFFLINE=true for an app that builds
+# its binary to migrate). When that fails, which an app on owt-accounts' ledger does as
+# soon as the branch adds a query its .sqlx/ does not hold yet, the binary is built
+# from the branch's merge base with origin/main instead (a detached worktree, sharing
+# this one's target/), so the libraries' migrations and main's run, and then sqlx-cli
+# applies the branch's own migrations, which needs no build.
+dev-db:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    server=${DEV_DB_SERVER:-postgres://postgres:pw@127.0.0.1:55432}
+    server=${server%/}
+    top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    name=$(basename "$top" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '_')
+    case $name in [a-z]*) ;; *) name=db_$name ;; esac
+    name=${name:0:63}
+    url=$server/$name
+    export DATABASE_URL=$url
+    sqlx database create >&2
+    if [ -d migrations ]; then
+        if ! ( {{ migrate_command }} ) >&2; then
+            base=$(git merge-base HEAD origin/main)
+            echo "dev-db: migrating with the build at the merge base ($base), then sqlx-cli" >&2
+            tmp=$(mktemp -d)
+            git worktree add -q --detach "$tmp/tree" "$base" >&2
+            trap 'git worktree remove --force "$tmp/tree" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
+            (cd "$tmp/tree" && export CARGO_TARGET_DIR="$top/target" && {{ migrate_command }}) >&2
+            sqlx migrate run >&2
+        fi
+    fi
+    echo "export DATABASE_URL=$url"
 
 # Stop them (the data stays in the volume).
 db-stop:
@@ -103,7 +143,12 @@ audit:
     #!/usr/bin/env bash
     set -euo pipefail
     # safe.directory: in a CI container the checkout's owner need not be the user.
-    locks=$(git -c safe.directory="$PWD" ls-files '*Cargo.lock')
+    # Without a .git (a `git archive` export), every lockfile outside target/.
+    if [ -e .git ]; then
+        locks=$(git -c safe.directory="$PWD" ls-files '*Cargo.lock')
+    else
+        locks=$(find . -name Cargo.lock -not -path '*/target/*' -not -path '*/node_modules/*' | sed 's|^\./||' | sort)
+    fi
     [ -n "$locks" ] || { echo "no tracked Cargo.lock to audit" >&2; exit 1; }
     status=0
     while IFS= read -r lock; do

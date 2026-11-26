@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Before a push: `cargo fmt --check`, and the commit messages linted by the rules CI's
+# commitlint applies (commitlint.config.mjs; conventional-commits.yml writes the same
+# rules for a repository without a configuration of its own), so a push that CI would
+# refuse for either never leaves the machine. `just hooks` installs it
+# (`git config core.hooksPath .githooks`); `git push --no-verify` skips it.
+#
+# The commits checked are those of each pushed ref that origin/main does not have.
+# `.githooks/pre-push --lint` reads one message on stdin and lints it alone.
+#
+# owt-stack ships this file twice, as .githooks/pre-push and templates/githooks/pre-push;
+# `just ci-config` keeps the two identical and runs scripts/pre-push-test.sh.
+
+set -euo pipefail
+
+# commitlint.config.mjs's limits: a header of at most 120 characters, and body and
+# footer lines of any length (0 is no limit). `just ci-config` compares the header's.
+header_max=120
+body_max=0
+types="build chore ci docs feat fix perf refactor revert style test"
+
+# The problems with one message (on stdin), one per line; none when it passes.
+lint() {
+    local msg header type scope subject word line n=0
+    msg=$(cat)
+    header=${msg%%$'\n'*}
+    # commitlint's ignores: Dependabot's commits, and a merge of the base in git's
+    # own wording only.
+    case $msg in *"Signed-off-by: dependabot[bot]"*) return 0 ;; esac
+    local trimmed=${header%"${header##*[![:space:]]}"}
+    if [[ $trimmed =~ ^Merge\ (branch|remote-tracking\ branch)\ \'[^\']+\'(\ of\ [^[:space:]]+)?(\ into\ [^[:space:]]+)?$ ]] ||
+        [[ $trimmed =~ ^Merge\ origin/[^[:space:]]+(\ into\ [^[:space:]]+)?$ ]] ||
+        [[ $trimmed =~ ^Merge\ main(\ into\ [^[:space:]]+)?$ ]]; then
+        return 0
+    fi
+    if [ "${#header}" -gt "$header_max" ]; then
+        echo "header is ${#header} characters, more than $header_max"
+    fi
+    if [ "$header" != "$trimmed" ] || [[ $header =~ ^[[:space:]] ]]; then
+        echo "header has leading or trailing whitespace"
+    fi
+    # config-conventional's header: type(scope)!: subject
+    if ! [[ $header =~ ^([[:alnum:]_]*)(\((.*)\))?!?:\ (.*)$ ]]; then
+        echo "header is not 'type(scope): subject' (types: $types)"
+        return 0
+    fi
+    type=${BASH_REMATCH[1]} scope=${BASH_REMATCH[3]} subject=${BASH_REMATCH[4]}
+    if [ -z "$type" ]; then
+        echo "type is empty"
+    elif ! [[ " $types " == *" $type "* ]]; then
+        echo "type '$type' is not one of: $types"
+    fi
+    if [ "$scope" != "${scope,,}" ]; then
+        echo "scope '$scope' is not lower-case"
+    fi
+    if [ -z "$subject" ]; then
+        echo "subject is empty"
+    elif [[ $subject == *. ]]; then
+        echo "subject ends with a full stop"
+    fi
+    # A subject starts lower-case unless its first word is a code identifier: a word in
+    # backticks, or one with a capital, a digit, an underscore or `::` after its first
+    # letter. One of several words is not all capitals.
+    word=${subject%%[[:space:]]*}
+    word=${word%[,;:.]}
+    if [[ $word =~ ^[A-Z] ]] &&
+        ! [[ $word =~ ^(\`[^\`]+\`|[A-Za-z][[:alnum:]_:]*([A-Z0-9_]|::)[[:alnum:]_:]*)$ ]]; then
+        echo "subject must start lower-case, unless its first word is a code identifier"
+    fi
+    local inner=${subject#"${subject%%[![:space:]]*}"}
+    inner=${inner%"${inner##*[![:space:]]}"}
+    if [[ $inner =~ [[:space:]] ]] && ! [[ $subject =~ [a-z] ]]; then
+        echo "subject must not be all capitals"
+    fi
+    if [ "$body_max" -gt 0 ]; then
+        while IFS= read -r line; do
+            n=$((n + 1))
+            [ "$n" -gt 1 ] || continue
+            if [ "${#line}" -gt "$body_max" ]; then
+                echo "body line $n is ${#line} characters, more than $body_max"
+            fi
+        done <<<"$msg"
+    fi
+}
+
+if [ "${1:-}" = "--lint" ]; then
+    problems=$(lint)
+    [ -z "$problems" ] || { printf '%s\n' "$problems"; exit 1; }
+    exit 0
+fi
+
+status=0
+
+if command -v cargo >/dev/null && [ -f Cargo.toml ]; then
+    if ! cargo fmt --check >/dev/null 2>&1; then
+        echo "pre-push: cargo fmt --check fails; run cargo fmt and commit" >&2
+        cargo fmt --check 2>&1 | head -20 >&2 || true
+        status=1
+    fi
+else
+    echo "pre-push: no cargo here; formatting not checked" >&2
+fi
+
+if ! git rev-parse -q --verify origin/main >/dev/null; then
+    echo "pre-push: no origin/main; commit messages not checked" >&2
+    exit "$status"
+fi
+
+# git writes one line per pushed ref: a deletion's local object is all zeros. Run by
+# hand (nothing on stdin), the current branch.
+pushed=()
+if ! [ -t 0 ]; then
+    while read -r _ local_sha _ _; do
+        if [ -n "${local_sha:-}" ] && [ -n "${local_sha//0/}" ]; then
+            pushed+=("$local_sha")
+        fi
+    done
+fi
+[ "${#pushed[@]}" -gt 0 ] || pushed=(HEAD)
+
+for tip in "${pushed[@]}"; do
+    for commit in $(git rev-list "origin/main..$tip"); do
+        problems=$(git log -1 --format=%B "$commit" | lint)
+        if [ -n "$problems" ]; then
+            echo "pre-push: commit $(git log -1 --format='%h %s' "$commit"):" >&2
+            printf '  %s\n' "$problems" >&2
+            status=1
+        fi
+    done
+done
+
+if [ "$status" -ne 0 ]; then
+    echo "pre-push: refused (git push --no-verify skips these checks)" >&2
+fi
+exit "$status"
