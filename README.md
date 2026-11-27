@@ -5201,14 +5201,20 @@ lints one message on stdin. This repository runs the same file from its own
 `.githooks/`, and `just ci-config` keeps the two copies identical and tests the lint.
 
 **A database per worktree:** `just dev-db` creates a database named after the
-worktree's directory on a shared server (`DEV_DB_SERVER`, by default
+repository, the worktree's directory and a hash of the worktree's path (so same-named
+worktrees of two repositories get two databases, within 63 characters) on a shared server (`DEV_DB_SERVER`, by default
 `postgres://postgres:pw@127.0.0.1:55432`), migrates it, and prints
 `export DATABASE_URL=…`, so `eval "$(just dev-db)"` points the shell at it and parallel
 worktrees never migrate one another's schema. It works when the branch adds a query
 that `.sqlx/` does not hold yet: when `migrate_command` fails (an app on owt-accounts'
 ledger builds its binary to migrate, offline), it builds the binary at the merge base
-with origin/main in a temporary worktree, which runs the libraries' migrations and
-main's, and then applies the branch's own with `sqlx migrate run`.
+with origin/main in a temporary worktree (the source checkout only, removed
+afterwards) with a target directory of its own, `DEV_DB_TARGET` (default
+`target/dev-db-base`), so the branch's build is left alone; it stays warm across runs,
+`cargo clean` removes it, and a cold build needs several GB of disk. That build runs
+the libraries' migrations and main's, and then the branch's own are applied with
+`sqlx migrate run`. A removed worktree's database stays on the server: drop it with
+`dropdb`.
 
 `just audit` audits every tracked `Cargo.lock`; in an export without `.git` (`git
 archive`), every `Cargo.lock` outside `target/` and `node_modules/`.
