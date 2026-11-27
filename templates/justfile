@@ -61,15 +61,15 @@ migrate:
     {{ migrate_command }}
 
 # A database of this worktree's own on a shared Postgres server (DEV_DB_SERVER, by
-# default the test server at 127.0.0.1:55432), named after the worktree's directory,
-# created if absent and migrated. It prints only the export, so
+# default the test server at 127.0.0.1:55432), named after the repository, the
+# worktree's directory and a hash of the worktree's path, created if absent and migrated. It prints only the export, so
 # `eval "$(just dev-db)"` points this shell at it; the progress goes to stderr.
 #
 # `migrate_command` runs first as it is (with SQLX_OFFLINE=true for an app that builds
 # its binary to migrate). When that fails, which an app on owt-accounts' ledger does as
 # soon as the branch adds a query its .sqlx/ does not hold yet, the binary is built
-# from the branch's merge base with origin/main instead (a detached worktree, sharing
-# this one's target/), so the libraries' migrations and main's run, and then sqlx-cli
+# from the branch's merge base with origin/main instead (a detached worktree with a
+# target/ of its own, so the branch's build stays as it is), so the libraries' migrations and main's run, and then sqlx-cli
 # applies the branch's own migrations, which needs no build.
 dev-db:
     #!/usr/bin/env bash
@@ -77,9 +77,12 @@ dev-db:
     server=${DEV_DB_SERVER:-postgres://postgres:pw@127.0.0.1:55432}
     server=${server%/}
     top=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-    name=$(basename "$top" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '_')
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$top/.git")
+    repo=$(basename "$(dirname "$common")")
+    hash=$(printf %s "$top" | sha1sum | cut -c1-8)
+    name=$(printf %s "${repo}_$(basename "$top")" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '_')
     case $name in [a-z]*) ;; *) name=db_$name ;; esac
-    name=${name:0:63}
+    name=${name:0:54}_$hash
     url=$server/$name
     export DATABASE_URL=$url
     sqlx database create >&2
@@ -90,7 +93,7 @@ dev-db:
             tmp=$(mktemp -d)
             git worktree add -q --detach "$tmp/tree" "$base" >&2
             trap 'git worktree remove --force "$tmp/tree" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
-            (cd "$tmp/tree" && export CARGO_TARGET_DIR="$top/target" && {{ migrate_command }}) >&2
+            (cd "$tmp/tree" && export CARGO_TARGET_DIR="$tmp/target" && {{ migrate_command }}) >&2
             sqlx migrate run >&2
         fi
     fi
