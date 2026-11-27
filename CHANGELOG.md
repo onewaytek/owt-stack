@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.15.3](https://github.com/onewaytek/owt-stack/compare/v0.15.2...v0.15.3) (2026-11-27)
+
+
+### Features
+
+* pre-push hook, `just dev-db`, and a migrate lock timeout that spares sqlx's lock ([#395](https://github.com/onewaytek/owt-stack/issues/395)) ([dadb6a8](https://github.com/onewaytek/owt-stack/commit/dadb6a8cb8288f66db51bfecd5753566a98e2f27))
+* **web:** name secure session cookies __Host- and move bare-named sessions ([#392](https://github.com/onewaytek/owt-stack/issues/392)) ([1b79626](https://github.com/onewaytek/owt-stack/commit/1b79626855677611952ccbd9cbd3cd3e8612fd1b))
+
+
+### Bug Fixes
+
+* name dev-db after the repository and path, and build its fallback apart ([#396](https://github.com/onewaytek/owt-stack/issues/396)) ([d63f7ee](https://github.com/onewaytek/owt-stack/commit/d63f7ee1137cb872b180bdac69ce62ea939a2356))
+* **runtime:** bound migrations' table-lock wait and retry on timeout ([#394](https://github.com/onewaytek/owt-stack/issues/394)) ([4ba948b](https://github.com/onewaytek/owt-stack/commit/4ba948b19233fceb881f25b7fd12b8c91312f5d9))
+
 ## [0.15.2](https://github.com/onewaytek/owt-stack/compare/v0.15.1...v0.15.2) (2026-11-24)
 
 
