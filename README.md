@@ -5208,10 +5208,13 @@ worktrees of two repositories get two databases, within 63 characters) on a shar
 worktrees never migrate one another's schema. It works when the branch adds a query
 that `.sqlx/` does not hold yet: when `migrate_command` fails (an app on owt-accounts'
 ledger builds its binary to migrate, offline), it builds the binary at the merge base
-with origin/main in a temporary worktree with a target directory of its own (the
-branch's build is left alone, and both are removed afterwards), which runs the libraries' migrations and
-main's, and then applies the branch's own with `sqlx migrate run`. A removed worktree's database stays on
-the server: drop it with `dropdb`.
+with origin/main in a temporary worktree (the source checkout only, removed
+afterwards) with a target directory of its own, `DEV_DB_TARGET` (default
+`target/dev-db-base`), so the branch's build is left alone; it stays warm across runs,
+`cargo clean` removes it, and a cold build needs several GB of disk. That build runs
+the libraries' migrations and main's, and then the branch's own are applied with
+`sqlx migrate run`. A removed worktree's database stays on the server: drop it with
+`dropdb`.
 
 `just audit` audits every tracked `Cargo.lock`; in an export without `.git` (`git
 archive`), every `Cargo.lock` outside `target/` and `node_modules/`.
